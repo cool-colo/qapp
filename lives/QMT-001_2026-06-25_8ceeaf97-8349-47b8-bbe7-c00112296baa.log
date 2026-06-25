@@ -1,0 +1,453 @@
+2026-06-25T02:14:38.990790378Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.990858063Z [INFO] QMT-001.TradingNode:  NAUTILUS TRADER - Automated Algorithmic Trading Platform
+2026-06-25T02:14:38.990860477Z [INFO] QMT-001.TradingNode:  by Nautech Systems Pty Ltd.
+2026-06-25T02:14:38.990861207Z [INFO] QMT-001.TradingNode:  Copyright (C) 2015-2026. All rights reserved.
+2026-06-25T02:14:38.990861967Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.990862921Z [INFO] QMT-001.TradingNode: 
+2026-06-25T02:14:38.990864514Z [INFO] QMT-001.TradingNode: ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣴⣶⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+2026-06-25T02:14:38.990865060Z [INFO] QMT-001.TradingNode: ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣾⣿⣿⣿⠀⢸⣿⣿⣿⣿⣶⣶⣤⣀⠀⠀⠀⠀⠀
+2026-06-25T02:14:38.990865777Z [INFO] QMT-001.TradingNode: ⠀⠀⠀⠀⠀⠀⢀⣴⡇⢀⣾⣿⣿⣿⣿⣿⠀⣾⣿⣿⣿⣿⣿⣿⣿⠿⠓⠀⠀⠀⠀
+2026-06-25T02:14:38.990866442Z [INFO] QMT-001.TradingNode: ⠀⠀⠀⠀⠀⣰⣿⣿⡀⢸⣿⣿⣿⣿⣿⣿⠀⣿⣿⣿⣿⣿⣿⠟⠁⣠⣄⠀⠀⠀⠀
+2026-06-25T02:14:38.990867021Z [INFO] QMT-001.TradingNode: ⠀⠀⠀⠀⢠⣿⣿⣿⣇⠀⢿⣿⣿⣿⣿⣿⠀⢻⣿⣿⣿⡿⢃⣠⣾⣿⣿⣧⡀⠀⠀
+2026-06-25T02:14:38.990867568Z [INFO] QMT-001.TradingNode: ⠀⠀⠀⠠⣾⣿⣿⣿⣿⣿⣧⠈⠋⢀⣴⣧⠀⣿⡏⢠⡀⢸⣿⣿⣿⣿⣿⣿⣿⡇⠀
+2026-06-25T02:14:38.990868030Z [INFO] QMT-001.TradingNode: ⠀⠀⠀⣀⠙⢿⣿⣿⣿⣿⣿⠇⢠⣿⣿⣿⡄⠹⠃⠼⠃⠈⠉⠛⠛⠛⠛⠛⠻⠇⠀
+2026-06-25T02:14:38.990868583Z [INFO] QMT-001.TradingNode: ⠀⠀⢸⡟⢠⣤⠉⠛⠿⢿⣿⠀⢸⣿⡿⠋⣠⣤⣄⠀⣾⣿⣿⣶⣶⣶⣦⡄⠀⠀⠀
+2026-06-25T02:14:38.990869113Z [INFO] QMT-001.TradingNode: ⠀⠀⠸⠀⣾⠏⣸⣷⠂⣠⣤⠀⠘⢁⣴⣾⣿⣿⣿⡆⠘⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀
+2026-06-25T02:14:38.990869657Z [INFO] QMT-001.TradingNode: ⠀⠀⠀⠀⠛⠀⣿⡟⠀⢻⣿⡄⠸⣿⣿⣿⣿⣿⣿⣿⡀⠘⣿⣿⣿⣿⠟⠀⠀⠀⠀
+2026-06-25T02:14:38.990870117Z [INFO] QMT-001.TradingNode: ⠀⠀⠀⠀⠀⠀⣿⠇⠀⠀⢻⡿⠀⠈⠻⣿⣿⣿⣿⣿⡇⠀⢹⣿⠿⠋⠀⠀⠀⠀⠀
+2026-06-25T02:14:38.990870560Z [INFO] QMT-001.TradingNode: ⠀⠀⠀⠀⠀⠀⠋⠀⠀⠀⡘⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠁⠀⠀⠀⠀⠀⠀⠀
+2026-06-25T02:14:38.990870993Z [INFO] QMT-001.TradingNode: 
+2026-06-25T02:14:38.990871400Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.990872101Z [INFO] QMT-001.TradingNode:  SYSTEM SPECIFICATION
+2026-06-25T02:14:38.990872569Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.990875183Z [INFO] QMT-001.TradingNode: CPU architecture: Intel(R) Xeon(R) Platinum 8369B CPU @ 2.90GHz
+2026-06-25T02:14:38.990877565Z [INFO] QMT-001.TradingNode: CPU(s): 128 @ 3495 MHz
+2026-06-25T02:14:38.990878956Z [INFO] QMT-001.TradingNode: OS: kernel-5.15.0-73-generic Linux (Ubuntu 22.04)
+2026-06-25T02:14:38.991061495Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.991064744Z [INFO] QMT-001.TradingNode:  MEMORY USAGE
+2026-06-25T02:14:38.991065497Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.991074518Z [INFO] QMT-001.TradingNode: RAM-Total: 1006.99 GiB
+2026-06-25T02:14:38.991076140Z [INFO] QMT-001.TradingNode: RAM-Used: 476.10 GiB (47.28%)
+2026-06-25T02:14:38.991077209Z [INFO] QMT-001.TradingNode: RAM-Avail: 530.89 GiB (52.72%)
+2026-06-25T02:14:38.991078817Z [INFO] QMT-001.TradingNode: Swap: disabled
+2026-06-25T02:14:38.991082442Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.991083231Z [INFO] QMT-001.TradingNode:  IDENTIFIERS
+2026-06-25T02:14:38.991083930Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.991086825Z [INFO] QMT-001.TradingNode: trader_id: QMT-001
+2026-06-25T02:14:38.991087846Z [INFO] QMT-001.TradingNode: machine_id: ai-t3
+2026-06-25T02:14:38.991091772Z [INFO] QMT-001.TradingNode: instance_id: 8ceeaf97-8349-47b8-bbe7-c00112296baa
+2026-06-25T02:14:38.991092874Z [INFO] QMT-001.TradingNode: PID: 3310379
+2026-06-25T02:14:38.991093419Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.991093979Z [INFO] QMT-001.TradingNode:  VERSIONING
+2026-06-25T02:14:38.991094477Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.991128752Z [INFO] QMT-001.TradingNode: nautilus_trader: 1.229.0
+2026-06-25T02:14:38.991143027Z [INFO] QMT-001.TradingNode: python: 3.12.13
+2026-06-25T02:14:38.991149884Z [INFO] QMT-001.TradingNode: numpy: 2.1.3
+2026-06-25T02:14:38.991154780Z [INFO] QMT-001.TradingNode: pandas: 2.3.3
+2026-06-25T02:14:38.991158514Z [INFO] QMT-001.TradingNode: msgspec: 0.21.1
+2026-06-25T02:14:38.991169638Z [INFO] QMT-001.TradingNode: pyarrow: 24.0.0
+2026-06-25T02:14:38.991174242Z [INFO] QMT-001.TradingNode: pytz: 2026.2
+2026-06-25T02:14:38.991185453Z [INFO] QMT-001.TradingNode: uvloop: 0.22.1
+2026-06-25T02:14:38.991187288Z [INFO] QMT-001.TradingNode: =================================================================
+2026-06-25T02:14:38.991237242Z [INFO] QMT-001.TradingNode: Building system kernel
+2026-06-25T02:14:38.991571993Z [INFO] QMT-001.MessageBus: config.database=None
+2026-06-25T02:14:38.991581175Z [INFO] QMT-001.MessageBus: config.encoding='json'
+2026-06-25T02:14:38.991583190Z [INFO] QMT-001.MessageBus: config.timestamps_as_iso8601=False
+2026-06-25T02:14:38.991584853Z [INFO] QMT-001.MessageBus: config.buffer_interval_ms=None
+2026-06-25T02:14:38.991586117Z [INFO] QMT-001.MessageBus: config.autotrim_mins=None
+2026-06-25T02:14:38.991587910Z [INFO] QMT-001.MessageBus: config.use_trader_prefix=True
+2026-06-25T02:14:38.991589344Z [INFO] QMT-001.MessageBus: config.use_trader_id=True
+2026-06-25T02:14:38.991594553Z [INFO] QMT-001.MessageBus: config.use_instance_id=False
+2026-06-25T02:14:38.991596098Z [INFO] QMT-001.MessageBus: config.streams_prefix='stream'
+2026-06-25T02:14:38.991597367Z [INFO] QMT-001.MessageBus: config.types_filter=None
+2026-06-25T02:14:38.991709330Z [INFO] QMT-001.Cache: READY
+2026-06-25T02:14:38.992441569Z [INFO] QMT-001.DataEngine: READY
+2026-06-25T02:14:38.992659254Z [INFO] QMT-001.DataEngine: config.graceful_shutdown_on_exception=False
+2026-06-25T02:14:38.992720393Z [INFO] QMT-001.RiskEngine: READY
+2026-06-25T02:14:38.992797944Z [INFO] QMT-001.RiskEngine: TradingState is ACTIVE
+2026-06-25T02:14:38.992890967Z [INFO] QMT-001.Throttler-ORDER_SUBMIT_THROTTLER: READY
+2026-06-25T02:14:38.992918134Z [INFO] QMT-001.RiskEngine: Set MAX_ORDER_SUBMIT_RATE: 100/00:00:01
+2026-06-25T02:14:38.992942181Z [INFO] QMT-001.Throttler-ORDER_MODIFY_THROTTLER: READY
+2026-06-25T02:14:38.992951753Z [INFO] QMT-001.RiskEngine: Set MAX_ORDER_MODIFY_RATE: 100/00:00:01
+2026-06-25T02:14:38.992993229Z [INFO] QMT-001.RiskEngine: config.graceful_shutdown_on_exception=False
+2026-06-25T02:14:38.993067264Z [INFO] QMT-001.ExecEngine: READY
+2026-06-25T02:14:38.993112018Z [INFO] QMT-001.ExecEngine: config.snapshot_orders=False
+2026-06-25T02:14:38.993115605Z [INFO] QMT-001.ExecEngine: config.snapshot_positions=False
+2026-06-25T02:14:38.993117478Z [INFO] QMT-001.ExecEngine: config.snapshot_positions_interval_secs=None
+2026-06-25T02:14:38.993118926Z [INFO] QMT-001.ExecEngine: config.allow_overfills=False
+2026-06-25T02:14:38.993181027Z [INFO] QMT-001.ExecEngine: config.reconciliation=True
+2026-06-25T02:14:38.993185205Z [INFO] QMT-001.ExecEngine: config.reconciliation_lookback_mins=1440
+2026-06-25T02:14:38.993186886Z [INFO] QMT-001.ExecEngine: config.reconciliation_instrument_ids=None
+2026-06-25T02:14:38.993188717Z [INFO] QMT-001.ExecEngine: config.filter_unclaimed_external_orders=True
+2026-06-25T02:14:38.993190306Z [INFO] QMT-001.ExecEngine: config.filter_position_reports=False
+2026-06-25T02:14:38.993192017Z [INFO] QMT-001.ExecEngine: config.filtered_client_order_ids=None
+2026-06-25T02:14:38.993193325Z [INFO] QMT-001.ExecEngine: config.inflight_check_interval_ms=2000
+2026-06-25T02:14:38.993194370Z [INFO] QMT-001.ExecEngine: config.inflight_check_threshold_ms=5000
+2026-06-25T02:14:38.993195658Z [INFO] QMT-001.ExecEngine: config.inflight_check_retries=5
+2026-06-25T02:14:38.993196909Z [INFO] QMT-001.ExecEngine: config.own_books_audit_interval_secs=None
+2026-06-25T02:14:38.993198256Z [INFO] QMT-001.ExecEngine: config.open_check_interval_secs=None
+2026-06-25T02:14:38.993199343Z [INFO] QMT-001.ExecEngine: config.open_check_open_only=True
+2026-06-25T02:14:38.993200683Z [INFO] QMT-001.ExecEngine: config.open_check_lookback_mins=60
+2026-06-25T02:14:38.993201857Z [INFO] QMT-001.ExecEngine: config.open_check_threshold_ms=5000
+2026-06-25T02:14:38.993203388Z [INFO] QMT-001.ExecEngine: config.open_check_missing_retries=5
+2026-06-25T02:14:38.993204610Z [INFO] QMT-001.ExecEngine: config.max_single_order_queries_per_cycle=10
+2026-06-25T02:14:38.993206967Z [INFO] QMT-001.ExecEngine: config.single_order_query_delay_ms=100
+2026-06-25T02:14:38.993208366Z [INFO] QMT-001.ExecEngine: config.position_check_interval_secs=None
+2026-06-25T02:14:38.993209481Z [INFO] QMT-001.ExecEngine: config.position_check_lookback_mins=60
+2026-06-25T02:14:38.993210627Z [INFO] QMT-001.ExecEngine: config.position_check_threshold_ms=5000
+2026-06-25T02:14:38.993211821Z [INFO] QMT-001.ExecEngine: config.position_check_retries=3
+2026-06-25T02:14:38.993215041Z [INFO] QMT-001.ExecEngine: config.reconciliation_startup_delay_secs=10.0
+2026-06-25T02:14:38.993216450Z [INFO] QMT-001.ExecEngine: config.purge_closed_orders_interval_mins=None
+2026-06-25T02:14:38.993217679Z [INFO] QMT-001.ExecEngine: config.purge_closed_orders_buffer_mins=None
+2026-06-25T02:14:38.993219002Z [INFO] QMT-001.ExecEngine: config.purge_closed_positions_interval_mins=None
+2026-06-25T02:14:38.993220274Z [INFO] QMT-001.ExecEngine: config.purge_closed_positions_buffer_mins=None
+2026-06-25T02:14:38.993221400Z [INFO] QMT-001.ExecEngine: config.purge_account_events_interval_mins=None
+2026-06-25T02:14:38.993222483Z [INFO] QMT-001.ExecEngine: config.purge_account_events_lookback_mins=None
+2026-06-25T02:14:38.993223700Z [INFO] QMT-001.ExecEngine: config.purge_from_database=False
+2026-06-25T02:14:38.993224929Z [INFO] QMT-001.ExecEngine: config.graceful_shutdown_on_exception=False
+2026-06-25T02:14:38.993293285Z [INFO] QMT-001.Cache: Cached 0 general objects from database
+2026-06-25T02:14:38.993298690Z [INFO] QMT-001.Cache: Cached 0 currencies from database
+2026-06-25T02:14:38.993301972Z [INFO] QMT-001.Cache: Cached 0 instruments from database
+2026-06-25T02:14:38.993305868Z [INFO] QMT-001.Cache: Cached 0 accounts from database
+2026-06-25T02:14:38.993308833Z [INFO] QMT-001.Cache: Cached 0 orders from database
+2026-06-25T02:14:38.993312120Z [INFO] QMT-001.Cache: Cached 0 order lists from database
+2026-06-25T02:14:38.993314891Z [INFO] QMT-001.Cache: Cached 0 positions from database
+2026-06-25T02:14:38.993329525Z [INFO] QMT-001.Cache: Checking data integrity
+2026-06-25T02:14:38.993340977Z [INFO] QMT-001.Cache: Integrity check passed in 8μs
+2026-06-25T02:14:38.993359234Z [INFO] QMT-001.ExecEngine: Loaded cache in 0ms
+2026-06-25T02:14:38.993440062Z [INFO] QMT-001.OrderEmulator: READY
+2026-06-25T02:14:38.993521408Z [INFO] QMT-001.QMT-001: READY
+2026-06-25T02:14:38.993562292Z [INFO] QMT-001.TradingNode: Initialized in 11ms
+2026-06-25T02:14:38.993582943Z [INFO] QMT-001.TradingNode: has_cache_backing=False
+2026-06-25T02:14:38.993585786Z [INFO] QMT-001.TradingNode: has_msgbus_backing=False
+2026-06-25T02:14:38.996300021Z [INFO] QMT-001.LiveModelPredictionsStrategy: READY
+2026-06-25T02:14:38.996413485Z [INFO] QMT-001.ExecEngine: Registered OMS.UNSPECIFIED for Strategy LiveModelPredictionsStrategy-001
+2026-06-25T02:14:38.996463516Z [INFO] QMT-001.ExecEngine: Registered external order claims for LiveModelPredictionsStrategy-001: [InstrumentId('605365.SH.QMT'), InstrumentId('605598.SH.QMT'), InstrumentId('688013.SH.QMT'), InstrumentId('688051.SH.QMT'), InstrumentId('688117.SH.QMT'), InstrumentId('688136.SH.QMT'), InstrumentId('688191.SH.QMT'), InstrumentId('688195.SH.QMT'), InstrumentId('688196.SH.QMT'), InstrumentId('688236.SH.QMT'), InstrumentId('688311.SH.QMT'), InstrumentId('688353.SH.QMT'), InstrumentId('688355.SH.QMT'), InstrumentId('688370.SH.QMT'), InstrumentId('688377.SH.QMT'), InstrumentId('688389.SH.QMT'), InstrumentId('688395.SH.QMT'), InstrumentId('688468.SH.QMT'), InstrumentId('688517.SH.QMT'), InstrumentId('688528.SH.QMT'), InstrumentId('688543.SH.QMT'), InstrumentId('688552.SH.QMT'), InstrumentId('688577.SH.QMT'), InstrumentId('688613.SH.QMT'), InstrumentId('688639.SH.QMT'), InstrumentId('688658.SH.QMT'), InstrumentId('688659.SH.QMT'), InstrumentId('688660.SH.QMT'), InstrumentId('688670.SH.QMT'), InstrumentId('688776.SH.QMT')]
+2026-06-25T02:14:38.996471891Z [INFO] QMT-001.QMT-001: Registered Strategy LiveModelPredictionsStrategy-001
+2026-06-25T02:14:38.996495317Z [INFO] QMT-001.TradingNode: Building data client for QMT
+2026-06-25T02:14:38.996569097Z [INFO] QMT-001.QMTInstrumentProvider: READY
+2026-06-25T02:14:38.996695242Z [INFO] QMT-001.DataClient-QMT: READY
+2026-06-25T02:14:38.996741406Z [INFO] QMT-001.DataClient-QMT: config.base_url_http='https://2395ebf9eb74494ba7c720002d305ccb.hn.takin.cc/'
+2026-06-25T02:14:38.996745578Z [INFO] QMT-001.DataClient-QMT: config.base_url_ws='wss://2395ebf9eb74494ba7c720002d305ccb.hn.takin.cc/'
+2026-06-25T02:14:38.996747407Z [INFO] QMT-001.DataClient-QMT: config.adjust_type='none'
+2026-06-25T02:14:38.996758230Z [INFO] QMT-001.DataEngine: Registered QMT
+2026-06-25T02:14:38.996767397Z [INFO] QMT-001.TradingNode: Building execution client for QMT
+2026-06-25T02:14:38.996792699Z [INFO] QMT-001.QMTInstrumentProvider: READY
+2026-06-25T02:14:38.996885597Z [INFO] QMT-001.ExecClient-QMT: READY
+2026-06-25T02:14:38.996925264Z [INFO] QMT-001.ExecClient-QMT: config.base_url_http='https://2395ebf9eb74494ba7c720002d305ccb.hn.takin.cc/'
+2026-06-25T02:14:38.996929407Z [INFO] QMT-001.ExecClient-QMT: config.account_id='86904088'
+2026-06-25T02:14:38.996931474Z [INFO] QMT-001.ExecClient-QMT: config.account_type='STOCK'
+2026-06-25T02:14:38.996934549Z [INFO] QMT-001.ExecClient-QMT: config.poll_interval_secs=1.0
+2026-06-25T02:14:38.996939565Z [INFO] QMT-001.ExecEngine: Registered ExecutionClient-QMT
+2026-06-25T02:14:38.997807286Z [INFO] QMT-001.TradingNode: STARTING
+2026-06-25T02:14:38.997905876Z [INFO] QMT-001.DataClient-QMT: RUNNING
+2026-06-25T02:14:38.997940094Z [INFO] QMT-001.DataEngine: RUNNING
+2026-06-25T02:14:38.997964567Z [INFO] QMT-001.RiskEngine: RUNNING
+2026-06-25T02:14:38.997981137Z [INFO] QMT-001.ExecClient-QMT: RUNNING
+2026-06-25T02:14:38.998002354Z [INFO] QMT-001.ExecEngine: Started reconciliation task
+2026-06-25T02:14:38.998010423Z [INFO] QMT-001.ExecEngine: RUNNING
+2026-06-25T02:14:38.998018216Z [INFO] QMT-001.DataEngine: Connecting all clients...
+2026-06-25T02:14:38.998022183Z [INFO] QMT-001.DataClient-QMT: Connecting...
+2026-06-25T02:14:38.998040457Z [INFO] QMT-001.ExecEngine: Connecting all clients...
+2026-06-25T02:14:38.998044873Z [INFO] QMT-001.ExecClient-QMT: Connecting...
+2026-06-25T02:14:38.998056834Z [INFO] QMT-001.TradingNode: Awaiting engine connections and initializations (30.0s timeout)...
+2026-06-25T02:14:38.998205291Z [INFO] QMT-001.ExecEngine: Starting continuous reconciliation with intervals: inflight=2000ms, consistency=Nones, position=Nones
+2026-06-25T02:14:38.998213602Z [INFO] QMT-001.ExecEngine: Awaiting startup reconciliation completion before starting continuous checks
+2026-06-25T02:14:38.998372063Z [INFO] QMT-001.QMTInstrumentProvider: Initializing instruments...
+2026-06-25T02:14:38.998404410Z [INFO] QMT-001.QMTInstrumentProvider: Loading instruments: 688639.SH.QMT, 688552.SH.QMT, 688776.SH.QMT, 688577.SH.QMT, 688543.SH.QMT, 688353.SH.QMT, 605365.SH.QMT, 688195.SH.QMT, 688236.SH.QMT, 688389.SH.QMT, 688051.SH.QMT, 688670.SH.QMT, 688613.SH.QMT, 688136.SH.QMT, 688468.SH.QMT, 688355.SH.QMT, 688191.SH.QMT, 605598.SH.QMT, 688311.SH.QMT, 688117.SH.QMT, 688659.SH.QMT, 688013.SH.QMT, 688395.SH.QMT, 688517.SH.QMT, 688528.SH.QMT, 688377.SH.QMT, 688660.SH.QMT, 688658.SH.QMT, 688370.SH.QMT, 688196.SH.QMT...
+2026-06-25T02:14:38.999120389Z [INFO] QMT-001.QMTInstrumentProvider: Initializing instruments...
+2026-06-25T02:14:38.999157685Z [INFO] QMT-001.QMTInstrumentProvider: Loading instruments: 688639.SH.QMT, 688552.SH.QMT, 688776.SH.QMT, 688577.SH.QMT, 688543.SH.QMT, 688353.SH.QMT, 605365.SH.QMT, 688195.SH.QMT, 688236.SH.QMT, 688389.SH.QMT, 688051.SH.QMT, 688670.SH.QMT, 688613.SH.QMT, 688136.SH.QMT, 688468.SH.QMT, 688355.SH.QMT, 688191.SH.QMT, 605598.SH.QMT, 688311.SH.QMT, 688117.SH.QMT, 688659.SH.QMT, 688013.SH.QMT, 688395.SH.QMT, 688517.SH.QMT, 688528.SH.QMT, 688377.SH.QMT, 688660.SH.QMT, 688658.SH.QMT, 688370.SH.QMT, 688196.SH.QMT...
+2026-06-25T02:14:41.737400614Z [INFO] QMT-001.QMTInstrumentProvider: Loaded 30 instruments
+2026-06-25T02:14:41.737458447Z [INFO] QMT-001.QMTInstrumentProvider: Initialized instruments
+2026-06-25T02:14:41.737921029Z [INFO] QMT-001.DataClient-QMT: Connected
+2026-06-25T02:14:41.774545115Z [INFO] QMT-001.QMTInstrumentProvider: Loaded 30 instruments
+2026-06-25T02:14:41.774584021Z [INFO] QMT-001.QMTInstrumentProvider: Initialized instruments
+2026-06-25T02:14:41.989384559Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=117d8b95-371c-42ab-b80b-8edb29a2c595)
+2026-06-25T02:14:41.989714323Z [INFO] QMT-001.ExecClient-QMT: Connected
+2026-06-25T02:14:41.989804148Z [INFO] QMT-001.TradingNode: Awaiting execution state reconciliation (10.0s timeout)...
+2026-06-25T02:14:41.989945833Z [INFO] QMT-001.ExecClient-QMT: Generating ExecutionMassStatus...
+2026-06-25T02:14:42.082523433Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=36f04b4e-d293-4c2b-83bb-7f1a2ca16bce)
+2026-06-25T02:14:42.175833068Z [INFO] QMT-001.ExecEngine: Reconciling ExecutionMassStatus for QMT
+2026-06-25T02:14:42.175913459Z [INFO] QMT-001.ExecEngine: Attempting to adjust fills for 0 instruments
+2026-06-25T02:14:42.182284679Z [INFO] QMT-001.ExecEngine: Updating adjusted fills for 0 instruments
+2026-06-25T02:14:42.182328030Z [INFO] QMT-001.ExecEngine: Final order_reports contains 6 orders, fill_reports contains 5 fills across all instruments
+2026-06-25T02:14:42.182485347Z [INFO] QMT-001.ExecEngine: Reconciling NET position for 600000.SH.QMT
+2026-06-25T02:14:42.182496363Z [INFO] QMT-001.ExecEngine: Reconciling NET position for 600036.SH.QMT
+2026-06-25T02:14:42.182501162Z [INFO] QMT-001.ExecEngine: Reconciling NET position for 000001.SZ.QMT
+2026-06-25T02:14:42.182504938Z [INFO] QMT-001.ExecEngine: Reconciling NET position for 159530.SZ.QMT
+2026-06-25T02:14:42.182583134Z [INFO] QMT-001.ExecEngine: Reconciliation for QMT succeeded
+2026-06-25T02:14:42.182604620Z [INFO] QMT-001.TradingNode: Execution state reconciled
+2026-06-25T02:14:42.182682351Z [INFO] QMT-001.OrderEmulator: No emulated orders to reactivate
+2026-06-25T02:14:42.182740251Z [INFO] QMT-001.OrderEmulator: RUNNING
+2026-06-25T02:14:42.182783253Z [INFO] QMT-001.Portfolio: Initialized 0 open orders
+2026-06-25T02:14:42.182792653Z [INFO] QMT-001.Portfolio: Initialized 0 open positions
+2026-06-25T02:14:42.182809689Z [INFO] QMT-001.TradingNode: Awaiting portfolio initialization (10.0s timeout)...
+2026-06-25T02:14:42.182915655Z [INFO] QMT-001.ExecEngine: Startup reconciliation completed
+2026-06-25T02:14:42.182925097Z [INFO] QMT-001.ExecEngine: Applying post-reconciliation startup delay (10.0s)
+2026-06-25T02:14:42.182992622Z [INFO] QMT-001.TradingNode: Portfolio initialized
+2026-06-25T02:14:42.183087922Z [INFO] QMT-001.LiveModelPredictionsStrategy: self.config.oms_type=None
+2026-06-25T02:14:42.183155442Z [INFO] QMT-001.LiveModelPredictionsStrategy: self.config.external_order_claims=[InstrumentId('605365.SH.QMT'), InstrumentId('605598.SH.QMT'), InstrumentId('688013.SH.QMT'), InstrumentId('688051.SH.QMT'), InstrumentId('688117.SH.QMT'), InstrumentId('688136.SH.QMT'), InstrumentId('688191.SH.QMT'), InstrumentId('688195.SH.QMT'), InstrumentId('688196.SH.QMT'), InstrumentId('688236.SH.QMT'), InstrumentId('688311.SH.QMT'), InstrumentId('688353.SH.QMT'), InstrumentId('688355.SH.QMT'), InstrumentId('688370.SH.QMT'), InstrumentId('688377.SH.QMT'), InstrumentId('688389.SH.QMT'), InstrumentId('688395.SH.QMT'), InstrumentId('688468.SH.QMT'), InstrumentId('688517.SH.QMT'), InstrumentId('688528.SH.QMT'), InstrumentId('688543.SH.QMT'), InstrumentId('688552.SH.QMT'), InstrumentId('688577.SH.QMT'), InstrumentId('688613.SH.QMT'), InstrumentId('688639.SH.QMT'), InstrumentId('688658.SH.QMT'), InstrumentId('688659.SH.QMT'), InstrumentId('688660.SH.QMT'), InstrumentId('688670.SH.QMT'), InstrumentId('688776.SH.QMT')]
+2026-06-25T02:14:42.183158847Z [INFO] QMT-001.LiveModelPredictionsStrategy: self.config.manage_gtd_expiry=False
+2026-06-25T02:14:42.183182981Z [INFO] QMT-001.LiveModelPredictionsStrategy: Set ClientOrderIdGenerator client_order_id count to 0
+2026-06-25T02:14:42.183185052Z [INFO] QMT-001.LiveModelPredictionsStrategy: Set ClientOrderIdGenerator order_list_id count to 0
+2026-06-25T02:14:42.184034797Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=605365.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184114943Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=605598.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184139387Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688013.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184160450Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688051.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184185000Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688117.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184205847Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688136.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184223569Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688191.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184241488Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688195.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184258065Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688196.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184274272Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688236.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184290932Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688311.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184307508Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688353.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184327224Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688355.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184344428Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688370.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184361044Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688377.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184378221Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688389.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184393549Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688395.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184410077Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688468.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184425021Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688517.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184440254Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688528.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184457295Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688543.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184474732Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688552.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184490880Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688577.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184507394Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688613.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184525362Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688639.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184546142Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688658.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184571011Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688659.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184599376Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688660.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184629697Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688670.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.184661195Z [INFO] QMT-001.LiveModelPredictionsStrategy: [CMD]--> SubscribeBars(bar_type=688776.SH.QMT-1-DAY-LAST-EXTERNAL, client_id=None, venue=QMT)
+2026-06-25T02:14:42.190230900Z [INFO] QMT-001.LiveModelPredictionsStrategy: RUNNING
+2026-06-25T02:14:42.190283331Z [INFO] QMT-001.QMT-001: RUNNING
+2026-06-25T02:14:42.190309660Z [INFO] QMT-001.TradingNode: RUNNING
+2026-06-25T02:14:42.319360881Z [INFO] QMT-001.DataClient-QMT: Subscribed 605365.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.394088496Z [INFO] QMT-001.DataClient-QMT: Subscribed 688195.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.514187263Z [INFO] QMT-001.DataClient-QMT: Subscribed 688117.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.585148173Z [INFO] QMT-001.DataClient-QMT: Subscribed 688136.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.588005750Z [INFO] QMT-001.DataClient-QMT: Subscribed 688236.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.657662166Z [INFO] QMT-001.DataClient-QMT: Subscribed 688013.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.660251950Z [INFO] QMT-001.DataClient-QMT: Subscribed 688051.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.752435374Z [INFO] QMT-001.DataClient-QMT: Subscribed 688191.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.755200517Z [INFO] QMT-001.DataClient-QMT: Subscribed 688196.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.756656968Z [INFO] QMT-001.DataClient-QMT: Subscribed 605598.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.761695904Z [INFO] QMT-001.DataClient-QMT: Subscribed 688311.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.793670851Z [INFO] QMT-001.DataClient-QMT: Subscribed 688353.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.954293644Z [INFO] QMT-001.DataClient-QMT: Subscribed 688355.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.967358741Z [INFO] QMT-001.DataClient-QMT: Subscribed 688370.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.970357317Z [INFO] QMT-001.DataClient-QMT: Subscribed 688377.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.972021870Z [INFO] QMT-001.DataClient-QMT: Subscribed 688389.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:42.975271652Z [INFO] QMT-001.DataClient-QMT: Subscribed 688395.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.182749538Z [INFO] QMT-001.DataClient-QMT: Subscribed 688468.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.185095856Z [INFO] QMT-001.DataClient-QMT: Subscribed 688552.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.185806132Z [INFO] QMT-001.DataClient-QMT: Subscribed 688528.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.187904764Z [INFO] QMT-001.DataClient-QMT: Subscribed 688517.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.188039630Z [INFO] QMT-001.DataClient-QMT: Subscribed 688543.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.359266374Z [INFO] QMT-001.DataClient-QMT: Subscribed 688613.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.359698587Z [INFO] QMT-001.DataClient-QMT: Subscribed 688577.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.360108473Z [INFO] QMT-001.DataClient-QMT: Subscribed 688658.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.361704316Z [INFO] QMT-001.DataClient-QMT: Subscribed 688639.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.362629231Z [INFO] QMT-001.DataClient-QMT: Subscribed 688659.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.366283341Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=208a3701-1a1d-4939-864c-6e478d8f101e)
+2026-06-25T02:14:43.722168303Z [INFO] QMT-001.DataClient-QMT: Subscribed 688670.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.722468751Z [INFO] QMT-001.DataClient-QMT: Subscribed 688660.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:43.725539804Z [INFO] QMT-001.DataClient-QMT: Subscribed 688776.SH.QMT-1-DAY-LAST-EXTERNAL bars
+2026-06-25T02:14:44.919771730Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=93a6bbdf-4ec2-4d72-b07a-466bcabb1dea)
+2026-06-25T02:14:46.165897641Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=aa5ce7e5-b7af-4897-aea2-6003e05121a6)
+2026-06-25T02:14:47.410794690Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=7f7f859c-377c-412e-b284-722f533c616b)
+2026-06-25T02:14:48.653559956Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=b17fa4fb-32b9-4efa-a6ec-2d6cb1d9de0a)
+2026-06-25T02:14:49.893157690Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=f54da4e2-6de2-4d63-abfb-3b6bb72b113b)
+2026-06-25T02:14:51.132595993Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=aee77f57-9fc7-4a0f-a7b2-ae0576f79c9b)
+2026-06-25T02:14:52.384164599Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2ec55d20-0f7f-45d4-93c1-ecdc16dad45e)
+2026-06-25T02:14:53.634232999Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=55ac4b61-6087-4ef9-b7ad-b04f96b53b1e)
+2026-06-25T02:14:54.876668949Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=155bfb5b-da0d-46f5-9ba7-d87138f87739)
+2026-06-25T02:14:56.123213435Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=868851d8-3e8a-4b1a-b72d-134616d5e1f1)
+2026-06-25T02:14:57.364430608Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=c91683e3-0bdb-4b8e-9c63-b8ba812565e6)
+2026-06-25T02:14:58.609243403Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2a1c8a98-c3d9-4a3c-b4c2-87d82a21fe1c)
+2026-06-25T02:14:59.921390028Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=e694e920-35cb-430a-b6c8-58c9111146ce)
+2026-06-25T02:15:01.175335174Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=23d00b01-6db9-4c77-8336-24bf0e4ff803)
+2026-06-25T02:15:02.428251020Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=6ccddcfa-58d5-4a2f-8f38-eec2041f3646)
+2026-06-25T02:15:03.687338306Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=1ed552c6-78c5-4a41-b001-2a447d693326)
+2026-06-25T02:15:04.921430233Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=513ed911-4adc-47a7-a416-9c8378efdc23)
+2026-06-25T02:15:06.168724498Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=9547cda6-cdd6-42b7-b686-5a3013a215f2)
+2026-06-25T02:15:07.410033736Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=b4e9b7aa-90f8-45de-87e9-a7e5e0c558b4)
+2026-06-25T02:15:08.649173799Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=810003f7-a518-442e-861f-1b959d262c2d)
+2026-06-25T02:15:09.950807148Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=efe22876-aca7-4125-b990-b9e68c01509f)
+2026-06-25T02:15:11.197864922Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=bcc72219-7270-4b8e-8974-05a633ef5ac2)
+2026-06-25T02:15:12.436689623Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=d8787bda-064e-432a-86bd-4d57d3b0bd6b)
+2026-06-25T02:15:13.682455839Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=16ce4bff-0ac0-45e3-8e4e-fc3ad7c88c5d)
+2026-06-25T02:15:14.928676122Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=e6ef25a8-da18-469c-8493-abc359cc5fe9)
+2026-06-25T02:15:16.181977058Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=19fa2c32-0195-43d9-b8e7-3ad6077ac3d8)
+2026-06-25T02:15:17.424750433Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=3da6fb7d-2247-4121-9d8a-920c14960cbf)
+2026-06-25T02:15:18.665486715Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=13199a38-be17-40eb-8d81-428aab039ba2)
+2026-06-25T02:15:19.994144131Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=d57b334e-1085-4ac7-a227-c0d00f7894fe)
+2026-06-25T02:15:21.253247936Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=f249ae09-9685-4998-8110-c8a68860e4ff)
+2026-06-25T02:15:22.493242935Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2602ea66-df28-4d3e-9496-7c8b6644b1eb)
+2026-06-25T02:15:23.732452634Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=3c911a96-02e7-45c8-8c65-a95a74ea4178)
+2026-06-25T02:15:25.159184409Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=4d90af13-802b-4149-add3-fe5d68855258)
+2026-06-25T02:15:26.527572146Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=f45fa6b7-529e-4d8b-a4b6-88d27addb9e6)
+2026-06-25T02:15:27.765450425Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=c3bd7573-38cd-4837-949b-55e832d87570)
+2026-06-25T02:15:28.995221168Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=4ca8978d-2246-4f15-8de3-b789c13f42e3)
+2026-06-25T02:15:30.252904779Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=598820ef-d733-4c45-9d0c-e0fdb25102e2)
+2026-06-25T02:15:31.503390122Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=b9fa2e69-bfd1-4262-9cee-9f05744caf63)
+2026-06-25T02:15:32.750113555Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=de541183-11d3-4f24-b8dc-41b0f2442c29)
+2026-06-25T02:15:34.014719562Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=f8989c95-570a-476f-8ee8-c678b730aa67)
+2026-06-25T02:15:35.262651262Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=43fead7b-8774-4cfc-994c-7b25887a06ee)
+2026-06-25T02:15:36.525250147Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=23818fee-ac3a-461c-a025-05cd83c76331)
+2026-06-25T02:15:37.782422396Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=20b9115d-fa19-4fcb-84b2-8e6c46eaebe2)
+2026-06-25T02:15:39.033806159Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=6b396c1e-129a-4e32-b306-241b809d0874)
+2026-06-25T02:15:40.294129477Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=d82de2d3-fde4-4fe6-81e3-1c495da11077)
+2026-06-25T02:15:41.552444911Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=9a4eed53-8f41-49f0-a2ce-d6658f2e5db1)
+2026-06-25T02:15:42.803245944Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=f70df567-b31b-44ea-bc2e-cb8711d7c0ab)
+2026-06-25T02:15:44.060247046Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=c17d2a4e-9c1e-436a-a980-85b167e6df0e)
+2026-06-25T02:15:45.311903546Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=8923d011-59d3-4e55-b990-9fd4f79da697)
+2026-06-25T02:15:46.571965698Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=d9619f34-5d6c-45f5-81e1-234fdb8cf9da)
+2026-06-25T02:15:47.822161037Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=1960b14f-6e5b-49df-87de-946ff6095397)
+2026-06-25T02:15:49.065006246Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=0cfddb85-173a-45db-bcf8-6d5aa2ddb0f7)
+2026-06-25T02:15:50.330336954Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=8280bfdf-b4bb-4254-8e3f-5948fd7eab74)
+2026-06-25T02:15:51.596285142Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=15cf5b4e-ac78-466c-87da-128083feaed8)
+2026-06-25T02:15:52.839688547Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=d5984731-c696-427c-9b4d-7f2e5cc2ddfa)
+2026-06-25T02:15:54.107858711Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=51b07f11-9a05-4442-95a1-d02185dcfc0b)
+2026-06-25T02:15:55.355919162Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=50eeb334-03c2-42eb-b4a9-153b258e9323)
+2026-06-25T02:15:56.613309696Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=1d8e6be0-5967-4ce3-af9b-712090373e79)
+2026-06-25T02:15:57.869246964Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=22dbe509-c399-471f-8fa3-76cf83510aa6)
+2026-06-25T02:15:59.108584648Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=5619ddcb-1bcf-4aaf-a867-1f057ab5eafa)
+2026-06-25T02:16:00.364434971Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=677c1365-8b1a-40ac-9667-bb7af2677be8)
+2026-06-25T02:16:01.618306906Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=c82f6970-4809-475a-b080-946cdc10011e)
+2026-06-25T02:16:02.866174567Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=54143acb-07f5-495d-af6c-f5620ffd4c7c)
+2026-06-25T02:16:04.125485867Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=696ffcaf-2566-4b09-a6c6-c7cff8bf3dba)
+2026-06-25T02:16:05.381785798Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2043b18b-f0fc-491c-a780-c9e849d16f8e)
+2026-06-25T02:16:06.640464941Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=67a0af28-ca16-42c3-98a5-e8090935fe36)
+2026-06-25T02:16:07.894535197Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=9919ab3a-810e-4820-9736-8a46fcdd7050)
+2026-06-25T02:16:09.150683628Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=3c5e520c-072e-48b2-a11b-79d84b4c201b)
+2026-06-25T02:16:10.413270762Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=c1a11fda-fd19-497f-a558-faf1f6a61542)
+2026-06-25T02:16:11.664549838Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=4536b859-9aba-4ccc-9f80-c3c16f918b8a)
+2026-06-25T02:16:12.915849788Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=7e27b767-761c-475d-82e6-e420b667c952)
+2026-06-25T02:16:14.164275253Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=000fad21-d318-4c95-b8f0-218fd6e41d53)
+2026-06-25T02:16:15.448330702Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=a7c2bffa-8f5f-446f-b757-c2ef1314bc8b)
+2026-06-25T02:16:16.716402631Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=b4312a47-e840-4a48-84be-4d729ab01353)
+2026-06-25T02:16:17.966673839Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=36bff844-5b9e-4d7d-89de-410b10de6a0e)
+2026-06-25T02:16:19.212542180Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=343cab85-70eb-430e-8a7c-14729e669eff)
+2026-06-25T02:16:20.465275492Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2a378eb4-a6b9-47f8-8b5c-9a6348b1559b)
+2026-06-25T02:16:21.719075072Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=5df24689-e86a-4120-bb43-de583b7a84ee)
+2026-06-25T02:16:22.964609162Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=3144fe7a-367a-4cdf-99fe-06627f6ccd1d)
+2026-06-25T02:16:24.225018824Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=fcd2a023-db2c-4ed3-87ce-a774cf95adc5)
+2026-06-25T02:16:25.475304802Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=09e39992-1c05-4457-aec2-1ab0054f2d45)
+2026-06-25T02:16:26.751395459Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=00a93820-4579-42e9-a647-7360aaee8faf)
+2026-06-25T02:16:28.049027366Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=7d0c7898-9f86-426f-a656-3ed5df776af3)
+2026-06-25T02:16:29.343936934Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=9184b67d-8d13-4f6b-bfe2-9a43e61c528f)
+2026-06-25T02:16:30.639834907Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=7ed2738e-7e10-4227-955b-855cf9e89dac)
+2026-06-25T02:16:31.904072554Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=fd0b50e9-cf07-4051-994d-d7a1a3dc6cf6)
+2026-06-25T02:16:33.151532267Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=eed47e4d-7cb4-4315-a1d2-56b7fe079162)
+2026-06-25T02:16:34.400375664Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=148e8a78-910e-4cc9-8461-4eeb4cfee4f4)
+2026-06-25T02:16:35.655017619Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=f17bf50a-a328-40f9-b3f6-fd4b04c105d1)
+2026-06-25T02:16:36.912469054Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=130b50d2-249d-4e05-bba1-14736e30baaf)
+2026-06-25T02:16:38.157920051Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=1098639f-2648-423e-8f65-830f5a694c57)
+2026-06-25T02:16:39.408313459Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=de1d4fef-0def-4d0d-9459-2fb353f998ee)
+2026-06-25T02:16:40.658853260Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=20b75095-0135-4944-97fd-c0b26e970d8a)
+2026-06-25T02:16:41.923772750Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=c0901f35-6702-4a80-a772-8a859cdd3b85)
+2026-06-25T02:16:43.168199983Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=0f5f58ba-5fac-4d2f-8bcc-e9a7d0c6fafa)
+2026-06-25T02:16:44.412427864Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2079390d-b8ea-4e26-8501-ccffc7d54c99)
+2026-06-25T02:16:45.662833182Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=9637a9af-5982-4995-86ab-d72f27386f1a)
+2026-06-25T02:16:46.923098230Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=6ef37acb-d819-4551-b9bf-33ea906bf20d)
+2026-06-25T02:16:48.186881006Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2b5207ea-3809-4813-8de2-0fc0dd5d36b8)
+2026-06-25T02:16:49.441241821Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=df791304-ebae-4f82-9574-423c320a4342)
+2026-06-25T02:16:50.696578524Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=bcd4757e-2934-4a2e-bb14-b017a1e58af0)
+2026-06-25T02:16:51.948653051Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=8fcd07ea-8c14-48c5-8267-6c59338407b5)
+2026-06-25T02:16:53.193674439Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=590a80d5-be54-47b5-b6c8-711b60211783)
+2026-06-25T02:16:54.443124922Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=3ab597f9-45cb-489e-8b6a-c4c6ad5c3c42)
+2026-06-25T02:16:55.693517284Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=0e95c281-70ea-457a-8a6d-a65622991275)
+2026-06-25T02:16:56.975164085Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=95634862-5821-4ee6-a58e-14c236103a8f)
+2026-06-25T02:16:58.276330435Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=50977e4e-9a78-46bb-a73c-f32486febe46)
+2026-06-25T02:16:59.560309214Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=293f1f2c-54ef-42b9-ade6-d961034df16c)
+2026-06-25T02:17:00.823120659Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=cb44564a-e5bb-43dd-9f5c-ba3a857d6538)
+2026-06-25T02:17:02.078967968Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=35444a04-ac6d-4ece-af1a-0e3373920ccf)
+2026-06-25T02:17:03.339377949Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=6023b342-e9ad-49d0-b060-d8669d4f297c)
+2026-06-25T02:17:04.580478704Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=784829ab-1345-489c-ad4d-85cd9b87e68a)
+2026-06-25T02:17:05.838062370Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=08f4070a-4c67-4c62-b1d8-896a3aaf482b)
+2026-06-25T02:17:07.143438709Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=1218ff87-44ad-4928-b7dd-4a6722c2eda5)
+2026-06-25T02:17:08.394795620Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=445066e0-419b-48d6-9975-0bd9f2fe563b)
+2026-06-25T02:17:09.641701300Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=fe444e1f-40d8-4ac3-a47b-49de447dd006)
+2026-06-25T02:17:10.903109141Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=661b9b34-f984-4c73-a6ea-1c38b19bb041)
+2026-06-25T02:17:12.160418783Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=40faa1c6-086c-4ec3-9293-6a7a12e60036)
+2026-06-25T02:17:13.412151791Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=97f1d793-3ad9-4a10-b6f7-2feadae2d2db)
+2026-06-25T02:17:14.657830022Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=9c557886-eaad-473d-800f-e054f28b6ffb)
+2026-06-25T02:17:15.922593056Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=272abf3e-58c7-4c15-ac21-c84a5de1fcc2)
+2026-06-25T02:17:17.182826484Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=bd8aecf4-81b5-4a5f-b9ff-0f0090b0a81b)
+2026-06-25T02:17:18.444784297Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=a96e288a-4ded-4315-97f4-bc7bbd5ea64d)
+2026-06-25T02:17:19.691334989Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2abd3ad0-3e3c-4fc8-a643-8ca718bf8f0b)
+2026-06-25T02:17:20.950687273Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=d3f4020e-c128-45b7-894a-209790716c88)
+2026-06-25T02:17:22.213364883Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=c8e5bbb2-6e49-4bc2-a66e-0ad51f93fa45)
+2026-06-25T02:17:23.459986257Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=43987a52-1b55-45c1-aeea-72ac68c0b660)
+2026-06-25T02:17:24.715364024Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=f116307c-690d-4bf8-8d75-4db7449d23ba)
+2026-06-25T02:17:25.975953291Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=b0b3a224-305d-43ae-800a-87da2b162350)
+2026-06-25T02:17:27.243247689Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=42eaae8e-aa94-4f53-b2b3-c1238a347247)
+2026-06-25T02:17:28.489345248Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=a06025ca-8f46-46ba-8898-c33f6d5e0e36)
+2026-06-25T02:17:29.731596903Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=f0ff9159-d24a-44c8-a850-4fab4bdedc6d)
+2026-06-25T02:17:30.994133920Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=e47585f5-ba6c-4d99-ae63-41ce923451e6)
+2026-06-25T02:17:32.257813382Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=979e9819-1762-4daf-b0fe-f455170da238)
+2026-06-25T02:17:33.514384330Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=545492b2-e20e-410d-862b-e433a906ec7e)
+2026-06-25T02:17:34.761770885Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=b2001c0b-98df-4881-93bb-335bc6308107)
+2026-06-25T02:17:36.015196955Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=6aa1416f-e9a7-4bb7-ba74-8c6abbf7256e)
+2026-06-25T02:17:37.281678697Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=e1681fc2-d320-4f64-bf98-57c32bcf7775)
+2026-06-25T02:17:38.533350701Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=fedeb3eb-4600-467e-98d3-5bb6efafe7cb)
+2026-06-25T02:17:39.784637589Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=e72b0fc2-a469-43b2-86f2-c68d3706d75b)
+2026-06-25T02:17:41.048966539Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=6c72bbf9-4a90-419e-864f-ac95d2d7bb43)
+2026-06-25T02:17:42.309842356Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=9ae758d9-d9b7-41a2-9cda-10efeb1677fe)
+2026-06-25T02:17:43.559256663Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=26bd37b4-d0f6-48e4-9188-4a54d462475e)
+2026-06-25T02:17:44.805944728Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=dec1128d-2244-4b10-92c4-510b450291aa)
+2026-06-25T02:17:46.075650095Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=32085e16-b467-4089-8364-ff1a9377ce96)
+2026-06-25T02:17:47.334292195Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=1df20242-d1ce-4dad-8730-d9afce4289d5)
+2026-06-25T02:17:48.590064278Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=329d9947-f461-4613-b0af-6495e76e42e5)
+2026-06-25T02:17:49.839364060Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=a7fb2c11-97a0-40a7-9511-89bbd888ed01)
+2026-06-25T02:17:51.094128613Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=94e213eb-5103-420f-9dca-89897fe2bec9)
+2026-06-25T02:17:52.349341421Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=f3c76aca-b1c6-495e-9578-b3539e9d23de)
+2026-06-25T02:17:53.593569746Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=c96aa9e9-cd3c-4cda-9912-11d56ea5b01d)
+2026-06-25T02:17:54.847787321Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=9b18c5a5-2bc2-4f3d-9f48-589377429cc8)
+2026-06-25T02:17:56.116377005Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=03e63d83-9225-4073-8bf5-c20c9d6075b8)
+2026-06-25T02:17:57.380874394Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=1a7617d6-d76f-4a17-a6fa-c65ab7c396b2)
+2026-06-25T02:17:58.630524215Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=fdfa0cc9-fc93-43c3-9585-4c1968a6612d)
+2026-06-25T02:17:59.893467014Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=54bdd917-fc40-402b-bf7e-1656500b0c84)
+2026-06-25T02:18:01.151683322Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=6f170720-8532-4ce3-957f-581bbf38fb80)
+2026-06-25T02:18:02.413572877Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=101205bb-0942-42d9-8509-101aed5d7848)
+2026-06-25T02:18:03.665308983Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=414cb033-7bc5-41ca-a48e-e9a13808aed2)
+2026-06-25T02:18:04.907911652Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=b22ff471-60de-4b11-a233-42fdeb0c673c)
+2026-06-25T02:18:06.176148896Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=039acad6-abd7-4e68-8b39-078b5d1ef46f)
+2026-06-25T02:18:07.443960401Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=320c983a-b68d-4172-9e6b-945137e0e3d4)
+2026-06-25T02:18:08.697682459Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=9a25d488-94c2-432b-93b8-b9070f37c76e)
+2026-06-25T02:18:09.955887491Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=8700cd2a-04fc-4c25-80d2-56f1be94fa39)
+2026-06-25T02:18:11.226565526Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2fd520ee-b529-468b-878b-f9cf41cebe95)
+2026-06-25T02:18:12.493627086Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=8b16d7c9-e63c-40d6-bd13-b51d3f26ac2b)
+2026-06-25T02:18:13.749275258Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2a59db73-dcf6-4544-9318-3c5348a7b1af)
+2026-06-25T02:18:14.998165451Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=917fa429-5852-41fb-bdad-eb7ecf4c05f3)
+2026-06-25T02:18:16.262439328Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=cdb14f4d-a39f-4d89-949d-9927a7538eb2)
+2026-06-25T02:18:17.530221581Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=398a09b6-2a48-426d-af86-fd42ba0ee88f)
+2026-06-25T02:18:18.789851810Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=94495a7e-0afa-4326-9fde-9dab6145b329)
+2026-06-25T02:18:20.036762846Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=b3617437-114a-4d33-bb62-8841fe05c63b)
+2026-06-25T02:18:21.299839034Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=f10968c5-6113-479b-a583-9a3ca0df6067)
+2026-06-25T02:18:22.552158221Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=10eeb52d-531f-4cd9-a326-68ced992ea05)
+2026-06-25T02:18:23.805412399Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=eb5143f9-31af-4bcb-b634-4f0f6907f4d9)
+2026-06-25T02:18:25.058293673Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=e3fd93ea-709e-4da2-8110-2a8864b852f2)
+2026-06-25T02:18:26.307193282Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=fd9bc76a-6de9-45e6-bdca-318ca7b1b698)
+2026-06-25T02:18:27.566356877Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=2511b7af-5682-4dd9-91b8-98f0cbefd11b)
+2026-06-25T02:18:28.832149137Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=29bb5c6b-ee2b-47de-af26-8762eebef955)
+2026-06-25T02:18:28.979414251Z [WARN] QMT-001.TradingNode: Received SIGINT, shutting down
+2026-06-25T02:18:28.979539493Z [INFO] QMT-001.TradingNode: STOPPING
+2026-06-25T02:18:28.980265326Z [WARN] QMT-001.LiveModelPredictionsStrategy: The `Strategy.on_stop` handler was called when not overridden. It's expected that any actions required when stopping the strategy occur here, such as unsubscribing from data
+2026-06-25T02:18:28.981043313Z [INFO] QMT-001.LiveModelPredictionsStrategy: Canceled Timer(name=MODEL-PREDICTION-DATA-REFRESH)
+2026-06-25T02:18:28.981054516Z [INFO] QMT-001.LiveModelPredictionsStrategy: Canceling executor tasks
+2026-06-25T02:18:28.981436444Z [INFO] QMT-001.LiveModelPredictionsStrategy: STOPPED
+2026-06-25T02:18:28.981490088Z [INFO] QMT-001.QMT-001: STOPPED
+2026-06-25T02:18:28.981532942Z [INFO] QMT-001.TradingNode: Awaiting post stop (5.0s timeout)...
+2026-06-25T02:18:30.147188694Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=43ecc48a-442a-452f-95f6-bee62a9a80e7)
+2026-06-25T02:18:31.394592033Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=dac2557f-e1ee-4870-9e31-18bb38134cc3)
+2026-06-25T02:18:32.657099205Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=dc94fce1-96f6-4097-abcc-d94d634d4bbe)
+2026-06-25T02:18:33.950223160Z [INFO] QMT-001.Portfolio: Updated AccountState(account_id=QMT-86904088, account_type=CASH, base_currency=CNY, is_reported=True, balances=[AccountBalance(total=9_991_459.60 CNY, locked=0.00 CNY, free=9_991_459.60 CNY)], margins=[], event_id=b5c4adf0-f241-4b34-a2ea-1281253b7b2e)
+2026-06-25T02:18:33.982360470Z [INFO] QMT-001.DataClient-QMT: STOPPED
+2026-06-25T02:18:33.982437999Z [INFO] QMT-001.ExecClient-QMT: STOPPED
+2026-06-25T02:18:33.982458192Z [INFO] QMT-001.DataEngine: Disconnecting all clients...
+2026-06-25T02:18:33.982469376Z [INFO] QMT-001.DataClient-QMT: Disconnecting...
+2026-06-25T02:18:33.982496689Z [INFO] QMT-001.ExecEngine: Disconnecting all clients...
+2026-06-25T02:18:33.982501939Z [INFO] QMT-001.ExecClient-QMT: Disconnecting...

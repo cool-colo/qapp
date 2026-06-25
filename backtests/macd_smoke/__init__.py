@@ -1,0 +1,1 @@
+"""MACD smoke backtest package."""
