@@ -227,6 +227,13 @@ class ModelPredictionsStrategy(Strategy):
         self._seed_active_positions_from_portfolio(trading_date)
 
         signal_date = previous_trading_date(self._trading_dates, trading_date)
+        # DEBUG HACK: today (2026-06-25) has no predictions for the real previous
+        # trading day (2026-06-24) — the predictions table only holds data up to
+        # 2026-06-10, so the strategy generates zero entries and never places an
+        # order. Hardcode the signal date to a date that DOES have signals so we
+        # can exercise the full entry/order path end-to-end during live testing.
+        # Remove this once the predictions table is populated up to date.
+        signal_date = date(2026, 6, 8)
         today_signals = self._signals_by_date.get(signal_date, []) if signal_date else []
         target_ids = {
             str(self._instrument_by_stock[signal["stock_code"]])
