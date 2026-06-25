@@ -125,6 +125,15 @@ class ModelPredictionsStrategy(Strategy):
         self.order_events: list[ModelPredictionOrderEvent] = []
 
     def on_start(self) -> None:
+        self.log.info(
+            f"on_start: subscribing bars instruments={len(self._instrument_ids)} "
+            f"bar_types={len(self._bar_types)} signal_dates={len(self._signals_by_date)} "
+            f"trading_dates={len(self._trading_dates)} last_closes={len(self._last_close)} "
+            f"rebalance_start_date={self._rebalance_start_date}",
+            color=LogColor.BLUE,
+        )
+        if not self._bar_types:
+            self.log.warning("on_start: no bar_types configured — no bars will arrive, no orders will be made")
         for bar_type in self._bar_types.values():
             self.subscribe_bars(bar_type)
 
@@ -230,10 +239,33 @@ class ModelPredictionsStrategy(Strategy):
             current_date=trading_date,
             holding_days=self.config.holding_days,
         )
+        self.log.info(
+            f"_process_trading_day {trading_date}: signal_date={signal_date} "
+            f"signals_for_signal_date={len(today_signals)} "
+            f"mapped_targets={len(target_ids)} rebalance_today={rebalance_today} "
+            f"active_positions={len(self._active_positions)}",
+            color=LogColor.BLUE,
+        )
+        if signal_date is None:
+            self.log.warning(
+                f"_process_trading_day {trading_date}: no previous trading date found "
+                f"(trading_dates range may not cover {trading_date}) — no entry signals",
+            )
+        elif not today_signals:
+            self.log.warning(
+                f"_process_trading_day {trading_date}: zero signals for signal_date={signal_date} "
+                f"— available signal_dates={sorted(self._signals_by_date)[-5:]}",
+            )
         self._prepare_exits(trading_date, signal_date, target_ids, rebalance_today)
         self._prepare_entries_and_refresh(trading_date, today_signals)
         self._trim_active_positions()
         self._set_equal_weight_targets()
+        self.log.info(
+            f"_process_trading_day {trading_date}: pending_targets={len(self._pending_targets)} "
+            f"(exits={sum(1 for w in self._pending_targets.values() if w == 0.0)} "
+            f"entries={sum(1 for w in self._pending_targets.values() if w != 0.0)})",
+            color=LogColor.BLUE,
+        )
         self._submit_pending_targets(trading_date, signal_date)
 
     def _seed_active_positions_from_portfolio(self, trading_date: date) -> None:
@@ -353,14 +385,25 @@ class ModelPredictionsStrategy(Strategy):
             return
         active_ids = set(self._active_positions)
         available_slots = max(0, int(self.config.max_positions) - len(active_ids))
+        self.log.info(
+            f"_prepare_entries {trading_date}: candidates={len(signals)} "
+            f"active={len(active_ids)} available_slots={available_slots} "
+            f"max_positions={self.config.max_positions}",
+        )
+        drop_no_instrument = 0
+        drop_pending_exit = 0
+        drop_no_price = 0
+        drop_no_slots = 0
         entry_rank = 0
         for signal in signals:
             stock_code = signal["stock_code"]
             instrument = self._instrument_by_stock.get(stock_code)
             if instrument is None:
+                drop_no_instrument += 1
                 continue
             instrument_id = str(instrument)
             if self._pending_targets.get(instrument_id) == 0.0:
+                drop_pending_exit += 1
                 continue
             skip_reason = self._entry_skip_reason(stock_code, trading_date)
             if skip_reason:
@@ -378,10 +421,12 @@ class ModelPredictionsStrategy(Strategy):
                 continue
             close_price = self._last_close.get(instrument_id)
             if close_price is None or close_price <= 0:
+                drop_no_price += 1
                 continue
             state = self._active_positions.get(instrument_id)
             if state is None:
                 if available_slots <= 0:
+                    drop_no_slots += 1
                     continue
                 self._active_positions[instrument_id] = {
                     "entry_date": trading_date,
@@ -405,6 +450,12 @@ class ModelPredictionsStrategy(Strategy):
                 side="buy",
                 selected=True,
                 extra={"avg_amount_20": signal.get("avg_amount_20")},
+            )
+        if drop_no_instrument or drop_pending_exit or drop_no_price or drop_no_slots:
+            self.log.info(
+                f"_prepare_entries {trading_date}: selected={entry_rank} dropped "
+                f"no_instrument={drop_no_instrument} pending_exit={drop_pending_exit} "
+                f"no_price={drop_no_price} no_slots={drop_no_slots}",
             )
 
     def _entry_skip_reason(self, stock_code: str, trading_date: date) -> str | None:
@@ -490,6 +541,10 @@ class ModelPredictionsStrategy(Strategy):
 
         close_price = self._last_close.get(instrument_id_text)
         if close_price is None or close_price <= 0:
+            self.log.warning(
+                f"_submit_target {instrument_id_text}: missing/invalid price "
+                f"close={close_price} weight={target_weight:.6f} reason={reason} — order skipped",
+            )
             self._record_order(trading_date, instrument_id_text, "buy", 0, target_weight, "rejected", "missing_price")
             return False
 
@@ -497,12 +552,22 @@ class ModelPredictionsStrategy(Strategy):
         target_qty = self._target_quantity(instrument, close_price, target_weight)
         delta_qty = target_qty - current_qty
         if delta_qty == 0:
+            self.log.info(
+                f"_submit_target {instrument_id_text}: no-op delta_qty=0 "
+                f"current={current_qty} target={target_qty} weight={target_weight:.6f} "
+                f"close={close_price} reason={reason}",
+            )
             self._record_order(trading_date, instrument_id_text, "buy", 0, target_weight, "skipped", "already_target")
             return True
 
         side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
         qty_abs = abs(delta_qty)
         if qty_abs <= 0:
+            self.log.warning(
+                f"_submit_target {instrument_id_text}: qty_abs<=0 "
+                f"current={current_qty} target={target_qty} weight={target_weight:.6f} "
+                f"close={close_price} portfolio_value={self._portfolio_value()} reason={reason}",
+            )
             return True
         order = self.order_factory.market(
             instrument_id=instrument_id,

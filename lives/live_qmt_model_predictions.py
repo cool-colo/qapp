@@ -498,6 +498,38 @@ def build_node(
 
     extra_stock_codes = normalized_stock_codes(env_list_from_value(args.extra_stock_codes))
     context = loader.load(extra_stock_codes=extra_stock_codes)
+    print(
+        "[build_node] loaded context: "
+        f"stock_codes={len(context.stock_codes)} "
+        f"instrument_ids={len(context.instrument_ids)} "
+        f"bar_types={len(context.bar_types)} "
+        f"signal_dates={len(context.signals_by_date)} "
+        f"signals_total={sum(len(v) for v in context.signals_by_date.values())} "
+        f"last_closes={len(context.last_closes)} "
+        f"trading_dates={len(context.bundle.trading_dates)} "
+        f"selected_rows={context.bundle.selected_rows} "
+        f"universe={len(context.bundle.universe)}",
+        flush=True,
+    )
+    if not context.instrument_ids:
+        print(
+            "[build_node] WARNING: zero instruments selected — no bars will be subscribed "
+            "and no orders will ever be placed. Check --all-stocks/--stock-codes, the "
+            "predictions table, and the ClickHouse data for the requested date range.",
+            flush=True,
+        )
+    if not context.signals_by_date:
+        print(
+            "[build_node] WARNING: zero signal dates loaded — entries cannot be generated. "
+            "Check the predictions table contents and date range.",
+            flush=True,
+        )
+    if not context.last_closes:
+        print(
+            "[build_node] WARNING: zero last_closes loaded — _submit_target_weight will reject "
+            "every order as 'missing_price' until live bars arrive.",
+            flush=True,
+        )
     instrument_provider = QMTInstrumentProviderConfig(
         load_ids=frozenset(context.instrument_ids),
         complete_details=args.complete_instrument_details,
