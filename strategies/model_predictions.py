@@ -226,14 +226,7 @@ class ModelPredictionsStrategy(Strategy):
         self._exit_retry_pool = set()
         self._seed_active_positions_from_portfolio(trading_date)
 
-        signal_date = previous_trading_date(self._trading_dates, trading_date)
-        # DEBUG HACK: today (2026-06-25) has no predictions for the real previous
-        # trading day (2026-06-24) — the predictions table only holds data up to
-        # 2026-06-10, so the strategy generates zero entries and never places an
-        # order. Hardcode the signal date to a date that DOES have signals so we
-        # can exercise the full entry/order path end-to-end during live testing.
-        # Remove this once the predictions table is populated up to date.
-        signal_date = date(2026, 6, 8)
+        signal_date = self._resolve_signal_date(trading_date)
         today_signals = self._signals_by_date.get(signal_date, []) if signal_date else []
         target_ids = {
             str(self._instrument_by_stock[signal["stock_code"]])
@@ -274,6 +267,40 @@ class ModelPredictionsStrategy(Strategy):
             color=LogColor.BLUE,
         )
         self._submit_pending_targets(trading_date, signal_date)
+
+    def _resolve_signal_date(self, trading_date: date) -> date | None:
+        """
+        Choose which signal date drives entries for ``trading_date``.
+
+        The strategy trades on the previous trading day's predictions, so the
+        primary choice is ``previous_trading_date``. That exact lookup is what we
+        want in a backtest, where every replayed day has its own prior-day
+        signals available.
+
+        In live trading the most recent prediction may lag the real previous
+        trading day (e.g. the predictions table has not been refreshed yet), so a
+        strict prior-day lookup yields zero entries and the strategy never trades.
+        Mirror the fallback in ``live_qmt_model_predictions.subscription_signal_date``:
+        when no signals exist for the prior day, use the most recent signal date
+        on or before it. This only ever looks backwards, so it stays correct for
+        backtests — it can never pull a future signal, and when the exact
+        prior-day signals exist they are still preferred.
+        """
+        prev_date = previous_trading_date(self._trading_dates, trading_date)
+        if prev_date is not None and prev_date in self._signals_by_date:
+            return prev_date
+        # Fall back to the latest available signal date <= the prior trading day
+        # (or <= trading_date itself if the prior day couldn't be resolved).
+        cutoff = prev_date or trading_date
+        candidates = [value for value in self._signals_by_date if value <= cutoff]
+        if candidates:
+            fallback = max(candidates)
+            self.log.info(
+                f"_resolve_signal_date {trading_date}: no signals for prior trading "
+                f"day {prev_date}, falling back to latest available {fallback}",
+            )
+            return fallback
+        return prev_date
 
     def _seed_active_positions_from_portfolio(self, trading_date: date) -> None:
         for instrument_id in self._instrument_ids:
