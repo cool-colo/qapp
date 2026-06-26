@@ -25,8 +25,8 @@ def env(name: str, default: str | None = None) -> str | None:
 class BenchmarkConfig:
     code: str = ""
     name: str = ""
-    table: str = "dwd_index_daily"
-    code_column: str = "index_code"
+    table: str = "dwd_index_eod_price"
+    code_column: str = "ts_code"
     date_column: str = "trade_date"
     close_column: str = "close"
 
@@ -52,12 +52,12 @@ def add_benchmark_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--benchmark-table",
-        default=env("BACKTEST_BENCHMARK_TABLE", "dwd_index_daily"),
+        default=env("BACKTEST_BENCHMARK_TABLE", "dwd_index_eod_price"),
         help="ClickHouse table containing benchmark close prices.",
     )
     parser.add_argument(
         "--benchmark-code-column",
-        default=env("BACKTEST_BENCHMARK_CODE_COLUMN", "index_code"),
+        default=env("BACKTEST_BENCHMARK_CODE_COLUMN", "ts_code"),
         help="Benchmark table code column.",
     )
     parser.add_argument(
@@ -100,8 +100,8 @@ def benchmark_config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
     return BenchmarkConfig(
         code=str(getattr(args, "benchmark_code", "") or "").strip().upper(),
         name=str(getattr(args, "benchmark_name", "") or "").strip(),
-        table=str(getattr(args, "benchmark_table", "dwd_index_daily") or "dwd_index_daily"),
-        code_column=str(getattr(args, "benchmark_code_column", "index_code") or "index_code"),
+        table=str(getattr(args, "benchmark_table", "dwd_index_eod_price") or "dwd_index_eod_price"),
+        code_column=str(getattr(args, "benchmark_code_column", "ts_code") or "ts_code"),
         date_column=str(getattr(args, "benchmark_date_column", "trade_date") or "trade_date"),
         close_column=str(getattr(args, "benchmark_close_column", "close") or "close"),
     )

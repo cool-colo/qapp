@@ -1,0 +1,31 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments and local config
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Runtime logs and generated reports
+*.log
+lives/*.log
+lives/log.txt
+output/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
