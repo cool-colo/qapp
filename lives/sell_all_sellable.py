@@ -72,6 +72,31 @@ def derive_ws_url(http_url: str) -> str:
     return urlunsplit((scheme, parsed.netloc, parsed.path, "", ""))
 
 
+def build_cache_config(args: argparse.Namespace):
+    """Return a Redis-backed CacheConfig when --use-redis is set, otherwise None.
+
+    None keeps the default in-memory cache (no persistence across restarts).
+    """
+    if not args.use_redis:
+        return None
+
+    from nautilus_trader.config import CacheConfig
+    from nautilus_trader.config import DatabaseConfig
+
+    return CacheConfig(
+        database=DatabaseConfig(
+            type="redis",
+            host=args.redis_host,
+            port=args.redis_port,
+            username=args.redis_username,
+            password=args.redis_password,
+            ssl=args.redis_ssl,
+        ),
+        flush_on_start=args.redis_flush_on_start,
+    )
+
+
+
 def parse_symbols(value: str | None) -> set[str]:
     if not value:
         return set()
@@ -281,6 +306,45 @@ def parse_args() -> argparse.Namespace:
         "--log-file-name",
         default=env("QMT_LOG_FILE_NAME"),
         help="Base log file name (without extension). Defaults to an auto-generated trader-id/timestamp name.",
+    )
+    parser.add_argument(
+        "--use-redis",
+        action="store_true",
+        default=env_bool("QMT_USE_REDIS", False),
+        help="Back the Nautilus cache with Redis instead of the default in-memory cache (persists state across restarts).",
+    )
+    parser.add_argument(
+        "--redis-host",
+        default=env("QMT_REDIS_HOST", "127.0.0.1"),
+        help="Redis host (used only with --use-redis).",
+    )
+    parser.add_argument(
+        "--redis-port",
+        type=int,
+        default=int(env("QMT_REDIS_PORT", "6379")),
+        help="Redis port (used only with --use-redis).",
+    )
+    parser.add_argument(
+        "--redis-username",
+        default=env("QMT_REDIS_USERNAME"),
+        help="Redis username (used only with --use-redis).",
+    )
+    parser.add_argument(
+        "--redis-password",
+        default=env("QMT_REDIS_PASSWORD"),
+        help="Redis password (used only with --use-redis).",
+    )
+    parser.add_argument(
+        "--redis-ssl",
+        action="store_true",
+        default=env_bool("QMT_REDIS_SSL", False),
+        help="Use an SSL/TLS connection to Redis (used only with --use-redis).",
+    )
+    parser.add_argument(
+        "--redis-flush-on-start",
+        action="store_true",
+        default=env_bool("QMT_REDIS_FLUSH_ON_START", False),
+        help="Flush the Redis database on start instead of reusing persisted state.",
     )
     parser.add_argument(
         "--adjust-type",
@@ -950,6 +1014,7 @@ def build_node(
     )
     config_node = TradingNodeConfig(
         trader_id=TraderId(args.trader_id),
+        cache=build_cache_config(args),
         logging=LoggingConfig(
             log_level=args.log_level,
             log_level_file=args.log_level,
