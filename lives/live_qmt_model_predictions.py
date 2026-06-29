@@ -79,16 +79,24 @@ def build_cache_config(args: argparse.Namespace):
     if not args.use_redis:
         return None
 
+    from urllib.parse import quote
+
     from nautilus_trader.config import CacheConfig
     from nautilus_trader.config import DatabaseConfig
+
+    # Nautilus interpolates username/password directly into a redis:// URL, so
+    # any URL-reserved characters (@ : / # ? % ...) must be percent-encoded here
+    # or the Rust client rejects the URL with "InvalidClientConfig".
+    username = quote(args.redis_username, safe="") if args.redis_username else None
+    password = quote(args.redis_password, safe="") if args.redis_password else None
 
     return CacheConfig(
         database=DatabaseConfig(
             type="redis",
             host=args.redis_host,
             port=args.redis_port,
-            username=args.redis_username,
-            password=args.redis_password,
+            username=username,
+            password=password,
             ssl=args.redis_ssl,
         ),
         flush_on_start=args.redis_flush_on_start,
