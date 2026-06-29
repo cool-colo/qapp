@@ -137,6 +137,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-avg-amount", type=float, default=float(env("MODEL_MIN_AVG_AMOUNT", "0.0")))
     parser.add_argument("--min-listed-days", type=int, default=int(env("MODEL_MIN_LISTED_DAYS", "120")))
+    parser.add_argument(
+        "--unfilled-timeout-secs",
+        type=float,
+        default=float(env("MODEL_UNFILLED_TIMEOUT_SECS", "30")),
+        help="Cancel and resubmit an order that stays unfilled longer than this (0 disables).",
+    )
+    parser.add_argument(
+        "--resubmit-interval-secs",
+        type=float,
+        default=float(env("MODEL_RESUBMIT_INTERVAL_SECS", "10")),
+        help="How often to check for stale unfilled orders to cancel/resubmit.",
+    )
+    parser.add_argument(
+        "--excluded-name-prefixes",
+        default=",".join(env_list("MODEL_EXCLUDED_NAME_PREFIXES", "*ST,ST,退市")),
+        help="Never buy stocks whose instrument name starts with any of these prefixes.",
+    )
     parser.add_argument("--signal-warmup-days", type=int, default=int(env("MODEL_SIGNAL_WARMUP_DAYS", "7")))
     parser.add_argument("--max-universe", type=int, default=int(env("MODEL_MAX_UNIVERSE", "0")))
     parser.add_argument(
@@ -599,6 +616,9 @@ def build_node(
             initial_cash=args.initial_cash,
             timezone_name=args.exchange_timezone,
             initial_last_closes=context.last_closes,
+            excluded_name_prefixes=tuple(env_list_from_value(args.excluded_name_prefixes)),
+            unfilled_timeout_secs=args.unfilled_timeout_secs,
+            resubmit_check_interval_secs=args.resubmit_interval_secs,
             order_id_tag=args.order_id_tag,
         ),
         refresh_context=lambda active_stock_codes: loader.load(

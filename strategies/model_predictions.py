@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -76,6 +77,9 @@ class ModelPredictionsStrategyConfig(StrategyConfig, frozen=True):
     timezone_name: str = "Asia/Shanghai"
     initial_last_closes: dict[str, float] | None = None
     initial_active_positions: dict[str, dict[str, Any]] | None = None
+    excluded_name_prefixes: tuple[str, ...] = ("*ST", "ST", "退市")
+    unfilled_timeout_secs: float = 30.0
+    resubmit_check_interval_secs: float = 10.0
 
 
 class ModelPredictionsStrategy(Strategy):
@@ -115,6 +119,7 @@ class ModelPredictionsStrategy(Strategy):
         self._active_positions = normalize_initial_active_positions(config.initial_active_positions)
         self._pending_targets: dict[str, float] = {}
         self._exit_retry_pool: set[str] = set()
+        self._order_submit_ts: dict[str, int] = {}
         self._processed_dates: set[date] = set()
         self._rebalance_start_date = first_trading_date_on_or_after(
             self._trading_dates,
@@ -136,6 +141,14 @@ class ModelPredictionsStrategy(Strategy):
             self.log.warning("on_start: no bar_types configured — no bars will arrive, no orders will be made")
         for bar_type in self._bar_types.values():
             self.subscribe_bars(bar_type)
+        interval_secs = float(self.config.resubmit_check_interval_secs)
+        if float(self.config.unfilled_timeout_secs) > 0 and interval_secs > 0:
+            self.clock.set_timer(
+                name="MODEL-PREDICTION-RESUBMIT",
+                interval=timedelta(seconds=interval_secs),
+                callback=self._on_resubmit_timer,
+                fire_immediately=False,
+            )
 
     def refresh_reference_data(
         self,
@@ -493,6 +506,9 @@ class ModelPredictionsStrategy(Strategy):
             )
 
     def _entry_skip_reason(self, stock_code: str, trading_date: date) -> str | None:
+        name_reason = self._name_skip_reason(stock_code)
+        if name_reason:
+            return name_reason
         if stock_code in self._suspended_by_date.get(trading_date, set()):
             return "suspended"
         if stock_code in self._st_by_date.get(trading_date, set()):
@@ -504,6 +520,33 @@ class ModelPredictionsStrategy(Strategy):
                 if listed_days < int(self.config.min_listed_days):
                     return "new_stock"
         return None
+
+    def _name_skip_reason(self, stock_code: str) -> str | None:
+        instrument_id = self._instrument_by_stock.get(stock_code)
+        if instrument_id is None:
+            return None
+        name = self._instrument_name(str(instrument_id)).strip()
+        if not name:
+            return None
+        # Check the more specific prefix first so "*ST" is not reported as "st".
+        for prefix in sorted(self.config.excluded_name_prefixes, key=len, reverse=True):
+            if prefix and name.startswith(prefix):
+                if prefix.endswith("ST"):
+                    return "st_name"
+                return "delisting"
+        return None
+
+    def _instrument_name(self, instrument_id_text: str) -> str:
+        try:
+            instrument = self.cache.instrument(InstrumentId.from_str(instrument_id_text))
+        except Exception:
+            return ""
+        if instrument is None:
+            return ""
+        info = getattr(instrument, "info", None)
+        if not isinstance(info, dict):
+            return ""
+        return str(info.get("name", "") or "")
 
     def _trim_active_positions(self) -> None:
         max_positions = int(self.config.max_positions)
@@ -528,11 +571,17 @@ class ModelPredictionsStrategy(Strategy):
             self._pending_targets[instrument_id] = 0.0
             self._active_positions.pop(instrument_id, None)
 
+    def _equal_weight_percent(self) -> float:
+        active_count = len(self._active_positions)
+        if active_count <= 0:
+            return 0.0
+        return min(float(self.config.max_position_percent), 1.0 / active_count)
+
     def _set_equal_weight_targets(self) -> None:
         active_ids = sorted(self._active_positions)
         if not active_ids:
             return
-        target_percent = min(float(self.config.max_position_percent), 1.0 / len(active_ids))
+        target_percent = self._equal_weight_percent()
         for instrument_id in active_ids:
             self._pending_targets.setdefault(instrument_id, target_percent)
 
@@ -609,6 +658,7 @@ class ModelPredictionsStrategy(Strategy):
             quantity=instrument.make_qty(qty_abs),
         )
         self.submit_order(order)
+        self._order_submit_ts[str(order.client_order_id)] = self.clock.timestamp_ns()
         side_text = "buy" if side == OrderSide.BUY else "sell"
         self._record_order(
             trading_date=trading_date,
@@ -625,6 +675,143 @@ class ModelPredictionsStrategy(Strategy):
             color=LogColor.BLUE,
         )
         return True
+
+    def on_order_filled(self, event: Any) -> None:
+        self._order_submit_ts.pop(str(event.client_order_id), None)
+
+    def on_order_canceled(self, event: Any) -> None:
+        self._order_submit_ts.pop(str(event.client_order_id), None)
+
+    def on_order_rejected(self, event: Any) -> None:
+        self._order_submit_ts.pop(str(event.client_order_id), None)
+
+    def _on_resubmit_timer(self, _event: Any) -> None:
+        try:
+            self._reconcile_unfilled_orders()
+        except Exception as exc:
+            self.log.warning(f"Unfilled-order reconcile failed: {exc}")
+
+    def _reconcile_unfilled_orders(self) -> None:
+        """
+        Cancel orders that stay unfilled past the timeout, then resubmit toward the
+        desired target for the instruments whose order was just canceled.
+
+        The desired weight is derived from ``_active_positions`` (equal-weight if
+        still active, otherwise ``0`` for an in-progress exit) — the same source the
+        trading-day logic uses. Crucially this method does NOT re-seed
+        ``_active_positions`` from the portfolio: within a session ``_active_positions``
+        already reflects exits, and after a process restart it is empty here, so the
+        reconciler simply cancels stale orders and lets the next bar's
+        ``_process_trading_day`` rebuild state and recompute targets. That makes a
+        restart inert — it can never introduce an unexpected position change.
+        """
+        timeout_secs = float(self.config.unfilled_timeout_secs)
+        if timeout_secs <= 0:
+            return
+        now = self.clock.timestamp_ns()
+        timeout_ns = int(timeout_secs * 1_000_000_000)
+        trading_date = self.clock.utc_now().date()
+        try:
+            open_orders = self.cache.orders_open(strategy_id=self.id)
+        except Exception:
+            open_orders = []
+
+        canceled_instruments: set[str] = set()
+        instruments_with_open_order: set[str] = set()
+        for order in open_orders:
+            instrument_id_text = str(order.instrument_id)
+            client_order_id = str(order.client_order_id)
+            try:
+                if order.is_pending_cancel:
+                    instruments_with_open_order.add(instrument_id_text)
+                    continue
+            except Exception:
+                pass
+            submit_ts = self._order_submit_ts.get(client_order_id)
+            if submit_ts is None:
+                submit_ts = int(getattr(order, "ts_last", now) or now)
+            if now - submit_ts < timeout_ns:
+                instruments_with_open_order.add(instrument_id_text)
+                continue
+            try:
+                self.cancel_order(order)
+            except Exception as exc:
+                self.log.warning(f"cancel_order failed for {client_order_id}: {exc}")
+                instruments_with_open_order.add(instrument_id_text)
+                continue
+            self._order_submit_ts.pop(client_order_id, None)
+            instruments_with_open_order.add(instrument_id_text)
+            canceled_instruments.add(instrument_id_text)
+            self.log.info(
+                f"Canceled unfilled order {client_order_id} {instrument_id_text} "
+                f"after {timeout_secs:.0f}s — will resubmit toward target",
+                color=LogColor.BLUE,
+            )
+            self._record_order(
+                trading_date=trading_date,
+                instrument_id=instrument_id_text,
+                side="buy" if order.side == OrderSide.BUY else "sell",
+                quantity=0,
+                target_weight=0.0,
+                status="canceled",
+                reason="unfilled_timeout",
+                order_id=client_order_id,
+            )
+
+        # Resubmit only for instruments whose stale order we just canceled and that have
+        # no other open order in flight. Targets come from current _active_positions, so
+        # exits resubmit as sells and entries as buys — and the delta-to-target math is a
+        # no-op once the position already matches, making this safe to repeat.
+        for instrument_id_text in sorted(canceled_instruments):
+            if instrument_id_text in instruments_with_open_order.difference(canceled_instruments):
+                continue
+            self._resubmit_toward_target(trading_date, instrument_id_text)
+
+    def _resubmit_toward_target(self, trading_date: date, instrument_id_text: str) -> None:
+        instrument_id = InstrumentId.from_str(instrument_id_text)
+        instrument = self.cache.instrument(instrument_id)
+        if instrument is None:
+            return
+        # Desired weight: equal-weight if active, otherwise 0 (exit).
+        if instrument_id_text in self._active_positions:
+            target_weight = self._equal_weight_percent()
+        else:
+            target_weight = 0.0
+        close_price = self._last_close.get(instrument_id_text)
+        if close_price is None or close_price <= 0:
+            return
+        current_qty = self._current_quantity(instrument_id)
+        target_qty = self._target_quantity(instrument, close_price, target_weight)
+        delta_qty = target_qty - current_qty
+        if delta_qty == 0:
+            return
+        side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
+        qty_abs = abs(delta_qty)
+        if qty_abs <= 0:
+            return
+        order = self.order_factory.market(
+            instrument_id=instrument_id,
+            order_side=side,
+            quantity=instrument.make_qty(qty_abs),
+        )
+        self.submit_order(order)
+        self._order_submit_ts[str(order.client_order_id)] = self.clock.timestamp_ns()
+        side_text = "buy" if side == OrderSide.BUY else "sell"
+        self._record_order(
+            trading_date=trading_date,
+            instrument_id=instrument_id_text,
+            side=side_text,
+            quantity=int(qty_abs),
+            target_weight=float(target_weight),
+            status="submitted",
+            reason="resubmit_unfilled",
+            order_id=str(order.client_order_id),
+        )
+        self.log.info(
+            f"Resubmitted {side_text} {instrument_id_text} qty={qty_abs} toward "
+            f"target_qty={target_qty} (current={current_qty})",
+            color=LogColor.BLUE,
+        )
 
     def _target_quantity(self, instrument: Any, close_price: float, target_weight: float) -> Decimal:
         if target_weight <= 0:
