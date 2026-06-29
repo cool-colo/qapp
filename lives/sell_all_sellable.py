@@ -273,6 +273,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--log-level", default=env("QMT_LOG_LEVEL", "INFO"))
     parser.add_argument(
+        "--log-directory",
+        default=env("QMT_LOG_DIRECTORY"),
+        help="Directory for Nautilus log files. Defaults to the working directory.",
+    )
+    parser.add_argument(
+        "--log-file-name",
+        default=env("QMT_LOG_FILE_NAME"),
+        help="Base log file name (without extension). Defaults to an auto-generated trader-id/timestamp name.",
+    )
+    parser.add_argument(
         "--adjust-type",
         default=env("QMT_ADJUST_TYPE", "none"),
         help="QMT dividend adjustment mode.",
@@ -943,6 +953,8 @@ def build_node(
         logging=LoggingConfig(
             log_level=args.log_level,
             log_level_file=args.log_level,
+            log_directory=args.log_directory,
+            log_file_name=args.log_file_name,
         ),
         exec_engine=LiveExecEngineConfig(
             reconciliation=True,

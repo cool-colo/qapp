@@ -203,6 +203,16 @@ def parse_args() -> argparse.Namespace:
         default=float(env("QMT_POLL_INTERVAL_SECS", "1.0")),
     )
     parser.add_argument("--log-level", default=env("QMT_LOG_LEVEL", "INFO"))
+    parser.add_argument(
+        "--log-directory",
+        default=env("QMT_LOG_DIRECTORY"),
+        help="Directory for Nautilus log files. Defaults to the working directory.",
+    )
+    parser.add_argument(
+        "--log-file-name",
+        default=env("QMT_LOG_FILE_NAME"),
+        help="Base log file name (without extension). Defaults to an auto-generated trader-id/timestamp name.",
+    )
     parser.add_argument("--no-sellable-check", action="store_true")
     parser.add_argument("--no-reconciliation", action="store_true")
     parser.add_argument(
@@ -557,6 +567,8 @@ def build_node(
         logging=LoggingConfig(
             log_level=args.log_level,
             log_level_file=args.log_level,
+            log_directory=args.log_directory,
+            log_file_name=args.log_file_name,
         ),
         exec_engine=LiveExecEngineConfig(
             reconciliation=not args.no_reconciliation,
