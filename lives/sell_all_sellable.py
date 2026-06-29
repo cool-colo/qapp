@@ -10,6 +10,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any
@@ -345,14 +346,17 @@ def qmt_client_order_id_age_secs(client_order_id: object) -> float | None:
         return None
 
     try:
+        # Nautilus encodes the client order id timestamp from its engine clock,
+        # which is UTC in live trading. Comparing against a naive datetime.now()
+        # (local time) skewed the computed age by the machine's UTC offset.
         submitted_at = datetime.strptime(
             match.group("date") + match.group("time"),
             "%Y%m%d%H%M%S",
-        )
+        ).replace(tzinfo=timezone.utc)
     except ValueError:
         return None
 
-    age_secs = (datetime.now() - submitted_at).total_seconds()
+    age_secs = (datetime.now(timezone.utc) - submitted_at).total_seconds()
     return max(0.0, age_secs)
 
 
@@ -408,7 +412,7 @@ def build_node(
             self.cancel_requested_at_by_order_id: dict[str, float] = {}
             self.terminal_order_ids: set[str] = set()
             self.waiting_order_snapshot_by_instrument: dict[str, str] = {}
-            self.cancel_wait_logged_order_ids: set[str] = set()
+            self.retry_wait_logged_instruments: set[str] = set()
 
         def on_start(self) -> None:
             self.clock.set_timer(
@@ -511,6 +515,8 @@ def build_node(
                     self._track_open_order(instrument_key, order, now)
                     self._account_order_filled_qty(order, instrument_key)
 
+                # Orders that have outlived order_timeout_secs and have no
+                # cancel in flight yet.
                 stale_orders = [
                     order
                     for order in active_orders
@@ -518,17 +524,33 @@ def build_node(
                     and not self._is_pending_cancel(order)
                     and self._order_age_secs(order, now) >= self.config.order_timeout_secs
                 ]
-                if not stale_orders:
+                # Orders we already asked to cancel, but the venue neither
+                # canceled nor acknowledged within cancel_wait_secs. The cancel
+                # was likely lost; re-issue it instead of leaving the order live
+                # forever (which previously let us resubmit alongside it).
+                lost_cancel_orders = [
+                    order
+                    for order in active_orders
+                    if self._cancel_wait_elapsed(str(order.client_order_id), now)
+                    and not self._is_pending_cancel(order)
+                ]
+
+                to_cancel = stale_orders + lost_cancel_orders
+                if not to_cancel:
                     continue
 
                 self.log.warning(
-                    f"Canceling {len(stale_orders)} stale undealt SELL order(s) for {instrument_key}; "
-                    f"{len(stale_orders)} exceeded {self.config.order_timeout_secs:g}s",
+                    f"Canceling {len(stale_orders)} stale and re-canceling "
+                    f"{len(lost_cancel_orders)} unacknowledged SELL order(s) for "
+                    f"{instrument_key} (timeout {self.config.order_timeout_secs:g}s)",
                 )
-                for order in stale_orders:
+                canceled_any = False
+                seen_order_ids: set[str] = set()
+                for order in to_cancel:
                     order_id = str(order.client_order_id)
-                    if order_id in self.cancel_requested_at_by_order_id:
+                    if order_id in seen_order_ids:
                         continue
+                    seen_order_ids.add(order_id)
                     if order.is_closed or self._is_pending_cancel(order):
                         continue
                     self.log.info(
@@ -537,9 +559,10 @@ def build_node(
                     )
                     self.cancel_order(order)
                     self.cancel_requested_at_by_order_id[order_id] = now
-                    self.cancel_wait_logged_order_ids.discard(order_id)
                     self.canceled_count += 1
-                self.retry_after_by_instrument[instrument_key] = now
+                    canceled_any = True
+                if canceled_any:
+                    self.retry_after_by_instrument[instrument_key] = now
 
             self._submit_missing_orders()
             self._mark_done_if_finished()
@@ -567,7 +590,7 @@ def build_node(
                 retry_after += self.config.cancel_wait_secs
             self.retry_after_by_instrument[instrument_key] = retry_after
             self.cancel_requested_at_by_order_id.pop(order_id, None)
-            self.cancel_wait_logged_order_ids.discard(order_id)
+            self.retry_wait_logged_instruments.discard(instrument_key)
             self.log.info(
                 f"SELL order {status} {instrument_key}: order={order_id} "
                 f"remaining={self.remaining_by_instrument.get(instrument_key, 0)}",
@@ -584,7 +607,7 @@ def build_node(
                 self.active_order_by_instrument.pop(instrument_key, None)
                 self.submitted_at_by_order_id.pop(order_id, None)
                 self.cancel_requested_at_by_order_id.pop(order_id, None)
-                self.cancel_wait_logged_order_ids.discard(order_id)
+                self.retry_wait_logged_instruments.discard(instrument_key)
                 if self.remaining_by_instrument.get(instrument_key, 0) > 0:
                     retry_after = monotonic()
                     if self._order_status(order) != "CANCELED":
@@ -628,7 +651,7 @@ def build_node(
             self.terminal_order_ids.add(order_id)
             self.instrument_by_order_id[order_id] = instrument_key
             self.cancel_requested_at_by_order_id.pop(order_id, None)
-            self.cancel_wait_logged_order_ids.discard(order_id)
+            self.retry_wait_logged_instruments.discard(instrument_key)
             self.submitted_at_by_order_id.pop(order_id, None)
             active_order = self.active_order_by_instrument.get(instrument_key)
             if active_order is not None and str(active_order.client_order_id) == order_id:
@@ -668,10 +691,16 @@ def build_node(
             cumulative_filled = quantity_to_int(getattr(order, "filled_qty", 0))
             accounted_filled = self.accounted_filled_by_order_id.get(order_id, 0)
             missing_filled = cumulative_filled - accounted_filled
-            self.accounted_trade_ids.update(str(trade_id) for trade_id in getattr(order, "trade_ids", []))
             if missing_filled <= 0:
+                # Do NOT mark this order's trade ids accounted here. The cache may
+                # expose a trade_id before its quantity is reflected in
+                # filled_qty; marking it now would let the matching on_order_filled
+                # event be skipped and the fill silently dropped from remaining.
                 return
 
+            # The cumulative reconciliation below covers every fill on this order,
+            # so the corresponding fill events are now redundant and safe to skip.
+            self.accounted_trade_ids.update(str(trade_id) for trade_id in getattr(order, "trade_ids", []))
             self.accounted_filled_by_order_id[order_id] = cumulative_filled
             self.remaining_by_instrument[instrument_key] = max(
                 0,
@@ -749,8 +778,12 @@ def build_node(
                 remaining = int(self.remaining_by_instrument.get(instrument_key, 0))
                 if remaining <= 0:
                     continue
-                active_orders = self._active_unfilled_sell_orders(instrument_id)
-                blocking_orders = self._blocking_active_orders(active_orders, remaining, now)
+                # Any live SELL order on the venue (leaves_qty > 0, not terminal)
+                # blocks resubmission. Submitting a fresh full-size order while
+                # the old one is still open risks selling twice the intended
+                # quantity if both fill. Stale/lost orders are re-canceled by the
+                # monitor instead.
+                blocking_orders = self._active_unfilled_sell_orders(instrument_id)
                 if blocking_orders:
                     for order in blocking_orders:
                         self._track_open_order(instrument_key, order, now)
@@ -761,15 +794,17 @@ def build_node(
                     )
                     self._log_waiting_for_active_orders(instrument_key, remaining, blocking_orders)
                     continue
-                if active_orders:
-                    self._log_cancel_wait_elapsed_orders(instrument_key, active_orders, now)
                 retry_after = self.retry_after_by_instrument.get(instrument_key, 0.0)
                 if now < retry_after:
-                    self.log.info(
-                        f"Waiting to resubmit SELL {instrument_key}: "
-                        f"remaining={remaining} retry_in_secs={retry_after - now:.1f}",
-                    )
+                    # Log once per retry window instead of every monitor tick.
+                    if instrument_key not in self.retry_wait_logged_instruments:
+                        self.retry_wait_logged_instruments.add(instrument_key)
+                        self.log.info(
+                            f"Waiting to resubmit SELL {instrument_key}: "
+                            f"remaining={remaining} retry_in_secs={retry_after - now:.1f}",
+                        )
                     continue
+                self.retry_wait_logged_instruments.discard(instrument_key)
 
                 instrument = self.cache.instrument(instrument_id)
                 if instrument is None:
@@ -793,45 +828,11 @@ def build_node(
                 self.submitted_count += 1
                 self.log.info(f"Submitted SELL {instrument_id} qty={remaining} order={order_id}")
 
-        def _blocking_active_orders(
-            self,
-            active_orders: list[Any],
-            remaining: int,
-            now: float,
-        ) -> list[Any]:
-            if remaining <= 0:
-                return active_orders
-            return [
-                order
-                for order in active_orders
-                if not self._cancel_wait_elapsed(str(order.client_order_id), now)
-            ]
-
         def _cancel_wait_elapsed(self, order_id: str, now: float) -> bool:
             requested_at = self.cancel_requested_at_by_order_id.get(order_id)
             if requested_at is None:
                 return False
             return now - requested_at >= self.config.cancel_wait_secs
-
-        def _log_cancel_wait_elapsed_orders(
-            self,
-            instrument_key: str,
-            active_orders: list[Any],
-            now: float,
-        ) -> None:
-            for order in active_orders:
-                order_id = str(order.client_order_id)
-                if order_id in self.cancel_wait_logged_order_ids:
-                    continue
-                if not self._cancel_wait_elapsed(order_id, now):
-                    continue
-
-                self.cancel_wait_logged_order_ids.add(order_id)
-                self.log.warning(
-                    f"SELL cancel wait elapsed for {instrument_key}: "
-                    f"order={order_id} status={self._order_status(order)}; "
-                    f"submitting replacement if sellable volume is available",
-                )
 
         def _log_waiting_for_active_orders(
             self,
@@ -854,13 +855,7 @@ def build_node(
                 return
             remaining = sum(max(0, int(value)) for value in self.remaining_by_instrument.values())
             open_order_count = sum(
-                len(
-                    self._blocking_active_orders(
-                        self._active_unfilled_sell_orders(instrument_id),
-                        int(self.remaining_by_instrument.get(str(instrument_id), 0)),
-                        monotonic(),
-                    ),
-                )
+                len(self._active_unfilled_sell_orders(instrument_id))
                 for instrument_id in self.config.instrument_ids
             )
             if remaining > 0 or open_order_count > 0:
