@@ -256,6 +256,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trader-id", default=env("QMT_TRADER_ID", "QMT-001"))
     parser.add_argument("--order-id-tag", default=env("QMT_ORDER_ID_TAG", "001"))
     parser.add_argument(
+        "--position-ready-timeout-secs",
+        type=float,
+        default=float(env("QMT_POSITION_READY_TIMEOUT_SECS", "15")),
+        help=(
+            "Max seconds to wait for the freshly opened QMT session to load account "
+            "positions before building the sell plan. A cold session can return an "
+            "empty position list until MiniQMT finishes loading the account."
+        ),
+    )
+    parser.add_argument(
         "--poll-interval-secs",
         type=float,
         default=float(env("QMT_POLL_INTERVAL_SECS", "1.0")),
@@ -305,6 +315,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--order-timeout-secs must be positive")
     if args.cancel_wait_secs < 0:
         parser.error("--cancel-wait-secs must be non-negative")
+    if args.position_ready_timeout_secs < 0:
+        parser.error("--position-ready-timeout-secs must be non-negative")
     return args
 
 
@@ -321,7 +333,7 @@ async def load_position_plan(args: argparse.Namespace) -> list[PositionPlanItem]
         await client.connect()
         session = await client.open_session(args.account_id, args.account_type)
         session_id = str(session["session_id"])
-        positions = await client.get_positions(session_id)
+        positions = await wait_for_positions(client, session_id, args.position_ready_timeout_secs)
         open_orders = await client.get_orders(session_id, cancelable_only=False)
         return build_position_plan(
             positions=positions,
@@ -334,6 +346,61 @@ async def load_position_plan(args: argparse.Namespace) -> list[PositionPlanItem]
         if session_id is not None:
             await client.close_session(session_id)
         await client.close()
+
+
+def asset_is_loaded(asset: dict[str, object]) -> bool:
+    # A freshly opened session returns empty/zero asset fields until MiniQMT
+    # finishes loading the account. Any populated cash/asset figure means the
+    # account snapshot has arrived, so an empty position list is now trustworthy.
+    for key in ("cash", "frozen_cash", "total_asset", "market_value"):
+        if safe_float(asset.get(key)):
+            return True
+    return False
+
+
+async def wait_for_positions(
+    client: object,
+    session_id: str,
+    timeout_secs: float,
+) -> list[dict[str, object]]:
+    # A cold QMT session can return an empty position list before MiniQMT has
+    # loaded the account, which made the first run report "no sellable stock"
+    # while a restart (warm proxy) showed the real positions. Poll until
+    # positions appear, or until the account snapshot confirms there genuinely
+    # are none, bounded by timeout_secs.
+    deadline = monotonic() + max(0.0, timeout_secs)
+    attempt = 0
+    last_positions: list[dict[str, object]] = []
+    while True:
+        attempt += 1
+        positions = await client.get_positions(session_id)
+        last_positions = positions
+        if positions:
+            if attempt > 1:
+                print(
+                    f"[INFO] account positions loaded after {attempt} attempt(s)",
+                    flush=True,
+                )
+            return positions
+
+        # No positions yet. If the account snapshot is loaded, trust the empty
+        # result; otherwise the session is still warming up.
+        try:
+            asset = await client.get_asset(session_id)
+        except Exception:  # noqa: BLE001 - asset probe is best-effort
+            asset = {}
+        if asset_is_loaded(asset):
+            return positions
+
+        if monotonic() >= deadline:
+            print(
+                "[WARN] timed out waiting for QMT session to load positions; "
+                "proceeding with the latest (possibly empty) snapshot",
+                flush=True,
+            )
+            return last_positions
+
+        await asyncio.sleep(0.5)
 
 
 def quantity_to_int(value: object) -> int:
