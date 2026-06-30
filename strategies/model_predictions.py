@@ -255,7 +255,11 @@ class ModelPredictionsStrategy(Strategy):
 
         signal_date = self._resolve_signal_date(trading_date)
         today_signals = self._signals_by_date.get(signal_date, []) if signal_date else []
-        target_ids = self._selected_target_ids(trading_date, today_signals)
+        target_ids = {
+            str(self._instrument_by_stock[signal["stock_code"]])
+            for signal in today_signals
+            if signal["stock_code"] in self._instrument_by_stock
+        }
         rebalance_today = is_rebalance_day(
             trading_dates=self._trading_dates,
             rebalance_start_date=self._rebalance_start_date,
