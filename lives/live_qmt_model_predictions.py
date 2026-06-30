@@ -183,6 +183,12 @@ def parse_args() -> argparse.Namespace:
         help="How often to check for stale unfilled orders to cancel/resubmit.",
     )
     parser.add_argument(
+        "--cash-buffer-percent",
+        type=float,
+        default=float(env("MODEL_CASH_BUFFER_PERCENT", "0.01")),
+        help="Fraction of free cash held back when sizing/gating buys (commission + slippage margin).",
+    )
+    parser.add_argument(
         "--excluded-name-prefixes",
         default=",".join(env_list("MODEL_EXCLUDED_NAME_PREFIXES", "*ST,ST,退市")),
         help="Never buy stocks whose instrument name starts with any of these prefixes.",
@@ -704,6 +710,7 @@ def build_node(
             excluded_name_prefixes=tuple(env_list_from_value(args.excluded_name_prefixes)),
             unfilled_timeout_secs=args.unfilled_timeout_secs,
             resubmit_check_interval_secs=args.resubmit_interval_secs,
+            cash_buffer_percent=args.cash_buffer_percent,
             order_id_tag=args.order_id_tag,
         ),
         refresh_context=lambda active_stock_codes: loader.load(

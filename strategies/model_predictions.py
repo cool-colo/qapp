@@ -80,6 +80,10 @@ class ModelPredictionsStrategyConfig(StrategyConfig, frozen=True):
     excluded_name_prefixes: tuple[str, ...] = ("*ST", "ST", "退市")
     unfilled_timeout_secs: float = 30.0
     resubmit_check_interval_secs: float = 10.0
+    # Fraction of free cash held back when sizing/gating buys, to absorb commission
+    # and market-buy slippage above last close so a buy that "just fits" by close
+    # price does not get rejected as 废单 (可用资金不足). 0.0 disables the buffer.
+    cash_buffer_percent: float = 0.01
 
 
 class ModelPredictionsStrategy(Strategy):
@@ -120,6 +124,16 @@ class ModelPredictionsStrategy(Strategy):
         self._pending_targets: dict[str, float] = {}
         self._exit_retry_pool: set[str] = set()
         self._order_submit_ts: dict[str, int] = {}
+        # Buys that could not be funded from currently-free cash. They wait here
+        # until a sell frees cash; the resubmit timer drains them as cash arrives.
+        self._deferred_buys: dict[str, float] = {}
+        # Client order ids the venue terminally rejected (e.g. QMT 废单 — insufficient
+        # funds, price/volume validation). A rejected order is gone from the venue and
+        # is NOT cancellable; track them so we never try to cancel or resubmit them.
+        self._rejected_order_ids: set[str] = set()
+        # Instruments whose last buy was rejected for insufficient funds — do not keep
+        # resubmitting a buy that will only be rejected again until cash is available.
+        self._insufficient_funds: set[str] = set()
         self._processed_dates: set[date] = set()
         self._rebalance_start_date = first_trading_date_on_or_after(
             self._trading_dates,
@@ -596,17 +610,81 @@ class ModelPredictionsStrategy(Strategy):
             for instrument_id, weight in self._pending_targets.items()
             if weight != 0.0
         }
+        # Sells first: they release the cash the buys below need. The buys are then
+        # gated on free cash and any that don't fit are deferred until a sell fills
+        # (drained by the resubmit timer), so we never fire a buy the account can't
+        # fund and trigger a 废单 (可用资金不足).
         for instrument_id, target_weight in exit_targets.items():
             self._record_target(trading_date, signal_date, instrument_id, target_weight, "exit")
             submitted = self._submit_target_weight(trading_date, instrument_id, target_weight, "exit")
             if not submitted:
                 self._exit_retry_pool.add(instrument_id)
+
+        # A fresh rebalance supersedes any buys left deferred from a previous one.
+        self._deferred_buys = {}
+        buy_candidates: dict[str, float] = {}
         for instrument_id, target_weight in non_exit_targets.items():
             self._record_target(trading_date, signal_date, instrument_id, target_weight, "entry_or_target")
             if self._current_quantity(InstrumentId.from_str(instrument_id)) > 0:
                 continue
-            self._submit_target_weight(trading_date, instrument_id, target_weight, "entry_or_target")
+            buy_candidates[instrument_id] = target_weight
+        self._submit_buys_within_cash(trading_date, buy_candidates, "entry_or_target")
         self._pending_targets = {}
+
+    def _submit_buys_within_cash(
+        self,
+        trading_date: date,
+        buy_candidates: dict[str, float],
+        reason: str,
+    ) -> None:
+        """
+        Submit buys in target-weight order while free cash covers each one; defer
+        the rest into ``_deferred_buys`` so the resubmit timer can drain them once a
+        sell frees cash. This is the single funnel for new buys — same-tick rebalance
+        buys and resubmitted deferred buys both pass through here, so the free-cash
+        check is always enforced.
+        """
+        if not buy_candidates:
+            return
+        free_cash = self._free_cash()
+        buffer_pct = max(0.0, float(self.config.cash_buffer_percent))
+        if buffer_pct > 0:
+            free_cash = free_cash * Decimal(str(1.0 - min(buffer_pct, 1.0)))
+        # Highest target weight first so the most-wanted names get funded earliest.
+        for instrument_id in sorted(buy_candidates, key=lambda i: buy_candidates[i], reverse=True):
+            target_weight = buy_candidates[instrument_id]
+            est_cost = self._estimated_buy_cost(instrument_id, target_weight)
+            if est_cost is None:
+                # No price yet — let _submit_target_weight log/record the skip.
+                self._submit_target_weight(trading_date, instrument_id, target_weight, reason)
+                continue
+            if est_cost > free_cash:
+                self._deferred_buys[instrument_id] = target_weight
+                self.log.info(
+                    f"Deferred buy {instrument_id} weight={target_weight:.6f} "
+                    f"est_cost={est_cost} > free_cash={free_cash} — waiting for cash",
+                    color=LogColor.BLUE,
+                )
+                self._record_order(
+                    trading_date, instrument_id, "buy", 0, target_weight, "deferred", "insufficient_cash",
+                )
+                continue
+            submitted = self._submit_target_weight(trading_date, instrument_id, target_weight, reason)
+            if submitted and est_cost > 0:
+                free_cash -= est_cost
+
+    def _estimated_buy_cost(self, instrument_id_text: str, target_weight: float) -> Decimal | None:
+        instrument_id = InstrumentId.from_str(instrument_id_text)
+        instrument = self.cache.instrument(instrument_id)
+        close_price = self._last_close.get(instrument_id_text)
+        if instrument is None or close_price is None or close_price <= 0:
+            return None
+        current_qty = self._current_quantity(instrument_id)
+        target_qty = self._target_quantity(instrument, close_price, target_weight)
+        delta_qty = target_qty - current_qty
+        if delta_qty <= 0:
+            return Decimal("0")
+        return Decimal(str(delta_qty)) * Decimal(str(close_price))
 
     def _submit_target_weight(
         self,
@@ -677,13 +755,34 @@ class ModelPredictionsStrategy(Strategy):
         return True
 
     def on_order_filled(self, event: Any) -> None:
-        self._order_submit_ts.pop(str(event.client_order_id), None)
+        client_order_id = str(event.client_order_id)
+        self._order_submit_ts.pop(client_order_id, None)
+        self._deferred_buys.pop(str(getattr(event, "instrument_id", "")), None)
+        # A fill (typically a sell) frees cash — clear the insufficient-funds flag so
+        # deferred/blocked buys can be retried on the next resubmit tick.
+        self._insufficient_funds.discard(str(getattr(event, "instrument_id", "")))
 
     def on_order_canceled(self, event: Any) -> None:
         self._order_submit_ts.pop(str(event.client_order_id), None)
 
     def on_order_rejected(self, event: Any) -> None:
-        self._order_submit_ts.pop(str(event.client_order_id), None)
+        client_order_id = str(event.client_order_id)
+        self._order_submit_ts.pop(client_order_id, None)
+        # A rejected order (QMT 废单) is terminal and NOT cancellable. Remember it so
+        # the reconcile loop never tries to cancel or resubmit it.
+        self._rejected_order_ids.add(client_order_id)
+        instrument_id_text = str(getattr(event, "instrument_id", ""))
+        reason = str(getattr(event, "reason", "") or "")
+        if _is_insufficient_funds(reason):
+            # Don't keep resubmitting a buy that will only be rejected again; wait for
+            # a sell to free cash (on_order_filled clears this). Keep the intent in
+            # _deferred_buys so the next funded resubmit tick can pick it back up.
+            if instrument_id_text:
+                self._insufficient_funds.add(instrument_id_text)
+            self.log.warning(
+                f"Order {client_order_id} {instrument_id_text} rejected for insufficient "
+                f"funds — will retry after cash frees up. reason={reason}",
+            )
 
     def _on_resubmit_timer(self, _event: Any) -> None:
         try:
@@ -721,6 +820,11 @@ class ModelPredictionsStrategy(Strategy):
         for order in open_orders:
             instrument_id_text = str(order.instrument_id)
             client_order_id = str(order.client_order_id)
+            # A venue-rejected order (QMT 废单) is terminal and cannot be canceled.
+            # It should already be gone from orders_open(), but guard defensively so
+            # we never fire a doomed cancel against it.
+            if client_order_id in self._rejected_order_ids:
+                continue
             try:
                 if order.is_pending_cancel:
                     instruments_with_open_order.add(instrument_id_text)
@@ -767,6 +871,25 @@ class ModelPredictionsStrategy(Strategy):
                 continue
             self._resubmit_toward_target(trading_date, instrument_id_text)
 
+        # Drain buys that were deferred for lack of cash. Sells that have since filled
+        # freed cash, so retry them through the same free-cash funnel — any that still
+        # don't fit stay deferred for the next tick. Skip instruments with an order in
+        # flight or still flagged insufficient-funds (no fill has freed cash yet).
+        if self._deferred_buys:
+            retryable = {
+                instrument_id: weight
+                for instrument_id, weight in self._deferred_buys.items()
+                if instrument_id not in instruments_with_open_order
+                and instrument_id not in self._insufficient_funds
+                and self._current_quantity(InstrumentId.from_str(instrument_id)) <= 0
+            }
+            self._deferred_buys = {
+                instrument_id: weight
+                for instrument_id, weight in self._deferred_buys.items()
+                if instrument_id not in retryable
+            }
+            self._submit_buys_within_cash(trading_date, retryable, "resubmit_deferred")
+
     def _resubmit_toward_target(self, trading_date: date, instrument_id_text: str) -> None:
         instrument_id = InstrumentId.from_str(instrument_id_text)
         instrument = self.cache.instrument(instrument_id)
@@ -788,6 +911,16 @@ class ModelPredictionsStrategy(Strategy):
         side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
         qty_abs = abs(delta_qty)
         if qty_abs <= 0:
+            return
+        # Route resubmitted buys through the free-cash gate so the timer can never
+        # fire an unfundable buy and trigger a 废单. Sells (exits) go straight through —
+        # they free cash and were canceled precisely to be retried.
+        if side == OrderSide.BUY:
+            self._submit_buys_within_cash(
+                trading_date,
+                {instrument_id_text: float(target_weight)},
+                "resubmit_unfilled",
+            )
             return
         order = self.order_factory.market(
             instrument_id=instrument_id,
@@ -836,6 +969,38 @@ class ModelPredictionsStrategy(Strategy):
             except Exception:
                 return Decimal(str(float(first)))
         return Decimal(str(self.config.initial_cash))
+
+    def _free_cash(self) -> Decimal:
+        """
+        Return the cash available to fund new buys.
+
+        Sells release cash only once they fill (and, for the QMT proxy, once that
+        fill is polled back into the account state), so buys must be sized against
+        this free balance rather than total equity — otherwise several buys each
+        sized against full equity overrun the cash and the venue rejects them as
+        废单 (可用资金不足). Falls back to total equity when no account/balance is
+        available (e.g. before the first account-state update).
+        """
+        venue = self._instrument_ids[0].venue if self._instrument_ids else None
+        try:
+            account = (
+                self.portfolio.account(venue=Venue(str(venue)))
+                if venue is not None
+                else self.portfolio.account()
+            )
+        except Exception:
+            account = None
+        if account is not None:
+            try:
+                free = account.balance_free()
+            except Exception:
+                free = None
+            if free is not None:
+                try:
+                    return Decimal(str(free.as_decimal()))
+                except Exception:
+                    return Decimal(str(float(free)))
+        return self._portfolio_value()
 
     def _current_quantity(self, instrument_id: InstrumentId) -> Decimal:
         try:
@@ -957,6 +1122,17 @@ class ModelPredictionsStrategy(Strategy):
                 extra={"source": "strategy_internal"},
             ),
         )
+
+
+# QMT counter error 260200 is "可用资金不足" (insufficient available funds). Match the
+# code and the Chinese phrase so a wording change on either side still triggers the
+# cash-aware backoff.
+_INSUFFICIENT_FUNDS_MARKERS = ("260200", "可用资金不足", "资金不足", "insufficient")
+
+
+def _is_insufficient_funds(reason: str) -> bool:
+    text = (reason or "").lower()
+    return any(marker.lower() in text for marker in _INSUFFICIENT_FUNDS_MARKERS)
 
 
 def normalize_signals(raw: dict[str, list[dict[str, Any]]]) -> dict[date, list[dict[str, Any]]]:
