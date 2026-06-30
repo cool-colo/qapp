@@ -173,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--unfilled-timeout-secs",
         type=float,
-        default=float(env("MODEL_UNFILLED_TIMEOUT_SECS", "30")),
+        default=float(env("MODEL_UNFILLED_TIMEOUT_SECS", "300")),
         help="Cancel and resubmit an order that stays unfilled longer than this (0 disables).",
     )
     parser.add_argument(
