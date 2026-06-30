@@ -69,6 +69,9 @@ class ModelPredictionsStrategyConfig(StrategyConfig, frozen=True):
     suspended_by_date: dict[str, list[str]]
     max_positions: int = 30
     max_position_percent: float = 0.03
+    # Minimum buy quantity for 科创板 (STAR Market, codes starting with 688). The
+    # venue rejects buys below this as 废单; above it the increment is 1 share.
+    star_min_buy_qty: int = 200
     holding_days: int = 10
     stop_loss: float = 0.05
     trailing_take_profit: float = 0.0
@@ -627,6 +630,58 @@ class ModelPredictionsStrategy(Strategy):
             return ""
         return str(info.get("name", "") or "")
 
+    # Candidate field names for the daily up/down price limits in the QMT proxy
+    # instrument detail (stashed in instrument.info["fields"] by parse_equity).
+    # Several spellings are tried so we work regardless of the exact key the
+    # proxy returns; if none are present, limit detection is simply disabled.
+    _UP_LIMIT_KEYS = ("UpStopPrice", "up_stop_price", "high_limit", "up_limit", "limit_up", "涨停价")
+    _DOWN_LIMIT_KEYS = ("DownStopPrice", "down_stop_price", "low_limit", "down_limit", "limit_down", "跌停价")
+
+    def _price_limits(self, instrument_id_text: str) -> tuple[float | None, float | None]:
+        """Return (up_limit, down_limit) from the instrument's proxy fields, or (None, None)."""
+        try:
+            instrument = self.cache.instrument(InstrumentId.from_str(instrument_id_text))
+        except Exception:
+            return (None, None)
+        info = getattr(instrument, "info", None)
+        if not isinstance(info, dict):
+            return (None, None)
+        fields = info.get("fields")
+        if not isinstance(fields, dict):
+            return (None, None)
+
+        def _read(keys: tuple[str, ...]) -> float | None:
+            for key in keys:
+                if key in fields:
+                    try:
+                        value = float(fields[key])
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        return value
+            return None
+
+        return (_read(self._UP_LIMIT_KEYS), _read(self._DOWN_LIMIT_KEYS))
+
+    def _at_price_limit(self, order: Any) -> bool:
+        """
+        Whether the current price sits at the limit in the order's direction.
+
+        A buy resting at the up-limit (limit-up) or a sell resting at the
+        down-limit (limit-down) is very unlikely to fill and re-queuing only
+        loses time priority, so such orders should be left in place rather than
+        canceled. Uses the latest tracked close as the current price. Returns
+        False (allow cancel) when limit data or price is unavailable.
+        """
+        instrument_id_text = str(order.instrument_id)
+        price = self._last_close.get(instrument_id_text)
+        if price is None or price <= 0:
+            return False
+        up_limit, down_limit = self._price_limits(instrument_id_text)
+        if order.side == OrderSide.BUY:
+            return up_limit is not None and price >= up_limit
+        return down_limit is not None and price <= down_limit
+
     def _trim_active_positions(self) -> None:
         max_positions = int(self.config.max_positions)
         if max_positions <= 0 or len(self._active_positions) <= max_positions:
@@ -950,6 +1005,17 @@ class ModelPredictionsStrategy(Strategy):
             if now - submit_ts < timeout_ns:
                 instruments_with_open_order.add(instrument_id_text)
                 continue
+            # Don't cancel a buy resting at the up-limit or a sell at the
+            # down-limit: a fill is very unlikely and resubmitting only forfeits
+            # time priority. Leave it in flight and try again next tick.
+            if self._at_price_limit(order):
+                instruments_with_open_order.add(instrument_id_text)
+                self.log.info(
+                    f"Holding unfilled {'buy' if order.side == OrderSide.BUY else 'sell'} "
+                    f"{instrument_id_text} at price limit — not canceling",
+                    color=LogColor.BLUE,
+                )
+                continue
             try:
                 self.cancel_order(order)
             except Exception as exc:
@@ -1074,10 +1140,33 @@ class ModelPredictionsStrategy(Strategy):
             return Decimal("0")
         portfolio_value = self._portfolio_value()
         raw_qty = Decimal(str(portfolio_value * Decimal(str(target_weight)) / Decimal(str(close_price))))
+
+        # 科创板 (STAR Market, codes starting with 688): a buy must be at least
+        # 200 shares, and above the minimum the increment is 1 share (not the
+        # 100-lot rule of the main board). A sub-200 buy is rejected by the venue
+        # as 废单 ([p_low_amount=200.00]), so size to 0 rather than 100 in that
+        # case. The full-position exit path sells held odd lots as-is, so this
+        # only governs buys.
+        if self._is_star_market(instrument):
+            min_qty = Decimal(str(self.config.star_min_buy_qty))
+            if raw_qty < min_qty:
+                return Decimal("0")
+            return Decimal(int(raw_qty))  # 1-share increment above the minimum
+
         lot_size = Decimal(str(instrument.lot_size))
         if lot_size <= 0:
             lot_size = Decimal("1")
         return (raw_qty // lot_size) * lot_size
+
+    @staticmethod
+    def _is_star_market(instrument: Any) -> bool:
+        """Whether the instrument is a 科创板 (STAR Market) stock (code starts with 688)."""
+        try:
+            symbol = str(getattr(instrument, "raw_symbol", "") or instrument.id)
+        except Exception:
+            return False
+        # symbol forms: "688195.SH" or "688195.SH.QMT"
+        return symbol.lstrip().startswith("688")
 
     def _portfolio_value(self) -> Decimal:
         venue = self._instrument_ids[0].venue if self._instrument_ids else None
