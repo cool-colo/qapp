@@ -223,7 +223,7 @@ class ModelPredictionsStrategy(Strategy):
                 self.subscribe_bars(bar_type)
 
     def on_bar(self, bar: Bar) -> None:
-        self.log.info(f"on_bar: {bar.bar_type.instrument_id} ts={bar.ts_event} close={bar.close}")
+        #self.log.info(f"on_bar: {bar.bar_type.instrument_id} ts={bar.ts_event} close={bar.close}")
         trading_date = bar_date(bar, self.config.timezone_name)
         if trading_date not in self._processed_dates:
             self._process_trading_day(trading_date)

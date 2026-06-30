@@ -33,3 +33,4 @@ Thumbs.db
 .gitignore
 .pyc
 .gitignore
+logs
