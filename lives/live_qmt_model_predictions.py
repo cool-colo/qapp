@@ -221,6 +221,15 @@ def parse_args() -> argparse.Namespace:
         default=float(env("CLICKHOUSE_TIMEOUT_SECS", "60")),
     )
     parser.add_argument("--exchange-timezone", default=env("QMT_EXCHANGE_TIMEZONE", "Asia/Shanghai"))
+    parser.add_argument(
+        "--trading-windows",
+        default=env("QMT_TRADING_WINDOWS", "09:25-11:30,13:00-14:55"),
+        help=(
+            "Live-only: comma-separated HH:MM-HH:MM order sessions (exchange tz). "
+            "Orders submit only inside these ranges; the lunch break is excluded. "
+            "Default '09:25-11:30,13:00-14:55'."
+        ),
+    )
     parser.add_argument("--price-precision", type=int, default=int(env("QMT_PRICE_PRECISION", "2")))
     parser.add_argument(
         "--initial-cash",
@@ -302,6 +311,18 @@ def parse_args() -> argparse.Namespace:
         "--complete-instrument-details",
         action="store_true",
         default=env_bool("QMT_COMPLETE_INSTRUMENT_DETAILS", False),
+    )
+    parser.add_argument(
+        "--no-load-all-instruments",
+        dest="load_all_instruments",
+        action="store_false",
+        default=env_bool("QMT_LOAD_ALL_INSTRUMENTS", True),
+        help=(
+            "By default the venue's full instrument set is loaded so reconciliation "
+            "can import every held position into the cache (held names outside today's "
+            "universe must be reconciled to be sold). Pass this to load only the "
+            "universe instruments instead (positions outside it will not reconcile)."
+        ),
     )
     parser.add_argument(
         "--build-only",
@@ -635,11 +656,27 @@ def build_node(
             "every order as 'missing_price' until live bars arrive.",
             flush=True,
         )
-    instrument_provider = QMTInstrumentProviderConfig(
-        load_ids=frozenset(context.instrument_ids),
-        complete_details=args.complete_instrument_details,
-    )
-    reconciliation_ids = context.instrument_ids if args.restrict_reconciliation else None
+    if args.load_all_instruments:
+        # Load the venue's full instrument set so reconciliation can build a
+        # position for every held name — including those outside today's
+        # universe, which would otherwise be missing an instrument and never
+        # reconcile into the cache (so the strategy could never see or sell
+        # them). The strategy still only subscribes bars for its own bar_types.
+        instrument_provider = QMTInstrumentProviderConfig(
+            load_all=True,
+            complete_details=args.complete_instrument_details,
+        )
+    else:
+        instrument_provider = QMTInstrumentProviderConfig(
+            load_ids=frozenset(context.instrument_ids),
+            complete_details=args.complete_instrument_details,
+        )
+    # When loading all instruments, don't narrow reconciliation either, so every
+    # broker position is reconstructed regardless of today's universe.
+    if args.restrict_reconciliation and not args.load_all_instruments:
+        reconciliation_ids = context.instrument_ids
+    else:
+        reconciliation_ids = None
     config_node = TradingNodeConfig(
         trader_id=TraderId(args.trader_id),
         cache=build_cache_config(args),
@@ -653,7 +690,11 @@ def build_node(
             reconciliation=not args.no_reconciliation,
             reconciliation_lookback_mins=1440,
             reconciliation_instrument_ids=reconciliation_ids,
-            filter_unclaimed_external_orders=True,
+            # When loading the full universe, keep unclaimed external orders so
+            # every held position (incl. names outside today's universe) lands in
+            # the cache and the strategy can seed/exit it. With a narrowed load
+            # set, filtering avoids spurious positions for unrelated instruments.
+            filter_unclaimed_external_orders=not args.load_all_instruments,
         ),
         data_clients={
             QMT_CLIENT: QMTDataClientConfig(
@@ -711,6 +752,7 @@ def build_node(
             unfilled_timeout_secs=args.unfilled_timeout_secs,
             resubmit_check_interval_secs=args.resubmit_interval_secs,
             cash_buffer_percent=args.cash_buffer_percent,
+            trading_windows=args.trading_windows,
             order_id_tag=args.order_id_tag,
         ),
         refresh_context=lambda active_stock_codes: loader.load(

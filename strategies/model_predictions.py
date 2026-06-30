@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from nautilus_trader.config import StrategyConfig
+from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
@@ -75,6 +76,12 @@ class ModelPredictionsStrategyConfig(StrategyConfig, frozen=True):
     min_listed_days: int = 120
     initial_cash: Decimal = Decimal("1000000")
     timezone_name: str = "Asia/Shanghai"
+    # Live-only order sessions: comma-separated "HH:MM-HH:MM" ranges in
+    # ``timezone_name``. Orders are only submitted when the current wall-clock
+    # time falls inside one of these ranges; the lunch break between them is
+    # excluded. Outside any session on_bar still tracks last prices but skips the
+    # trading-day logic, and the resubmit timer is a no-op. Ignored in backtests.
+    trading_windows: str = "09:25-11:30,13:00-14:55"
     initial_last_closes: dict[str, float] | None = None
     initial_active_positions: dict[str, dict[str, Any]] | None = None
     excluded_name_prefixes: tuple[str, ...] = ("*ST", "ST", "退市")
@@ -236,15 +243,52 @@ class ModelPredictionsStrategy(Strategy):
                     self.log.warning(f"Instrument request failed for {bar_type.instrument_id}: {exc}")
                 self.subscribe_bars(bar_type)
 
+    def _within_trading_window(self) -> bool:
+        """
+        Whether order submission is currently allowed.
+
+        Always True outside live trading (backtests replay bars at arbitrary
+        simulated times and must not be gated). In live trading, True only when
+        the current wall-clock time in ``timezone_name`` falls within one of the
+        configured ``trading_windows`` sessions (the lunch break between them is
+        excluded).
+        """
+        if not isinstance(self.clock, LiveClock):
+            return True
+        try:
+            now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
+        except Exception:
+            # If the time can't be resolved, fail open rather than block trading.
+            return True
+        for session in str(self.config.trading_windows).split(","):
+            session = session.strip()
+            if not session or "-" not in session:
+                continue
+            open_str, close_str = session.split("-", 1)
+            try:
+                open_t = pd.Timestamp(open_str.strip()).time()
+                close_t = pd.Timestamp(close_str.strip()).time()
+            except Exception:
+                continue
+            if open_t <= now <= close_t:
+                return True
+        return False
+
     def on_bar(self, bar: Bar) -> None:
         self.log.info(f"on_bar: {bar.bar_type.instrument_id} ts={bar.ts_event} close={bar.close}")
+        # Always keep last prices fresh (for sizing once the window opens), but
+        # only run the trading-day logic — which submits orders — inside the
+        # live order window.
+        instrument_id = str(bar.bar_type.instrument_id)
+        self._last_close[instrument_id] = float(bar.close)
+
+        if not self._within_trading_window():
+            return
+
         trading_date = bar_date(bar, self.config.timezone_name)
         if trading_date not in self._processed_dates:
             self._process_trading_day(trading_date)
             self._processed_dates.add(trading_date)
-
-        instrument_id = str(bar.bar_type.instrument_id)
-        self._last_close[instrument_id] = float(bar.close)
 
     def _process_trading_day(self, trading_date: date) -> None:
         self._pending_targets = {}
@@ -850,6 +894,10 @@ class ModelPredictionsStrategy(Strategy):
             )
 
     def _on_resubmit_timer(self, _event: Any) -> None:
+        # The reconciler cancels and resubmits orders, so it must respect the same
+        # live order window as on_bar — no submissions before open / after close.
+        if not self._within_trading_window():
+            return
         try:
             self._reconcile_unfilled_orders()
         except Exception as exc:
