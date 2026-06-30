@@ -255,11 +255,7 @@ class ModelPredictionsStrategy(Strategy):
 
         signal_date = self._resolve_signal_date(trading_date)
         today_signals = self._signals_by_date.get(signal_date, []) if signal_date else []
-        target_ids = {
-            str(self._instrument_by_stock[signal["stock_code"]])
-            for signal in today_signals
-            if signal["stock_code"] in self._instrument_by_stock
-        }
+        target_ids = self._selected_target_ids(trading_date, today_signals)
         rebalance_today = is_rebalance_day(
             trading_dates=self._trading_dates,
             rebalance_start_date=self._rebalance_start_date,
@@ -330,14 +326,34 @@ class ModelPredictionsStrategy(Strategy):
         return prev_date
 
     def _seed_active_positions_from_portfolio(self, trading_date: date) -> None:
-        for instrument_id in self._instrument_ids:
+        # Drive seeding off the portfolio's open positions rather than the
+        # loaded universe (``self._instrument_ids``, today's ~max_positions
+        # names). After a restart the broker may hold names that dropped out of
+        # today's universe; those must still be seeded so ``_prepare_exits`` can
+        # liquidate them — otherwise the book never rotates and positions pile
+        # up well past max_positions. Stay entirely within the Nautilus cache.
+        try:
+            open_positions = self.cache.positions_open()
+        except Exception:
+            open_positions = []
+        for position in open_positions:
+            try:
+                if not position.is_long:
+                    continue
+                instrument_id = position.instrument_id
+            except Exception:
+                continue
             instrument_id_text = str(instrument_id)
             if instrument_id_text in self._active_positions:
                 continue
             if self._current_quantity(instrument_id) <= 0:
                 continue
             close_price = self._last_close.get(instrument_id_text)
-            entry_price = self._open_position_entry_price(instrument_id) or close_price
+            try:
+                avg_px_open = float(position.avg_px_open)
+            except Exception:
+                avg_px_open = 0.0
+            entry_price = avg_px_open if avg_px_open > 0 else close_price
             if entry_price is None or entry_price <= 0:
                 continue
             stock_code = self._stock_by_instrument.get(instrument_id_text, "")
@@ -351,7 +367,8 @@ class ModelPredictionsStrategy(Strategy):
             }
             self.log.info(
                 f"Seeded active model position from portfolio: {instrument_id_text} "
-                f"entry_price={entry_price:.4f}",
+                f"entry_price={entry_price:.4f}"
+                + ("" if instrument_id_text in self._stock_by_instrument else " (outside loaded universe)"),
                 color=LogColor.BLUE,
             )
 
@@ -700,6 +717,17 @@ class ModelPredictionsStrategy(Strategy):
             self._record_order(trading_date, instrument_id_text, "buy", 0, target_weight, "rejected", "missing_instrument")
             return False
 
+        current_qty = self._current_quantity(instrument_id)
+
+        # A full exit (target_weight <= 0) sells the entire held quantity, which
+        # comes from the portfolio — no price is needed for a market order. Take
+        # this path before the missing-price gate so stale holdings that have no
+        # subscribed bar (and therefore no _last_close) can still be liquidated.
+        if target_weight <= 0:
+            if current_qty <= 0:
+                return True
+            return self._submit_full_exit(trading_date, instrument_id, instrument, current_qty, reason)
+
         close_price = self._last_close.get(instrument_id_text)
         if close_price is None or close_price <= 0:
             self.log.warning(
@@ -709,7 +737,6 @@ class ModelPredictionsStrategy(Strategy):
             self._record_order(trading_date, instrument_id_text, "buy", 0, target_weight, "rejected", "missing_price")
             return False
 
-        current_qty = self._current_quantity(instrument_id)
         target_qty = self._target_quantity(instrument, close_price, target_weight)
         delta_qty = target_qty - current_qty
         if delta_qty == 0:
@@ -750,6 +777,40 @@ class ModelPredictionsStrategy(Strategy):
         )
         self.log.info(
             f"Submitted {side_text} target {instrument_id_text} qty={qty_abs} target_weight={target_weight:.6f}",
+            color=LogColor.BLUE,
+        )
+        return True
+
+    def _submit_full_exit(
+        self,
+        trading_date: date,
+        instrument_id: InstrumentId,
+        instrument: Any,
+        current_qty: Decimal,
+        reason: str,
+    ) -> bool:
+        """Sell the entire held quantity with a market order (no price needed)."""
+        instrument_id_text = str(instrument_id)
+        qty_abs = abs(current_qty)
+        order = self.order_factory.market(
+            instrument_id=instrument_id,
+            order_side=OrderSide.SELL,
+            quantity=instrument.make_qty(qty_abs),
+        )
+        self.submit_order(order)
+        self._order_submit_ts[str(order.client_order_id)] = self.clock.timestamp_ns()
+        self._record_order(
+            trading_date=trading_date,
+            instrument_id=instrument_id_text,
+            side="sell",
+            quantity=int(qty_abs),
+            target_weight=0.0,
+            status="submitted",
+            reason=reason,
+            order_id=str(order.client_order_id),
+        )
+        self.log.info(
+            f"Submitted sell exit {instrument_id_text} qty={qty_abs} (full position) reason={reason}",
             color=LogColor.BLUE,
         )
         return True
@@ -900,10 +961,20 @@ class ModelPredictionsStrategy(Strategy):
             target_weight = self._equal_weight_percent()
         else:
             target_weight = 0.0
+        current_qty = self._current_quantity(instrument_id)
+
+        # Full exit needs no price (see _submit_target_weight) — resubmit the
+        # whole held quantity directly so a stale holding without a live bar
+        # still retries until it fills.
+        if target_weight <= 0:
+            if current_qty <= 0:
+                return
+            self._submit_full_exit(trading_date, instrument_id, instrument, current_qty, "resubmit_unfilled")
+            return
+
         close_price = self._last_close.get(instrument_id_text)
         if close_price is None or close_price <= 0:
             return
-        current_qty = self._current_quantity(instrument_id)
         target_qty = self._target_quantity(instrument, close_price, target_weight)
         delta_qty = target_qty - current_qty
         if delta_qty == 0:
