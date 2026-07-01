@@ -52,8 +52,8 @@ if _PROMETHEUS_AVAILABLE:
     _LABELS = ("account",)
     _CASH_FREE = Gauge("qapp_cash_free", "Free (available) cash balance", _LABELS)
     _CASH_TOTAL = Gauge("qapp_cash_total", "Total cash balance", _LABELS)
-    _EQUITY = Gauge("qapp_equity", "Account equity (cash + positions mark value)", _LABELS)
-    _NET_EXPOSURE = Gauge("qapp_net_exposure", "Total net exposure across positions", _LABELS)
+    _EQUITY = Gauge("qapp_equity", "Broker-reported total account assets", _LABELS)
+    _NET_EXPOSURE = Gauge("qapp_net_exposure", "Broker-reported total market value", _LABELS)
     _UNREALIZED_PNL = Gauge("qapp_unrealized_pnl", "Total unrealized PnL", _LABELS)
     _REALIZED_PNL = Gauge("qapp_realized_pnl", "Total realized PnL", _LABELS)
     _OPEN_ORDERS = Gauge("qapp_open_orders", "Number of open (working) orders", _LABELS)
@@ -121,21 +121,66 @@ class PrometheusExporter(Actor):
             return
         label = self.config.account_label
         try:
-            # Single-venue deployment: pass venue=None so the portfolio aggregates
-            # across the (one) venue. Avoids fragile venue-object derivation.
-            _EQUITY.labels(label).set(self._sum_money(self.portfolio.equity()))
-            _NET_EXPOSURE.labels(label).set(self._sum_money(self.portfolio.net_exposures()))
-            _UNREALIZED_PNL.labels(label).set(self._sum_money(self.portfolio.unrealized_pnls()))
-            _REALIZED_PNL.labels(label).set(self._sum_money(self.portfolio.realized_pnls()))
+            # Portfolio queries now require a venue or account_id — passing both as
+            # None raises "venue or account_id must be provided". This is a
+            # single-account deployment, so resolve the (one) account from the cache
+            # and scope every query to its account_id. If the account has not landed
+            # in the cache yet, skip this scrape rather than raise.
+            account = self._first_account()
+            if account is None:
+                _SCRAPE_OK.labels(label).set(0)
+                return
+            account_id = account.id
 
-            free, total = self._balance_totals()
-            _CASH_FREE.labels(label).set(free)
-            _CASH_TOTAL.labels(label).set(total)
+            info = self._account_info(account)
+            free, total_cash = self._balance_totals(account)
+            positions_open = self.cache.positions_open(account_id=account_id)
 
-            _OPEN_ORDERS.labels(label).set(len(self.cache.orders_open()))
-            _OPEN_POSITIONS.labels(label).set(len(self.cache.positions_open()))
+            # Broker-reconciled account aggregates carried through the Nautilus
+            # AccountState info by the QMT execution adapter.
+            self._safe_set(
+                "equity",
+                _EQUITY,
+                label,
+                lambda: self._info_float(info, "total_asset"),
+            )
+            self._safe_set(
+                "net_exposure",
+                _NET_EXPOSURE,
+                label,
+                lambda: self._info_float(info, "market_value"),
+            )
+            # The broker asset endpoint has no holdings-PnL field, so unrealized PnL
+            # stays sourced from Nautilus (accurate once positions are priced; 0 during
+            # the post-startup price-warmup window). Realized PnL likewise.
+            self._safe_set(
+                "unrealized_pnl",
+                _UNREALIZED_PNL,
+                label,
+                lambda: self._sum_money(self.portfolio.unrealized_pnls(account_id=account_id)),
+            )
+            self._safe_set(
+                "realized_pnls",
+                _REALIZED_PNL,
+                label,
+                lambda: self._sum_money(self.portfolio.realized_pnls(account_id=account_id)),
+            )
 
-            self._set_strategy_health(label)
+            self._safe_set("cash_free", _CASH_FREE, label, lambda: free)
+            self._safe_set("cash_total", _CASH_TOTAL, label, lambda: total_cash)
+
+            self._safe_set(
+                "open_orders",
+                _OPEN_ORDERS,
+                label,
+                lambda: len(self.cache.orders_open(account_id=account_id)),
+            )
+            self._safe_set("open_positions", _OPEN_POSITIONS, label, lambda: len(positions_open))
+
+            try:
+                self._set_strategy_health(label)
+            except Exception as exc:
+                self.log.warning(f"PrometheusExporter: strategy health failed: {exc!r}")
 
             _SCRAPE_OK.labels(label).set(1)
         except Exception as exc:  # keep the node alive even if a query fails
@@ -144,15 +189,61 @@ class PrometheusExporter(Actor):
 
     # ---- helpers -------------------------------------------------------------
 
-    def _balance_totals(self) -> tuple[float, float]:
-        """(free, total) cash summed across the single account's currencies."""
+    def _first_account(self) -> Any:
+        """The single deployment account, or None if none has landed in the cache."""
         accounts = self.cache.accounts()
-        if not accounts:
-            return (0.0, 0.0)
-        account = accounts[0]
-        free = sum(float(m.as_double()) for m in account.balances_free().values())
-        total = sum(float(m.as_double()) for m in account.balances_total().values())
-        return (free, total)
+        return accounts[0] if accounts else None
+
+    def _balance_totals(self, account: Any) -> tuple[float, float]:
+        """(free, total) cash summed across the single account's currencies."""
+        return (
+            self._sum_money(account.balances_free()),
+            self._sum_money(account.balances_total()),
+        )
+
+    @staticmethod
+    def _account_info(account: Any) -> dict:
+        """Broker asset payload carried on the Nautilus AccountState info."""
+        try:
+            event = account.last_event
+        except Exception:
+            return {}
+        info = getattr(event, "info", None) if event is not None else None
+        return info if isinstance(info, dict) else {}
+
+    @staticmethod
+    def _info_float(info: dict, key: str) -> float | None:
+        """Read a numeric field from AccountState info."""
+        value = info.get(key)
+        if value is None:
+            return None
+        return float(value)
+
+    def _safe_set(self, name: str, gauge: Any, label: str, producer: Any) -> None:
+        """Compute a metric value and set it, isolating failures per-metric.
+
+        If ``producer()`` raises (or the value is None/non-numeric), publish 0.0 and
+        log which metric failed, instead of aborting the whole scrape. This is the
+        diagnostic that pins down which portfolio query is returning a bad value.
+        """
+        try:
+            value = producer()
+        except Exception as exc:
+            self.log.warning(f"PrometheusExporter: metric {name!r} failed: {exc!r}")
+            value = 0.0
+        self._set_gauge(gauge, label, value)
+
+    def _set_gauge(self, gauge: Any, label: str, value: Any) -> None:
+        """Set a gauge, coercing a missing/non-numeric value to 0.0.
+
+        Prometheus' ``Gauge.set`` raises ``must be real number, not NoneType`` if
+        handed ``None``; we would rather publish 0.0 and note which metric was
+        unavailable than fail the whole scrape.
+        """
+        if value is None:
+            self.log.warning(f"PrometheusExporter: metric {gauge._name!r} had no value; setting 0")
+            value = 0.0
+        gauge.labels(label).set(float(value))
 
     @staticmethod
     def _sum_money(money_map: Any) -> float:
@@ -161,10 +252,18 @@ class PrometheusExporter(Actor):
         A-share trading is single-currency (CNY) so summing is exact here; for a
         multi-currency book this would need FX conversion, which the target_currency
         argument on the portfolio methods can provide.
+
+        Returns 0.0 for an empty/None map, and skips any None entries so a single
+        unpriced currency cannot poison the whole sum.
         """
         if not money_map:
             return 0.0
-        return sum(float(v.as_double()) for v in money_map.values())
+        total = 0.0
+        for v in money_map.values():
+            if v is None:
+                continue
+            total += float(v.as_double())
+        return total
 
     def _set_strategy_health(self, label: str) -> None:
         """Read strategy-specific health counters if a strategy handle was set."""

@@ -30,8 +30,8 @@ curl -s localhost:9100/metrics | grep qapp_
 |---|---|
 | `qapp_cash_free` | Free (available) cash — the buy-gating balance |
 | `qapp_cash_total` | Total cash balance |
-| `qapp_equity` | Account equity (cash + positions mark value) |
-| `qapp_net_exposure` | Total net exposure across positions |
+| `qapp_equity` | Broker-reported total account assets (`AccountState.info["total_asset"]`) |
+| `qapp_net_exposure` | Broker-reported total market value (`AccountState.info["market_value"]`) |
 | `qapp_unrealized_pnl` | Total unrealized PnL |
 | `qapp_realized_pnl` | Total realized PnL |
 | `qapp_open_orders` | Number of open (working) orders |
