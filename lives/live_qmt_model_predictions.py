@@ -98,6 +98,10 @@ def build_cache_config(args: argparse.Namespace):
             username=username,
             password=password,
             ssl=args.redis_ssl,
+            connection_timeout=args.redis_connection_timeout,
+            response_timeout=args.redis_response_timeout,
+            number_of_retries=args.redis_retries,
+            max_delay=args.redis_max_delay,
         ),
         flush_on_start=args.redis_flush_on_start,
     )
@@ -290,6 +294,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=env_bool("QMT_REDIS_FLUSH_ON_START", False),
         help="Flush the Redis database on start instead of reusing persisted state.",
+    )
+    parser.add_argument(
+        "--redis-connection-timeout",
+        type=int,
+        default=int(env("QMT_REDIS_CONNECTION_TIMEOUT_SECS", "5")),
+        help="Redis connection timeout in seconds (used only with --use-redis).",
+    )
+    parser.add_argument(
+        "--redis-response-timeout",
+        type=int,
+        default=int(env("QMT_REDIS_RESPONSE_TIMEOUT_SECS", "5")),
+        help="Redis response timeout in seconds (used only with --use-redis).",
+    )
+    parser.add_argument(
+        "--redis-retries",
+        type=int,
+        default=int(env("QMT_REDIS_RETRIES", "3")),
+        help="Redis connection retry attempts (used only with --use-redis).",
+    )
+    parser.add_argument(
+        "--redis-max-delay",
+        type=int,
+        default=int(env("QMT_REDIS_MAX_DELAY_SECS", "5")),
+        help="Maximum Redis retry backoff delay in seconds (used only with --use-redis).",
+    )
+    parser.add_argument(
+        "--load-cache-on-start",
+        action="store_true",
+        default=env_bool("QMT_LOAD_CACHE_ON_START", False),
+        help="Replay persisted Nautilus execution cache before live reconciliation. Defaults off for QMT live runs.",
     )
     parser.add_argument("--no-sellable-check", action="store_true")
     parser.add_argument("--no-reconciliation", action="store_true")
@@ -640,6 +674,17 @@ def build_node(
         complete_details=args.complete_instrument_details,
     )
     reconciliation_ids = context.instrument_ids if args.restrict_reconciliation else None
+    if args.use_redis:
+        print(
+            "[build_node] redis enabled: "
+            f"load_cache_on_start={args.load_cache_on_start} "
+            f"flush_on_start={args.redis_flush_on_start} "
+            f"connection_timeout={args.redis_connection_timeout}s "
+            f"response_timeout={args.redis_response_timeout}s "
+            f"retries={args.redis_retries} "
+            f"max_delay={args.redis_max_delay}s",
+            flush=True,
+        )
     config_node = TradingNodeConfig(
         trader_id=TraderId(args.trader_id),
         cache=build_cache_config(args),
@@ -650,6 +695,7 @@ def build_node(
             log_file_name=args.log_file_name,
         ),
         exec_engine=LiveExecEngineConfig(
+            load_cache=args.load_cache_on_start,
             reconciliation=not args.no_reconciliation,
             reconciliation_lookback_mins=1440,
             reconciliation_instrument_ids=reconciliation_ids,
