@@ -106,6 +106,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-frac", type=float, default=float(env("MODEL_TOP_FRAC", "0.10")))
     parser.add_argument("--max-positions", type=int, default=int(env("MODEL_MAX_POSITIONS", "30")))
     parser.add_argument(
+        "--price-offset-ticks",
+        type=int,
+        default=int(env("MODEL_PRICE_OFFSET_TICKS", "1")),
+        help="Limit-order offset in ticks past the touch: buy at ask+N*tick, sell at bid-N*tick.",
+    )
+    parser.add_argument(
         "--max-position-percent",
         type=float,
         default=float(env("MODEL_MAX_POSITION_PERCENT", "0.03")),
@@ -312,6 +318,7 @@ def build_engine(
             min_listed_days=args.min_listed_days,
             initial_cash=args.starting_cash,
             timezone_name=args.exchange_timezone,
+            price_offset_ticks=args.price_offset_ticks,
         ),
     )
     engine.add_strategy(strategy)

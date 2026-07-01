@@ -37,11 +37,13 @@ from backtests.data_providers.clickhouse import quote_literal  # noqa: E402
 from backtests.data_providers.clickhouse_model_predictions import normalize_stock_code  # noqa: E402
 from strategies.model_predictions import ModelPredictionsStrategy  # noqa: E402
 from strategies.model_predictions import ModelPredictionsStrategyConfig  # noqa: E402
+from lives.monitoring import PrometheusExporter  # noqa: E402
+from lives.monitoring import PrometheusExporterConfig  # noqa: E402
+from nautilus_trader.common.enums import LogColor  # noqa: E402
 
 
 QMT_CLIENT = "QMT"
-QMT_DEFAULT_HTTP_URL = "https://2395ebf9eb74494ba7c720002d305ccb.hn.takin.cc/"
-DEFAULT_REFRESH_INTERVAL_SECS = 60 * 60
+QMT_DEFAULT_HTTP_URL = "http://172.18.193.224:8000"
 
 
 @dataclass(frozen=True)
@@ -137,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the model-prediction strategy as a long-running Nautilus live node via QMT.",
     )
-    parser.add_argument("--predictions-table", default=env("MODEL_PREDICTIONS_TABLE", "model_predictions"))
+    parser.add_argument("--predictions-table", default=env("MODEL_PREDICTIONS_TABLE", "daily_model_predictions"))
     parser.add_argument("--stock-codes", default=",".join(env_list("MODEL_STOCK_CODES", "000001.SZ,000002.SZ")))
     parser.add_argument("--all-stocks", action="store_true", default=env_bool("MODEL_ALL_STOCKS", False))
     parser.add_argument("--excluded-stock-codes", default=",".join(env_list("MODEL_EXCLUDED_STOCK_CODES", "")))
@@ -177,7 +179,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--unfilled-timeout-secs",
         type=float,
-        default=float(env("MODEL_UNFILLED_TIMEOUT_SECS", "30")),
+        default=float(env("MODEL_UNFILLED_TIMEOUT_SECS", "60")),
         help="Cancel and resubmit an order that stays unfilled longer than this (0 disables).",
     )
     parser.add_argument(
@@ -191,6 +193,34 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(env("MODEL_CASH_BUFFER_PERCENT", "0.01")),
         help="Fraction of free cash held back when sizing/gating buys (commission + slippage margin).",
+    )
+    parser.add_argument(
+        "--price-offset-ticks",
+        type=int,
+        default=int(env("MODEL_PRICE_OFFSET_TICKS", "1")),
+        help="Limit-order offset in ticks past the touch: buy at ask+N*tick, sell at bid-N*tick.",
+    )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=int(env("MODEL_METRICS_PORT", "9100")),
+        help="Prometheus metrics HTTP port. Set to 0 to disable the exporter.",
+    )
+    parser.add_argument(
+        "--metrics-addr",
+        default=env("MODEL_METRICS_ADDR", "0.0.0.0"),
+        help="Bind address for the Prometheus metrics HTTP server.",
+    )
+    parser.add_argument(
+        "--metrics-interval-secs",
+        type=float,
+        default=float(env("MODEL_METRICS_INTERVAL_SECS", "10")),
+        help="How often the exporter snapshots portfolio/cache into gauges.",
+    )
+    parser.add_argument(
+        "--metrics-account-label",
+        default=env("MODEL_METRICS_ACCOUNT_LABEL", "default"),
+        help="Prometheus label value identifying this node/account.",
     )
     parser.add_argument(
         "--excluded-name-prefixes",
@@ -211,9 +241,22 @@ def parse_args() -> argparse.Namespace:
         default=int(env("MODEL_LIVE_CALENDAR_LOOKAHEAD_DAYS", "30")),
     )
     parser.add_argument(
+        "--refresh-time",
+        default=env("MODEL_LIVE_REFRESH_TIME", "09:00"),
+        help=(
+            "Daily reference-data refresh time as HH:MM in --exchange-timezone (default "
+            "09:00 Beijing). Fires once per day. Set empty to disable and fall back to "
+            "--refresh-interval-secs."
+        ),
+    )
+    parser.add_argument(
         "--refresh-interval-secs",
         type=float,
-        default=float(env("MODEL_LIVE_REFRESH_INTERVAL_SECS", str(DEFAULT_REFRESH_INTERVAL_SECS))),
+        default=float(env("MODEL_LIVE_REFRESH_INTERVAL_SECS", "0")),
+        help=(
+            "Legacy periodic refresh interval in seconds. Only used when --refresh-time "
+            "is empty. 0 disables periodic refresh."
+        ),
     )
     parser.add_argument("--clickhouse-url", default=env("CLICKHOUSE_URL", "http://127.0.0.1:8123"))
     parser.add_argument("--clickhouse-database", default=env("CLICKHOUSE_DATABASE"))
@@ -225,6 +268,15 @@ def parse_args() -> argparse.Namespace:
         default=float(env("CLICKHOUSE_TIMEOUT_SECS", "60")),
     )
     parser.add_argument("--exchange-timezone", default=env("QMT_EXCHANGE_TIMEZONE", "Asia/Shanghai"))
+    parser.add_argument(
+        "--trading-windows",
+        default=env("QMT_TRADING_WINDOWS", "09:25-11:30,13:00-14:55"),
+        help=(
+            "Live-only: comma-separated HH:MM-HH:MM order sessions (exchange tz). "
+            "Orders submit only inside these ranges; the lunch break is excluded. "
+            "Default '09:25-11:30,13:00-14:55'."
+        ),
+    )
     parser.add_argument("--price-precision", type=int, default=int(env("QMT_PRICE_PRECISION", "2")))
     parser.add_argument(
         "--initial-cash",
@@ -336,6 +388,18 @@ def parse_args() -> argparse.Namespace:
         "--complete-instrument-details",
         action="store_true",
         default=env_bool("QMT_COMPLETE_INSTRUMENT_DETAILS", False),
+    )
+    parser.add_argument(
+        "--no-load-all-instruments",
+        dest="load_all_instruments",
+        action="store_false",
+        default=env_bool("QMT_LOAD_ALL_INSTRUMENTS", True),
+        help=(
+            "By default the venue's full instrument set is loaded so reconciliation "
+            "can import every held position into the cache (held names outside today's "
+            "universe must be reconciled to be sold). Pass this to load only the "
+            "universe instruments instead (positions outside it will not reconcile)."
+        ),
     )
     parser.add_argument(
         "--build-only",
@@ -499,27 +563,71 @@ GROUP BY source_code
 
 
 class LiveModelPredictionsStrategy(ModelPredictionsStrategy):
+    _REFRESH_ALERT = "MODEL-PREDICTION-DATA-REFRESH"
+
     def __init__(
         self,
         config: ModelPredictionsStrategyConfig,
         refresh_context: Any,
-        refresh_interval_secs: float,
+        refresh_interval_secs: float = 0.0,
+        refresh_time: str | None = "09:00",
     ) -> None:
         super().__init__(config)
         self._refresh_context = refresh_context
         self._refresh_interval_secs = float(refresh_interval_secs)
+        # Parse "HH:MM" once; None/empty disables the daily alert.
+        self._refresh_time = self._parse_hh_mm(refresh_time)
+
+    @staticmethod
+    def _parse_hh_mm(value: str | None) -> tuple[int, int] | None:
+        if not value or not str(value).strip():
+            return None
+        hh, mm = str(value).strip().split(":")
+        return int(hh), int(mm)
+
+    def _next_refresh_time(self) -> pd.Timestamp:
+        """Next occurrence of the configured HH:MM in ``timezone_name`` (strictly future)."""
+        tz = self.config.timezone_name
+        now = pd.Timestamp(self.clock.utc_now()).tz_convert(tz)
+        hh, mm = self._refresh_time
+        target = now.normalize() + pd.Timedelta(hours=hh, minutes=mm)
+        if target <= now:
+            target = target + pd.Timedelta(days=1)
+        return target
 
     def on_start(self) -> None:
         super().on_start()
-        if self._refresh_interval_secs > 0:
+        if self._refresh_time is not None:
+            # Daily one-shot alert at HH:MM; the callback re-arms for the next day.
+            self._schedule_daily_refresh()
+        elif self._refresh_interval_secs > 0:
+            # Legacy periodic refresh.
             self.clock.set_timer(
-                name="MODEL-PREDICTION-DATA-REFRESH",
+                name=self._REFRESH_ALERT,
                 interval=timedelta(seconds=self._refresh_interval_secs),
                 callback=self._on_refresh_timer,
                 fire_immediately=False,
             )
 
+    def _schedule_daily_refresh(self) -> None:
+        alert_time = self._next_refresh_time()
+        self.clock.set_time_alert(
+            name=self._REFRESH_ALERT,
+            alert_time=alert_time,
+            callback=self._on_refresh_timer,
+            override=True,
+        )
+        self.log.info(
+            f"Next reference-data refresh scheduled for {alert_time.isoformat()} "
+            f"({self.config.timezone_name})",
+            color=LogColor.BLUE,
+        )
+
     def _on_refresh_timer(self, _event: Any) -> None:
+        # Re-arm for the next day before doing the work, so a refresh failure never
+        # cancels the daily schedule.
+        if self._refresh_time is not None:
+            self._schedule_daily_refresh()
         try:
             context = self._refresh_context(self._active_stock_codes())
             self.refresh_reference_data(
@@ -669,11 +777,27 @@ def build_node(
             "every order as 'missing_price' until live bars arrive.",
             flush=True,
         )
-    instrument_provider = QMTInstrumentProviderConfig(
-        load_ids=frozenset(context.instrument_ids),
-        complete_details=args.complete_instrument_details,
-    )
-    reconciliation_ids = context.instrument_ids if args.restrict_reconciliation else None
+    if args.load_all_instruments:
+        # Load the venue's full instrument set so reconciliation can build a
+        # position for every held name — including those outside today's
+        # universe, which would otherwise be missing an instrument and never
+        # reconcile into the cache (so the strategy could never see or sell
+        # them). The strategy still only subscribes bars for its own bar_types.
+        instrument_provider = QMTInstrumentProviderConfig(
+            load_all=True,
+            complete_details=args.complete_instrument_details,
+        )
+    else:
+        instrument_provider = QMTInstrumentProviderConfig(
+            load_ids=frozenset(context.instrument_ids),
+            complete_details=args.complete_instrument_details,
+        )
+    # When loading all instruments, don't narrow reconciliation either, so every
+    # broker position is reconstructed regardless of today's universe.
+    if args.restrict_reconciliation and not args.load_all_instruments:
+        reconciliation_ids = context.instrument_ids
+    else:
+        reconciliation_ids = None
     if args.use_redis:
         print(
             "[build_node] redis enabled: "
@@ -699,7 +823,11 @@ def build_node(
             reconciliation=not args.no_reconciliation,
             reconciliation_lookback_mins=1440,
             reconciliation_instrument_ids=reconciliation_ids,
-            filter_unclaimed_external_orders=True,
+            # When loading the full universe, keep unclaimed external orders so
+            # every held position (incl. names outside today's universe) lands in
+            # the cache and the strategy can seed/exit it. With a narrowed load
+            # set, filtering avoids spurious positions for unrelated instruments.
+            filter_unclaimed_external_orders=not args.load_all_instruments,
         ),
         data_clients={
             QMT_CLIENT: QMTDataClientConfig(
@@ -722,8 +850,11 @@ def build_node(
                 enforce_sellable_position=not args.no_sellable_check,
             ),
         },
-        timeout_connection=30.0,
-        timeout_reconciliation=10.0,
+        # Loading the whole-market instrument set (thousands of names, fetched
+        # concurrently) takes ~30s; give the connection/reconciliation phases
+        # enough headroom so startup completes before these timeouts fire.
+        timeout_connection=90.0,
+        timeout_reconciliation=30.0,
         timeout_portfolio=10.0,
         timeout_disconnection=10.0,
         timeout_post_stop=5.0,
@@ -757,14 +888,30 @@ def build_node(
             unfilled_timeout_secs=args.unfilled_timeout_secs,
             resubmit_check_interval_secs=args.resubmit_interval_secs,
             cash_buffer_percent=args.cash_buffer_percent,
+            price_offset_ticks=args.price_offset_ticks,
+            trading_windows=args.trading_windows,
             order_id_tag=args.order_id_tag,
         ),
         refresh_context=lambda active_stock_codes: loader.load(
             extra_stock_codes=extra_stock_codes.union(active_stock_codes),
         ),
         refresh_interval_secs=args.refresh_interval_secs,
+        refresh_time=args.refresh_time,
     )
     node.trader.add_strategy(strategy)
+    if args.metrics_port and int(args.metrics_port) > 0:
+        exporter = PrometheusExporter(
+            config=PrometheusExporterConfig(
+                port=int(args.metrics_port),
+                addr=args.metrics_addr,
+                scrape_interval_secs=args.metrics_interval_secs,
+                account_label=args.metrics_account_label,
+            ),
+        )
+        # The Cache does not hold live Strategy instances, so hand the exporter a
+        # direct handle to read strategy-specific health counters.
+        exporter.strategy_ref = strategy
+        node.trader.add_actor(exporter)
     node.add_data_client_factory(QMT_CLIENT, QMTLiveDataClientFactory)
     node.add_exec_client_factory(QMT_CLIENT, QMTLiveExecClientFactory)
     node.build()

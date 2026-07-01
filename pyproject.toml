@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qapp"
+version = "0.1.0"
+description = "China A-share daily model-prediction trading strategy (backtest + live) on Nautilus Trader"
+requires-python = ">=3.12"
+
+# NOTE: nautilus_trader is intentionally NOT listed here. It is consumed as an
+# out-of-tree checkout (default /data/flc/code/quant/nautilus_trader, overridable
+# via NAUTILUS_TRADER_PATH); every runnable script prepends it to sys.path rather
+# than importing an installed package. Do not add it as a dependency — pip would
+# try to resolve a version from PyPI that does not match the local checkout.
+dependencies = [
+    "numpy",
+    "pandas",
+]
+
+[project.optional-dependencies]
+# MySQL result persistence (backtests run with --write-results). Imported lazily
+# in backtests/result_writers/mysql.py, so only needed when persisting results.
+mysql = ["pymysql"]
+
+# Prometheus metrics endpoint for the live node (lives/monitoring.py). Imported
+# optionally — the exporter no-ops with a warning if this is absent.
+monitoring = ["prometheus_client"]
+
+# Everything optional at once, for a full deployment environment.
+all = ["pymysql", "prometheus_client"]
+
+[tool.setuptools.packages.find]
+# Scripts run as modules from the repo root
+# (e.g. `python -m backtests.model_predictions.run_backtest`), so the trading
+# packages and their subpackages must be importable as top-level packages. There
+# is no src/ layout. logs/, output/, and monitoring/ are not import packages.
+include = ["backtests*", "lives*", "strategies*"]
+exclude = ["logs*", "output*", "monitoring*"]

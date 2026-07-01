@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from nautilus_trader.config import StrategyConfig
+from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
@@ -68,6 +69,9 @@ class ModelPredictionsStrategyConfig(StrategyConfig, frozen=True):
     suspended_by_date: dict[str, list[str]]
     max_positions: int = 30
     max_position_percent: float = 0.03
+    # Minimum buy quantity for 科创板 (STAR Market, codes starting with 688). The
+    # venue rejects buys below this as 废单; above it the increment is 1 share.
+    star_min_buy_qty: int = 200
     holding_days: int = 10
     stop_loss: float = 0.05
     trailing_take_profit: float = 0.0
@@ -75,6 +79,12 @@ class ModelPredictionsStrategyConfig(StrategyConfig, frozen=True):
     min_listed_days: int = 120
     initial_cash: Decimal = Decimal("1000000")
     timezone_name: str = "Asia/Shanghai"
+    # Live-only order sessions: comma-separated "HH:MM-HH:MM" ranges in
+    # ``timezone_name``. Orders are only submitted when the current wall-clock
+    # time falls inside one of these ranges; the lunch break between them is
+    # excluded. Outside any session on_bar still tracks last prices but skips the
+    # trading-day logic, and the resubmit timer is a no-op. Ignored in backtests.
+    trading_windows: str = "09:25-11:30,13:00-14:55"
     initial_last_closes: dict[str, float] | None = None
     initial_active_positions: dict[str, dict[str, Any]] | None = None
     excluded_name_prefixes: tuple[str, ...] = ("*ST", "ST", "退市")
@@ -84,6 +94,11 @@ class ModelPredictionsStrategyConfig(StrategyConfig, frozen=True):
     # and market-buy slippage above last close so a buy that "just fits" by close
     # price does not get rejected as 废单 (可用资金不足). 0.0 disables the buffer.
     cash_buffer_percent: float = 0.01
+    # Limit-order price offset in ticks (instrument.price_increment) applied against
+    # the top-of-book: buys rest at ask + N*tick, sells at bid - N*tick, to cross the
+    # spread for a quick fill. N=1 (one tick past touch). Falls back to last close
+    # +/- offset when no live quote is cached (e.g. backtests without quote data).
+    price_offset_ticks: int = 1
 
 
 class ModelPredictionsStrategy(Strategy):
@@ -155,6 +170,10 @@ class ModelPredictionsStrategy(Strategy):
             self.log.warning("on_start: no bar_types configured — no bars will arrive, no orders will be made")
         for bar_type in self._bar_types.values():
             self.subscribe_bars(bar_type)
+            # Quote ticks feed the top-of-book used to price limit orders (ask/bid
+            # +/- N ticks). The daily trading logic stays bar-driven; quotes are only
+            # read from the cache at submission time, never reacted to here.
+            self.subscribe_quote_ticks(bar_type.instrument_id)
         interval_secs = float(self.config.resubmit_check_interval_secs)
         if float(self.config.unfilled_timeout_secs) > 0 and interval_secs > 0:
             self.clock.set_timer(
@@ -235,16 +254,54 @@ class ModelPredictionsStrategy(Strategy):
                 except Exception as exc:
                     self.log.warning(f"Instrument request failed for {bar_type.instrument_id}: {exc}")
                 self.subscribe_bars(bar_type)
+                self.subscribe_quote_ticks(bar_type.instrument_id)
+
+    def _within_trading_window(self) -> bool:
+        """
+        Whether order submission is currently allowed.
+
+        Always True outside live trading (backtests replay bars at arbitrary
+        simulated times and must not be gated). In live trading, True only when
+        the current wall-clock time in ``timezone_name`` falls within one of the
+        configured ``trading_windows`` sessions (the lunch break between them is
+        excluded).
+        """
+        if not isinstance(self.clock, LiveClock):
+            return True
+        try:
+            now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
+        except Exception:
+            # If the time can't be resolved, fail open rather than block trading.
+            return True
+        for session in str(self.config.trading_windows).split(","):
+            session = session.strip()
+            if not session or "-" not in session:
+                continue
+            open_str, close_str = session.split("-", 1)
+            try:
+                open_t = pd.Timestamp(open_str.strip()).time()
+                close_t = pd.Timestamp(close_str.strip()).time()
+            except Exception:
+                continue
+            if open_t <= now <= close_t:
+                return True
+        return False
 
     def on_bar(self, bar: Bar) -> None:
         #self.log.info(f"on_bar: {bar.bar_type.instrument_id} ts={bar.ts_event} close={bar.close}")
+        # Always keep last prices fresh (for sizing once the window opens), but
+        # only run the trading-day logic — which submits orders — inside the
+        # live order window.
+        instrument_id = str(bar.bar_type.instrument_id)
+        self._last_close[instrument_id] = float(bar.close)
+
+        if not self._within_trading_window():
+            return
+
         trading_date = bar_date(bar, self.config.timezone_name)
         if trading_date not in self._processed_dates:
             self._process_trading_day(trading_date)
             self._processed_dates.add(trading_date)
-
-        instrument_id = str(bar.bar_type.instrument_id)
-        self._last_close[instrument_id] = float(bar.close)
 
     def _process_trading_day(self, trading_date: date) -> None:
         self._pending_targets = {}
@@ -583,6 +640,58 @@ class ModelPredictionsStrategy(Strategy):
             return ""
         return str(info.get("name", "") or "")
 
+    # Candidate field names for the daily up/down price limits in the QMT proxy
+    # instrument detail (stashed in instrument.info["fields"] by parse_equity).
+    # Several spellings are tried so we work regardless of the exact key the
+    # proxy returns; if none are present, limit detection is simply disabled.
+    _UP_LIMIT_KEYS = ("UpStopPrice", "up_stop_price", "high_limit", "up_limit", "limit_up", "涨停价")
+    _DOWN_LIMIT_KEYS = ("DownStopPrice", "down_stop_price", "low_limit", "down_limit", "limit_down", "跌停价")
+
+    def _price_limits(self, instrument_id_text: str) -> tuple[float | None, float | None]:
+        """Return (up_limit, down_limit) from the instrument's proxy fields, or (None, None)."""
+        try:
+            instrument = self.cache.instrument(InstrumentId.from_str(instrument_id_text))
+        except Exception:
+            return (None, None)
+        info = getattr(instrument, "info", None)
+        if not isinstance(info, dict):
+            return (None, None)
+        fields = info.get("fields")
+        if not isinstance(fields, dict):
+            return (None, None)
+
+        def _read(keys: tuple[str, ...]) -> float | None:
+            for key in keys:
+                if key in fields:
+                    try:
+                        value = float(fields[key])
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        return value
+            return None
+
+        return (_read(self._UP_LIMIT_KEYS), _read(self._DOWN_LIMIT_KEYS))
+
+    def _at_price_limit(self, order: Any) -> bool:
+        """
+        Whether the current price sits at the limit in the order's direction.
+
+        A buy resting at the up-limit (limit-up) or a sell resting at the
+        down-limit (limit-down) is very unlikely to fill and re-queuing only
+        loses time priority, so such orders should be left in place rather than
+        canceled. Uses the latest tracked close as the current price. Returns
+        False (allow cancel) when limit data or price is unavailable.
+        """
+        instrument_id_text = str(order.instrument_id)
+        price = self._last_close.get(instrument_id_text)
+        if price is None or price <= 0:
+            return False
+        up_limit, down_limit = self._price_limits(instrument_id_text)
+        if order.side == OrderSide.BUY:
+            return up_limit is not None and price >= up_limit
+        return down_limit is not None and price <= down_limit
+
     def _trim_active_positions(self) -> None:
         max_positions = int(self.config.max_positions)
         if max_positions <= 0 or len(self._active_positions) <= max_positions:
@@ -707,6 +816,43 @@ class ModelPredictionsStrategy(Strategy):
             return Decimal("0")
         return Decimal(str(delta_qty)) * Decimal(str(close_price))
 
+    def _limit_price(self, instrument: Any, instrument_id: InstrumentId, side: OrderSide) -> Any | None:
+        """
+        Limit price for an order, one tick past the touch to cross the spread:
+        buys at ask + N*tick, sells at bid - N*tick (N = price_offset_ticks, tick =
+        instrument.price_increment). Falls back to the last close +/- offset when no
+        live quote is cached (e.g. backtests without quote data). Returns a
+        ``Price`` rounded to the instrument's precision, or None if no reference
+        price is available at all.
+        """
+        offset_ticks = int(self.config.price_offset_ticks)
+        tick = float(instrument.price_increment)
+        offset = offset_ticks * tick
+
+        quote = self.cache.quote_tick(instrument_id)
+        if quote is not None:
+            if side == OrderSide.BUY:
+                base = float(quote.ask_price)
+            else:
+                base = float(quote.bid_price)
+            if base > 0:
+                raw = base + offset if side == OrderSide.BUY else base - offset
+                if raw > 0:
+                    return instrument.make_price(raw)
+
+        # No usable quote — fall back to last close +/- offset so the order still prices.
+        close_price = self._last_close.get(str(instrument_id))
+        if close_price is None or close_price <= 0:
+            return None
+        raw = close_price + offset if side == OrderSide.BUY else close_price - offset
+        if raw <= 0:
+            return None
+        self.log.warning(
+            f"_limit_price {instrument_id}: no cached quote — pricing off last close "
+            f"{close_price} {'+' if side == OrderSide.BUY else '-'} {offset}",
+        )
+        return instrument.make_price(raw)
+
     def _submit_target_weight(
         self,
         trading_date: date,
@@ -761,10 +907,23 @@ class ModelPredictionsStrategy(Strategy):
                 f"close={close_price} portfolio_value={self._portfolio_value()} reason={reason}",
             )
             return True
-        order = self.order_factory.market(
+        price = self._limit_price(instrument, instrument_id, side)
+        if price is None:
+            self.log.warning(
+                f"_submit_target {instrument_id_text}: no limit price available "
+                f"(no quote/close) side={side} — order skipped",
+            )
+            self._record_order(
+                trading_date, instrument_id_text,
+                "buy" if side == OrderSide.BUY else "sell",
+                0, target_weight, "rejected", "missing_price",
+            )
+            return False
+        order = self.order_factory.limit(
             instrument_id=instrument_id,
             order_side=side,
             quantity=instrument.make_qty(qty_abs),
+            price=price,
         )
         self.submit_order(order)
         self._order_submit_ts[str(order.client_order_id)] = self.clock.timestamp_ns()
@@ -793,14 +952,32 @@ class ModelPredictionsStrategy(Strategy):
         current_qty: Decimal,
         reason: str,
     ) -> bool:
-        """Sell the entire held quantity with a market order (no price needed)."""
+        """
+        Sell the entire held quantity. Prices a limit at bid - N*tick when a quote
+        (or last close) is available; falls back to a market order for stale holdings
+        that have no bar and no quote, so a position that must be liquidated is never
+        stranded for lack of a reference price.
+        """
         instrument_id_text = str(instrument_id)
         qty_abs = abs(current_qty)
-        order = self.order_factory.market(
-            instrument_id=instrument_id,
-            order_side=OrderSide.SELL,
-            quantity=instrument.make_qty(qty_abs),
-        )
+        price = self._limit_price(instrument, instrument_id, OrderSide.SELL)
+        if price is not None:
+            order = self.order_factory.limit(
+                instrument_id=instrument_id,
+                order_side=OrderSide.SELL,
+                quantity=instrument.make_qty(qty_abs),
+                price=price,
+            )
+        else:
+            self.log.warning(
+                f"_submit_full_exit {instrument_id_text}: no limit price available — "
+                f"falling back to market sell",
+            )
+            order = self.order_factory.market(
+                instrument_id=instrument_id,
+                order_side=OrderSide.SELL,
+                quantity=instrument.make_qty(qty_abs),
+            )
         self.submit_order(order)
         self._order_submit_ts[str(order.client_order_id)] = self.clock.timestamp_ns()
         self._record_order(
@@ -850,6 +1027,10 @@ class ModelPredictionsStrategy(Strategy):
             )
 
     def _on_resubmit_timer(self, _event: Any) -> None:
+        # The reconciler cancels and resubmits orders, so it must respect the same
+        # live order window as on_bar — no submissions before open / after close.
+        if not self._within_trading_window():
+            return
         try:
             self._reconcile_unfilled_orders()
         except Exception as exc:
@@ -880,6 +1061,10 @@ class ModelPredictionsStrategy(Strategy):
         except Exception:
             open_orders = []
 
+        self.log.info(
+                f"reconcile_unfilled_orders, open order count:{len(open_orders)}",
+                    color=LogColor.BLUE,
+                )
         canceled_instruments: set[str] = set()
         instruments_with_open_order: set[str] = set()
         for order in open_orders:
@@ -901,6 +1086,17 @@ class ModelPredictionsStrategy(Strategy):
                 submit_ts = int(getattr(order, "ts_last", now) or now)
             if now - submit_ts < timeout_ns:
                 instruments_with_open_order.add(instrument_id_text)
+                continue
+            # Don't cancel a buy resting at the up-limit or a sell at the
+            # down-limit: a fill is very unlikely and resubmitting only forfeits
+            # time priority. Leave it in flight and try again next tick.
+            if self._at_price_limit(order):
+                instruments_with_open_order.add(instrument_id_text)
+                self.log.info(
+                    f"Holding unfilled {'buy' if order.side == OrderSide.BUY else 'sell'} "
+                    f"{instrument_id_text} at price limit — not canceling",
+                    color=LogColor.BLUE,
+                )
                 continue
             try:
                 self.cancel_order(order)
@@ -997,11 +1193,22 @@ class ModelPredictionsStrategy(Strategy):
                 "resubmit_unfilled",
             )
             return
-        order = self.order_factory.market(
-            instrument_id=instrument_id,
-            order_side=side,
-            quantity=instrument.make_qty(qty_abs),
-        )
+        # Sell resubmit (buys returned above). Price a limit at bid - N*tick; fall
+        # back to market if no reference price so a canceled sell still retries.
+        price = self._limit_price(instrument, instrument_id, side)
+        if price is not None:
+            order = self.order_factory.limit(
+                instrument_id=instrument_id,
+                order_side=side,
+                quantity=instrument.make_qty(qty_abs),
+                price=price,
+            )
+        else:
+            order = self.order_factory.market(
+                instrument_id=instrument_id,
+                order_side=side,
+                quantity=instrument.make_qty(qty_abs),
+            )
         self.submit_order(order)
         self._order_submit_ts[str(order.client_order_id)] = self.clock.timestamp_ns()
         side_text = "buy" if side == OrderSide.BUY else "sell"
@@ -1026,10 +1233,33 @@ class ModelPredictionsStrategy(Strategy):
             return Decimal("0")
         portfolio_value = self._portfolio_value()
         raw_qty = Decimal(str(portfolio_value * Decimal(str(target_weight)) / Decimal(str(close_price))))
+
+        # 科创板 (STAR Market, codes starting with 688): a buy must be at least
+        # 200 shares, and above the minimum the increment is 1 share (not the
+        # 100-lot rule of the main board). A sub-200 buy is rejected by the venue
+        # as 废单 ([p_low_amount=200.00]), so size to 0 rather than 100 in that
+        # case. The full-position exit path sells held odd lots as-is, so this
+        # only governs buys.
+        if self._is_star_market(instrument):
+            min_qty = Decimal(str(self.config.star_min_buy_qty))
+            if raw_qty < min_qty:
+                return Decimal("0")
+            return Decimal(int(raw_qty))  # 1-share increment above the minimum
+
         lot_size = Decimal(str(instrument.lot_size))
         if lot_size <= 0:
             lot_size = Decimal("1")
         return (raw_qty // lot_size) * lot_size
+
+    @staticmethod
+    def _is_star_market(instrument: Any) -> bool:
+        """Whether the instrument is a 科创板 (STAR Market) stock (code starts with 688)."""
+        try:
+            symbol = str(getattr(instrument, "raw_symbol", "") or instrument.id)
+        except Exception:
+            return False
+        # symbol forms: "688195.SH" or "688195.SH.QMT"
+        return symbol.lstrip().startswith("688")
 
     def _portfolio_value(self) -> Decimal:
         venue = self._instrument_ids[0].venue if self._instrument_ids else None
