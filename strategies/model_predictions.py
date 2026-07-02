@@ -84,7 +84,7 @@ class ModelPredictionsStrategyConfig(StrategyConfig, frozen=True):
     # time falls inside one of these ranges; the lunch break between them is
     # excluded. Outside any session on_bar still tracks last prices but skips the
     # trading-day logic, and the resubmit timer is a no-op. Ignored in backtests.
-    trading_windows: str = "09:25-11:30,13:00-14:55"
+    trading_windows: str = "09:35-11:30,13:00-14:55"
     initial_last_closes: dict[str, float] | None = None
     initial_active_positions: dict[str, dict[str, Any]] | None = None
     excluded_name_prefixes: tuple[str, ...] = ("*ST", "ST", "退市")
