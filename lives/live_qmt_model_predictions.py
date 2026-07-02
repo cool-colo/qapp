@@ -195,6 +195,46 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of free cash held back when sizing/gating buys (commission + slippage margin).",
     )
     parser.add_argument(
+        "--target-cash-buffer-percent",
+        type=float,
+        default=float(env("MODEL_TARGET_CASH_BUFFER_PERCENT", "0.05")),
+        help="Framework target cash reserve; target model weights normally sum to 1 minus this value.",
+    )
+    parser.add_argument(
+        "--weight-tolerance-percent",
+        type=float,
+        default=float(env("MODEL_WEIGHT_TOLERANCE_PERCENT", "0.003")),
+        help="Practical achievement tolerance for per-instrument target weights.",
+    )
+    parser.add_argument(
+        "--cash-tolerance-percent",
+        type=float,
+        default=float(env("MODEL_CASH_TOLERANCE_PERCENT", "0.01")),
+        help="Practical achievement tolerance for residual free-cash weight.",
+    )
+    parser.add_argument(
+        "--stop-time",
+        default=env("MODEL_TARGET_STOP_TIME", "14:55"),
+        help="Exchange-local HH:MM time after which the target framework stops new convergence work.",
+    )
+    parser.add_argument(
+        "--limit-stop-mode",
+        default=env("MODEL_LIMIT_STOP_MODE", "freeze_symbol"),
+        help="Target framework limit handling. Default freezes only the affected symbol.",
+    )
+    parser.add_argument(
+        "--order-slice-notional",
+        type=parse_decimal,
+        default=parse_decimal(env("MODEL_ORDER_SLICE_NOTIONAL", "300000")),
+        help="Target framework order split size in CNY notional. 0 disables splitting.",
+    )
+    parser.add_argument(
+        "--leave-non-targets",
+        action="store_true",
+        default=env_bool("MODEL_LEAVE_NON_TARGETS", False),
+        help="Do not sell holdings absent from the latest target weights.",
+    )
+    parser.add_argument(
         "--price-offset-ticks",
         type=int,
         default=int(env("MODEL_PRICE_OFFSET_TICKS", "1")),

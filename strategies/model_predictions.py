@@ -350,6 +350,7 @@ class ModelPredictionsStrategy(Strategy):
             f"entries={sum(1 for w in self._pending_targets.values() if w != 0.0)})",
             color=LogColor.BLUE,
         )
+        self._log_draft_target_plan(trading_date, signal_date)
         self._submit_pending_targets(trading_date, signal_date)
 
     def _resolve_signal_date(self, trading_date: date) -> date | None:
@@ -760,6 +761,63 @@ class ModelPredictionsStrategy(Strategy):
             buy_candidates[instrument_id] = target_weight
         self._submit_buys_within_cash(trading_date, buy_candidates, "entry_or_target")
         self._pending_targets = {}
+
+    def _log_draft_target_plan(self, trading_date: date, signal_date: date | None) -> None:
+        if not self._pending_targets:
+            self.log.info(
+                f"Draft target plan {trading_date}: no target changes",
+                color=LogColor.BLUE,
+            )
+            return
+
+        plan_items: list[str] = []
+        for instrument_id_text, target_weight in sorted(self._pending_targets.items()):
+            instrument_id = InstrumentId.from_str(instrument_id_text)
+            current_qty = self._current_quantity(instrument_id)
+            target_qty = self._draft_target_quantity(instrument_id_text, target_weight)
+            display_id = self._stock_by_instrument.get(instrument_id_text, instrument_id_text)
+
+            if target_qty is None:
+                plan_items.append(
+                    f"{display_id} {self._format_plan_qty(current_qty)} -> ? "
+                    f"(weight={target_weight:.6f}, missing price/instrument)",
+                )
+                continue
+
+            plan_items.append(
+                f"{display_id} {self._format_plan_qty(current_qty)} -> "
+                f"{self._format_plan_qty(target_qty)} (weight={target_weight:.6f})",
+            )
+
+        chunk_size = 20
+        total_chunks = (len(plan_items) + chunk_size - 1) // chunk_size
+        for index in range(0, len(plan_items), chunk_size):
+            chunk = plan_items[index:index + chunk_size]
+            chunk_no = index // chunk_size + 1
+            suffix = f" part={chunk_no}/{total_chunks}" if total_chunks > 1 else ""
+            self.log.info(
+                f"Draft target plan {trading_date} signal_date={signal_date} "
+                f"count={len(plan_items)}{suffix}: " + ", ".join(chunk),
+                color=LogColor.BLUE,
+            )
+
+    def _draft_target_quantity(self, instrument_id_text: str, target_weight: float) -> Decimal | None:
+        if target_weight <= 0:
+            return Decimal("0")
+
+        instrument_id = InstrumentId.from_str(instrument_id_text)
+        instrument = self.cache.instrument(instrument_id)
+        close_price = self._last_close.get(instrument_id_text)
+        if instrument is None or close_price is None or close_price <= 0:
+            return None
+
+        return self._target_quantity(instrument, close_price, target_weight)
+
+    @staticmethod
+    def _format_plan_qty(quantity: Decimal) -> str:
+        if quantity == quantity.to_integral_value():
+            return str(int(quantity))
+        return format(quantity.normalize(), "f")
 
     def _submit_buys_within_cash(
         self,
