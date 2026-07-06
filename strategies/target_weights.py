@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
+import random
 from dataclasses import dataclass
 from datetime import date
 from datetime import timedelta
@@ -9,11 +12,15 @@ from typing import Any
 import pandas as pd
 
 from nautilus_trader.config import StrategyConfig
-from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
+from nautilus_trader.model.data import OrderBookDepth10
+from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import TradeTick
+from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.trading.strategy import Strategy
@@ -60,6 +67,14 @@ class TargetOrderIntent:
     side: OrderSide
     quantity: Decimal
     price: Any
+
+
+@dataclass(frozen=True)
+class TodayFillSnapshot:
+    buy_qty: Decimal
+    sell_qty: Decimal
+    fill_count: int
+    latest_ts_event: int
 
 
 class NotionalOrderSplitter:
@@ -113,6 +128,9 @@ class TargetWeightStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     limit_stop_mode: str = "freeze_symbol"
     order_slice_notional: Decimal = Decimal("300000")
     require_account_cash: bool = True
+    quote_tick_log_sample_rate: float = 0.0
+    trade_tick_log_sample_rate: float = 0.0
+    order_book_depth_log_sample_rate: float = 0.0
 
 
 class TargetWeightStrategy(Strategy):
@@ -133,6 +151,7 @@ class TargetWeightStrategy(Strategy):
         "limit_down",
         "\u8dcc\u505c\u4ef7",
     )
+    _PRE_OPEN_RECONCILE_ALERT = "TARGET-WEIGHT-PRE-OPEN-RECONCILE"
 
     def __init__(self, config: TargetWeightStrategyConfig) -> None:
         super().__init__(config)
@@ -153,8 +172,23 @@ class TargetWeightStrategy(Strategy):
         self._order_target_versions: dict[str, str] = {}
         self._order_splitter = NotionalOrderSplitter(config.order_slice_notional)
         self._convergence_suspended = False
+        self._pre_open_reconcile = None
+        self._pre_open_reconcile_time: tuple[int, int] | None = None
+        self._pre_open_reconcile_timeout_secs = 30.0
+        self._pre_open_reconcile_task: asyncio.Future[Any] | None = None
+        self._sellable_exhausted: dict[str, date] = {}
         self.target_events: list[TargetWeightTargetEvent] = []
         self.order_events: list[TargetWeightOrderEvent] = []
+
+    def configure_pre_open_reconciliation(
+        self,
+        reconcile: Any | None,
+        reconcile_time: str | None,
+        timeout_secs: float,
+    ) -> None:
+        self._pre_open_reconcile = reconcile
+        self._pre_open_reconcile_time = self._parse_hh_mm(reconcile_time)
+        self._pre_open_reconcile_timeout_secs = float(timeout_secs)
 
     def on_start(self) -> None:
         self.log.info(
@@ -162,11 +196,20 @@ class TargetWeightStrategy(Strategy):
             f"bar_types={len(self._bar_types)} target_version={self._target_version or '<none>'}",
             color=LogColor.BLUE,
         )
+        if self._pre_open_reconcile_time is not None:
+            self._schedule_pre_open_reconcile()
         if not self._bar_types:
             self.log.warning("target-weight executor has no bar_types configured")
         for bar_type in self._bar_types.values():
             self.subscribe_bars(bar_type)
             self.subscribe_quote_ticks(bar_type.instrument_id)
+            # self.subscribe_trade_ticks(bar_type.instrument_id)
+            if self._order_book_depth_logging_enabled():
+                self.subscribe_order_book_depth(
+                    bar_type.instrument_id,
+                    book_type=BookType.L2_MBP,
+                    depth=10,
+                )
         interval_secs = float(self.config.resubmit_check_interval_secs)
         if float(self.config.unfilled_timeout_secs) > 0 and interval_secs > 0:
             self.clock.set_timer(
@@ -175,6 +218,82 @@ class TargetWeightStrategy(Strategy):
                 callback=self._on_converge_timer,
                 fire_immediately=False,
             )
+
+    @staticmethod
+    def _parse_hh_mm(value: str | None) -> tuple[int, int] | None:
+        if not value or not str(value).strip():
+            return None
+        hh, mm = str(value).strip().split(":")
+        return int(hh), int(mm)
+
+    def _next_daily_time(self, hh_mm: tuple[int, int] | None) -> pd.Timestamp:
+        if hh_mm is None:
+            raise RuntimeError("daily time is not configured")
+        tz = self.config.timezone_name
+        now = pd.Timestamp(self.clock.utc_now()).tz_convert(tz)
+        hh, mm = hh_mm
+        target = now.normalize() + pd.Timedelta(hours=hh, minutes=mm)
+        if target <= now:
+            target = target + pd.Timedelta(days=1)
+        return target
+
+    def _schedule_pre_open_reconcile(self) -> None:
+        alert_time = self._next_daily_time(self._pre_open_reconcile_time)
+        self.clock.set_time_alert(
+            name=self._PRE_OPEN_RECONCILE_ALERT,
+            alert_time=alert_time,
+            callback=self._on_pre_open_reconcile_timer,
+            override=True,
+        )
+        self.log.info(
+            f"Next pre-open execution-state reconciliation scheduled for {alert_time.isoformat()} "
+            f"({self.config.timezone_name})",
+            color=LogColor.BLUE,
+        )
+
+    def _on_pre_open_reconcile_timer(self, _event: Any) -> None:
+        if self._pre_open_reconcile_time is not None:
+            self._schedule_pre_open_reconcile()
+        if self._pre_open_reconcile is None:
+            self.log.warning("Pre-open execution-state reconciliation is configured but no callback is available")
+            return
+        if self._pre_open_reconcile_task is not None and not self._pre_open_reconcile_task.done():
+            self.log.warning("Previous pre-open execution-state reconciliation is still running; skipping")
+            return
+        try:
+            result = self._pre_open_reconcile(timeout_secs=self._pre_open_reconcile_timeout_secs)
+        except Exception as exc:
+            self.log.warning(f"Pre-open execution-state reconciliation failed to start: {exc}")
+            return
+        if inspect.isawaitable(result):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError as exc:
+                if inspect.iscoroutine(result):
+                    result.close()
+                self.log.warning(f"Pre-open execution-state reconciliation has no running event loop: {exc}")
+                return
+            task = asyncio.ensure_future(result, loop=loop)
+            self._pre_open_reconcile_task = task
+            task.add_done_callback(self._on_pre_open_reconcile_done)
+            self.log.info("Started pre-open execution-state reconciliation", color=LogColor.BLUE)
+            return
+        self._log_pre_open_reconcile_result(bool(result))
+
+    def _on_pre_open_reconcile_done(self, task: asyncio.Future[Any]) -> None:
+        self._pre_open_reconcile_task = None
+        try:
+            result = task.result()
+        except Exception as exc:
+            self.log.warning(f"Pre-open execution-state reconciliation failed: {exc}")
+            return
+        self._log_pre_open_reconcile_result(bool(result))
+
+    def _log_pre_open_reconcile_result(self, succeeded: bool) -> None:
+        if succeeded:
+            self.log.info("Pre-open execution-state reconciliation succeeded", color=LogColor.GREEN)
+        else:
+            self.log.warning("Pre-open execution-state reconciliation did not complete successfully")
 
     def refresh_target_instruments(
         self,
@@ -195,6 +314,13 @@ class TargetWeightStrategy(Strategy):
                     self.unsubscribe_bars(self._bar_types[key])
                 except Exception as exc:
                     self.log.warning(f"Bar unsubscribe failed for {self._bar_types[key]}: {exc}")
+                if self._order_book_depth_logging_enabled():
+                    try:
+                        self.unsubscribe_order_book_depth(self._bar_types[key].instrument_id)
+                    except Exception as exc:
+                        self.log.warning(
+                            f"Order-book depth unsubscribe failed for {self._bar_types[key].instrument_id}: {exc}",
+                        )
                 self._bar_types.pop(key, None)
         self._bar_types.update(refreshed_bar_types)
         known_ids = {str(instrument_id): instrument_id for instrument_id in self._instrument_ids}
@@ -212,6 +338,13 @@ class TargetWeightStrategy(Strategy):
                     self.log.warning(f"Instrument request failed for {bar_type.instrument_id}: {exc}")
                 self.subscribe_bars(bar_type)
                 self.subscribe_quote_ticks(bar_type.instrument_id)
+                self.subscribe_trade_ticks(bar_type.instrument_id)
+                if self._order_book_depth_logging_enabled():
+                    self.subscribe_order_book_depth(
+                        bar_type.instrument_id,
+                        book_type=BookType.L2_MBP,
+                        depth=10,
+                    )
 
     def update_target_weights(
         self,
@@ -265,6 +398,66 @@ class TargetWeightStrategy(Strategy):
     def on_target_bar(self, bar: Bar) -> None:
         """Hook for subclasses to update targets before convergence."""
 
+    def on_quote_tick(self, tick: QuoteTick) -> None:
+        if not self._should_log_sample(self.config.quote_tick_log_sample_rate):
+            return
+        self.log.info(
+            "Quote tick order-book sample, "
+            f"instrument_id={tick.instrument_id}, "
+            f"bid_price={tick.bid_price}, bid_size={tick.bid_size}, "
+            f"ask_price={tick.ask_price}, ask_size={tick.ask_size}, "
+            f"ts_event={tick.ts_event}, ts_init={tick.ts_init}",
+            color=LogColor.CYAN,
+        )
+
+    def on_trade_tick(self, tick: TradeTick) -> None:
+        if not self._should_log_sample(self.config.trade_tick_log_sample_rate):
+            return
+        self.log.info(
+            "Trade tick sample, "
+            f"instrument_id={tick.instrument_id}, "
+            f"price={tick.price}, size={tick.size}, "
+            f"aggressor_side={tick.aggressor_side}, trade_id={tick.trade_id}, "
+            f"ts_event={tick.ts_event}, ts_init={tick.ts_init}",
+            color=LogColor.CYAN,
+        )
+
+    def on_order_book_depth(self, depth: OrderBookDepth10) -> None:
+        if not self._should_log_sample(self.config.order_book_depth_log_sample_rate):
+            return
+        self.log.info(
+            "Order-book depth sample, "
+            f"instrument_id={depth.instrument_id}, "
+            f"bids={self._format_depth_side(depth.bids)}, "
+            f"asks={self._format_depth_side(depth.asks)}, "
+            f"ts_event={depth.ts_event}, ts_init={depth.ts_init}",
+            color=LogColor.CYAN,
+        )
+
+    def _order_book_depth_logging_enabled(self) -> bool:
+        return float(self.config.order_book_depth_log_sample_rate) > 0.0
+
+    @staticmethod
+    def _should_log_sample(sample_rate: float) -> bool:
+        rate = max(0.0, min(1.0, float(sample_rate)))
+        if rate <= 0.0:
+            return False
+        return rate >= 1.0 or random.random() < rate
+
+    @staticmethod
+    def _format_depth_side(orders: list[Any]) -> str:
+        levels = []
+        for order in orders[:10]:
+            try:
+                price = float(order.price)
+                size = float(order.size)
+            except Exception:
+                continue
+            if price <= 0 or size <= 0:
+                continue
+            levels.append(f"{order.price}@{order.size}")
+        return "[" + ", ".join(levels) + "]"
+
     def on_order_filled(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
         instrument_id_text = str(getattr(event, "instrument_id", ""))
@@ -300,6 +493,14 @@ class TargetWeightStrategy(Strategy):
                 f"will retry after cash changes. reason={reason}",
             )
             return
+        if _is_sellable_position_denial(reason):
+            if instrument_id_text:
+                self._sellable_exhausted[instrument_id_text] = self._clock_date()
+            self.log.warning(
+                f"Order {client_order_id} {instrument_id_text} rejected for sellable-position exhaustion; "
+                f"will not retry this instrument today. reason={reason}",
+            )
+            return
         if instrument_id_text:
             self._deferred_buys.pop(instrument_id_text, None)
 
@@ -316,6 +517,11 @@ class TargetWeightStrategy(Strategy):
             return
         if self._target_version in self._achieved_versions:
             return
+        self._sellable_exhausted = {
+            instrument_id: exhausted_date
+            for instrument_id, exhausted_date in self._sellable_exhausted.items()
+            if exhausted_date == current_date
+        }
         if self._stop_time_reached():
             self.log.info(
                 f"target convergence stopped by stop_time={self.config.stop_time} "
@@ -336,6 +542,8 @@ class TargetWeightStrategy(Strategy):
                 continue
             side = self._target_side(instrument_id_text, target_weight)
             if side == "sell":
+                if self._sellable_exhausted.get(instrument_id_text) == current_date:
+                    continue
                 sell_targets[instrument_id_text] = target_weight
             elif side == "buy":
                 buy_targets[instrument_id_text] = target_weight
@@ -670,7 +878,15 @@ class TargetWeightStrategy(Strategy):
         current_qty: Decimal,
         reason: str,
     ) -> bool:
-        qty_abs = abs(current_qty)
+        qty_abs = self._clamp_sell_quantity(
+            trading_date=trading_date,
+            instrument_id=instrument_id,
+            requested_qty=abs(current_qty),
+            target_weight=0.0,
+            reason=reason,
+        )
+        if qty_abs is None or qty_abs <= 0:
+            return False
         price = self._limit_price(instrument, instrument_id, OrderSide.SELL)
         if price is None:
             order = self.order_factory.market(
@@ -709,7 +925,18 @@ class TargetWeightStrategy(Strategy):
         quantity: Decimal,
         target_weight: float,
         reason: str,
-    ) -> None:
+    ) -> bool:
+        if intent.side == OrderSide.SELL:
+            clamped_quantity = self._clamp_sell_quantity(
+                trading_date=trading_date,
+                instrument_id=intent.instrument_id,
+                requested_qty=quantity,
+                target_weight=target_weight,
+                reason=reason,
+            )
+            if clamped_quantity is None or clamped_quantity <= 0:
+                return False
+            quantity = clamped_quantity
         if intent.price is not None:
             order = self.order_factory.limit(
                 instrument_id=intent.instrument_id,
@@ -736,6 +963,149 @@ class TargetWeightStrategy(Strategy):
             reason,
             str(order.client_order_id),
         )
+        return True
+
+    def _clamp_sell_quantity(
+        self,
+        trading_date: date,
+        instrument_id: InstrumentId,
+        requested_qty: Decimal,
+        target_weight: float,
+        reason: str,
+    ) -> Decimal | None:
+        instrument_id_text = str(instrument_id)
+        if requested_qty <= 0:
+            return Decimal("0")
+
+        fills_before = self._today_fill_snapshot(instrument_id, trading_date)
+        current_qty = self._current_quantity(instrument_id)
+        open_sell_qty = self._open_sell_quantity(instrument_id)
+        fills_after = self._today_fill_snapshot(instrument_id, trading_date)
+        if fills_before != fills_after:
+            self._record_order(
+                trading_date,
+                instrument_id_text,
+                "sell",
+                0,
+                target_weight,
+                "deferred",
+                "sellable_snapshot_unstable",
+            )
+            self.log.warning(
+                f"Deferring SELL for {instrument_id_text}: Nautilus fill snapshot changed while "
+                f"calculating sellable quantity; before={fills_before}, after={fills_after}",
+            )
+            return None
+
+        sellable_qty = max(Decimal("0"), current_qty - fills_after.buy_qty - open_sell_qty)
+        if sellable_qty <= 0:
+            self._sellable_exhausted[instrument_id_text] = trading_date
+            self._record_order(
+                trading_date,
+                instrument_id_text,
+                "sell",
+                0,
+                target_weight,
+                "deferred",
+                "sellable_exhausted",
+            )
+            self.log.warning(
+                f"Skipping SELL for {instrument_id_text}: strategy sellable estimate exhausted "
+                f"(net_qty={current_qty}, today_buy_qty={fills_after.buy_qty}, open_sell_qty={open_sell_qty}, "
+                f"requested_qty={requested_qty})",
+            )
+            return Decimal("0")
+
+        clamped_qty = min(Decimal(str(requested_qty)), sellable_qty)
+        if clamped_qty < requested_qty:
+            self._sellable_exhausted[instrument_id_text] = trading_date
+            self.log.warning(
+                f"Clamping SELL for {instrument_id_text}: requested_qty={requested_qty}, "
+                f"strategy_sellable_qty={sellable_qty}, today_buy_qty={fills_after.buy_qty}, "
+                f"open_sell_qty={open_sell_qty}",
+            )
+        return clamped_qty
+
+    def _today_fill_snapshot(self, instrument_id: InstrumentId, trading_date: date) -> TodayFillSnapshot:
+        buy_qty = Decimal("0")
+        sell_qty = Decimal("0")
+        fill_count = 0
+        latest_ts_event = 0
+        try:
+            orders = self.cache.orders(instrument_id=instrument_id)
+        except Exception:
+            orders = []
+        for order in orders:
+            if self._is_reconciliation_order(order):
+                continue
+            for event in getattr(order, "events", []) or []:
+                if not isinstance(event, OrderFilled) and not (
+                    hasattr(event, "order_side") and hasattr(event, "last_qty")
+                ):
+                    continue
+                if getattr(event, "instrument_id", instrument_id) != instrument_id:
+                    continue
+                ts_event = int(getattr(event, "ts_event", 0) or 0)
+                if self._event_trading_date(ts_event) != trading_date:
+                    continue
+                order_side = getattr(event, "order_side", None)
+                last_qty = self._decimal_quantity(getattr(event, "last_qty", Decimal("0")))
+                if order_side == OrderSide.BUY:
+                    buy_qty += last_qty
+                elif order_side == OrderSide.SELL:
+                    sell_qty += last_qty
+                else:
+                    continue
+                fill_count += 1
+                latest_ts_event = max(latest_ts_event, ts_event)
+        return TodayFillSnapshot(
+            buy_qty=buy_qty,
+            sell_qty=sell_qty,
+            fill_count=fill_count,
+            latest_ts_event=latest_ts_event,
+        )
+
+    def _event_trading_date(self, ts_event: int) -> date | None:
+        if ts_event <= 0:
+            return None
+        try:
+            return pd.Timestamp(ts_event, unit="ns", tz="UTC").tz_convert(self.config.timezone_name).date()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_reconciliation_order(order: Any) -> bool:
+        tags = getattr(order, "tags", []) or []
+        return "RECONCILIATION" in {str(tag) for tag in tags}
+
+    def _open_sell_quantity(self, instrument_id: InstrumentId) -> Decimal:
+        total = Decimal("0")
+        try:
+            open_orders = self.cache.orders_open(instrument_id=instrument_id, side=OrderSide.SELL)
+        except Exception:
+            open_orders = []
+        for order in open_orders:
+            if getattr(order, "instrument_id", None) != instrument_id:
+                continue
+            if getattr(order, "side", None) != OrderSide.SELL:
+                continue
+            try:
+                if order.is_pending_cancel:
+                    continue
+            except Exception:
+                pass
+            quantity = getattr(order, "leaves_qty", getattr(order, "quantity", Decimal("0")))
+            total += self._decimal_quantity(quantity)
+        return total
+
+    @staticmethod
+    def _decimal_quantity(quantity: Any) -> Decimal:
+        if quantity is None:
+            return Decimal("0")
+        try:
+            return Decimal(str(quantity.as_decimal()))
+        except Exception:
+            return Decimal(str(quantity))
 
     def _track_submitted_order(self, order: Any, target_weight: float) -> None:
         client_order_id = str(order.client_order_id)
@@ -879,8 +1249,6 @@ class TargetWeightStrategy(Strategy):
         return self._price_limit_reason(str(order.instrument_id), side) is not None
 
     def _within_trading_window(self) -> bool:
-        if not isinstance(self.clock, LiveClock):
-            return True
         try:
             now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
         except Exception:
@@ -900,8 +1268,6 @@ class TargetWeightStrategy(Strategy):
         return False
 
     def _stop_time_reached(self) -> bool:
-        if not isinstance(self.clock, LiveClock):
-            return False
         stop_time = self.config.stop_time
         if not stop_time:
             return False
@@ -968,11 +1334,23 @@ class TargetWeightStrategy(Strategy):
 
 
 _INSUFFICIENT_FUNDS_MARKERS = ("260200", "\u53ef\u7528\u8d44\u91d1\u4e0d\u8db3", "\u8d44\u91d1\u4e0d\u8db3", "insufficient")
+_SELLABLE_POSITION_MARKERS = (
+    "sellable volume",
+    "sellable position",
+    "can_use_volume",
+    "\u53ef\u7528\u6301\u4ed3\u4e0d\u8db3",
+    "\u53ef\u5356\u6570\u91cf\u4e0d\u8db3",
+)
 
 
 def _is_insufficient_funds(reason: str) -> bool:
     text = (reason or "").lower()
     return any(marker.lower() in text for marker in _INSUFFICIENT_FUNDS_MARKERS)
+
+
+def _is_sellable_position_denial(reason: str) -> bool:
+    text = (reason or "").lower()
+    return any(marker.lower() in text for marker in _SELLABLE_POSITION_MARKERS)
 
 
 def normalize_initial_last_closes(raw: dict[str, float] | None) -> dict[str, float]:

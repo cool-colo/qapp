@@ -142,8 +142,9 @@ def parse_args():
     args = legacy.parse_args()
     try:
         args.refresh_time = normalize_refresh_time(args.refresh_time)
+        args.pre_open_reconcile_time = normalize_refresh_time(args.pre_open_reconcile_time)
     except ValueError as exc:
-        raise SystemExit(f"invalid --refresh-time: {exc}") from exc
+        raise SystemExit(f"invalid configured HH:MM time: {exc}") from exc
     return args
 
 
@@ -286,6 +287,9 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             exit_non_targets=not args.leave_non_targets,
             order_slice_notional=args.order_slice_notional,
             price_offset_ticks=args.price_offset_ticks,
+            quote_tick_log_sample_rate=args.quote_tick_log_sample_rate,
+            trade_tick_log_sample_rate=args.trade_tick_log_sample_rate,
+            order_book_depth_log_sample_rate=args.order_book_depth_log_sample_rate,
             trading_windows=args.trading_windows,
             order_id_tag=args.order_id_tag,
         ),
@@ -295,6 +299,12 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
         refresh_interval_secs=args.refresh_interval_secs,
         refresh_time=args.refresh_time,
     )
+    if not args.no_reconciliation and args.pre_open_reconcile_time is not None:
+        strategy.configure_pre_open_reconciliation(
+            reconcile=node.kernel.exec_engine.reconcile_execution_state,
+            reconcile_time=args.pre_open_reconcile_time,
+            timeout_secs=config_node.timeout_reconciliation,
+        )
     node.trader.add_strategy(strategy)
     if args.metrics_port and int(args.metrics_port) > 0:
         exporter = PrometheusExporter(
