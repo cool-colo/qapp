@@ -11,12 +11,12 @@ from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import InstrumentId
 
-from strategies.model_predictions import ModelPredictionSignalEvent
-from strategies.model_predictions import first_trading_date_on_or_after
-from strategies.model_predictions import is_rebalance_day
-from strategies.model_predictions import normalize_initial_active_positions
-from strategies.model_predictions import normalize_signals
-from strategies.model_predictions import previous_trading_date
+from strategies.model_common import ModelPredictionSignalEvent
+from strategies.model_common import first_trading_date_on_or_after
+from strategies.model_common import is_rebalance_day
+from strategies.model_common import normalize_initial_active_positions
+from strategies.model_common import normalize_signals
+from strategies.model_common import previous_trading_date
 from strategies.target_weights import TargetWeightStrategy
 from strategies.target_weights import TargetWeightStrategyConfig
 from strategies.target_weights import bar_date

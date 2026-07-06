@@ -10,6 +10,7 @@ import pandas as pd
 
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.identifiers import InstrumentId
 
 from strategies.target_weights import TargetWeightStrategyConfig
@@ -103,6 +104,7 @@ class FakeOrder:
     side: OrderSide
     quantity: Decimal = Decimal("0")
     price: Decimal | None = None
+    status: OrderStatus = OrderStatus.INITIALIZED
     is_pending_cancel: bool = False
     ts_last: int = 0
     events: list = field(default_factory=list)
@@ -161,6 +163,13 @@ class FakeCache:
     def orders_open(self, **kwargs):
         return self._filter_orders(self.open_orders, **kwargs)
 
+    def orders_inflight(self, **kwargs):
+        return [
+            order
+            for order in self._filter_orders(self.all_orders, **kwargs)
+            if order.status in {OrderStatus.SUBMITTED, OrderStatus.PENDING_CANCEL, OrderStatus.PENDING_UPDATE}
+        ]
+
     def orders(self, **kwargs):
         return self._filter_orders(self.all_orders, **kwargs)
 
@@ -171,7 +180,7 @@ class FakeCache:
         result = list(orders)
         if instrument_id is not None:
             result = [order for order in result if order.instrument_id == instrument_id]
-        if side is not None:
+        if side is not None and side != OrderSide.NO_ORDER_SIDE:
             result = [order for order in result if order.side == side]
         return result
 
@@ -220,13 +229,16 @@ class TestableTargetWeightStrategy:
     _UP_LIMIT_KEYS = TargetWeightStrategy._UP_LIMIT_KEYS
     _DOWN_LIMIT_KEYS = TargetWeightStrategy._DOWN_LIMIT_KEYS
     _PRE_OPEN_RECONCILE_ALERT = TargetWeightStrategy._PRE_OPEN_RECONCILE_ALERT
+    _TERMINAL_ORDER_STATUSES = TargetWeightStrategy._TERMINAL_ORDER_STATUSES
     on_start = TargetWeightStrategy.on_start
     refresh_target_instruments = TargetWeightStrategy.refresh_target_instruments
     update_target_weights = TargetWeightStrategy.update_target_weights
     on_bar = TargetWeightStrategy.on_bar
     on_trade_tick = TargetWeightStrategy.on_trade_tick
     on_order_filled = TargetWeightStrategy.on_order_filled
+    on_order_denied = TargetWeightStrategy.on_order_denied
     on_order_rejected = TargetWeightStrategy.on_order_rejected
+    _handle_order_not_accepted = TargetWeightStrategy._handle_order_not_accepted
     _converge_to_target = TargetWeightStrategy._converge_to_target
     _order_book_depth_logging_enabled = TargetWeightStrategy._order_book_depth_logging_enabled
     _should_log_sample = staticmethod(TargetWeightStrategy._should_log_sample)
@@ -246,12 +258,17 @@ class TestableTargetWeightStrategy:
     _submit_full_exit = TargetWeightStrategy._submit_full_exit
     _submit_order_quantity = TargetWeightStrategy._submit_order_quantity
     _clamp_sell_quantity = TargetWeightStrategy._clamp_sell_quantity
+    _subscribe_execution_mass_status = TargetWeightStrategy._subscribe_execution_mass_status
     _today_fill_snapshot = TargetWeightStrategy._today_fill_snapshot
     _event_trading_date = TargetWeightStrategy._event_trading_date
     _is_reconciliation_order = staticmethod(TargetWeightStrategy._is_reconciliation_order)
     _open_sell_quantity = TargetWeightStrategy._open_sell_quantity
+    _open_buy_order_notional = TargetWeightStrategy._open_buy_order_notional
     _decimal_quantity = staticmethod(TargetWeightStrategy._decimal_quantity)
     _track_submitted_order = TargetWeightStrategy._track_submitted_order
+    _forget_submitted_order = TargetWeightStrategy._forget_submitted_order
+    _active_orders = TargetWeightStrategy._active_orders
+    _is_active_order = TargetWeightStrategy._is_active_order
     _limit_price = TargetWeightStrategy._limit_price
     _target_quantity = TargetWeightStrategy._target_quantity
     _portfolio_value = TargetWeightStrategy._portfolio_value
@@ -291,11 +308,14 @@ class TestableTargetWeightStrategy:
 
     def submit_order(self, order) -> None:
         self.submitted_orders.append(order)
-        self.cache.open_orders.append(order)
+        order.status = OrderStatus.INITIALIZED
         self.cache.all_orders.append(order)
+        if self.submit_orders_to_cache:
+            self.cache.open_orders.append(order)
 
     def cancel_order(self, order) -> None:
         self.canceled_orders.append(order)
+        order.status = OrderStatus.CANCELED
         self.cache.open_orders = [
             existing
             for existing in self.cache.open_orders
@@ -365,6 +385,8 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy._pre_open_reconcile_timeout_secs = 30.0
         strategy._pre_open_reconcile_task = None
         strategy._sellable_exhausted = {}
+        strategy._venue_sellable = {}
+        strategy._venue_sellable_ts = 0
         strategy.target_events = []
         strategy.order_events = []
         strategy.requested_instruments = []
@@ -373,6 +395,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy.subscribed_trade_ticks = []
         strategy.subscribed_order_book_depths = []
         strategy.submitted_orders = []
+        strategy.submit_orders_to_cache = True
         strategy.canceled_orders = []
         strategy._last_close = {
             str(instrument_id): price
@@ -546,6 +569,48 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("29900")])
         self.assertEqual(strategy._deferred_buys, {str(INST_A): 0.95})
 
+    def test_buy_cash_gate_reserves_open_buy_notional(self) -> None:
+        strategy = self.make_strategy(
+            free_cash="350000",
+            equity="1000000",
+            prices={INST_A: 10.0, INST_B: 10.0},
+        )
+        strategy.cache.open_orders.append(
+            FakeOrder(
+                client_order_id="B-1",
+                instrument_id=INST_A,
+                side=OrderSide.BUY,
+                quantity=Decimal("29900"),
+                price=Decimal("10"),
+                status=OrderStatus.ACCEPTED,
+            ),
+        )
+
+        strategy._submit_buys_within_cash(
+            date(2026, 7, 2),
+            {str(INST_B): 0.1},
+            "cash_reserved",
+        )
+
+        self.assertEqual(strategy.submitted_orders, [])
+        self.assertEqual(strategy._deferred_buys, {str(INST_B): 0.1})
+
+    def test_initialized_buy_in_cache_blocks_cache_lag_duplicate_convergence(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(
+            free_cash="1000000",
+            equity="1000000",
+            prices={INST_A: 25.0},
+        )
+        strategy.submit_orders_to_cache = False
+
+        strategy.update_target_weights({INST_A: 0.03}, trading_date, "cache_lag")
+        strategy._converge_to_target(trading_date, "timer")
+
+        self.assertEqual(len(strategy.submitted_orders), 1)
+        self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("1200"))
+        self.assertEqual(strategy._open_order_instruments(), {str(INST_A)})
+
     def test_weight_tolerance_skips_tiny_residual_buy(self) -> None:
         strategy = self.make_strategy(
             positions={INST_A: Decimal("94800")},
@@ -606,6 +671,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
                 instrument_id=INST_A,
                 side=OrderSide.BUY,
                 quantity=Decimal("31500"),
+                status=OrderStatus.FILLED,
                 events=[
                     FakeFill(
                         instrument_id=INST_A,
@@ -627,7 +693,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         self.assertTrue(submitted)
         self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("400")])
-        self.assertEqual(strategy._sellable_exhausted, {str(INST_A): trading_date})
+        self.assertEqual(strategy._sellable_exhausted, {})
 
     def test_sell_defers_when_today_buys_exhaust_sellable_quantity(self) -> None:
         trading_date = date(2026, 7, 3)
@@ -641,6 +707,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
                 instrument_id=INST_A,
                 side=OrderSide.BUY,
                 quantity=Decimal("31500"),
+                status=OrderStatus.FILLED,
                 events=[
                     FakeFill(
                         instrument_id=INST_A,
@@ -662,8 +729,37 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         self.assertFalse(submitted)
         self.assertEqual(strategy.submitted_orders, [])
-        self.assertEqual(strategy._sellable_exhausted, {str(INST_A): trading_date})
-        self.assertEqual(strategy.order_events[-1].reason, "sellable_exhausted")
+        self.assertEqual(strategy._sellable_exhausted, {})
+        self.assertEqual(strategy.order_events[-1].reason, "sellable_pending_broker_data")
+
+    def test_initialized_sell_in_cache_counts_against_broker_sellable_during_cache_lag(self) -> None:
+        trading_date = date(2026, 7, 3)
+        strategy = self.make_strategy(
+            positions={INST_A: Decimal("42400")},
+            prices={INST_A: 13.9},
+        )
+        strategy.submit_orders_to_cache = False
+        strategy._venue_sellable = {str(INST_A): Decimal("600")}
+
+        first_submitted = strategy._submit_full_exit(
+            trading_date,
+            INST_A,
+            strategy.cache.instrument(INST_A),
+            Decimal("42400"),
+            "rebalance",
+        )
+        second_submitted = strategy._submit_full_exit(
+            trading_date,
+            INST_A,
+            strategy.cache.instrument(INST_A),
+            Decimal("41800"),
+            "rebalance",
+        )
+
+        self.assertTrue(first_submitted)
+        self.assertFalse(second_submitted)
+        self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("600")])
+        self.assertEqual(strategy._open_sell_quantity(INST_A), Decimal("600"))
 
     def test_sellable_estimate_excludes_synthetic_reconciliation_buys(self) -> None:
         trading_date = date(2026, 7, 3)
@@ -678,6 +774,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
                 instrument_id=INST_A,
                 side=OrderSide.BUY,
                 quantity=Decimal("31500"),
+                status=OrderStatus.FILLED,
                 events=[
                     FakeFill(
                         instrument_id=INST_A,
@@ -744,6 +841,38 @@ class TargetWeightStrategyTest(unittest.TestCase):
                 "client_order_id": "O-1",
                 "instrument_id": INST_A,
                 "reason": "QMT sellable volume is 400, requested SELL volume is 28300",
+            },
+        )()
+
+        strategy.on_order_rejected(event)
+
+        self.assertEqual(strategy._sellable_exhausted, {str(INST_A): date(2026, 7, 2)})
+
+    def test_sellable_volume_denial_backs_off_symbol_for_day(self) -> None:
+        strategy = self.make_strategy()
+        event = type(
+            "DeniedEvent",
+            (),
+            {
+                "client_order_id": "O-1",
+                "instrument_id": INST_A,
+                "reason": "QMT sellable volume is 400, requested SELL volume is 28300",
+            },
+        )()
+
+        strategy.on_order_denied(event)
+
+        self.assertEqual(strategy._sellable_exhausted, {str(INST_A): date(2026, 7, 2)})
+
+    def test_counter_sellable_rejection_code_backs_off_symbol_for_day(self) -> None:
+        strategy = self.make_strategy()
+        event = type(
+            "RejectedEvent",
+            (),
+            {
+                "client_order_id": "O-1",
+                "instrument_id": INST_A,
+                "reason": "[COUNTER][251005][证券可用数量不足]",
             },
         )()
 

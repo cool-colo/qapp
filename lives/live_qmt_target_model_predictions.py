@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if NAUTILUS_TRADER_PATH.exists() and str(NAUTILUS_TRADER_PATH) not in sys.path:
     sys.path.insert(0, str(NAUTILUS_TRADER_PATH))
 
-from lives import live_qmt_model_predictions as legacy
+from lives import live_common as legacy
 from lives.monitoring import PrometheusExporter
 from lives.monitoring import PrometheusExporterConfig
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
@@ -63,6 +63,14 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
 
     def on_start(self) -> None:
         super().on_start()
+        # Startup reconciliation runs before the trader (and thus this on_start) starts, so the
+        # mass status it publishes is emitted before our subscription exists and is missed.
+        # Trigger a fresh reconcile now that the subscription is active, to republish the mass
+        # status and populate the broker sellable (can_use_volume) map before the first sell.
+        try:
+            self.request_execution_reconcile()
+        except Exception as exc:
+            self.log.warning(f"Execution reconcile request on start failed: {exc}")
         if self._refresh_time is not None:
             self._schedule_daily_refresh()
         elif self._refresh_interval_secs > 0:
@@ -114,6 +122,13 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
             )
         except Exception as exc:
             self.log.warning(f"Target-model data refresh failed, keeping previous data: {exc}")
+        # Also refresh the broker sellable map (can_use_volume) by requesting an execution
+        # reconcile; the resulting mass status repopulates _venue_sellable. Inert if the
+        # reconcile callback is not configured.
+        try:
+            self.request_execution_reconcile()
+        except Exception as exc:
+            self.log.warning(f"Execution reconcile request on refresh failed: {exc}")
 
     def _active_stock_codes(self) -> set[str]:
         stock_codes = set()
@@ -140,6 +155,12 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
 
 def parse_args():
     args = legacy.parse_args()
+    # `--pre-open-reconcile-time` is target-specific and is not defined by the shared
+    # `live_common.parse_args()`, so fall back to its env default when the shared parser
+    # did not populate it. Configuring it triggers a pre-open execution-state reconcile,
+    # which also refreshes the broker sellable (can_use_volume) map before trading.
+    if not hasattr(args, "pre_open_reconcile_time"):
+        args.pre_open_reconcile_time = os.environ.get("MODEL_PRE_OPEN_RECONCILE_TIME") or None
     try:
         args.refresh_time = normalize_refresh_time(args.refresh_time)
         args.pre_open_reconcile_time = normalize_refresh_time(args.pre_open_reconcile_time)
@@ -299,7 +320,12 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
         refresh_interval_secs=args.refresh_interval_secs,
         refresh_time=args.refresh_time,
     )
-    if not args.no_reconciliation and args.pre_open_reconcile_time is not None:
+    if not args.no_reconciliation:
+        # Always wire the reconcile callback (not only when a pre-open time is configured):
+        # the strategy triggers a reconcile on start and on each refresh to republish the
+        # execution mass status — which carries the broker sellable (can_use_volume) map —
+        # to the strategy's subscription. reconcile_time may be None (no scheduled pre-open
+        # run); on-demand triggering via request_execution_reconcile() still works.
         strategy.configure_pre_open_reconciliation(
             reconcile=node.kernel.exec_engine.reconcile_execution_state,
             reconcile_time=args.pre_open_reconcile_time,

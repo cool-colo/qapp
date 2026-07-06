@@ -20,6 +20,7 @@ from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue
@@ -152,6 +153,13 @@ class TargetWeightStrategy(Strategy):
         "\u8dcc\u505c\u4ef7",
     )
     _PRE_OPEN_RECONCILE_ALERT = "TARGET-WEIGHT-PRE-OPEN-RECONCILE"
+    _TERMINAL_ORDER_STATUSES = {
+        OrderStatus.DENIED,
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELED,
+        OrderStatus.EXPIRED,
+        OrderStatus.FILLED,
+    }
 
     def __init__(self, config: TargetWeightStrategyConfig) -> None:
         super().__init__(config)
@@ -177,6 +185,11 @@ class TargetWeightStrategy(Strategy):
         self._pre_open_reconcile_timeout_secs = 30.0
         self._pre_open_reconcile_task: asyncio.Future[Any] | None = None
         self._sellable_exhausted: dict[str, date] = {}
+        # Broker-reported sellable quantity per instrument (QMT `can_use_volume`), refreshed
+        # from execution mass-status reports. Empty in backtest (no venue reports) -> the
+        # fill-based estimate is used. When populated it is authoritative over the estimate.
+        self._venue_sellable: dict[str, Decimal] = {}
+        self._venue_sellable_ts: int = 0
         self.target_events: list[TargetWeightTargetEvent] = []
         self.order_events: list[TargetWeightOrderEvent] = []
 
@@ -198,6 +211,7 @@ class TargetWeightStrategy(Strategy):
         )
         if self._pre_open_reconcile_time is not None:
             self._schedule_pre_open_reconcile()
+        self._subscribe_execution_mass_status()
         if not self._bar_types:
             self.log.warning("target-weight executor has no bar_types configured")
         for bar_type in self._bar_types.values():
@@ -254,6 +268,9 @@ class TargetWeightStrategy(Strategy):
     def _on_pre_open_reconcile_timer(self, _event: Any) -> None:
         if self._pre_open_reconcile_time is not None:
             self._schedule_pre_open_reconcile()
+        self._run_pre_open_reconcile()
+
+    def _run_pre_open_reconcile(self) -> None:
         if self._pre_open_reconcile is None:
             self.log.warning("Pre-open execution-state reconciliation is configured but no callback is available")
             return
@@ -279,6 +296,17 @@ class TargetWeightStrategy(Strategy):
             self.log.info("Started pre-open execution-state reconciliation", color=LogColor.BLUE)
             return
         self._log_pre_open_reconcile_result(bool(result))
+
+    def request_execution_reconcile(self) -> None:
+        """
+        Trigger an execution-state reconcile using the configured pre-open callback,
+        if available. Used to refresh the broker sellable map (``_venue_sellable``)
+        outside the scheduled pre-open window (e.g. on the periodic refresh timer).
+        Inert when no callback is configured (backtest / reconciliation disabled).
+        """
+        if self._pre_open_reconcile is None:
+            return
+        self._run_pre_open_reconcile()
 
     def _on_pre_open_reconcile_done(self, task: asyncio.Future[Any]) -> None:
         self._pre_open_reconcile_task = None
@@ -461,27 +489,31 @@ class TargetWeightStrategy(Strategy):
     def on_order_filled(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
         instrument_id_text = str(getattr(event, "instrument_id", ""))
-        self._order_submit_ts.pop(client_order_id, None)
-        self._order_target_weights.pop(client_order_id, None)
-        self._order_target_versions.pop(client_order_id, None)
+        self._forget_submitted_order(client_order_id)
         self._deferred_buys.pop(instrument_id_text, None)
         self._insufficient_funds.discard(instrument_id_text)
 
     def on_order_canceled(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
-        self._order_submit_ts.pop(client_order_id, None)
-        self._order_target_weights.pop(client_order_id, None)
-        self._order_target_versions.pop(client_order_id, None)
+        self._forget_submitted_order(client_order_id)
         if self._within_trading_window():
             self._converge_to_target(current_date=self._clock_date(), trigger="cancel")
 
+    def on_order_denied(self, event: Any) -> None:
+        self._handle_order_not_accepted(event)
+
     def on_order_rejected(self, event: Any) -> None:
+        self._handle_order_not_accepted(event)
+
+    def _handle_order_not_accepted(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
         instrument_id_text = str(getattr(event, "instrument_id", ""))
         reason = str(getattr(event, "reason", "") or "")
-        target_weight = self._order_target_weights.pop(client_order_id, self._target_weights.get(instrument_id_text, 0.0))
-        self._order_submit_ts.pop(client_order_id, None)
-        self._order_target_versions.pop(client_order_id, None)
+        target_weight = self._order_target_weights.get(
+            client_order_id,
+            self._target_weights.get(instrument_id_text, 0.0),
+        )
+        self._forget_submitted_order(client_order_id)
         self._rejected_order_ids.add(client_order_id)
         if _is_insufficient_funds(reason):
             if instrument_id_text:
@@ -698,9 +730,7 @@ class TargetWeightStrategy(Strategy):
             except Exception as exc:
                 self.log.warning(f"cancel_order failed for {client_order_id}: {exc}")
                 continue
-            self._order_submit_ts.pop(client_order_id, None)
-            self._order_target_weights.pop(client_order_id, None)
-            self._order_target_versions.pop(client_order_id, None)
+            self._forget_submitted_order(client_order_id)
             self._record_order(
                 trading_date=trading_date,
                 instrument_id=instrument_id_text,
@@ -737,6 +767,9 @@ class TargetWeightStrategy(Strategy):
         buffer_pct = max(0.0, float(self.config.cash_buffer_percent))
         if buffer_pct > 0:
             free_cash = free_cash * Decimal(str(1.0 - min(buffer_pct, 1.0)))
+        reserved_buy_cash = self._open_buy_order_notional()
+        if reserved_buy_cash > 0:
+            free_cash = max(Decimal("0"), free_cash - reserved_buy_cash)
         for instrument_id in sorted(buy_candidates, key=lambda i: buy_candidates[i], reverse=True):
             target_weight = buy_candidates[instrument_id]
             if instrument_id in self._insufficient_funds:
@@ -894,8 +927,12 @@ class TargetWeightStrategy(Strategy):
                 order_side=OrderSide.SELL,
                 quantity=instrument.make_qty(qty_abs),
             )
-            self.submit_order(order)
             self._track_submitted_order(order, 0.0)
+            try:
+                self.submit_order(order)
+            except Exception:
+                self._forget_submitted_order(str(order.client_order_id))
+                raise
             self._record_order(
                 trading_date,
                 str(instrument_id),
@@ -950,8 +987,12 @@ class TargetWeightStrategy(Strategy):
                 order_side=intent.side,
                 quantity=intent.instrument.make_qty(quantity),
             )
-        self.submit_order(order)
         self._track_submitted_order(order, target_weight)
+        try:
+            self.submit_order(order)
+        except Exception:
+            self._forget_submitted_order(str(order.client_order_id))
+            raise
         side_text = "buy" if intent.side == OrderSide.BUY else "sell"
         self._record_order(
             trading_date,
@@ -997,9 +1038,30 @@ class TargetWeightStrategy(Strategy):
             )
             return None
 
-        sellable_qty = max(Decimal("0"), current_qty - fills_after.buy_qty - open_sell_qty)
+        # Prefer the broker-reported sellable quantity (QMT `can_use_volume`) when available:
+        # it already excludes today's buys / frozen / in-transit shares and is immune to the
+        # reconciliation quirk where restart-rebuilt holdings get stamped as "today's buys"
+        # (which would zero out the fill-based estimate). Fall back to the fill-based estimate
+        # in backtest or when no venue report has arrived yet. In both cases still subtract this
+        # strategy's own open sells so we do not double-count in-flight sell orders.
+        venue_can_use = self._venue_sellable.get(instrument_id_text)
+        if venue_can_use is not None:
+            sellable_base = venue_can_use
+            sellable_source = "broker_can_use_volume"
+        else:
+            sellable_base = current_qty - fills_after.buy_qty
+            sellable_source = "fill_estimate"
+        # Only latch `_sellable_exhausted` (which blocks retries for the rest of the day) when
+        # the broker figure is authoritative. When we fell back to the fill estimate because no
+        # venue report has arrived yet, do NOT latch: the estimate is unreliable across restarts
+        # (reconstructed holdings look like today's buys), and the broker map is populated
+        # asynchronously by the on-start / refresh reconcile. Latching here would permanently
+        # skip a genuinely-sellable position for the day if the first attempt races the reconcile.
+        broker_authoritative = venue_can_use is not None
+        sellable_qty = max(Decimal("0"), sellable_base - open_sell_qty)
         if sellable_qty <= 0:
-            self._sellable_exhausted[instrument_id_text] = trading_date
+            if broker_authoritative:
+                self._sellable_exhausted[instrument_id_text] = trading_date
             self._record_order(
                 trading_date,
                 instrument_id_text,
@@ -1007,24 +1069,78 @@ class TargetWeightStrategy(Strategy):
                 0,
                 target_weight,
                 "deferred",
-                "sellable_exhausted",
+                "sellable_exhausted" if broker_authoritative else "sellable_pending_broker_data",
             )
             self.log.warning(
-                f"Skipping SELL for {instrument_id_text}: strategy sellable estimate exhausted "
-                f"(net_qty={current_qty}, today_buy_qty={fills_after.buy_qty}, open_sell_qty={open_sell_qty}, "
-                f"requested_qty={requested_qty})",
+                f"Skipping SELL for {instrument_id_text}: sellable exhausted "
+                f"(source={sellable_source}, latched={broker_authoritative}, net_qty={current_qty}, "
+                f"today_buy_qty={fills_after.buy_qty}, venue_can_use={venue_can_use}, "
+                f"open_sell_qty={open_sell_qty}, requested_qty={requested_qty})",
             )
             return Decimal("0")
 
         clamped_qty = min(Decimal(str(requested_qty)), sellable_qty)
         if clamped_qty < requested_qty:
-            self._sellable_exhausted[instrument_id_text] = trading_date
+            if broker_authoritative:
+                self._sellable_exhausted[instrument_id_text] = trading_date
             self.log.warning(
                 f"Clamping SELL for {instrument_id_text}: requested_qty={requested_qty}, "
-                f"strategy_sellable_qty={sellable_qty}, today_buy_qty={fills_after.buy_qty}, "
+                f"sellable_qty={sellable_qty}, source={sellable_source}, "
+                f"today_buy_qty={fills_after.buy_qty}, venue_can_use={venue_can_use}, "
                 f"open_sell_qty={open_sell_qty}",
             )
         return clamped_qty
+
+    def _subscribe_execution_mass_status(self) -> None:
+        """
+        Subscribe to execution mass-status reports so the broker-reported sellable
+        quantity (``can_use_volume``) can be cached per instrument. Inert in backtest,
+        where there is no execution client publishing these reports.
+        """
+        venue = self._instrument_ids[0].venue if self._instrument_ids else None
+        if venue is None:
+            return
+        msgbus = getattr(self, "msgbus", None)
+        if msgbus is None:
+            return
+        try:
+            msgbus.subscribe(
+                topic=f"reports.execution.{venue}",
+                handler=self._on_execution_mass_status,
+            )
+        except Exception as exc:  # pragma: no cover - defensive; backtest has no msgbus reports
+            self.log.warning(f"Could not subscribe to execution mass status: {exc}")
+
+    def _on_execution_mass_status(self, mass_status: Any) -> None:
+        """
+        Rebuild the per-instrument broker sellable map from a mass-status report.
+
+        Replaces the map wholesale each cycle so instruments no longer held drop out.
+        Only entries where the venue actually reported ``can_use_volume`` are kept.
+        """
+        position_reports = getattr(mass_status, "position_reports", None)
+        if not position_reports:
+            return
+        sellable: dict[str, Decimal] = {}
+        for reports in position_reports.values():
+            report_list = reports if isinstance(reports, (list, tuple)) else [reports]
+            for report in report_list:
+                can_use = getattr(report, "can_use_volume", None)
+                if can_use is None:
+                    continue
+                instrument_id = getattr(report, "instrument_id", None)
+                if instrument_id is None:
+                    continue
+                try:
+                    sellable[str(instrument_id)] = Decimal(str(can_use))
+                except Exception:
+                    continue
+        self._venue_sellable = sellable
+        self._venue_sellable_ts = self.clock.timestamp_ns()
+        self.log.info(
+            f"Updated broker sellable map from mass status: instruments={len(sellable)}",
+            color=LogColor.BLUE,
+        )
 
     def _today_fill_snapshot(self, instrument_id: InstrumentId, trading_date: date) -> TodayFillSnapshot:
         buy_qty = Decimal("0")
@@ -1080,15 +1196,7 @@ class TargetWeightStrategy(Strategy):
 
     def _open_sell_quantity(self, instrument_id: InstrumentId) -> Decimal:
         total = Decimal("0")
-        try:
-            open_orders = self.cache.orders_open(instrument_id=instrument_id, side=OrderSide.SELL)
-        except Exception:
-            open_orders = []
-        for order in open_orders:
-            if getattr(order, "instrument_id", None) != instrument_id:
-                continue
-            if getattr(order, "side", None) != OrderSide.SELL:
-                continue
+        for order in self._active_orders(instrument_id=instrument_id, side=OrderSide.SELL):
             try:
                 if order.is_pending_cancel:
                     continue
@@ -1096,6 +1204,21 @@ class TargetWeightStrategy(Strategy):
                 pass
             quantity = getattr(order, "leaves_qty", getattr(order, "quantity", Decimal("0")))
             total += self._decimal_quantity(quantity)
+        return total
+
+    def _open_buy_order_notional(self) -> Decimal:
+        total = Decimal("0")
+        for order in self._active_orders(side=OrderSide.BUY):
+            try:
+                if order.is_pending_cancel:
+                    continue
+            except Exception:
+                pass
+            price = getattr(order, "price", None)
+            if price is None:
+                continue
+            quantity = getattr(order, "leaves_qty", getattr(order, "quantity", Decimal("0")))
+            total += self._estimated_order_cost(self._decimal_quantity(quantity), price)
         return total
 
     @staticmethod
@@ -1112,6 +1235,45 @@ class TargetWeightStrategy(Strategy):
         self._order_submit_ts[client_order_id] = self.clock.timestamp_ns()
         self._order_target_weights[client_order_id] = float(target_weight)
         self._order_target_versions[client_order_id] = self._target_version
+
+    def _forget_submitted_order(self, client_order_id: str) -> None:
+        self._order_submit_ts.pop(client_order_id, None)
+        self._order_target_weights.pop(client_order_id, None)
+        self._order_target_versions.pop(client_order_id, None)
+
+    def _active_orders(
+        self,
+        instrument_id: InstrumentId | None = None,
+        side: OrderSide = OrderSide.NO_ORDER_SIDE,
+    ) -> list[Any]:
+        orders_by_id: dict[str, Any] = {}
+        query_kwargs = {"strategy_id": self.id, "side": side}
+        if instrument_id is not None:
+            query_kwargs["instrument_id"] = instrument_id
+        for method_name in ("orders", "orders_open", "orders_inflight"):
+            method = getattr(self.cache, method_name, None)
+            if method is None:
+                continue
+            try:
+                orders = method(**query_kwargs)
+            except Exception:
+                continue
+            for order in orders:
+                if not self._is_active_order(order):
+                    continue
+                orders_by_id[str(order.client_order_id)] = order
+        return list(orders_by_id.values())
+
+    def _is_active_order(self, order: Any) -> bool:
+        status = getattr(order, "status", None)
+        if status is not None:
+            return status not in self._TERMINAL_ORDER_STATUSES
+        try:
+            if order.is_closed:
+                return False
+        except Exception:
+            pass
+        return True
 
     def _limit_price(self, instrument: Any, instrument_id: InstrumentId, side: OrderSide) -> Any | None:
         offset_ticks = int(self.config.price_offset_ticks)
@@ -1212,11 +1374,7 @@ class TargetWeightStrategy(Strategy):
         return float(qty * Decimal(str(close_price)) / portfolio_value)
 
     def _open_order_instruments(self) -> set[str]:
-        try:
-            open_orders = self.cache.orders_open(strategy_id=self.id)
-        except Exception:
-            return set()
-        return {str(order.instrument_id) for order in open_orders}
+        return {str(order.instrument_id) for order in self._active_orders()}
 
     def _price_limits(self, instrument_id_text: str) -> tuple[float | None, float | None]:
         try:
@@ -1335,9 +1493,11 @@ class TargetWeightStrategy(Strategy):
 
 _INSUFFICIENT_FUNDS_MARKERS = ("260200", "\u53ef\u7528\u8d44\u91d1\u4e0d\u8db3", "\u8d44\u91d1\u4e0d\u8db3", "insufficient")
 _SELLABLE_POSITION_MARKERS = (
+    "251005",
     "sellable volume",
     "sellable position",
     "can_use_volume",
+    "\u8bc1\u5238\u53ef\u7528\u6570\u91cf\u4e0d\u8db3",
     "\u53ef\u7528\u6301\u4ed3\u4e0d\u8db3",
     "\u53ef\u5356\u6570\u91cf\u4e0d\u8db3",
 )
