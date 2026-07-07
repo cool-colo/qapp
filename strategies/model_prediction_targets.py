@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 import pandas as pd
@@ -17,17 +17,15 @@ from strategies.model_common import is_rebalance_day
 from strategies.model_common import normalize_initial_active_positions
 from strategies.model_common import normalize_signals
 from strategies.model_common import previous_trading_date
+from strategies.model_target_planners import EqualWeightModelTargetPlanner
+from strategies.model_target_planners import ModelTargetCandidate
+from strategies.model_target_planners import ModelTargetPlan
+from strategies.model_target_planners import ModelTargetPlanningRequest
+from strategies.model_target_planners import build_model_target_planner
+from strategies.model_target_planners import normalize_stock_code
 from strategies.target_weights import TargetWeightStrategy
 from strategies.target_weights import TargetWeightStrategyConfig
 from strategies.target_weights import bar_date
-
-
-@dataclass(frozen=True)
-class ModelTargetPlan:
-    trading_date: date
-    signal_date: date | None
-    weights: dict[str, float]
-    reason: str
 
 
 class TargetModelPredictionsStrategyConfig(TargetWeightStrategyConfig, kw_only=True, frozen=True):
@@ -46,6 +44,13 @@ class TargetModelPredictionsStrategyConfig(TargetWeightStrategyConfig, kw_only=T
     min_listed_days: int = 120
     initial_active_positions: dict[str, dict[str, Any]] | None = None
     excluded_name_prefixes: tuple[str, ...] = ("*ST", "ST", "\u9000\u5e02")
+    target_weight_planner: str = "equal_weight"
+    target_weight_planner_error_policy: str = "raise"
+    risk_manager_base_url: str = ""
+    risk_manager_risk_model_id: str = ""
+    risk_manager_mode: str = "simulation"
+    risk_manager_timeout_secs: float = 10.0
+    process_targets_on_timer: bool = False
 
 
 class TargetModelPredictionsStrategy(TargetWeightStrategy):
@@ -85,6 +90,8 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
             self._trading_dates,
             pd.Timestamp(config.trading_dates[0]).date() if config.trading_dates else None,
         )
+        self._equal_weight_target_planner = EqualWeightModelTargetPlanner()
+        self._target_weight_planner = build_model_target_planner(config)
         self.signal_events: list[ModelPredictionSignalEvent] = []
 
     def refresh_reference_data(
@@ -138,15 +145,30 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
             return
         self._processed_dates.discard(today)
         if self._within_trading_window():
-            self._process_trading_day(today)
-            self._processed_dates.add(today)
+            self._process_trading_day_once(today, "refresh")
 
     def on_target_bar(self, bar: Bar) -> None:
         trading_date = bar_date(bar, self.config.timezone_name)
+        self._process_trading_day_once(trading_date, "bar")
+
+    def _on_converge_timer(self, _event: Any) -> None:
+        if bool(self.config.process_targets_on_timer) and self._within_trading_window():
+            trading_date = self._clock_date()
+            self._seed_open_prices_from_last_close(trading_date)
+            self._process_trading_day_once(trading_date, "timer")
+        super()._on_converge_timer(_event)
+
+    def _process_trading_day_once(self, trading_date: date, trigger: str) -> bool:
         if trading_date in self._processed_dates:
-            return
+            return False
+        self._seed_open_prices_from_last_close(trading_date)
         self._process_trading_day(trading_date)
         self._processed_dates.add(trading_date)
+        self.log.info(
+            f"processed model target day from {trigger}: date={trading_date}",
+            color=LogColor.BLUE,
+        )
+        return True
 
     def _process_trading_day(self, trading_date: date) -> None:
         self._seed_active_positions_from_portfolio(trading_date)
@@ -366,17 +388,77 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
                 self._active_positions.pop(instrument_id, None)
 
     def _target_plan(self, trading_date: date, signal_date: date | None) -> ModelTargetPlan:
+        request = self._target_planning_request(trading_date, signal_date)
+        try:
+            return self._target_weight_planner.plan(request)
+        except Exception as exc:
+            policy = str(self.config.target_weight_planner_error_policy or "raise").strip().lower()
+            if policy == "equal_weight":
+                self.log.warning(f"target weight planner failed, falling back to equal weight: {exc}")
+                return self._equal_weight_target_planner.plan(request)
+            self.log.warning(f"target weight planner failed: {exc}")
+            raise
+
+    def _target_planning_request(
+        self,
+        trading_date: date,
+        signal_date: date | None,
+    ) -> ModelTargetPlanningRequest:
         active_ids = sorted(self._active_positions)
-        if not active_ids:
-            return ModelTargetPlan(trading_date, signal_date, {}, "model_prediction_score")
-        gross_weight = max(0.0, min(1.0, 1.0 - float(self.config.target_cash_buffer_percent)))
-        target_weight = min(float(self.config.max_position_percent), gross_weight / len(active_ids))
-        return ModelTargetPlan(
+        candidates = []
+        for instrument_id in active_ids:
+            stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
+            if not stock_code:
+                continue
+            state = self._active_positions.get(instrument_id, {})
+            try:
+                score = float(state.get("score", 0.0))
+            except (TypeError, ValueError):
+                score = 0.0
+            candidates.append(
+                ModelTargetCandidate(
+                    instrument_id=instrument_id,
+                    stock_code=stock_code,
+                    score=score,
+                ),
+            )
+        return ModelTargetPlanningRequest(
             trading_date=trading_date,
             signal_date=signal_date,
-            weights={instrument_id: target_weight for instrument_id in active_ids},
-            reason="model_prediction_score",
+            active_instrument_ids=active_ids,
+            candidates=candidates,
+            current_weights=self._current_weights_by_stock(),
+            target_cash_buffer_percent=float(self.config.target_cash_buffer_percent),
+            max_position_percent=float(self.config.max_position_percent),
         )
+
+    def _current_weights_by_stock(self) -> dict[str, float]:
+        instrument_ids = set(self._active_positions)
+        instrument_ids.update(self._held_instrument_ids())
+        weights: dict[str, float] = {}
+        for instrument_id in sorted(instrument_ids):
+            stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
+            if not stock_code:
+                continue
+            weight = self._planner_current_weight(instrument_id)
+            if weight is not None:
+                weights[stock_code] = weight
+        return weights
+
+    def _planner_current_weight(self, instrument_id_text: str) -> float | None:
+        current_weight = self._current_weight(instrument_id_text)
+        if current_weight is not None:
+            return current_weight
+        close_price = self._last_close.get(instrument_id_text)
+        if close_price is None or close_price <= 0:
+            return None
+        portfolio_value = self._portfolio_value()
+        if portfolio_value <= 0:
+            return None
+        quantity = self._current_quantity(InstrumentId.from_str(instrument_id_text))
+        if quantity <= 0:
+            return 0.0
+        return float(quantity * Decimal(str(close_price)) / portfolio_value)
 
     def _plan_version(self, plan: ModelTargetPlan) -> str:
         signal_text = "none" if plan.signal_date is None else plan.signal_date.isoformat()

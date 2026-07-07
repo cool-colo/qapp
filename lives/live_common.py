@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -200,6 +203,40 @@ def parse_args() -> argparse.Namespace:
         help="Framework target cash reserve; target model weights normally sum to 1 minus this value.",
     )
     parser.add_argument(
+        "--target-weight-planner",
+        default=env("MODEL_TARGET_WEIGHT_PLANNER", "risk_manager"),
+        choices=["equal_weight", "risk_manager"],
+        help="Target weight planner used after model entry/exit selection.",
+    )
+    parser.add_argument(
+        "--target-weight-planner-error-policy",
+        default=env("MODEL_TARGET_WEIGHT_PLANNER_ERROR_POLICY", "raise"),
+        choices=["raise", "equal_weight"],
+        help="How to handle target planner failures.",
+    )
+    parser.add_argument(
+        "--risk-manager-base-url",
+        default=env("RISK_MANAGER_BASE_URL", "http://127.0.0.1:8000"),
+        help="Base URL for risk-manager /v1/portfolio/optimize.",
+    )
+    parser.add_argument(
+        "--risk-manager-risk-model-id",
+        default=env("RISK_MANAGER_RISK_MODEL_ID", "cn_a_mean_variance"),
+        help="risk-manager risk_model_id for portfolio optimization.",
+    )
+    parser.add_argument(
+        "--risk-manager-mode",
+        default=env("RISK_MANAGER_MODE", "live"),
+        choices=["backtest", "simulation", "live"],
+        help="risk-manager request mode.",
+    )
+    parser.add_argument(
+        "--risk-manager-timeout-secs",
+        type=float,
+        default=float(env("RISK_MANAGER_TIMEOUT_SECS", "10")),
+        help="Timeout for risk-manager optimize requests.",
+    )
+    parser.add_argument(
         "--weight-tolerance-percent",
         type=float,
         default=float(env("MODEL_WEIGHT_TOLERANCE_PERCENT", "0.003")),
@@ -215,6 +252,23 @@ def parse_args() -> argparse.Namespace:
         "--stop-time",
         default=env("MODEL_TARGET_STOP_TIME", "14:55"),
         help="Exchange-local HH:MM time after which the target framework stops new convergence work.",
+    )
+    parser.add_argument(
+        "--full-tick-refresh-secs",
+        type=float,
+        default=float(env("MODEL_FULL_TICK_REFRESH_SECS", "60") or 60),
+        help=(
+            "Interval in seconds for refreshing the authoritative full-tick snapshot "
+            "(today's open, etc.) from the QMT proxy during the trading window. 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--full-tick-prefetch-time",
+        default=env("MODEL_FULL_TICK_PREFETCH_TIME", "09:27"),
+        help=(
+            "Exchange-local HH:MM time (pre-open) to fetch the full-tick snapshot "
+            "before the trading window opens. Empty disables the prefetch."
+        ),
     )
     parser.add_argument(
         "--limit-stop-mode",
@@ -327,11 +381,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exchange-timezone", default=env("QMT_EXCHANGE_TIMEZONE", "Asia/Shanghai"))
     parser.add_argument(
         "--trading-windows",
-        default=env("QMT_TRADING_WINDOWS", "09:25-11:30,13:00-14:55"),
+        default=env("QMT_TRADING_WINDOWS", "09:30-11:30,13:00-14:55"),
         help=(
             "Live-only: comma-separated HH:MM-HH:MM order sessions (exchange tz). "
             "Orders submit only inside these ranges; the lunch break is excluded. "
-            "Default '09:25-11:30,13:00-14:55'."
+            "Default '09:30-11:30,13:00-14:55'."
         ),
     )
     parser.add_argument("--price-precision", type=int, default=int(env("QMT_PRICE_PRECISION", "2")))
@@ -618,6 +672,78 @@ GROUP BY source_code
                     results[stock_code] = close
         return results
 
+    def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float]]:
+        """
+        Authoritative full-tick snapshot per instrument id from the QMT proxy
+        ``get_full_tick`` endpoint (``POST /api/v1/data/full-tick``).
+
+        This is infrastructure plumbing — Nautilus has no full-tick data type. The
+        proxy tick carries open/last_price/high/low/last_close/bid-ask; the whole
+        normalized tick is returned per instrument id (same keying as
+        ``last_closes``) so callers can consume whichever fields they need. Symbols
+        that return no usable tick are omitted. The strategy currently uses only
+        ``open`` to anchor pricing.
+        """
+        if not stock_codes:
+            return {}
+        base_url = str(getattr(self.args, "base_url_http", "") or "").rstrip("/")
+        if not base_url:
+            return {}
+        api_key = getattr(self.args, "api_key", None)
+        symbol_to_stock = {qmt_symbol(code): code for code in stock_codes}
+        by_stock: dict[str, dict[str, float]] = {}
+        for chunk in chunks(sorted(symbol_to_stock), 500):
+            payload = self._post_full_tick(base_url, api_key, chunk)
+            for item in payload:
+                symbol = str(item.get("symbol", "")).strip().upper()
+                stock_code = symbol_to_stock.get(symbol)
+                if not stock_code:
+                    continue
+                tick = self._coerce_tick_fields(item.get("tick"))
+                if tick:
+                    by_stock[stock_code] = tick
+        return {
+            str(build_bar_type(stock_code).instrument_id): tick
+            for stock_code, tick in by_stock.items()
+        }
+
+    @staticmethod
+    def _coerce_tick_fields(tick: Any) -> dict[str, float]:
+        if not isinstance(tick, dict):
+            return {}
+        coerced: dict[str, float] = {}
+        for key, value in tick.items():
+            try:
+                coerced[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return coerced
+
+    def _post_full_tick(
+        self,
+        base_url: str,
+        api_key: str | None,
+        symbols: list[str],
+    ) -> list[dict[str, Any]]:
+        url = f"{base_url}/api/v1/data/full-tick"
+        body = json.dumps({"symbols": symbols}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        timeout = float(getattr(self.args, "clickhouse_timeout_secs", 10.0) or 10.0)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, ValueError, TimeoutError) as exc:
+            raise RuntimeError(f"QMT full-tick request failed: {exc}") from exc
+        if isinstance(payload, dict) and not payload.get("success", True):
+            raise RuntimeError(str(payload.get("message") or payload))
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if isinstance(data, dict):
+            return list(data.get("items", []))
+        return list(data or [])
+
 
 def normalized_stock_codes(values: set[str] | list[str]) -> set[str]:
     result = set()
@@ -669,5 +795,4 @@ def subscription_signal_date(bundle: PredictionDataBundle, as_of_date: Any) -> A
 
 def chunks(values: list[str], size: int) -> list[list[str]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
-
 

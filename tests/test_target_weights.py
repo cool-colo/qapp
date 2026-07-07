@@ -17,6 +17,8 @@ from strategies.target_weights import TargetWeightStrategyConfig
 from strategies.target_weights import TargetWeightStrategy
 from strategies.target_weights import TodayFillSnapshot
 from strategies.target_weights import NotionalOrderSplitter
+from strategies.pricing import OpenOffsetBuyPriceStrategy
+from strategies.pricing import OpenOffsetSellPriceStrategy
 
 
 INST_A = InstrumentId.from_str("000001.SZ.QMT")
@@ -160,6 +162,9 @@ class FakeCache:
     def quote_tick(self, _instrument_id: InstrumentId):
         return None
 
+    def order_book(self, _instrument_id: InstrumentId):
+        return None
+
     def orders_open(self, **kwargs):
         return self._filter_orders(self.open_orders, **kwargs)
 
@@ -232,8 +237,13 @@ class TestableTargetWeightStrategy:
     _TERMINAL_ORDER_STATUSES = TargetWeightStrategy._TERMINAL_ORDER_STATUSES
     on_start = TargetWeightStrategy.on_start
     refresh_target_instruments = TargetWeightStrategy.refresh_target_instruments
+    _subscribe_market_data = TargetWeightStrategy._subscribe_market_data
+    _unsubscribe_market_data = TargetWeightStrategy._unsubscribe_market_data
+    _wants_order_book_depth_subscription = TargetWeightStrategy._wants_order_book_depth_subscription
     update_target_weights = TargetWeightStrategy.update_target_weights
+    _target_weights_log_detail = staticmethod(TargetWeightStrategy._target_weights_log_detail)
     on_bar = TargetWeightStrategy.on_bar
+    on_order_book_depth = TargetWeightStrategy.on_order_book_depth
     on_trade_tick = TargetWeightStrategy.on_trade_tick
     on_order_filled = TargetWeightStrategy.on_order_filled
     on_order_denied = TargetWeightStrategy.on_order_denied
@@ -270,6 +280,11 @@ class TestableTargetWeightStrategy:
     _active_orders = TargetWeightStrategy._active_orders
     _is_active_order = TargetWeightStrategy._is_active_order
     _limit_price = TargetWeightStrategy._limit_price
+    _build_price_context = TargetWeightStrategy._build_price_context
+    _quote_snapshot = TargetWeightStrategy._quote_snapshot
+    _book_snapshot = TargetWeightStrategy._book_snapshot
+    _ladder_levels = staticmethod(TargetWeightStrategy._ladder_levels)
+    _at_buy_price_cap = TargetWeightStrategy._at_buy_price_cap
     _target_quantity = TargetWeightStrategy._target_quantity
     _portfolio_value = TargetWeightStrategy._portfolio_value
     _free_cash = TargetWeightStrategy._free_cash
@@ -290,6 +305,19 @@ class TestableTargetWeightStrategy:
     _next_daily_time = TargetWeightStrategy._next_daily_time
     _schedule_pre_open_reconcile = TargetWeightStrategy._schedule_pre_open_reconcile
     _on_pre_open_reconcile_timer = TargetWeightStrategy._on_pre_open_reconcile_timer
+    _ensure_pricing_date = TargetWeightStrategy._ensure_pricing_date
+    _update_price_state = TargetWeightStrategy._update_price_state
+    _seed_open_prices_from_last_close = TargetWeightStrategy._seed_open_prices_from_last_close
+    _set_authoritative_open = TargetWeightStrategy._set_authoritative_open
+    _apply_full_tick = TargetWeightStrategy._apply_full_tick
+    _full_tick_open = staticmethod(TargetWeightStrategy._full_tick_open)
+    configure_full_tick_source = TargetWeightStrategy.configure_full_tick_source
+    _start_full_tick_refresh = TargetWeightStrategy._start_full_tick_refresh
+    _schedule_full_tick_prefetch = TargetWeightStrategy._schedule_full_tick_prefetch
+    _on_full_tick_prefetch_timer = TargetWeightStrategy._on_full_tick_prefetch_timer
+    _on_full_tick_refresh_timer = TargetWeightStrategy._on_full_tick_refresh_timer
+    _run_full_tick_fetch = TargetWeightStrategy._run_full_tick_fetch
+    _on_full_tick_fetch_done = TargetWeightStrategy._on_full_tick_fetch_done
 
     def request_instrument(self, instrument_id) -> None:
         self.requested_instruments.append(instrument_id)
@@ -305,6 +333,12 @@ class TestableTargetWeightStrategy:
 
     def subscribe_order_book_depth(self, instrument_id, **kwargs) -> None:
         self.subscribed_order_book_depths.append((instrument_id, kwargs))
+
+    def unsubscribe_bars(self, bar_type) -> None:
+        self.unsubscribed_bars.append(bar_type)
+
+    def unsubscribe_order_book_depth(self, instrument_id) -> None:
+        self.unsubscribed_order_book_depths.append(instrument_id)
 
     def submit_order(self, order) -> None:
         self.submitted_orders.append(order)
@@ -334,6 +368,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
         equity: Decimal | str = "1000000",
         free_cash: Decimal | str = "1000000",
         prices: dict[InstrumentId, float] | None = None,
+        open_prices: dict[InstrumentId, float] | None = None,
         fields: dict[InstrumentId, dict] | None = None,
         target_cash_buffer_percent: float = 0.05,
         order_slice_notional: Decimal | str = "300000",
@@ -379,6 +414,29 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy._order_target_weights = {}
         strategy._order_target_versions = {}
         strategy._order_splitter = NotionalOrderSplitter(Decimal(str(order_slice_notional)))
+        strategy._buy_pricer = OpenOffsetBuyPriceStrategy(
+            offset_bps=strategy.config.buy_offset_bps,
+            max_price_bps=strategy.config.buy_max_price_bps,
+            cancel_threshold=strategy.config.buy_cancel_threshold,
+        )
+        strategy._sell_pricer = OpenOffsetSellPriceStrategy(
+            offset_bps=strategy.config.sell_offset_bps,
+            cancel_threshold=strategy.config.sell_cancel_threshold,
+        )
+        initial_prices = prices or {INST_A: 10.0, INST_B: 20.0, INST_C: 25.0}
+        initial_open_prices = initial_prices if open_prices is None else open_prices
+        strategy._today_open = {
+            str(instrument_id): price
+            for instrument_id, price in initial_open_prices.items()
+        }
+        strategy._authoritative_open = set()
+        strategy._full_tick_source = None
+        strategy._full_tick_prefetch_time = None
+        strategy._full_tick_task = None
+        strategy._depth_books = {}
+        strategy._cancel_count_buy = {}
+        strategy._cancel_count_sell = {}
+        strategy._pricing_date = None
         strategy._convergence_suspended = False
         strategy._pre_open_reconcile = None
         strategy._pre_open_reconcile_time = None
@@ -394,12 +452,14 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy.subscribed_quote_ticks = []
         strategy.subscribed_trade_ticks = []
         strategy.subscribed_order_book_depths = []
+        strategy.unsubscribed_bars = []
+        strategy.unsubscribed_order_book_depths = []
         strategy.submitted_orders = []
         strategy.submit_orders_to_cache = True
         strategy.canceled_orders = []
         strategy._last_close = {
             str(instrument_id): price
-            for instrument_id, price in (prices or {INST_A: 10.0, INST_B: 20.0, INST_C: 25.0}).items()
+            for instrument_id, price in initial_prices.items()
         }
         return strategy
 
@@ -414,6 +474,29 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(strategy.subscribed_quote_ticks, [INST_A])
         self.assertEqual(strategy.subscribed_trade_ticks, [INST_A])
 
+    def test_on_start_can_disable_market_data_subscriptions(self) -> None:
+        bar_type = BarType.from_str(f"{INST_A}-1-MINUTE-LAST-EXTERNAL")
+        strategy = self.make_strategy()
+        strategy.config = TargetWeightStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={str(INST_A): bar_type},
+            subscribe_bars=False,
+            subscribe_quote_ticks=False,
+            subscribe_trade_ticks=False,
+            subscribe_order_book_depth=False,
+            unfilled_timeout_secs=1.0,
+            resubmit_check_interval_secs=10.0,
+        )
+        strategy._bar_types = {str(INST_A): bar_type}
+
+        strategy.on_start()
+
+        self.assertEqual(strategy.subscribed_bars, [])
+        self.assertEqual(strategy.subscribed_quote_ticks, [])
+        self.assertEqual(strategy.subscribed_trade_ticks, [])
+        self.assertEqual(strategy.subscribed_order_book_depths, [])
+        self.assertEqual(len(strategy.clock.timers), 1)
+
     def test_refresh_target_instruments_subscribes_trade_ticks_for_new_bars(self) -> None:
         bar_type = BarType.from_str(f"{INST_B}-1-MINUTE-LAST-EXTERNAL")
         strategy = self.make_strategy()
@@ -424,6 +507,44 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(strategy.subscribed_bars, [bar_type])
         self.assertEqual(strategy.subscribed_quote_ticks, [INST_B])
         self.assertEqual(strategy.subscribed_trade_ticks, [INST_B])
+
+    def test_refresh_target_instruments_respects_disabled_subscriptions(self) -> None:
+        bar_type = BarType.from_str(f"{INST_B}-1-MINUTE-LAST-EXTERNAL")
+        strategy = self.make_strategy()
+        strategy.config = TargetWeightStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            subscribe_bars=False,
+            subscribe_quote_ticks=False,
+            subscribe_trade_ticks=False,
+            subscribe_order_book_depth=False,
+        )
+
+        strategy.refresh_target_instruments([INST_B], {str(INST_B): bar_type})
+
+        self.assertEqual(strategy.requested_instruments, [INST_B])
+        self.assertEqual(strategy.subscribed_bars, [])
+        self.assertEqual(strategy.subscribed_quote_ticks, [])
+        self.assertEqual(strategy.subscribed_trade_ticks, [])
+        self.assertEqual(strategy.subscribed_order_book_depths, [])
+
+    def test_seed_open_prices_from_last_close_resets_new_day_counts(self) -> None:
+        strategy = self.make_strategy(prices={INST_A: 10.0, INST_B: 20.0})
+        strategy.config = TargetWeightStrategyConfig(
+            instrument_ids=[INST_A, INST_B],
+            bar_types={},
+            seed_open_from_last_close=True,
+        )
+        strategy._pricing_date = date(2026, 7, 1)
+        strategy._today_open = {str(INST_A): 9.0}
+        strategy._cancel_count_buy = {str(INST_A): 2}
+        strategy._cancel_count_sell = {str(INST_A): 1}
+
+        strategy._seed_open_prices_from_last_close(date(2026, 7, 2))
+
+        self.assertEqual(strategy._today_open, {str(INST_A): 10.0, str(INST_B): 20.0})
+        self.assertEqual(strategy._cancel_count_buy, {})
+        self.assertEqual(strategy._cancel_count_sell, {})
 
     def test_trade_tick_logging_uses_sample_rate_like_quote_ticks(self) -> None:
         strategy = self.make_strategy()
@@ -470,6 +591,19 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertNotIn(str(INST_A), strategy._deferred_buys)
         self.assertEqual(strategy._deferred_buys, {str(INST_B): 0.4})
         self.assertEqual(strategy._target_weights, {str(INST_B): 0.4})
+
+    def test_update_target_logs_target_weight_detail(self) -> None:
+        strategy = self.make_strategy()
+
+        strategy.update_target_weights({INST_B: 0.2, INST_A: 0.1}, date(2026, 7, 2), "detail")
+
+        accepted_logs = [
+            args[0]
+            for args, _kwargs in strategy.log.infos
+            if args and str(args[0]).startswith("accepted target weights version=")
+        ]
+        self.assertEqual(len(accepted_logs), 1)
+        self.assertIn("detail=[000001.SZ.QMT=0.100000, 000002.SZ.QMT=0.200000]", accepted_logs[0])
 
     def test_convergence_submits_sell_before_cash_gated_buy(self) -> None:
         strategy = self.make_strategy(
@@ -556,6 +690,24 @@ class TargetWeightStrategyTest(unittest.TestCase):
             Decimal("29900"),
             Decimal("5300"),
         ])
+
+    def test_target_helpers_value_position_with_today_open_not_last_close(self) -> None:
+        strategy = self.make_strategy(
+            positions={INST_A: Decimal("7500")},
+            free_cash="1000000",
+            equity="1000000",
+            prices={INST_A: 20.0},
+            open_prices={INST_A: 10.0},
+            order_slice_notional="1000000",
+        )
+
+        self.assertEqual(strategy._current_weight(str(INST_A)), 0.075)
+        self.assertEqual(strategy._target_side(str(INST_A), 0.1), "buy")
+        intent = strategy._target_order_intent(str(INST_A), 0.1)
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.side, OrderSide.BUY)
+        self.assertEqual(intent.quantity, Decimal("2500"))
+        self.assertEqual(strategy._estimated_buy_cost(str(INST_A), 0.1), Decimal("25000.0"))
 
     def test_buy_cash_gate_uses_each_slice_and_defers_unfunded_remainder(self) -> None:
         strategy = self.make_strategy(
@@ -909,6 +1061,184 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(alert["name"], TargetWeightStrategy._PRE_OPEN_RECONCILE_ALERT)
         self.assertEqual(alert["alert_time"], pd.Timestamp("2026-07-02 09:15:00", tz="Asia/Shanghai"))
         self.assertTrue(alert["override"])
+
+    def _make_bar(self, instrument_id: InstrumentId, open_price: float, close: float, ts: str):
+        bar_type = BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
+        return type(
+            "Bar",
+            (),
+            {
+                "bar_type": bar_type,
+                "open": Decimal(str(open_price)),
+                "close": Decimal(str(close)),
+                "ts_event": china_ts_ns(ts),
+            },
+        )()
+
+    def _make_depth(self, instrument_id: InstrumentId, bid: float, ask: float, ts: str):
+        def level(price: float, size: float):
+            return type("DepthLevel", (), {"price": Decimal(str(price)), "size": Decimal(str(size))})()
+
+        return type(
+            "Depth",
+            (),
+            {
+                "instrument_id": instrument_id,
+                "bids": [level(bid, 1000)],
+                "asks": [level(ask, 1200)],
+                "ts_event": china_ts_ns(ts),
+                "ts_init": china_ts_ns(ts),
+            },
+        )()
+
+    def test_on_bar_records_first_open_and_resets_counts_on_new_day(self) -> None:
+        strategy = self.make_strategy(free_cash="1000000")
+        strategy.on_target_bar = lambda _bar: None  # isolate open-capture behaviour
+        strategy.clock.now = pd.Timestamp("2026-07-02 02:00:00", tz="UTC")
+        strategy._cancel_count_buy = {str(INST_A): 3}
+        strategy._cancel_count_sell = {str(INST_A): 2}
+
+        strategy.on_bar(self._make_bar(INST_A, 10.0, 10.1, "2026-07-02 09:30:00"))
+        # first bar of a new date resets the side-specific cancel counts
+        self.assertEqual(strategy._cancel_count_buy, {})
+        self.assertEqual(strategy._cancel_count_sell, {})
+        self.assertEqual(strategy._today_open[str(INST_A)], 10.0)
+
+        # a later bar the same day does not overwrite the recorded open
+        strategy.on_bar(self._make_bar(INST_A, 10.5, 10.6, "2026-07-02 09:31:00"))
+        self.assertEqual(strategy._today_open[str(INST_A)], 10.0)
+
+        # a bar on the next day resets and records the new open
+        strategy._cancel_count_buy = {str(INST_A): 1}
+        strategy.on_bar(self._make_bar(INST_A, 11.0, 11.1, "2026-07-03 09:30:00"))
+        self.assertEqual(strategy._cancel_count_buy, {})
+        self.assertEqual(strategy._today_open[str(INST_A)], 11.0)
+
+    def test_on_order_book_depth_captures_ladder_only(self) -> None:
+        strategy = self.make_strategy()
+        strategy._today_open = {}
+        strategy._last_close = {}
+        strategy.clock.now = pd.Timestamp("2026-07-02 02:00:00", tz="UTC")
+
+        strategy.on_order_book_depth(self._make_depth(INST_A, 9.99, 10.01, "2026-07-02 09:30:01"))
+
+        # The depth mid/best price is NOT dependable for open/last price, so the
+        # depth handler must not populate _today_open / _last_close — only the
+        # walk-book ladder is captured.
+        self.assertNotIn(str(INST_A), strategy._today_open)
+        self.assertNotIn(str(INST_A), strategy._last_close)
+        bids, asks = strategy._depth_books[str(INST_A)]
+        self.assertEqual(bids, [(9.99, 1000.0)])
+        self.assertEqual(asks, [(10.01, 1200.0)])
+
+    def test_full_tick_open_overrides_seeded_last_close(self) -> None:
+        # Regression for the 42.14-vs-53.09 bug: a stale seeded last-close (or
+        # depth mid) must be overwritten by the authoritative full-tick open.
+        strategy = self.make_strategy()
+        strategy._pricing_date = date(2026, 7, 2)
+        strategy._today_open = {str(INST_A): 42.14}  # stale seed / depth value
+        strategy._authoritative_open = set()
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:27:00", tz="UTC")
+
+        strategy._apply_full_tick({str(INST_A): {"open": 53.09, "last_price": 54.0}}, "prefetch")
+
+        self.assertEqual(strategy._today_open[str(INST_A)], 53.09)
+        self.assertIn(str(INST_A), strategy._authoritative_open)
+
+    def test_seed_does_not_override_authoritative_open(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetWeightStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            seed_open_from_last_close=True,
+        )
+        strategy._pricing_date = date(2026, 7, 2)
+        strategy._today_open = {str(INST_A): 53.09}
+        strategy._authoritative_open = {str(INST_A)}
+        strategy._last_close = {str(INST_A): 42.14}
+
+        strategy._seed_open_prices_from_last_close(date(2026, 7, 2))
+
+        self.assertEqual(strategy._today_open[str(INST_A)], 53.09)
+
+    def test_full_tick_open_extraction(self) -> None:
+        self.assertEqual(TargetWeightStrategy._full_tick_open({"open": 53.09}), 53.09)
+        self.assertEqual(TargetWeightStrategy._full_tick_open(53.09), 53.09)
+        self.assertIsNone(TargetWeightStrategy._full_tick_open({"open": 0.0}))
+        self.assertIsNone(TargetWeightStrategy._full_tick_open({"open": None}))
+        self.assertIsNone(TargetWeightStrategy._full_tick_open({"last_price": 1.0}))
+
+    def test_buy_price_uses_gap_up_open_not_stale_seed(self) -> None:
+        # End-to-end: after a full-tick refresh, a gap-up open drives the buy
+        # limit price (open + offset), not the stale seeded last close.
+        strategy = self.make_strategy(open_prices={INST_A: 42.14})
+        strategy._pricing_date = date(2026, 7, 2)
+        strategy._authoritative_open = set()
+        strategy._apply_full_tick({str(INST_A): {"open": 53.09}}, "prefetch")
+
+        instrument = strategy.cache.instrument(INST_A)
+        price = strategy._limit_price(instrument, INST_A, OrderSide.BUY, Decimal("100"))
+
+        # buy price = open + max(open*offset_bps/1e4, tick); far above the stale 42.14.
+        self.assertGreater(float(price), 53.0)
+        self.assertLessEqual(float(price), 53.09 + 53.09 * strategy.config.buy_max_price_bps / 10_000.0)
+
+    def test_reconcile_increments_side_specific_cancel_count(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy._today_open = {str(INST_A): 10.0}
+        order = FakeOrder(
+            client_order_id="S-1",
+            instrument_id=INST_A,
+            side=OrderSide.SELL,
+            quantity=Decimal("100"),
+            price=Decimal("9.99"),
+            status=OrderStatus.ACCEPTED,
+            ts_last=1,
+        )
+        strategy.cache.open_orders.append(order)
+
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [order])
+        self.assertEqual(strategy._cancel_count_sell, {str(INST_A): 1})
+        self.assertEqual(strategy._cancel_count_buy, {})
+
+    def test_reconcile_does_not_cancel_buy_at_max_price_cap(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy._today_open = {str(INST_A): 10.0}
+        # cap = 10 + max(10*10bps=0.01, 0.01) = 10.01; order resting at the cap
+        order = FakeOrder(
+            client_order_id="B-1",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("100"),
+            price=Decimal("10.01"),
+            status=OrderStatus.ACCEPTED,
+            ts_last=1,
+        )
+        strategy.cache.open_orders.append(order)
+
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [])
+        self.assertEqual(strategy._cancel_count_buy, {})
+
+    def test_order_fill_resets_filled_side_cancel_count(self) -> None:
+        strategy = self.make_strategy()
+        strategy._cancel_count_buy = {str(INST_A): 4}
+        strategy._cancel_count_sell = {str(INST_A): 2}
+        event = type(
+            "FillEvent",
+            (),
+            {"client_order_id": "O-1", "instrument_id": INST_A, "order_side": OrderSide.BUY},
+        )()
+
+        strategy.on_order_filled(event)
+
+        self.assertEqual(strategy._cancel_count_buy, {})
+        self.assertEqual(strategy._cancel_count_sell, {str(INST_A): 2})
 
 
 if __name__ == "__main__":

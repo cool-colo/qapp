@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from datetime import timedelta
@@ -28,6 +29,7 @@ from nautilus_trader.common.enums import LogColor
 
 
 QMT_CLIENT = legacy.QMT_CLIENT
+_MISSING = object()
 
 
 class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
@@ -154,19 +156,49 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
 
 
 def parse_args():
-    args = legacy.parse_args()
+    original_argv = sys.argv[:]
+    cleaned_argv, pre_open_reconcile_time = _extract_pre_open_reconcile_time_arg(original_argv)
+    try:
+        sys.argv = cleaned_argv
+        args = legacy.parse_args()
+    finally:
+        sys.argv = original_argv
     # `--pre-open-reconcile-time` is target-specific and is not defined by the shared
-    # `live_common.parse_args()`, so fall back to its env default when the shared parser
-    # did not populate it. Configuring it triggers a pre-open execution-state reconcile,
-    # which also refreshes the broker sellable (can_use_volume) map before trading.
-    if not hasattr(args, "pre_open_reconcile_time"):
-        args.pre_open_reconcile_time = os.environ.get("MODEL_PRE_OPEN_RECONCILE_TIME") or None
+    # `live_common.parse_args()`, so strip it before delegating and then apply the
+    # target-model env/default here.
+    if pre_open_reconcile_time is _MISSING:
+        pre_open_reconcile_time = os.environ.get(
+            "MODEL_LIVE_PRE_OPEN_RECONCILE_TIME",
+            os.environ.get("MODEL_PRE_OPEN_RECONCILE_TIME", "09:15"),
+        )
+    args.pre_open_reconcile_time = pre_open_reconcile_time
     try:
         args.refresh_time = normalize_refresh_time(args.refresh_time)
         args.pre_open_reconcile_time = normalize_refresh_time(args.pre_open_reconcile_time)
     except ValueError as exc:
         raise SystemExit(f"invalid configured HH:MM time: {exc}") from exc
     return args
+
+
+def _extract_pre_open_reconcile_time_arg(argv: list[str]) -> tuple[list[str], str | object]:
+    cleaned = [argv[0]]
+    value: str | object = _MISSING
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--pre-open-reconcile-time":
+            if index + 1 >= len(argv):
+                raise SystemExit("--pre-open-reconcile-time requires a value")
+            value = argv[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--pre-open-reconcile-time="):
+            value = arg.split("=", 1)[1]
+            index += 1
+            continue
+        cleaned.append(arg)
+        index += 1
+    return cleaned, value
 
 
 def normalize_refresh_time(value: str | None) -> str | None:
@@ -297,6 +329,12 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             timezone_name=args.exchange_timezone,
             initial_last_closes=context.last_closes,
             excluded_name_prefixes=tuple(legacy.env_list_from_value(args.excluded_name_prefixes)),
+            target_weight_planner=args.target_weight_planner,
+            target_weight_planner_error_policy=args.target_weight_planner_error_policy,
+            risk_manager_base_url=args.risk_manager_base_url,
+            risk_manager_risk_model_id=args.risk_manager_risk_model_id,
+            risk_manager_mode=args.risk_manager_mode,
+            risk_manager_timeout_secs=args.risk_manager_timeout_secs,
             unfilled_timeout_secs=args.unfilled_timeout_secs,
             resubmit_check_interval_secs=args.resubmit_interval_secs,
             cash_buffer_percent=args.cash_buffer_percent,
@@ -307,12 +345,19 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             limit_stop_mode=args.limit_stop_mode,
             exit_non_targets=not args.leave_non_targets,
             order_slice_notional=args.order_slice_notional,
-            price_offset_ticks=args.price_offset_ticks,
             quote_tick_log_sample_rate=args.quote_tick_log_sample_rate,
             trade_tick_log_sample_rate=args.trade_tick_log_sample_rate,
             order_book_depth_log_sample_rate=args.order_book_depth_log_sample_rate,
             trading_windows=args.trading_windows,
             order_id_tag=args.order_id_tag,
+            subscribe_bars=False,
+            subscribe_quote_ticks=False,
+            subscribe_trade_ticks=False,
+            subscribe_order_book_depth=True,
+            seed_open_from_last_close=True,
+            full_tick_refresh_secs=args.full_tick_refresh_secs,
+            full_tick_prefetch_time=args.full_tick_prefetch_time,
+            process_targets_on_timer=True,
         ),
         refresh_context=lambda active_stock_codes: loader.load(
             extra_stock_codes=extra_stock_codes.union(active_stock_codes),
@@ -331,6 +376,21 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             reconcile_time=args.pre_open_reconcile_time,
             timeout_secs=config_node.timeout_reconciliation,
         )
+
+    async def _fetch_full_tick() -> dict[str, dict[str, float]]:
+        # Today's authoritative full-tick snapshot per instrument from the QMT
+        # proxy. Nautilus has no full-tick type, so this reaches the proxy directly
+        # (infrastructure plumbing). Offloaded to a thread so the sync HTTP call
+        # never blocks the trading event loop. Covers the full configured universe
+        # (not just held positions) so new buy targets are priced from the real
+        # open, plus any active positions that dropped out of the universe.
+        stock_codes = set(strategy._stock_by_instrument.values())
+        stock_codes.update(strategy._active_stock_codes())
+        if not stock_codes:
+            return {}
+        return await asyncio.to_thread(loader.full_tick_snapshot, sorted(stock_codes))
+
+    strategy.configure_full_tick_source(fetch_full_tick=_fetch_full_tick)
     node.trader.add_strategy(strategy)
     if args.metrics_port and int(args.metrics_port) > 0:
         exporter = PrometheusExporter(

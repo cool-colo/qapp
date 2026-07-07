@@ -26,6 +26,10 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.trading.strategy import Strategy
 
+from strategies.pricing import OpenOffsetBuyPriceStrategy
+from strategies.pricing import OpenOffsetSellPriceStrategy
+from strategies.pricing import PriceContext
+
 
 @dataclass(frozen=True)
 class TargetWeightPlan:
@@ -124,7 +128,11 @@ class TargetWeightStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     target_cash_buffer_percent: float = 0.05
     weight_tolerance_percent: float = 0.003
     cash_tolerance_percent: float = 0.01
-    price_offset_ticks: int = 1
+    buy_offset_bps: float = 5.0
+    sell_offset_bps: float = 5.0
+    buy_max_price_bps: float = 10.0
+    buy_cancel_threshold: int = 2
+    sell_cancel_threshold: int = 1
     exit_non_targets: bool = True
     limit_stop_mode: str = "freeze_symbol"
     order_slice_notional: Decimal = Decimal("300000")
@@ -132,6 +140,13 @@ class TargetWeightStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     quote_tick_log_sample_rate: float = 0.0
     trade_tick_log_sample_rate: float = 0.0
     order_book_depth_log_sample_rate: float = 0.0
+    subscribe_bars: bool = True
+    subscribe_quote_ticks: bool = True
+    subscribe_trade_ticks: bool = True
+    subscribe_order_book_depth: bool = False
+    seed_open_from_last_close: bool = False
+    full_tick_refresh_secs: float = 60.0
+    full_tick_prefetch_time: str | None = "09:27"
 
 
 class TargetWeightStrategy(Strategy):
@@ -153,6 +168,8 @@ class TargetWeightStrategy(Strategy):
         "\u8dcc\u505c\u4ef7",
     )
     _PRE_OPEN_RECONCILE_ALERT = "TARGET-WEIGHT-PRE-OPEN-RECONCILE"
+    _FULL_TICK_REFRESH_TIMER = "TARGET-WEIGHT-FULL-TICK-REFRESH"
+    _FULL_TICK_PREFETCH_ALERT = "TARGET-WEIGHT-FULL-TICK-PREFETCH"
     _TERMINAL_ORDER_STATUSES = {
         OrderStatus.DENIED,
         OrderStatus.REJECTED,
@@ -179,11 +196,37 @@ class TargetWeightStrategy(Strategy):
         self._order_target_weights: dict[str, float] = {}
         self._order_target_versions: dict[str, str] = {}
         self._order_splitter = NotionalOrderSplitter(config.order_slice_notional)
+        self._buy_pricer = OpenOffsetBuyPriceStrategy(
+            offset_bps=float(config.buy_offset_bps),
+            max_price_bps=float(config.buy_max_price_bps),
+            cancel_threshold=int(config.buy_cancel_threshold),
+        )
+        self._sell_pricer = OpenOffsetSellPriceStrategy(
+            offset_bps=float(config.sell_offset_bps),
+            cancel_threshold=int(config.sell_cancel_threshold),
+        )
+        # Today's open price per instrument (first bar of the trading date wins).
+        self._today_open: dict[str, float] = {}
+        # Instruments whose _today_open came from an authoritative source (real
+        # bar open or QMT full-tick). Fallback sources (depth mid, seeded last
+        # close) must not overwrite these, and an authoritative open overwrites a
+        # previously-set fallback value.
+        self._authoritative_open: set[str] = set()
+        self._depth_books: dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]] = {}
+        # Side-specific cancel counts per instrument; reset daily and on fill.
+        self._cancel_count_buy: dict[str, int] = {}
+        self._cancel_count_sell: dict[str, int] = {}
+        self._pricing_date: date | None = None
         self._convergence_suspended = False
         self._pre_open_reconcile = None
         self._pre_open_reconcile_time: tuple[int, int] | None = None
         self._pre_open_reconcile_timeout_secs = 30.0
         self._pre_open_reconcile_task: asyncio.Future[Any] | None = None
+        self._full_tick_source: Any | None = None
+        self._full_tick_prefetch_time: tuple[int, int] | None = self._parse_hh_mm(
+            config.full_tick_prefetch_time,
+        )
+        self._full_tick_task: asyncio.Future[Any] | None = None
         self._sellable_exhausted: dict[str, date] = {}
         # Broker-reported sellable quantity per instrument (QMT `can_use_volume`), refreshed
         # from execution mass-status reports. Empty in backtest (no venue reports) -> the
@@ -203,6 +246,18 @@ class TargetWeightStrategy(Strategy):
         self._pre_open_reconcile_time = self._parse_hh_mm(reconcile_time)
         self._pre_open_reconcile_timeout_secs = float(timeout_secs)
 
+    def configure_full_tick_source(self, fetch_full_tick: Any | None) -> None:
+        """
+        Inject an async callback returning today's authoritative full-tick snapshot
+        as ``{instrument_id_text: {"open": ..., ...}}``. Called at start, at the
+        configured pre-open prefetch time, and every ``full_tick_refresh_secs``
+        during the trading window. Nautilus has no full-tick data type, so this
+        callback reaches the QMT proxy directly (infrastructure plumbing). Only the
+        ``open`` field is consumed today; the snapshot carries the full tick so more
+        fields (last price, bid/ask, ...) can be used later without rewiring.
+        """
+        self._full_tick_source = fetch_full_tick
+
     def on_start(self) -> None:
         self.log.info(
             f"target-weight executor start: instruments={len(self._instrument_ids)} "
@@ -215,15 +270,7 @@ class TargetWeightStrategy(Strategy):
         if not self._bar_types:
             self.log.warning("target-weight executor has no bar_types configured")
         for bar_type in self._bar_types.values():
-            self.subscribe_bars(bar_type)
-            self.subscribe_quote_ticks(bar_type.instrument_id)
-            # self.subscribe_trade_ticks(bar_type.instrument_id)
-            if self._order_book_depth_logging_enabled():
-                self.subscribe_order_book_depth(
-                    bar_type.instrument_id,
-                    book_type=BookType.L2_MBP,
-                    depth=10,
-                )
+            self._subscribe_market_data(bar_type)
         interval_secs = float(self.config.resubmit_check_interval_secs)
         if float(self.config.unfilled_timeout_secs) > 0 and interval_secs > 0:
             self.clock.set_timer(
@@ -232,6 +279,131 @@ class TargetWeightStrategy(Strategy):
                 callback=self._on_converge_timer,
                 fire_immediately=False,
             )
+        self._start_full_tick_refresh()
+
+    def _start_full_tick_refresh(self) -> None:
+        if self._full_tick_source is None:
+            return
+        refresh_secs = float(self.config.full_tick_refresh_secs)
+        if refresh_secs > 0:
+            self.clock.set_timer(
+                name=self._FULL_TICK_REFRESH_TIMER,
+                interval=timedelta(seconds=refresh_secs),
+                callback=self._on_full_tick_refresh_timer,
+                fire_immediately=False,
+            )
+        if self._full_tick_prefetch_time is not None:
+            self._schedule_full_tick_prefetch()
+        # Prime the snapshot immediately on start (e.g. mid-session restart) so the
+        # first convergence prices against real opens rather than seeded closes.
+        self._run_full_tick_fetch(trigger="start")
+
+    def _schedule_full_tick_prefetch(self) -> None:
+        alert_time = self._next_daily_time(self._full_tick_prefetch_time)
+        self.clock.set_time_alert(
+            name=self._FULL_TICK_PREFETCH_ALERT,
+            alert_time=alert_time,
+            callback=self._on_full_tick_prefetch_timer,
+            override=True,
+        )
+        self.log.info(
+            f"Next full-tick prefetch scheduled for {alert_time.isoformat()} "
+            f"({self.config.timezone_name})",
+            color=LogColor.BLUE,
+        )
+
+    def _on_full_tick_prefetch_timer(self, _event: Any) -> None:
+        if self._full_tick_prefetch_time is not None:
+            self._schedule_full_tick_prefetch()
+        self._run_full_tick_fetch(trigger="prefetch")
+
+    def _on_full_tick_refresh_timer(self, _event: Any) -> None:
+        if not self._within_trading_window():
+            return
+        self._run_full_tick_fetch(trigger="refresh")
+
+    def _run_full_tick_fetch(self, trigger: str) -> None:
+        if self._full_tick_source is None:
+            return
+        if self._full_tick_task is not None and not self._full_tick_task.done():
+            return
+        try:
+            result = self._full_tick_source()
+        except Exception as exc:
+            self.log.warning(f"full-tick fetch failed to start ({trigger}): {exc}")
+            return
+        if not inspect.isawaitable(result):
+            self._apply_full_tick(result, trigger)
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as exc:
+            self.log.warning(f"full-tick fetch has no running event loop ({trigger}): {exc}")
+            return
+        task = asyncio.ensure_future(result, loop=loop)
+        self._full_tick_task = task
+        task.add_done_callback(lambda t: self._on_full_tick_fetch_done(t, trigger))
+
+    def _on_full_tick_fetch_done(self, task: asyncio.Future[Any], trigger: str) -> None:
+        self._full_tick_task = None
+        try:
+            result = task.result()
+        except Exception as exc:
+            self.log.warning(f"full-tick fetch failed ({trigger}): {exc}")
+            return
+        self._apply_full_tick(result, trigger)
+
+    def _apply_full_tick(self, snapshot: Any, trigger: str) -> None:
+        """
+        Apply an authoritative full-tick snapshot keyed by instrument id. Each
+        value is a per-instrument field mapping (e.g. ``{"open": ..., "last_price":
+        ...}``). Today only the ``open`` field is consumed (to anchor pricing); the
+        snapshot shape is deliberately open so future fields can be used without a
+        signature change.
+        """
+        if not isinstance(snapshot, dict) or not snapshot:
+            return
+        trading_date = self._clock_date()
+        updated = 0
+        for instrument_id, fields in snapshot.items():
+            open_price = self._full_tick_open(fields)
+            if open_price is None:
+                continue
+            if self._set_authoritative_open(str(instrument_id), trading_date, open_price):
+                updated += 1
+        if updated:
+            self.log.info(
+                f"applied authoritative opens from full-tick ({trigger}): "
+                f"date={trading_date} count={updated}",
+                color=LogColor.BLUE,
+            )
+            if self._within_trading_window():
+                self._converge_to_target(current_date=trading_date, trigger="full_tick")
+
+    @staticmethod
+    def _full_tick_open(fields: Any) -> float | None:
+        """Extract a positive open price from a full-tick value (mapping or float)."""
+        raw = fields.get("open") if isinstance(fields, dict) else fields
+        try:
+            price = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0 else None
+
+    def _set_authoritative_open(
+        self,
+        instrument_id: str,
+        trading_date: date,
+        open_price: float,
+    ) -> bool:
+        """Set today's open from an authoritative source, overwriting fallbacks."""
+        if open_price <= 0:
+            return False
+        self._ensure_pricing_date(trading_date)
+        previous = self._today_open.get(instrument_id)
+        self._today_open[instrument_id] = float(open_price)
+        self._authoritative_open.add(instrument_id)
+        return previous != float(open_price)
 
     @staticmethod
     def _parse_hh_mm(value: str | None) -> tuple[int, int] | None:
@@ -338,17 +510,7 @@ class TargetWeightStrategy(Strategy):
             for key in sorted(removable):
                 if self._current_quantity(InstrumentId.from_str(key)) > 0:
                     continue
-                try:
-                    self.unsubscribe_bars(self._bar_types[key])
-                except Exception as exc:
-                    self.log.warning(f"Bar unsubscribe failed for {self._bar_types[key]}: {exc}")
-                if self._order_book_depth_logging_enabled():
-                    try:
-                        self.unsubscribe_order_book_depth(self._bar_types[key].instrument_id)
-                    except Exception as exc:
-                        self.log.warning(
-                            f"Order-book depth unsubscribe failed for {self._bar_types[key].instrument_id}: {exc}",
-                        )
+                self._unsubscribe_market_data(self._bar_types[key])
                 self._bar_types.pop(key, None)
         self._bar_types.update(refreshed_bar_types)
         known_ids = {str(instrument_id): instrument_id for instrument_id in self._instrument_ids}
@@ -364,15 +526,38 @@ class TargetWeightStrategy(Strategy):
                     self.request_instrument(bar_type.instrument_id)
                 except Exception as exc:
                     self.log.warning(f"Instrument request failed for {bar_type.instrument_id}: {exc}")
-                self.subscribe_bars(bar_type)
-                self.subscribe_quote_ticks(bar_type.instrument_id)
-                self.subscribe_trade_ticks(bar_type.instrument_id)
-                if self._order_book_depth_logging_enabled():
-                    self.subscribe_order_book_depth(
-                        bar_type.instrument_id,
-                        book_type=BookType.L2_MBP,
-                        depth=10,
-                    )
+                self._subscribe_market_data(bar_type)
+
+    def _subscribe_market_data(self, bar_type: BarType) -> None:
+        if bool(self.config.subscribe_bars):
+            self.subscribe_bars(bar_type)
+        if bool(self.config.subscribe_quote_ticks):
+            self.subscribe_quote_ticks(bar_type.instrument_id)
+        if bool(self.config.subscribe_trade_ticks):
+            self.subscribe_trade_ticks(bar_type.instrument_id)
+        if self._wants_order_book_depth_subscription():
+            self.subscribe_order_book_depth(
+                bar_type.instrument_id,
+                book_type=BookType.L2_MBP,
+                depth=10,
+            )
+
+    def _unsubscribe_market_data(self, bar_type: BarType) -> None:
+        if bool(self.config.subscribe_bars):
+            try:
+                self.unsubscribe_bars(bar_type)
+            except Exception as exc:
+                self.log.warning(f"Bar unsubscribe failed for {bar_type}: {exc}")
+        if self._wants_order_book_depth_subscription():
+            try:
+                self.unsubscribe_order_book_depth(bar_type.instrument_id)
+            except Exception as exc:
+                self.log.warning(
+                    f"Order-book depth unsubscribe failed for {bar_type.instrument_id}: {exc}",
+                )
+
+    def _wants_order_book_depth_subscription(self) -> bool:
+        return bool(self.config.subscribe_order_book_depth) or self._order_book_depth_logging_enabled()
 
     def update_target_weights(
         self,
@@ -402,19 +587,40 @@ class TargetWeightStrategy(Strategy):
         total_weight = sum(self._target_weights.values())
         if total_weight > 1.0:
             self.log.warning(f"target weights sum to {total_weight:.6f}; buys may be cash-constrained")
+        detail = self._target_weights_log_detail(self._target_weights)
         self.log.info(
             f"accepted target weights version={version_value} date={target_date} "
-            f"count={len(self._target_weights)} total_weight={total_weight:.6f} reason={reason}",
+            f"count={len(self._target_weights)} total_weight={total_weight:.6f} reason={reason} "
+            f"detail={detail}",
             color=LogColor.BLUE,
         )
         if self._convergence_suspended or not self._within_trading_window():
             return
         self._converge_to_target(current_date=target_date, trigger="target_update")
 
+    @staticmethod
+    def _target_weights_log_detail(weights: dict[str, float]) -> str:
+        if not weights:
+            return "[]"
+        return "[" + ", ".join(
+            f"{instrument_id}={float(weight):.6f}"
+            for instrument_id, weight in sorted(weights.items())
+        ) + "]"
+
     def on_bar(self, bar: Bar) -> None:
         instrument_id = str(bar.bar_type.instrument_id)
-        self._last_close[instrument_id] = float(bar.close)
         trading_date = bar_date(bar, self.config.timezone_name)
+        self._update_price_state(
+            instrument_id=instrument_id,
+            trading_date=trading_date,
+            last_price=float(bar.close),
+        )
+        # The first real bar of the day carries the true daily open; later intraday
+        # bars must not clobber it. Full-tick fetches (below) remain authoritative
+        # and may still refine it. Fallback (seeded/depth) values are overwritten.
+        self._ensure_pricing_date(trading_date)
+        if instrument_id not in self._authoritative_open:
+            self._set_authoritative_open(instrument_id, trading_date, float(bar.open))
         within_window = self._within_trading_window()
         self._convergence_suspended = not within_window
         self.on_target_bar(bar)
@@ -425,6 +631,50 @@ class TargetWeightStrategy(Strategy):
 
     def on_target_bar(self, bar: Bar) -> None:
         """Hook for subclasses to update targets before convergence."""
+
+    def _ensure_pricing_date(self, trading_date: date) -> None:
+        if trading_date == self._pricing_date:
+            return
+        self._pricing_date = trading_date
+        self._today_open = {}
+        self._authoritative_open = set()
+        self._depth_books = {}
+        self._cancel_count_buy = {}
+        self._cancel_count_sell = {}
+
+    def _update_price_state(
+        self,
+        instrument_id: str,
+        trading_date: date,
+        last_price: float | None = None,
+    ) -> None:
+        self._ensure_pricing_date(trading_date)
+        if last_price is not None and last_price > 0:
+            self._last_close[instrument_id] = float(last_price)
+
+    def _seed_open_prices_from_last_close(self, trading_date: date) -> None:
+        if not bool(self.config.seed_open_from_last_close):
+            return
+        self._ensure_pricing_date(trading_date)
+        seeded = 0
+        for instrument_id, close_price in self._last_close.items():
+            try:
+                price = float(close_price)
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            if (
+                instrument_id not in self._today_open
+                and instrument_id not in self._authoritative_open
+            ):
+                self._today_open[instrument_id] = price
+                seeded += 1
+        if seeded:
+            self.log.info(
+                f"Seeded timer pricing opens from last closes: date={trading_date} count={seeded}",
+                color=LogColor.BLUE,
+            )
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         if not self._should_log_sample(self.config.quote_tick_log_sample_rate):
@@ -451,6 +701,16 @@ class TargetWeightStrategy(Strategy):
         )
 
     def on_order_book_depth(self, depth: OrderBookDepth10) -> None:
+        bids = self._ladder_levels(depth.bids)
+        asks = self._ladder_levels(depth.asks)
+        trading_date = self._event_trading_date(int(getattr(depth, "ts_event", 0) or 0)) or self._clock_date()
+        # The depth book is captured for aggressive walk-book pricing only. Its
+        # mid/best price is NOT a dependable reference for today's open or last
+        # price (pre-open auction levels are provisional, snapshots are sparse), so
+        # it must never feed _today_open / _last_close. Those come from the QMT
+        # full-tick snapshot and seeded ClickHouse closes instead.
+        self._ensure_pricing_date(trading_date)
+        self._depth_books[str(depth.instrument_id)] = (bids, asks)
         if not self._should_log_sample(self.config.order_book_depth_log_sample_rate):
             return
         self.log.info(
@@ -492,6 +752,14 @@ class TargetWeightStrategy(Strategy):
         self._forget_submitted_order(client_order_id)
         self._deferred_buys.pop(instrument_id_text, None)
         self._insufficient_funds.discard(instrument_id_text)
+        # Reset the filled side's cancel count so the next convergence cycle for
+        # this instrument starts pricing at the base offset again.
+        if instrument_id_text:
+            order_side = getattr(event, "order_side", None)
+            if order_side == OrderSide.BUY:
+                self._cancel_count_buy.pop(instrument_id_text, None)
+            elif order_side == OrderSide.SELL:
+                self._cancel_count_sell.pop(instrument_id_text, None)
 
     def on_order_canceled(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
@@ -628,15 +896,15 @@ class TargetWeightStrategy(Strategy):
         if target_weight <= 0:
             return "sell" if current_qty > 0 else None
         instrument = self.cache.instrument(instrument_id)
-        close_price = self._last_close.get(instrument_id_text)
-        if instrument is None or close_price is None or close_price <= 0:
+        open_price = self._today_open.get(instrument_id_text)
+        if instrument is None or open_price is None or open_price <= 0:
             return "buy" if current_qty <= 0 else None
         current_weight = self._current_weight(instrument_id_text)
         if current_weight is not None:
             tolerance = max(0.0, float(self.config.weight_tolerance_percent))
             if abs(current_weight - float(target_weight)) <= tolerance:
                 return None
-        target_qty = self._target_quantity(instrument, close_price, target_weight)
+        target_qty = self._target_quantity(instrument, open_price, target_weight)
         delta_qty = target_qty - current_qty
         if delta_qty > 0:
             return "buy"
@@ -725,12 +993,25 @@ class TargetWeightStrategy(Strategy):
                 continue
             if self._at_price_limit(order):
                 continue
+            # A buy already resting at its max-buy-price cap is left to fill if the
+            # market comes back down; do not cancel it (so its cancel count never
+            # grows and the price never escalates past the cap).
+            if self._at_buy_price_cap(order):
+                continue
             try:
                 self.cancel_order(order)
             except Exception as exc:
                 self.log.warning(f"cancel_order failed for {client_order_id}: {exc}")
                 continue
             self._forget_submitted_order(client_order_id)
+            if order.side == OrderSide.BUY:
+                self._cancel_count_buy[instrument_id_text] = (
+                    self._cancel_count_buy.get(instrument_id_text, 0) + 1
+                )
+            else:
+                self._cancel_count_sell[instrument_id_text] = (
+                    self._cancel_count_sell.get(instrument_id_text, 0) + 1
+                )
             self._record_order(
                 trading_date=trading_date,
                 instrument_id=instrument_id_text,
@@ -823,22 +1104,22 @@ class TargetWeightStrategy(Strategy):
         if target_weight <= 0:
             if current_qty <= 0:
                 return None
-            price = self._limit_price(instrument, instrument_id, OrderSide.SELL)
+            price = self._limit_price(instrument, instrument_id, OrderSide.SELL, abs(current_qty))
             return TargetOrderIntent(instrument_id, instrument, OrderSide.SELL, abs(current_qty), price)
-        close_price = self._last_close.get(instrument_id_text)
-        if close_price is None or close_price <= 0:
+        open_price = self._today_open.get(instrument_id_text)
+        if open_price is None or open_price <= 0:
             return None
         current_weight = self._current_weight(instrument_id_text)
         if current_weight is not None:
             tolerance = max(0.0, float(self.config.weight_tolerance_percent))
             if abs(current_weight - float(target_weight)) <= tolerance:
                 return None
-        target_qty = self._target_quantity(instrument, close_price, target_weight)
+        target_qty = self._target_quantity(instrument, open_price, target_weight)
         delta_qty = target_qty - current_qty
         if delta_qty == 0:
             return None
         side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
-        price = self._limit_price(instrument, instrument_id, side)
+        price = self._limit_price(instrument, instrument_id, side, abs(delta_qty))
         if price is None:
             return None
         return TargetOrderIntent(instrument_id, instrument, side, abs(delta_qty), price)
@@ -859,15 +1140,15 @@ class TargetWeightStrategy(Strategy):
     def _estimated_buy_cost(self, instrument_id_text: str, target_weight: float) -> Decimal | None:
         instrument_id = InstrumentId.from_str(instrument_id_text)
         instrument = self.cache.instrument(instrument_id)
-        close_price = self._last_close.get(instrument_id_text)
-        if instrument is None or close_price is None or close_price <= 0:
+        open_price = self._today_open.get(instrument_id_text)
+        if instrument is None or open_price is None or open_price <= 0:
             return None
         current_qty = self._current_quantity(instrument_id)
-        target_qty = self._target_quantity(instrument, close_price, target_weight)
+        target_qty = self._target_quantity(instrument, open_price, target_weight)
         delta_qty = target_qty - current_qty
         if delta_qty <= 0:
             return Decimal("0")
-        return Decimal(str(delta_qty)) * Decimal(str(close_price))
+        return Decimal(str(delta_qty)) * Decimal(str(open_price))
 
     def _submit_target_weight(
         self,
@@ -888,7 +1169,8 @@ class TargetWeightStrategy(Strategy):
             return self._submit_full_exit(trading_date, instrument_id, instrument, current_qty, reason)
         intent = self._target_order_intent(instrument_id_text, target_weight)
         if intent is None:
-            if self._last_close.get(instrument_id_text) is None:
+            open_price = self._today_open.get(instrument_id_text)
+            if open_price is None or open_price <= 0:
                 self._record_order(trading_date, instrument_id_text, "buy", 0, target_weight, "rejected", "missing_price")
                 return False
             self._record_order(trading_date, instrument_id_text, "buy", 0, target_weight, "skipped", "already_target")
@@ -920,7 +1202,7 @@ class TargetWeightStrategy(Strategy):
         )
         if qty_abs is None or qty_abs <= 0:
             return False
-        price = self._limit_price(instrument, instrument_id, OrderSide.SELL)
+        price = self._limit_price(instrument, instrument_id, OrderSide.SELL, qty_abs)
         if price is None:
             order = self.order_factory.market(
                 instrument_id=instrument_id,
@@ -1275,29 +1557,135 @@ class TargetWeightStrategy(Strategy):
             pass
         return True
 
-    def _limit_price(self, instrument: Any, instrument_id: InstrumentId, side: OrderSide) -> Any | None:
-        offset_ticks = int(self.config.price_offset_ticks)
-        tick = float(instrument.price_increment)
-        offset = offset_ticks * tick
-        quote = self.cache.quote_tick(instrument_id)
-        if quote is not None:
-            base = float(quote.ask_price) if side == OrderSide.BUY else float(quote.bid_price)
-            if base > 0:
-                raw = base + offset if side == OrderSide.BUY else base - offset
-                if raw > 0:
-                    return instrument.make_price(raw)
-        close_price = self._last_close.get(str(instrument_id))
-        if close_price is None or close_price <= 0:
-            return None
-        raw = close_price + offset if side == OrderSide.BUY else close_price - offset
-        if raw <= 0:
+    def _limit_price(
+        self,
+        instrument: Any,
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        quantity: Decimal | None = None,
+    ) -> Any | None:
+        ctx = self._build_price_context(instrument, instrument_id, side, quantity)
+        pricer = self._buy_pricer if side == OrderSide.BUY else self._sell_pricer
+        raw = pricer.compute(ctx)
+        if raw is None or raw <= 0:
             return None
         return instrument.make_price(raw)
 
-    def _target_quantity(self, instrument: Any, close_price: float, target_weight: float) -> Decimal:
+    def _build_price_context(
+        self,
+        instrument: Any,
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        quantity: Decimal | None,
+    ) -> PriceContext:
+        instrument_id_text = str(instrument_id)
+        tick = float(instrument.price_increment)
+        best_bid, best_ask, bids, asks = self._book_snapshot(instrument_id)
+        if side == OrderSide.BUY:
+            cancel_count = self._cancel_count_buy.get(instrument_id_text, 0)
+        else:
+            cancel_count = self._cancel_count_sell.get(instrument_id_text, 0)
+        return PriceContext(
+            instrument_id=instrument_id,
+            side=side,
+            open_price=self._today_open.get(instrument_id_text),
+            last_close=self._last_close.get(instrument_id_text),
+            tick=tick,
+            quantity=Decimal(str(quantity)) if quantity is not None else Decimal("0"),
+            cancel_count=cancel_count,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            bids=bids,
+            asks=asks,
+        )
+
+    def _quote_snapshot(
+        self,
+        instrument_id: InstrumentId,
+    ) -> tuple[float | None, float | None]:
+        best_bid: float | None = None
+        best_ask: float | None = None
+        try:
+            quote = self.cache.quote_tick(instrument_id)
+        except Exception:
+            quote = None
+        if quote is None:
+            return best_bid, best_ask
+        try:
+            bid_price = float(quote.bid_price)
+            if bid_price > 0:
+                best_bid = bid_price
+        except Exception:
+            pass
+        try:
+            ask_price = float(quote.ask_price)
+            if ask_price > 0:
+                best_ask = ask_price
+        except Exception:
+            pass
+        return best_bid, best_ask
+
+    def _book_snapshot(
+        self,
+        instrument_id: InstrumentId,
+    ) -> tuple[float | None, float | None, list[tuple[float, float]], list[tuple[float, float]]]:
+        """
+        Read the latest depth event captured by on_order_book_depth. This avoids
+        reaching through adapter internals while still letting the price strategy
+        use live depth when the strategy subscribed to it.
+        """
+        bids, asks = self._depth_books.get(str(instrument_id), ([], []))
+        best_bid = bids[0][0] if bids else None
+        best_ask = asks[0][0] if asks else None
+        if best_bid is None and best_ask is None:
+            best_bid, best_ask = self._quote_snapshot(instrument_id)
+            bids = [(best_bid, 0.0)] if best_bid is not None else []
+            asks = [(best_ask, 0.0)] if best_ask is not None else []
+        return best_bid, best_ask, bids, asks
+
+    @staticmethod
+    def _ladder_levels(levels: Any) -> list[tuple[float, float]]:
+        result: list[tuple[float, float]] = []
+        for level in levels or []:
+            try:
+                price = float(level.price)
+                size_attr = getattr(level, "size")
+                size = float(size_attr() if callable(size_attr) else size_attr)
+            except Exception:
+                continue
+            if price > 0 and size > 0:
+                result.append((price, size))
+        return result
+
+    def _at_buy_price_cap(self, order: Any) -> bool:
+        """
+        True when a BUY order is resting at (or above) the buy strategy's max-buy
+        price cap. Such orders are not cancelled by the reconciler.
+        """
+        if order.side != OrderSide.BUY:
+            return False
+        order_price = getattr(order, "price", None)
+        if order_price is None:
+            return False
+        instrument_id = getattr(order, "instrument_id", None)
+        if instrument_id is None:
+            return False
+        instrument = self.cache.instrument(instrument_id)
+        if instrument is None:
+            return False
+        ctx = self._build_price_context(instrument, instrument_id, OrderSide.BUY, None)
+        cap = self._buy_pricer.max_buy_price(ctx)
+        if cap is None:
+            return False
+        try:
+            return float(order_price) >= cap - float(instrument.price_increment) / 2.0
+        except Exception:
+            return False
+
+    def _target_quantity(self, instrument: Any, open_price: float, target_weight: float) -> Decimal:
         if target_weight <= 0:
             return Decimal("0")
-        raw_qty = self._portfolio_value() * Decimal(str(target_weight)) / Decimal(str(close_price))
+        raw_qty = self._portfolio_value() * Decimal(str(target_weight)) / Decimal(str(open_price))
         if self._is_star_market(instrument):
             min_qty = Decimal(str(self.config.star_min_buy_qty))
             if raw_qty < min_qty:
@@ -1364,14 +1752,14 @@ class TargetWeightStrategy(Strategy):
         return Decimal(str(qty))
 
     def _current_weight(self, instrument_id_text: str) -> float | None:
-        close_price = self._last_close.get(instrument_id_text)
-        if close_price is None or close_price <= 0:
+        open_price = self._today_open.get(instrument_id_text)
+        if open_price is None or open_price <= 0:
             return None
         portfolio_value = self._portfolio_value()
         if portfolio_value <= 0:
             return None
         qty = self._current_quantity(InstrumentId.from_str(instrument_id_text))
-        return float(qty * Decimal(str(close_price)) / portfolio_value)
+        return float(qty * Decimal(str(open_price)) / portfolio_value)
 
     def _open_order_instruments(self) -> set[str]:
         return {str(order.instrument_id) for order in self._active_orders()}
