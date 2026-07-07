@@ -38,9 +38,15 @@ class FakeMoney:
         return self.value
 
 
+class FakeAccountEvent:
+    def __init__(self, info: dict | None = None) -> None:
+        self.info = info or {}
+
+
 class FakeAccount:
-    def __init__(self, free_cash: Decimal | str) -> None:
+    def __init__(self, free_cash: Decimal | str, info: dict | None = None) -> None:
         self.free_cash = Decimal(str(free_cash))
+        self.last_event = FakeAccountEvent(info)
 
     def balance_free(self) -> FakeMoney:
         return FakeMoney(self.free_cash)
@@ -52,10 +58,11 @@ class FakePortfolio:
         positions: dict[InstrumentId, Decimal] | None = None,
         equity: Decimal | str = "1000000",
         free_cash: Decimal | str = "1000000",
+        account_info: dict | None = None,
     ) -> None:
         self.positions = positions or {}
         self.equity_value = Decimal(str(equity))
-        self.account_value = FakeAccount(free_cash)
+        self.account_value = FakeAccount(free_cash, account_info)
         self.has_account = True
 
     def net_position(self, instrument_id: InstrumentId) -> Decimal:
@@ -196,6 +203,9 @@ class FakeCache:
             if quantity > 0
         ]
 
+    def accounts(self):
+        return [self.portfolio.account_value]
+
 
 class FakeClock:
     def __init__(self) -> None:
@@ -287,7 +297,13 @@ class TestableTargetWeightStrategy:
     _at_buy_price_cap = TargetWeightStrategy._at_buy_price_cap
     _target_quantity = TargetWeightStrategy._target_quantity
     _portfolio_value = TargetWeightStrategy._portfolio_value
+    _nautilus_portfolio_equity = TargetWeightStrategy._nautilus_portfolio_equity
     _free_cash = TargetWeightStrategy._free_cash
+    _nautilus_free_cash = TargetWeightStrategy._nautilus_free_cash
+    _log_account_sizing_snapshot = TargetWeightStrategy._log_account_sizing_snapshot
+    _broker_account_decimal = TargetWeightStrategy._broker_account_decimal
+    _broker_accounts = TargetWeightStrategy._broker_accounts
+    _account_info = staticmethod(TargetWeightStrategy._account_info)
     _current_quantity = TargetWeightStrategy._current_quantity
     _current_weight = TargetWeightStrategy._current_weight
     _open_order_instruments = TargetWeightStrategy._open_order_instruments
@@ -305,6 +321,8 @@ class TestableTargetWeightStrategy:
     _next_daily_time = TargetWeightStrategy._next_daily_time
     _schedule_pre_open_reconcile = TargetWeightStrategy._schedule_pre_open_reconcile
     _on_pre_open_reconcile_timer = TargetWeightStrategy._on_pre_open_reconcile_timer
+    _run_pre_open_reconcile = TargetWeightStrategy._run_pre_open_reconcile
+    _log_pre_open_reconcile_result = TargetWeightStrategy._log_pre_open_reconcile_result
     _ensure_pricing_date = TargetWeightStrategy._ensure_pricing_date
     _update_price_state = TargetWeightStrategy._update_price_state
     _seed_open_prices_from_last_close = TargetWeightStrategy._seed_open_prices_from_last_close
@@ -373,6 +391,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
         target_cash_buffer_percent: float = 0.05,
         order_slice_notional: Decimal | str = "300000",
         require_account_cash: bool = True,
+        account_info: dict | None = None,
     ) -> TestableTargetWeightStrategy:
         instruments = {
             instrument_id: FakeInstrument(instrument_id, fields=(fields or {}).get(instrument_id))
@@ -392,7 +411,12 @@ class TargetWeightStrategyTest(unittest.TestCase):
             order_slice_notional=Decimal(str(order_slice_notional)),
             require_account_cash=require_account_cash,
         )
-        portfolio = FakePortfolio(positions=positions, equity=equity, free_cash=free_cash)
+        portfolio = FakePortfolio(
+            positions=positions,
+            equity=equity,
+            free_cash=free_cash,
+            account_info=account_info,
+        )
         strategy.cache = FakeCache(instruments, portfolio)
         strategy.portfolio = portfolio
         strategy.clock = FakeClock()
@@ -445,6 +469,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy._sellable_exhausted = {}
         strategy._venue_sellable = {}
         strategy._venue_sellable_ts = 0
+        strategy._last_account_sizing_snapshot = None
         strategy.target_events = []
         strategy.order_events = []
         strategy.requested_instruments = []
@@ -708,6 +733,54 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(intent.side, OrderSide.BUY)
         self.assertEqual(intent.quantity, Decimal("2500"))
         self.assertEqual(strategy._estimated_buy_cost(str(INST_A), 0.1), Decimal("25000.0"))
+
+    def test_live_sizing_prefers_broker_total_asset_over_cash_only_equity(self) -> None:
+        strategy = self.make_strategy(
+            positions={INST_A: Decimal("143100")},
+            equity="3352261.79",
+            free_cash="3352261.79",
+            prices={INST_A: 3.35},
+            open_prices={INST_A: 3.40},
+            account_info={"total_asset": "10007406.36", "available_cash": "3352261.79"},
+            order_slice_notional="1000000",
+        )
+
+        self.assertEqual(strategy._portfolio_value(), Decimal("10007406.36"))
+        self.assertEqual(strategy._nautilus_portfolio_equity(), Decimal("3352261.79"))
+        self.assertIsNone(strategy._target_side(str(INST_A), 0.05))
+
+        strategy.update_target_weights({INST_A: 0.05}, date(2026, 7, 2), "broker_total_asset")
+
+        self.assertEqual(strategy.submitted_orders, [])
+        sizing_logs = [
+            args[0]
+            for args, _kwargs in strategy.log.infos
+            if "Account sizing snapshot" in args[0]
+        ]
+        self.assertEqual(len(sizing_logs), 1)
+        self.assertIn("value_source=account_state_info.total_asset", sizing_logs[0])
+        self.assertIn("selected_portfolio_value=10007406.36", sizing_logs[0])
+        self.assertIn("nautilus_portfolio_equity=3352261.79", sizing_logs[0])
+        self.assertIn("broker_total_asset=10007406.36", sizing_logs[0])
+
+    def test_broker_total_asset_allows_underweight_buy_when_portfolio_equity_is_cash_only(self) -> None:
+        strategy = self.make_strategy(
+            positions={INST_A: Decimal("100000")},
+            equity="3352261.79",
+            free_cash="3352261.79",
+            prices={INST_A: 3.35},
+            open_prices={INST_A: 3.40},
+            account_info={"total_asset": "10007406.36", "cash": "3352261.79"},
+            order_slice_notional="1000000",
+        )
+
+        self.assertEqual(strategy._target_side(str(INST_A), 0.05), "buy")
+
+        strategy.update_target_weights({INST_A: 0.05}, date(2026, 7, 2), "broker_total_asset")
+
+        self.assertEqual(len(strategy.submitted_orders), 1)
+        self.assertEqual(strategy.submitted_orders[0].side, OrderSide.BUY)
+        self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("47100"))
 
     def test_buy_cash_gate_uses_each_slice_and_defers_unfunded_remainder(self) -> None:
         strategy = self.make_strategy(
@@ -1062,6 +1135,30 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(alert["alert_time"], pd.Timestamp("2026-07-02 09:15:00", tz="Asia/Shanghai"))
         self.assertTrue(alert["override"])
 
+    def test_pre_open_reconciliation_async_callback_runs_without_running_loop(self) -> None:
+        strategy = self.make_strategy()
+        calls = []
+
+        async def reconcile(timeout_secs: float) -> bool:
+            calls.append(timeout_secs)
+            return True
+
+        strategy.configure_pre_open_reconciliation(
+            reconcile=reconcile,
+            reconcile_time=None,
+            timeout_secs=30.0,
+        )
+
+        strategy._run_pre_open_reconcile()
+
+        self.assertEqual(calls, [30.0])
+        self.assertFalse(
+            any("no running event loop" in args[0] for args, _kwargs in strategy.log.warnings),
+        )
+        self.assertTrue(
+            any("Pre-open execution-state reconciliation succeeded" in args[0] for args, _kwargs in strategy.log.infos),
+        )
+
     def _make_bar(self, instrument_id: InstrumentId, open_price: float, close: float, ts: str):
         bar_type = BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
         return type(
@@ -1144,6 +1241,22 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         self.assertEqual(strategy._today_open[str(INST_A)], 53.09)
         self.assertIn(str(INST_A), strategy._authoritative_open)
+
+    def test_full_tick_async_source_runs_without_running_loop(self) -> None:
+        strategy = self.make_strategy()
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:27:00", tz="UTC")
+
+        async def fetch_full_tick() -> dict[str, dict[str, float]]:
+            return {str(INST_A): {"open": 53.09}}
+
+        strategy.configure_full_tick_source(fetch_full_tick)
+
+        strategy._run_full_tick_fetch(trigger="refresh")
+
+        self.assertEqual(strategy._today_open[str(INST_A)], 53.09)
+        self.assertFalse(
+            any("no running event loop" in args[0] for args, _kwargs in strategy.log.warnings),
+        )
 
     def test_seed_does_not_override_authoritative_open(self) -> None:
         strategy = self.make_strategy()

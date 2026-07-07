@@ -29,6 +29,11 @@ from nautilus_trader.trading.strategy import Strategy
 from strategies.pricing import OpenOffsetBuyPriceStrategy
 from strategies.pricing import OpenOffsetSellPriceStrategy
 from strategies.pricing import PriceContext
+from strategies.order_splitter import NotionalOrderSplitter
+
+
+async def _await_awaitable(awaitable: Any) -> Any:
+    return await awaitable
 
 
 @dataclass(frozen=True)
@@ -81,36 +86,6 @@ class TodayFillSnapshot:
     fill_count: int
     latest_ts_event: int
 
-
-class NotionalOrderSplitter:
-    """Splits a target delta into same-side orders capped by notional amount."""
-
-    def __init__(self, max_order_notional: Decimal) -> None:
-        self.max_order_notional = Decimal(str(max_order_notional))
-
-    def split(self, instrument: Any, quantity: Decimal, price: Decimal) -> list[Decimal]:
-        if quantity <= 0:
-            return []
-        if self.max_order_notional <= 0 or price <= 0:
-            return [quantity]
-        if quantity * price <= self.max_order_notional:
-            return [quantity]
-
-        lot_size = Decimal(str(getattr(instrument, "lot_size", Decimal("1"))))
-        if lot_size <= 0:
-            lot_size = Decimal("1")
-        max_qty = (self.max_order_notional / price // lot_size) * lot_size
-        if max_qty <= 0:
-            return [quantity]
-
-        slices: list[Decimal] = []
-        remaining = quantity
-        while remaining > max_qty:
-            slices.append(max_qty)
-            remaining -= max_qty
-        if remaining > 0:
-            slices.append(remaining)
-        return slices
 
 
 class TargetWeightStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
@@ -233,6 +208,7 @@ class TargetWeightStrategy(Strategy):
         # fill-based estimate is used. When populated it is authoritative over the estimate.
         self._venue_sellable: dict[str, Decimal] = {}
         self._venue_sellable_ts: int = 0
+        self._last_account_sizing_snapshot: str | None = None
         self.target_events: list[TargetWeightTargetEvent] = []
         self.order_events: list[TargetWeightOrderEvent] = []
 
@@ -337,8 +313,13 @@ class TargetWeightStrategy(Strategy):
             return
         try:
             loop = asyncio.get_running_loop()
-        except RuntimeError as exc:
-            self.log.warning(f"full-tick fetch has no running event loop ({trigger}): {exc}")
+        except RuntimeError:
+            try:
+                result = asyncio.run(_await_awaitable(result))
+            except Exception as exc:
+                self.log.warning(f"full-tick fetch failed ({trigger}): {exc}")
+                return
+            self._apply_full_tick(result, trigger)
             return
         task = asyncio.ensure_future(result, loop=loop)
         self._full_tick_task = task
@@ -457,10 +438,13 @@ class TargetWeightStrategy(Strategy):
         if inspect.isawaitable(result):
             try:
                 loop = asyncio.get_running_loop()
-            except RuntimeError as exc:
-                if inspect.iscoroutine(result):
-                    result.close()
-                self.log.warning(f"Pre-open execution-state reconciliation has no running event loop: {exc}")
+            except RuntimeError:
+                try:
+                    result = asyncio.run(_await_awaitable(result))
+                except Exception as exc:
+                    self.log.warning(f"Pre-open execution-state reconciliation failed: {exc}")
+                    return
+                self._log_pre_open_reconcile_result(bool(result))
                 return
             task = asyncio.ensure_future(result, loop=loop)
             self._pre_open_reconcile_task = task
@@ -829,6 +813,7 @@ class TargetWeightStrategy(Strategy):
                 color=LogColor.BLUE,
             )
             return
+        self._log_account_sizing_snapshot(trigger)
         self._reconcile_unfilled_orders(current_date)
         open_order_instruments = self._open_order_instruments()
         desired = self._desired_weights()
@@ -1705,20 +1690,35 @@ class TargetWeightStrategy(Strategy):
         return symbol.lstrip().startswith("688")
 
     def _portfolio_value(self) -> Decimal:
+        broker_total_asset = self._broker_account_decimal("total_asset")
+        if broker_total_asset is not None and broker_total_asset > 0:
+            return broker_total_asset
+        nautilus_equity = self._nautilus_portfolio_equity()
+        if nautilus_equity is not None:
+            return nautilus_equity
+        return Decimal(str(self.config.initial_cash))
+
+    def _nautilus_portfolio_equity(self) -> Decimal | None:
         venue = self._instrument_ids[0].venue if self._instrument_ids else None
         try:
             equity = self.portfolio.equity(venue=Venue(str(venue))) if venue is not None else self.portfolio.equity()
         except Exception:
             equity = {}
-        if equity:
-            first = next(iter(equity.values()))
-            try:
-                return Decimal(str(first.as_decimal()))
-            except Exception:
-                return Decimal(str(float(first)))
-        return Decimal(str(self.config.initial_cash))
+        if not equity:
+            return None
+        first = next(iter(equity.values()))
+        try:
+            return Decimal(str(first.as_decimal()))
+        except Exception:
+            return Decimal(str(float(first)))
 
     def _free_cash(self) -> Decimal | None:
+        broker_free_cash = self._broker_account_decimal("available_cash", "cash")
+        if broker_free_cash is not None:
+            return broker_free_cash
+        return self._nautilus_free_cash()
+
+    def _nautilus_free_cash(self) -> Decimal | None:
         venue = self._instrument_ids[0].venue if self._instrument_ids else None
         try:
             account = (
@@ -1741,6 +1741,96 @@ class TargetWeightStrategy(Strategy):
         if bool(self.config.require_account_cash):
             return None
         return self._portfolio_value()
+
+    def _log_account_sizing_snapshot(self, trigger: str) -> None:
+        broker_total_asset = self._broker_account_decimal("total_asset")
+        broker_cash = self._broker_account_decimal("available_cash", "cash")
+        broker_market_value = self._broker_account_decimal("market_value")
+        broker_fetch_balance = self._broker_account_decimal("fetch_balance")
+        nautilus_equity = self._nautilus_portfolio_equity()
+        nautilus_free_cash = self._nautilus_free_cash()
+        selected_portfolio_value = self._portfolio_value()
+        selected_free_cash = self._free_cash()
+        if broker_total_asset is not None and broker_total_asset > 0:
+            value_source = "account_state_info.total_asset"
+        elif nautilus_equity is not None:
+            value_source = "portfolio.equity"
+        else:
+            value_source = "config.initial_cash"
+        cash_source = (
+            "account_state_info.cash"
+            if broker_cash is not None
+            else "portfolio.account.balance_free"
+        )
+        snapshot = (
+            f"value_source={value_source} selected_portfolio_value={selected_portfolio_value} "
+            f"nautilus_portfolio_equity={nautilus_equity} "
+            f"broker_total_asset={broker_total_asset} broker_market_value={broker_market_value} "
+            f"cash_source={cash_source} selected_free_cash={selected_free_cash} "
+            f"nautilus_free_cash={nautilus_free_cash} broker_cash={broker_cash} "
+            f"broker_fetch_balance={broker_fetch_balance}"
+        )
+        if snapshot == getattr(self, "_last_account_sizing_snapshot", None):
+            return
+        self._last_account_sizing_snapshot = snapshot
+        self.log.info(
+            f"Account sizing snapshot trigger={trigger}: {snapshot}",
+            color=LogColor.BLUE,
+        )
+
+    def _broker_account_decimal(self, *keys: str) -> Decimal | None:
+        for account in self._broker_accounts():
+            info = self._account_info(account)
+            for key in keys:
+                value = info.get(key)
+                if value is None:
+                    continue
+                try:
+                    result = Decimal(str(value))
+                except Exception:
+                    continue
+                if result >= 0:
+                    return result
+        return None
+
+    def _broker_accounts(self) -> list[Any]:
+        accounts: list[Any] = []
+        cache_accounts = getattr(getattr(self, "cache", None), "accounts", None)
+        if cache_accounts is not None:
+            try:
+                accounts.extend(cache_accounts() or [])
+            except Exception:
+                pass
+        venue = self._instrument_ids[0].venue if self._instrument_ids else None
+        try:
+            account = (
+                self.portfolio.account(venue=Venue(str(venue)))
+                if venue is not None
+                else self.portfolio.account()
+            )
+        except Exception:
+            account = None
+        if account is not None:
+            accounts.append(account)
+
+        unique: list[Any] = []
+        seen: set[int] = set()
+        for account in accounts:
+            marker = id(account)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique.append(account)
+        return unique
+
+    @staticmethod
+    def _account_info(account: Any) -> dict[str, Any]:
+        try:
+            event = account.last_event
+        except Exception:
+            return {}
+        info = getattr(event, "info", None) if event is not None else None
+        return info if isinstance(info, dict) else {}
 
     def _current_quantity(self, instrument_id: InstrumentId) -> Decimal:
         try:

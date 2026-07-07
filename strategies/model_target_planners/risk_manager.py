@@ -74,6 +74,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
                     "stock_code": candidate.stock_code,
                     "score": candidate.score,
                     "is_tradable": True,
+                    "expected_return": 0.02,
                 }
                 for candidate in request.candidates
             ],

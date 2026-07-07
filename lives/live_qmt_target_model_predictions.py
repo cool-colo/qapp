@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 from datetime import timedelta
@@ -377,18 +376,17 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             timeout_secs=config_node.timeout_reconciliation,
         )
 
-    async def _fetch_full_tick() -> dict[str, dict[str, float]]:
+    def _fetch_full_tick() -> dict[str, dict[str, float]]:
         # Today's authoritative full-tick snapshot per instrument from the QMT
         # proxy. Nautilus has no full-tick type, so this reaches the proxy directly
-        # (infrastructure plumbing). Offloaded to a thread so the sync HTTP call
-        # never blocks the trading event loop. Covers the full configured universe
-        # (not just held positions) so new buy targets are priced from the real
-        # open, plus any active positions that dropped out of the universe.
+        # (infrastructure plumbing). Covers the full configured universe (not just
+        # held positions) so new buy targets are priced from the real open, plus
+        # any active positions that dropped out of the universe.
         stock_codes = set(strategy._stock_by_instrument.values())
         stock_codes.update(strategy._active_stock_codes())
         if not stock_codes:
             return {}
-        return await asyncio.to_thread(loader.full_tick_snapshot, sorted(stock_codes))
+        return loader.full_tick_snapshot(sorted(stock_codes))
 
     strategy.configure_full_tick_source(fetch_full_tick=_fetch_full_tick)
     node.trader.add_strategy(strategy)
