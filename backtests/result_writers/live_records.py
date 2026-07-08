@@ -91,12 +91,15 @@ class LiveTargetRecord:
     stock_code: str
     signal_date: date | None = None
     asset_snapshot_id: int | None = None
+    position_snapshot_id: int | None = None
     total_asset: Decimal | None = None
+    investable_asset: Decimal | None = None
     request_id: str | None = None
     target_version: str | None = None
     status: str = "ok"
     target_weight: Decimal | None = None
     open_price: Decimal | None = None
+    price_source: str | None = None
     target_qty: int | None = None
     score: Decimal | None = None
     reason: str | None = None

@@ -54,12 +54,15 @@ class ModelTargetPlannerTest(unittest.TestCase):
             signal_date=date(2026, 7, 1),
             active_instrument_ids=["000001.SZ.QMT", "000002.SZ.QMT"],
             candidates=[
-                ModelTargetCandidate("000001.SZ.QMT", "000001.SZ", 0.12),
-                ModelTargetCandidate("000002.SZ.QMT", "000002.SZ", 0.08),
+                ModelTargetCandidate("000001.SZ.QMT", "000001.SZ", 0.12, open_price=10.0),
+                ModelTargetCandidate("000002.SZ.QMT", "000002.SZ", 0.08, open_price=20.0),
             ],
             current_weights={"000001.SZ": 0.10, "000002.SZ": 0.20},
             target_cash_buffer_percent=0.05,
             max_position_percent=0.03,
+            total_asset=1_000_000.0,
+            investable_asset=950_000.0,
+            open_prices={"000001.SZ.QMT": 10.0, "000002.SZ.QMT": 20.0},
         )
         captured = {}
 
@@ -74,10 +77,10 @@ class ModelTargetPlannerTest(unittest.TestCase):
                     "risk_model_id": "cn_a_mean_variance",
                     "asof_date": "2026-07-01",
                     "target_weights": [
-                        {"stock_code": "000002.SZ", "target_weight": 0.40},
-                        {"stock_code": "000001.SZ", "target_weight": 0.30},
-                        {"stock_code": "999999.SZ", "target_weight": 0.20},
-                        {"stock_code": "000003.SZ", "target_weight": 0.0},
+                        {"stock_code": "000002.SZ", "target_weight": 0.40, "target_quantity": 19000},
+                        {"stock_code": "000001.SZ", "target_weight": 0.30, "target_quantity": 28500},
+                        {"stock_code": "999999.SZ", "target_weight": 0.20, "target_quantity": 100},
+                        {"stock_code": "000003.SZ", "target_weight": 0.0, "target_quantity": 0},
                     ],
                 },
             )
@@ -97,11 +100,13 @@ class ModelTargetPlannerTest(unittest.TestCase):
         self.assertEqual(captured["payload"]["risk_model_id"], "cn_a_mean_variance")
         self.assertEqual(captured["payload"]["asof_date"], "2026-07-01")
         self.assertEqual(captured["payload"]["trade_date"], "2026-07-02")
+        # Investable total (net of buffer) is sent so the service sizes share counts.
+        self.assertAlmostEqual(captured["payload"]["total_asset"], 950_000.0)
         self.assertEqual(
             captured["payload"]["candidates"],
             [
-                {"stock_code": "000001.SZ", "score": 0.12, "is_tradable": True},
-                {"stock_code": "000002.SZ", "score": 0.08, "is_tradable": True},
+                {"stock_code": "000001.SZ", "score": 0.12, "is_tradable": True, "expected_return": 0.02, "price": 10.0},
+                {"stock_code": "000002.SZ", "score": 0.08, "is_tradable": True, "expected_return": 0.02, "price": 20.0},
             ],
         )
         self.assertEqual(
@@ -113,6 +118,8 @@ class ModelTargetPlannerTest(unittest.TestCase):
         )
         self.assertAlmostEqual(captured["payload"]["previous_position_total"], 0.30)
         self.assertEqual(plan.reason, "risk_manager_optimize")
+        # Weights map to instrument ids for the two known candidates; the unknown
+        # 999999.SZ is dropped.
         self.assertEqual(
             plan.weights,
             {
@@ -120,6 +127,61 @@ class ModelTargetPlannerTest(unittest.TestCase):
                 "000002.SZ.QMT": 0.40,
             },
         )
+        # Service-provided share counts flow through verbatim, including the 0
+        # (liquidation) target — which is kept, not dropped.
+        self.assertEqual(
+            plan.target_qty,
+            {
+                "000001.SZ.QMT": 28500,
+                "000002.SZ.QMT": 19000,
+            },
+        )
+
+    def test_risk_manager_planner_synthesizes_weight_for_quantity_only_row(self) -> None:
+        request = ModelTargetPlanningRequest(
+            trading_date=date(2026, 7, 2),
+            signal_date=date(2026, 7, 1),
+            active_instrument_ids=["000001.SZ.QMT", "000003.SZ.QMT"],
+            candidates=[
+                ModelTargetCandidate("000001.SZ.QMT", "000001.SZ", 0.12, open_price=10.0),
+                ModelTargetCandidate("000003.SZ.QMT", "000003.SZ", 0.05, open_price=25.0),
+            ],
+            current_weights={},
+            target_cash_buffer_percent=0.05,
+            max_position_percent=0.03,
+            total_asset=1_000_000.0,
+            investable_asset=1_000_000.0,
+            open_prices={"000001.SZ.QMT": 10.0, "000003.SZ.QMT": 25.0},
+        )
+
+        def fake_urlopen(http_request, timeout):
+            return FakeResponse(
+                {
+                    "success": True,
+                    "status": "ok",
+                    "risk_model_id": "cn_a_mean_variance",
+                    "asof_date": "2026-07-01",
+                    "target_weights": [
+                        # Weighted row.
+                        {"stock_code": "000001.SZ", "target_weight": 0.30, "target_quantity": 30000},
+                        # Quantity-only row (no weight): weight synthesized from qty*price/basis.
+                        {"stock_code": "000003.SZ", "target_quantity": 4000},
+                    ],
+                },
+            )
+
+        planner = RiskManagerModelTargetPlanner(
+            base_url="http://risk-manager.local",
+            risk_model_id="cn_a_mean_variance",
+            mode="live",
+        )
+        with patch("strategies.model_target_planners.risk_manager.urlopen", side_effect=fake_urlopen):
+            plan = planner.plan(request)
+
+        self.assertEqual(plan.target_qty, {"000001.SZ.QMT": 30000, "000003.SZ.QMT": 4000})
+        self.assertAlmostEqual(plan.weights["000001.SZ.QMT"], 0.30)
+        # 4000 * 25 / 1_000_000 = 0.10
+        self.assertAlmostEqual(plan.weights["000003.SZ.QMT"], 0.10)
 
     def test_risk_manager_planner_raises_on_service_failure(self) -> None:
         request = ModelTargetPlanningRequest(

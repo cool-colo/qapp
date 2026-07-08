@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -172,6 +173,19 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
 
     def _process_trading_day(self, trading_date: date) -> None:
         plan = self.compute_daily_target_plan(trading_date)
+        if plan.target_qty:
+            # The planner (risk-manager) committed explicit share counts: pin them so
+            # the day trades fixed quantities against a frozen total asset instead of
+            # re-sizing from live equity, matching the snapshot recorder's frozen path.
+            self.apply_frozen_targets(
+                target_date=trading_date,
+                weights=plan.weights,
+                target_qty=plan.target_qty,
+                total_asset=plan.investable_asset,
+                reason=plan.reason,
+                version=self._plan_version(plan),
+            )
+            return
         self.update_target_weights(
             weights=plan.weights,
             target_date=trading_date,
@@ -407,14 +421,40 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
     def _target_plan(self, trading_date: date, signal_date: date | None) -> ModelTargetPlan:
         request = self._target_planning_request(trading_date, signal_date)
         try:
-            return self._target_weight_planner.plan(request)
+            plan = self._target_weight_planner.plan(request)
         except Exception as exc:
             policy = str(self.config.target_weight_planner_error_policy or "raise").strip().lower()
             if policy == "equal_weight":
                 self.log.warning(f"target weight planner failed, falling back to equal weight: {exc}")
-                return self._equal_weight_target_planner.plan(request)
-            self.log.warning(f"target weight planner failed: {exc}")
-            raise
+                plan = self._equal_weight_target_planner.plan(request)
+            else:
+                self.log.warning(f"target weight planner failed: {exc}")
+                raise
+        return self._annotate_plan(plan, request)
+
+    def _annotate_plan(
+        self,
+        plan: ModelTargetPlan,
+        request: ModelTargetPlanningRequest,
+    ) -> ModelTargetPlan:
+        """
+        Stamp the sizing-input audit fields onto the plan so the bar path and the
+        snapshot recorder persist consistent open prices, price sources, and asset
+        figures without recomputing them. Planners stay unaware of price provenance.
+        """
+        price_sources = {
+            instrument_id: source
+            for instrument_id in request.open_prices
+            for _price, source in (self._open_price_with_source(instrument_id),)
+            if source is not None
+        }
+        return dataclasses.replace(
+            plan,
+            open_prices=dict(request.open_prices),
+            price_sources=price_sources,
+            total_asset=request.total_asset,
+            investable_asset=request.investable_asset,
+        )
 
     def _target_planning_request(
         self,
@@ -422,6 +462,7 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
         signal_date: date | None,
     ) -> ModelTargetPlanningRequest:
         active_ids = sorted(self._active_positions)
+        open_prices: dict[str, float] = {}
         candidates = []
         for instrument_id in active_ids:
             stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
@@ -432,13 +473,19 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
                 score = float(state.get("score", 0.0))
             except (TypeError, ValueError):
                 score = 0.0
+            price, _source = self._open_price_with_source(instrument_id)
+            if price is not None:
+                open_prices[instrument_id] = price
             candidates.append(
                 ModelTargetCandidate(
                     instrument_id=instrument_id,
                     stock_code=stock_code,
                     score=score,
+                    open_price=price,
                 ),
             )
+        total_asset = float(self._portfolio_value())
+        investable_asset = float(self.investable_total_asset())
         return ModelTargetPlanningRequest(
             trading_date=trading_date,
             signal_date=signal_date,
@@ -447,7 +494,28 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
             current_weights=self._current_weights_by_stock(),
             target_cash_buffer_percent=float(self.config.target_cash_buffer_percent),
             max_position_percent=float(self.config.max_position_percent),
+            total_asset=total_asset,
+            investable_asset=investable_asset,
+            open_prices=open_prices,
         )
+
+    def _open_price_with_source(self, instrument_id_text: str) -> tuple[float | None, str | None]:
+        """
+        Resolve the sizing price for an instrument and where it came from.
+
+        Prefer today's open (``_today_open``); fall back to the previous close
+        (``_last_close``). The source is recorded so the persisted target rows show
+        when a prev-close fallback (an abnormal case) was used.
+        """
+        opens = getattr(self, "_today_open", None)
+        if isinstance(opens, dict):
+            open_price = opens.get(instrument_id_text)
+            if open_price is not None and open_price > 0:
+                return float(open_price), "open"
+        close_price = self._last_close.get(instrument_id_text)
+        if close_price is not None and close_price > 0:
+            return float(close_price), "prev_close"
+        return None, None
 
     def _current_weights_by_stock(self) -> dict[str, float]:
         instrument_ids = set(self._active_positions)

@@ -320,21 +320,25 @@ class SnapshotRecorder(Actor):
         except Exception as exc:
             self.log.warning(f"daily target plan computation failed: {exc}")
             return
-        total_asset = self._frozen_total_asset()
-        open_prices = self._current_open_prices()
-        try:
-            target_qty = self._strategy.compute_target_quantities(
-                weights=plan.weights,
-                total_asset=total_asset,
-                open_prices=open_prices,
-            )
-        except Exception as exc:
-            self.log.warning(f"frozen target quantity computation failed: {exc}")
-            return
+        # Raw total asset and the buffer-adjusted investable basis both come from the
+        # plan (stamped by the strategy when it built the request) so the persisted
+        # figures match exactly what was sent to the risk manager.
+        total_asset = self._plan_total_asset(plan)
+        investable_asset = self._plan_investable_asset(plan, total_asset)
+        open_prices = dict(plan.open_prices) if plan.open_prices else self._current_open_prices()
+        price_sources = dict(plan.price_sources)
+        # Prefer the risk-manager's committed share counts (固定目标股数, 0 kept). Only
+        # fall back to local sizing when the planner returned none (e.g. equal-weight).
+        target_qty = self._plan_target_quantities(plan, total_asset, open_prices)
         version = self._strategy.plan_version(plan)
         plan_signal_date = plan.signal_date or signal_date
+        position_id = self._position_snapshot_anchor(trading_date)
+        # Persist a row per committed target (union of weighted + quantity-bearing
+        # instruments) so qty==0 liquidation targets are recorded, not dropped.
+        instrument_ids = sorted(set(plan.weights) | set(target_qty))
         records: list[LiveTargetRecord] = []
-        for instrument_id_text, weight in sorted(plan.weights.items()):
+        for instrument_id_text in instrument_ids:
+            weight = plan.weights.get(instrument_id_text)
             qty = target_qty.get(instrument_id_text)
             records.append(
                 LiveTargetRecord(
@@ -345,13 +349,16 @@ class SnapshotRecorder(Actor):
                     trader_id=self.config.trader_id,
                     signal_date=plan_signal_date,
                     asset_snapshot_id=asset_id,
-                    total_asset=Decimal(str(total_asset)),
+                    position_snapshot_id=position_id,
+                    total_asset=self._decimal_or_none(total_asset),
+                    investable_asset=self._decimal_or_none(investable_asset),
                     request_id=plan.request_id,
                     target_version=version,
                     instrument_id=instrument_id_text,
                     stock_code=self._stock_code(instrument_id_text),
-                    target_weight=Decimal(str(weight)),
+                    target_weight=None if weight is None else Decimal(str(weight)),
                     open_price=self._decimal_or_none(open_prices.get(instrument_id_text)),
+                    price_source=price_sources.get(instrument_id_text),
                     target_qty=self._int_or_none(qty),
                     score=self._instrument_score(instrument_id_text),
                     reason=plan.reason,
@@ -364,17 +371,73 @@ class SnapshotRecorder(Actor):
                 self._writer.write_target_portfolios(records)
             except Exception as exc:
                 self.log.warning(f"target portfolio write failed: {exc}")
-        self._apply_frozen(trading_date, plan.weights, target_qty, total_asset, plan.reason, version)
+        self._apply_frozen(trading_date, plan.weights, target_qty, investable_asset, plan.reason, version)
         self.log.info(
             f"generated & persisted daily target: date={trading_date} signal_date={plan_signal_date} "
-            f"weights={len(plan.weights)} frozen_qty={len(target_qty)} total_asset={total_asset}",
+            f"weights={len(plan.weights)} frozen_qty={len(target_qty)} "
+            f"total_asset={total_asset} investable_asset={investable_asset}",
             color=LogColor.GREEN,
         )
+
+    def _plan_target_quantities(
+        self,
+        plan: Any,
+        total_asset: Any,
+        open_prices: dict[str, float],
+    ) -> dict[str, Any]:
+        plan_qty = getattr(plan, "target_qty", None)
+        if isinstance(plan_qty, dict) and plan_qty:
+            # Keep every entry, including committed 0 (liquidate) targets.
+            return {str(instrument_id): qty for instrument_id, qty in plan_qty.items()}
+        try:
+            return self._strategy.compute_target_quantities(
+                weights=plan.weights,
+                total_asset=total_asset,
+                open_prices=open_prices,
+            )
+        except Exception as exc:
+            self.log.warning(f"frozen target quantity computation failed: {exc}")
+            return {}
+
+    def _plan_total_asset(self, plan: Any) -> Decimal:
+        value = getattr(plan, "total_asset", None)
+        coerced = self._decimal_or_none(value)
+        if coerced is not None and coerced > 0:
+            return coerced
+        return self._frozen_total_asset()
+
+    def _plan_investable_asset(self, plan: Any, total_asset: Decimal) -> Decimal:
+        value = getattr(plan, "investable_asset", None)
+        coerced = self._decimal_or_none(value)
+        if coerced is not None and coerced > 0:
+            return coerced
+        # No stamped basis (equal-weight fallback): the frozen path already leaves room
+        # for the buffer, so pin sizing on the raw total.
+        return total_asset
+
+    def _position_snapshot_anchor(self, trading_date: date) -> int | None:
+        try:
+            return self._writer.latest_position_snapshot_id(
+                self.config.account_id,
+                self.config.trader_id,
+                trading_date,
+                self._prev_trading_date(trading_date),
+            )
+        except Exception as exc:
+            self.log.warning(f"position snapshot anchor lookup failed: {exc}")
+            return None
+
+    def _prev_trading_date(self, trading_date: date) -> date | None:
+        dates = getattr(self._strategy, "_trading_dates", None)
+        if not isinstance(dates, list):
+            return None
+        prev = [value for value in dates if value < trading_date]
+        return max(prev) if prev else None
 
     def _apply_loaded_target(self, trading_date: date, rows: list[dict[str, Any]]) -> None:
         weights: dict[str, float] = {}
         target_qty: dict[str, int] = {}
-        total_asset: Decimal | None = None
+        frozen_asset: Decimal | None = None  # sizing basis (prefer investable_asset)
         version: str | None = None
         reason = "loaded_target"
         for row in rows:
@@ -385,18 +448,23 @@ class SnapshotRecorder(Actor):
                 weights[instrument_id_text] = float(weight)
             if qty is not None:
                 target_qty[instrument_id_text] = int(qty)
-            if total_asset is None and row.get("total_asset") is not None:
-                total_asset = Decimal(str(row.get("total_asset")))
+                # A committed quantity (including 0) still needs a weight entry so the
+                # convergence loop visits the instrument; default 0 for qty-only rows.
+                weights.setdefault(instrument_id_text, 0.0)
+            if frozen_asset is None:
+                frozen_asset = self._decimal_or_none(
+                    row.get("investable_asset") or row.get("total_asset"),
+                )
             if version is None and row.get("target_version"):
                 version = str(row.get("target_version"))
             if row.get("reason"):
                 reason = str(row.get("reason"))
         if not weights:
             return
-        self._apply_frozen(trading_date, weights, target_qty, total_asset, reason, version)
+        self._apply_frozen(trading_date, weights, target_qty, frozen_asset, reason, version)
         self.log.info(
             f"loaded persisted daily target: date={trading_date} weights={len(weights)} "
-            f"frozen_qty={len(target_qty)} total_asset={total_asset} version={version}",
+            f"frozen_qty={len(target_qty)} frozen_asset={frozen_asset} version={version}",
             color=LogColor.GREEN,
         )
 
@@ -648,7 +716,31 @@ class SnapshotRecorder(Actor):
         total = self._info_decimal(info, "total_asset")
         if total is not None and total > 0:
             return total
+        # Restart tail case: neither the strategy nor the broker exposes a live total.
+        # Fall back to a persisted snapshot by input priority (today before_trading →
+        # today continuous_trading → previous after_trading).
+        snapshot_total = self._snapshot_total_asset_fallback()
+        if snapshot_total is not None and snapshot_total > 0:
+            return snapshot_total
         return Decimal(str(getattr(self._strategy.config, "initial_cash", "1000000")))
+
+    def _snapshot_total_asset_fallback(self) -> Decimal | None:
+        try:
+            trading_date = self._now().date()
+        except Exception:
+            return None
+        try:
+            value = self._writer.latest_asset_snapshot_value(
+                self.config.account_id,
+                self.config.trader_id,
+                trading_date,
+                self._prev_trading_date(trading_date),
+                column="total_asset",
+            )
+        except Exception as exc:
+            self.log.warning(f"snapshot total-asset fallback lookup failed: {exc}")
+            return None
+        return self._decimal_or_none(value)
 
     def _current_open_prices(self) -> dict[str, float]:
         opens = getattr(self._strategy, "_today_open", None)

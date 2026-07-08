@@ -1834,6 +1834,18 @@ class TargetWeightStrategy(Strategy):
             return False
         return symbol.lstrip().startswith("688")
 
+    def investable_total_asset(self) -> Decimal:
+        """
+        Pre-market investable total: current total asset net of the trading cash
+        buffer. This is the sizing basis handed to the target planner (so the
+        server-side share counts leave room for the buffer) and the value persisted as
+        ``investable_asset`` alongside the raw ``total_asset``.
+        """
+        total = self._portfolio_value()
+        buffer_pct = Decimal(str(self.config.target_cash_buffer_percent))
+        investable = total * (Decimal("1") - buffer_pct)
+        return investable if investable > 0 else Decimal("0")
+
     def _portfolio_value(self) -> Decimal:
         # A frozen total asset (set alongside 固定目标股数) pins the day's sizing
         # denominator so weight/cash checks stay consistent with the committed target

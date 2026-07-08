@@ -312,6 +312,11 @@ class TestableTargetWeightStrategy:
     _target_side = TargetWeightStrategy._target_side
     _stop_time_reached = TargetWeightStrategy._stop_time_reached
     _within_trading_window = TargetWeightStrategy._within_trading_window
+    _within_trading_time = TargetWeightStrategy._within_trading_time
+    _note_quote_tick = TargetWeightStrategy._note_quote_tick
+    on_quote_tick = TargetWeightStrategy.on_quote_tick
+    _quantity_from_value = TargetWeightStrategy._quantity_from_value
+    investable_total_asset = TargetWeightStrategy.investable_total_asset
     _clock_date = TargetWeightStrategy._clock_date
     _record_target = TargetWeightStrategy._record_target
     _record_order = TargetWeightStrategy._record_order
@@ -461,6 +466,14 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy._cancel_count_buy = {}
         strategy._cancel_count_sell = {}
         strategy._pricing_date = None
+        # Mark the trading window as already unlocked by a live quote tick (the runtime
+        # state during a trading session). The window gate now requires a tick when
+        # subscribe_quote_ticks is on; these tests exercise convergence, not the gate.
+        strategy._quote_tick_window_date = pd.Timestamp(
+            strategy.clock.utc_now(),
+        ).tz_convert(strategy.config.timezone_name).date()
+        strategy._frozen_target_qty = {}
+        strategy._frozen_portfolio_value = None
         strategy._convergence_suspended = False
         strategy._pre_open_reconcile = None
         strategy._pre_open_reconcile_time = None

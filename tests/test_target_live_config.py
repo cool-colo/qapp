@@ -221,19 +221,22 @@ class TargetLiveConfigTest(unittest.TestCase):
             side_effect=[
                 [],
                 [(
-                    "000001.SZ.QMT",
-                    "000001.SZ",
-                    signal_date,
-                    9,
-                    1000,
-                    "req-1",
-                    "ver-1",
-                    0.1,
-                    10.0,
-                    1000,
-                    1.2,
-                    "loaded_target",
-                    CONTINUOUS_TRADING,
+                    "000001.SZ.QMT",  # instrument_id
+                    "000001.SZ",      # stock_code
+                    signal_date,      # signal_date
+                    9,                # asset_snapshot_id
+                    7,                # position_snapshot_id
+                    1000,             # total_asset
+                    950,              # investable_asset
+                    "req-1",          # request_id
+                    "ver-1",          # target_version
+                    0.1,              # target_weight
+                    10.0,             # open_price
+                    "open",           # price_source
+                    1000,             # target_qty
+                    1.2,              # score
+                    "loaded_target",  # reason
+                    CONTINUOUS_TRADING,  # snapshot_type
                 )],
             ],
         )

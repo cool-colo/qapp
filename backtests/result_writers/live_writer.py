@@ -9,6 +9,7 @@ from typing import Iterable
 from typing import Mapping
 from typing import Sequence
 
+from backtests.result_writers.live_records import AFTER_TRADING
 from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveAssetSnapshotRecord
@@ -110,7 +111,9 @@ CREATE TABLE IF NOT EXISTS `live_target_portfolio` (
   `trader_id`     VARCHAR(64)  NOT NULL,
   `signal_date`   DATE         NULL,
   `asset_snapshot_id` BIGINT   NULL,
+  `position_snapshot_id` BIGINT NULL,
   `total_asset`   DECIMAL(20,4) NULL,
+  `investable_asset` DECIMAL(20,4) NULL,
   `request_id`    VARCHAR(128) NULL,
   `target_version` VARCHAR(128) NULL,
   `status`        VARCHAR(24)  NOT NULL DEFAULT 'ok',
@@ -118,6 +121,7 @@ CREATE TABLE IF NOT EXISTS `live_target_portfolio` (
   `stock_code`    VARCHAR(16)  NOT NULL,
   `target_weight` DECIMAL(12,8) NULL,
   `open_price`    DECIMAL(20,4) NULL,
+  `price_source`  VARCHAR(16)  NULL,
   `target_qty`    BIGINT       NULL,
   `score`         DECIMAL(20,8) NULL,
   `reason`        VARCHAR(64)  NULL,
@@ -229,6 +233,37 @@ class LiveSnapshotWriter:
     def create_tables(self) -> None:
         for statement in CREATE_TABLES_SQL:
             self._execute(statement, ())
+        self._ensure_target_columns()
+
+    def _ensure_target_columns(self) -> None:
+        """
+        Add columns introduced after the table was first created. ``CREATE TABLE IF NOT
+        EXISTS`` never alters an existing table, so older deployments miss the newer
+        target columns; add them idempotently. Failures only warn (best-effort).
+        """
+        additions = {
+            "position_snapshot_id": "BIGINT NULL",
+            "investable_asset": "DECIMAL(20,4) NULL",
+            "price_source": "VARCHAR(16) NULL",
+        }
+        try:
+            existing = {
+                str(row[0])
+                for row in self._query("SHOW COLUMNS FROM `live_target_portfolio`", ())
+            }
+        except Exception:
+            return
+        for column, ddl in additions.items():
+            if column in existing:
+                continue
+            try:
+                self._execute(
+                    f"ALTER TABLE `live_target_portfolio` ADD COLUMN `{column}` {ddl}",
+                    (),
+                )
+            except Exception:
+                # Concurrent add or insufficient privilege — leave as-is.
+                pass
 
     # ---- writes --------------------------------------------------------------
 
@@ -378,11 +413,14 @@ class LiveSnapshotWriter:
             "stock_code",
             "signal_date",
             "asset_snapshot_id",
+            "position_snapshot_id",
             "total_asset",
+            "investable_asset",
             "request_id",
             "target_version",
             "target_weight",
             "open_price",
+            "price_source",
             "target_qty",
             "score",
             "reason",
@@ -403,6 +441,73 @@ class LiveSnapshotWriter:
             if rows:
                 return [dict(zip(columns, row)) for row in rows]
         return []
+
+    def latest_asset_snapshot_value(
+        self,
+        account_id: str,
+        trader_id: str,
+        trade_date: date,
+        prev_trade_date: date | None = None,
+        column: str = "total_asset",
+    ) -> Any:
+        """
+        Resolve a persisted asset value by input priority: today's before_trading →
+        today's continuous_trading → the previous trading day's after_trading. Returns
+        None when no snapshot exists at any tier.
+        """
+        column_sql = self._quote_identifier(column)
+        for account, trader, day, snapshot_type in self._input_snapshot_tiers(
+            account_id, trader_id, trade_date, prev_trade_date,
+        ):
+            rows = self._query(
+                f"SELECT {column_sql} FROM `live_asset_snapshot` "
+                "WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s AND `snapshot_type`=%s "
+                f"AND {column_sql} IS NOT NULL LIMIT 1",
+                (account, trader, day, snapshot_type),
+            )
+            if rows and rows[0][0] is not None:
+                return rows[0][0]
+        return None
+
+    def latest_position_snapshot_id(
+        self,
+        account_id: str,
+        trader_id: str,
+        trade_date: date,
+        prev_trade_date: date | None = None,
+    ) -> int | None:
+        """
+        Resolve a position-snapshot batch anchor id by the same input priority as
+        ``latest_asset_snapshot_value``. The table stores one row per instrument with no
+        batch column, so the smallest id for the winning (date, snapshot_type) group is
+        returned as the anchor linking a target back to the positions it was built from.
+        """
+        for account, trader, day, snapshot_type in self._input_snapshot_tiers(
+            account_id, trader_id, trade_date, prev_trade_date,
+        ):
+            rows = self._query(
+                "SELECT MIN(`id`) FROM `live_position_snapshot` "
+                "WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s AND `snapshot_type`=%s",
+                (account, trader, day, snapshot_type),
+            )
+            if rows and rows[0][0] is not None:
+                return int(rows[0][0])
+        return None
+
+    @staticmethod
+    def _input_snapshot_tiers(
+        account_id: str,
+        trader_id: str,
+        trade_date: date,
+        prev_trade_date: date | None,
+    ) -> list[tuple[str, str, date, str]]:
+        tiers = [
+            (account_id, trader_id, trade_date, BEFORE_TRADING),
+            (account_id, trader_id, trade_date, CONTINUOUS_TRADING),
+        ]
+        if prev_trade_date is not None:
+            tiers.append((account_id, trader_id, prev_trade_date, AFTER_TRADING))
+        return tiers
 
     @staticmethod
     def _snapshot_type_candidates(snapshot_type: str, fallback_to_continuous: bool) -> tuple[str, ...]:
@@ -477,7 +582,9 @@ class LiveSnapshotWriter:
             "trader_id": record.trader_id,
             "signal_date": record.signal_date,
             "asset_snapshot_id": record.asset_snapshot_id,
+            "position_snapshot_id": record.position_snapshot_id,
             "total_asset": record.total_asset,
+            "investable_asset": record.investable_asset,
             "request_id": record.request_id,
             "target_version": record.target_version,
             "status": record.status,
@@ -485,6 +592,7 @@ class LiveSnapshotWriter:
             "stock_code": record.stock_code,
             "target_weight": record.target_weight,
             "open_price": record.open_price,
+            "price_source": record.price_source,
             "target_qty": record.target_qty,
             "score": record.score,
             "reason": record.reason,
