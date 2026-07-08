@@ -176,7 +176,30 @@ def parse_args():
         args.pre_open_reconcile_time = normalize_refresh_time(args.pre_open_reconcile_time)
     except ValueError as exc:
         raise SystemExit(f"invalid configured HH:MM time: {exc}") from exc
+    _apply_snapshot_args(args)
     return args
+
+
+def _apply_snapshot_args(args: Any) -> None:
+    """
+    Attach daily-snapshot / MySQL settings to args from the environment.
+
+    These are target-model-specific and not defined by the shared
+    ``live_common.parse_args()``, so — like ``--pre-open-reconcile-time`` — they are
+    resolved here rather than added to the shared parser. Snapshots are opt-in via
+    ``MODEL_SNAPSHOTS_ENABLED``; when disabled no MySQL connection is made.
+    """
+    env = os.environ.get
+    args.snapshots_enabled = str(env("MODEL_SNAPSHOTS_ENABLED", "") or "").lower() in {
+        "1", "true", "yes", "on",
+    }
+    args.snapshot_before_time = env("MODEL_SNAPSHOT_BEFORE_TIME", "09:27")
+    args.snapshot_after_time = env("MODEL_SNAPSHOT_AFTER_TIME", "15:40")
+    args.mysql_host = env("MYSQL_HOST", "127.0.0.1")
+    args.mysql_port = int(env("MYSQL_PORT", "3306"))
+    args.mysql_user = env("MYSQL_USER", "root")
+    args.mysql_password = env("MYSQL_PASSWORD", "")
+    args.mysql_database = env("MYSQL_DATABASE", "")
 
 
 def _extract_pre_open_reconcile_time_arg(argv: list[str]) -> tuple[list[str], str | object]:
@@ -215,6 +238,57 @@ def normalize_refresh_time(value: str | None) -> str | None:
     if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
         raise ValueError("time must be within 00:00:00 and 23:59:59")
     return f"{hour:02d}:{minute:02d}"
+
+
+def _maybe_add_snapshot_recorder(
+    args: Any,
+    node: Any,
+    strategy: Any,
+    fetch_full_tick: Any,
+) -> None:
+    """
+    Build the MySQL-backed daily-snapshot recorder actor and add it to the node when
+    snapshots are enabled. No-op (and no MySQL connection) when disabled, so the node
+    runs without pymysql installed.
+    """
+    if not getattr(args, "snapshots_enabled", False):
+        return
+    from backtests.result_writers.live_writer import LiveSnapshotWriter
+    from lives.snapshot_recorder import SnapshotRecorder
+    from lives.snapshot_recorder import SnapshotRecorderConfig
+
+    try:
+        writer = LiveSnapshotWriter.from_pymysql_kwargs(
+            host=args.mysql_host,
+            port=int(args.mysql_port),
+            user=args.mysql_user,
+            password=args.mysql_password,
+            database=args.mysql_database,
+            charset="utf8mb4",
+            autocommit=False,
+        )
+    except Exception as exc:
+        print(f"[snapshot] MySQL writer init failed, snapshots disabled: {exc}", flush=True)
+        return
+    recorder = SnapshotRecorder(
+        config=SnapshotRecorderConfig(
+            account_id=str(args.account_id),
+            trader_id=str(args.trader_id),
+            timezone_name=args.exchange_timezone,
+            before_time=args.snapshot_before_time,
+            after_time=args.snapshot_after_time,
+            trading_windows=args.trading_windows,
+        ),
+        writer=writer,
+        strategy_ref=strategy,
+        fetch_full_tick=fetch_full_tick,
+    )
+    node.trader.add_actor(recorder)
+    print(
+        f"[snapshot] recorder enabled: account={args.account_id} "
+        f"before={args.snapshot_before_time} after={args.snapshot_after_time}",
+        flush=True,
+    )
 
 
 def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
@@ -390,6 +464,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
 
     strategy.configure_full_tick_source(fetch_full_tick=_fetch_full_tick)
     node.trader.add_strategy(strategy)
+    _maybe_add_snapshot_recorder(args, node, strategy, _fetch_full_tick)
     if args.metrics_port and int(args.metrics_port) > 0:
         exporter = PrometheusExporter(
             config=PrometheusExporterConfig(

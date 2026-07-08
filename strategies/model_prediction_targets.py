@@ -171,6 +171,25 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
         return True
 
     def _process_trading_day(self, trading_date: date) -> None:
+        plan = self.compute_daily_target_plan(trading_date)
+        self.update_target_weights(
+            weights=plan.weights,
+            target_date=trading_date,
+            reason=plan.reason,
+            version=self._plan_version(plan),
+        )
+
+    def compute_daily_target_plan(self, trading_date: date) -> ModelTargetPlan:
+        """
+        Run the daily selection pipeline (seed positions → exits → entries → trim →
+        target planner) and return the resulting plan **without submitting orders or
+        accepting the target weights**.
+
+        The bar/timer path (_process_trading_day) uses this and then applies the plan
+        via update_target_weights. The snapshot recorder uses it before-trading to
+        derive the day's frozen share counts, persist them, and then feed them back via
+        apply_frozen_targets. Both paths therefore run the same selection logic.
+        """
         self._seed_active_positions_from_portfolio(trading_date)
         signal_date = self._resolve_signal_date(trading_date)
         today_signals = self._signals_by_date.get(signal_date, []) if signal_date else []
@@ -194,13 +213,11 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
         self._prepare_model_exits(trading_date, signal_date, target_ids, rebalance_today)
         self._prepare_model_entries(trading_date, today_signals)
         self._trim_active_positions()
-        plan = self._target_plan(trading_date, signal_date)
-        self.update_target_weights(
-            weights=plan.weights,
-            target_date=trading_date,
-            reason=plan.reason,
-            version=self._plan_version(plan),
-        )
+        return self._target_plan(trading_date, signal_date)
+
+    def plan_version(self, plan: ModelTargetPlan) -> str:
+        """Public alias of the version string used by update_target_weights."""
+        return self._plan_version(plan)
 
     def _resolve_signal_date(self, trading_date: date) -> date | None:
         prev_date = previous_trading_date(self._trading_dates, trading_date)

@@ -54,6 +54,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             signal_date=request.signal_date,
             weights=self._target_weights(response, request.candidates),
             reason=self.reason,
+            request_id=self._request_id(request),
         )
 
     def _payload(self, request: ModelTargetPlanningRequest) -> dict[str, Any]:

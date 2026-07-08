@@ -162,6 +162,13 @@ class TargetWeightStrategy(Strategy):
         self._target_date: date | None = None
         self._target_reason = "target_weight"
         self._target_version = ""
+        # Frozen target quantities (固定目标股数). When populated for the current
+        # target version, sizing bypasses the live portfolio value: each instrument
+        # converges to its pre-committed share count instead of re-deriving quantity
+        # from portfolio.equity every cycle. Populated via apply_frozen_targets and
+        # cleared whenever the target version changes.
+        self._frozen_target_qty: dict[str, Decimal] = {}
+        self._frozen_portfolio_value: Decimal | None = None
         self._achieved_versions: set[str] = set()
         self._frozen_instruments: dict[str, str] = {}
         self._deferred_buys: dict[str, float] = {}
@@ -192,6 +199,13 @@ class TargetWeightStrategy(Strategy):
         self._cancel_count_buy: dict[str, int] = {}
         self._cancel_count_sell: dict[str, int] = {}
         self._pricing_date: date | None = None
+        # Trading-day (in config timezone) on which we have received at least one
+        # quote tick while the clock was inside a scheduled trading window. Time
+        # in the window is necessary but not sufficient to trade/converge: we also
+        # require live quotes, since ticks confirm the market is actually open and
+        # streaming. Reset daily via _ensure_pricing_date. A single subscribed
+        # instrument's tick is enough to unlock the whole window.
+        self._quote_tick_window_date: date | None = None
         self._convergence_suspended = False
         self._pre_open_reconcile = None
         self._pre_open_reconcile_time: tuple[int, int] | None = None
@@ -567,6 +581,10 @@ class TargetWeightStrategy(Strategy):
         self._frozen_instruments = {}
         self._deferred_buys = {}
         self._insufficient_funds = set()
+        # A plain weight update supersedes any previously frozen share counts;
+        # apply_frozen_targets re-populates them after delegating here.
+        self._frozen_target_qty = {}
+        self._frozen_portfolio_value = None
         self._achieved_versions.discard(version_value)
         total_weight = sum(self._target_weights.values())
         if total_weight > 1.0:
@@ -581,6 +599,61 @@ class TargetWeightStrategy(Strategy):
         if self._convergence_suspended or not self._within_trading_window():
             return
         self._converge_to_target(current_date=target_date, trigger="target_update")
+
+    def apply_frozen_targets(
+        self,
+        target_date: date,
+        weights: dict[str | InstrumentId, float],
+        target_qty: dict[str | InstrumentId, int | Decimal],
+        total_asset: Decimal | float | None,
+        reason: str,
+        version: str | None = None,
+    ) -> None:
+        """
+        Accept a set of target weights together with pre-committed share counts
+        (固定目标股数) and a frozen total-asset value.
+
+        The weights drive the same convergence/freeze/record machinery as
+        update_target_weights; the frozen quantities and total asset make sizing
+        deterministic for the day: _target_quantity returns the committed share count
+        and _portfolio_value returns the frozen total asset, so the day's execution no
+        longer depends on the live (fluctuating) portfolio equity. Called from the
+        snapshot recorder once per day after the target is generated or loaded from
+        MySQL on restart.
+        """
+        # Delegating clears _frozen_target_qty/_frozen_portfolio_value (a plain weight
+        # update supersedes stale freezes); re-populate them below for this version.
+        self.update_target_weights(
+            weights=weights,
+            target_date=target_date,
+            reason=reason,
+            version=version,
+        )
+        frozen: dict[str, Decimal] = {}
+        for instrument_id, quantity in target_qty.items():
+            try:
+                value = Decimal(str(quantity))
+            except Exception:
+                continue
+            if value < 0:
+                continue
+            frozen[str(instrument_id)] = value
+        self._frozen_target_qty = frozen
+        if total_asset is not None:
+            try:
+                frozen_value = Decimal(str(total_asset))
+            except Exception:
+                frozen_value = None
+            if frozen_value is not None and frozen_value > 0:
+                self._frozen_portfolio_value = frozen_value
+        self.log.info(
+            f"applied frozen targets version={self._target_version} date={target_date} "
+            f"count={len(frozen)} frozen_total_asset={self._frozen_portfolio_value}",
+            color=LogColor.BLUE,
+        )
+        if self._convergence_suspended or not self._within_trading_window():
+            return
+        self._converge_to_target(current_date=target_date, trigger="frozen_targets")
 
     @staticmethod
     def _target_weights_log_detail(weights: dict[str, float]) -> str:
@@ -625,6 +698,11 @@ class TargetWeightStrategy(Strategy):
         self._depth_books = {}
         self._cancel_count_buy = {}
         self._cancel_count_sell = {}
+        # New trading day: require a fresh live quote before the window unlocks.
+        # Keep a flag already set for this same date (a tick may have arrived
+        # before the first bar of the day triggered this reset).
+        if self._quote_tick_window_date != trading_date:
+            self._quote_tick_window_date = None
 
     def _update_price_state(
         self,
@@ -661,6 +739,7 @@ class TargetWeightStrategy(Strategy):
             )
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
+        self._note_quote_tick(tick)
         if not self._should_log_sample(self.config.quote_tick_log_sample_rate):
             return
         self.log.info(
@@ -1667,10 +1746,60 @@ class TargetWeightStrategy(Strategy):
         except Exception:
             return False
 
-    def _target_quantity(self, instrument: Any, open_price: float, target_weight: float) -> Decimal:
-        if target_weight <= 0:
+    def compute_target_quantities(
+        self,
+        weights: dict[str | InstrumentId, float],
+        total_asset: Decimal | float,
+        open_prices: dict[str, float] | None = None,
+    ) -> dict[str, Decimal]:
+        """
+        Compute per-instrument target share counts (固定目标股数) from weights and a
+        fixed total-asset value, applying the same lot-size / STAR-market rounding as
+        live sizing. Open prices default to the currently known today-open per
+        instrument (self._today_open); callers may pass an explicit map (e.g. the
+        pre-open full-tick snapshot). Instruments without an instrument in cache or a
+        positive open price are skipped.
+
+        This is the pure sizing step the snapshot recorder uses before-trading to
+        commit the day's quantities; it does not mutate any strategy state.
+        """
+        total_value = Decimal(str(total_asset))
+        prices = open_prices or self._today_open
+        result: dict[str, Decimal] = {}
+        for instrument_id, weight in weights.items():
+            instrument_id_text = str(instrument_id)
+            weight_value = float(weight)
+            if weight_value <= 0:
+                continue
+            try:
+                instrument = self.cache.instrument(InstrumentId.from_str(instrument_id_text))
+            except Exception:
+                instrument = None
+            if instrument is None:
+                continue
+            open_price = prices.get(instrument_id_text)
+            if open_price is None or open_price <= 0:
+                continue
+            qty = self._quantity_from_value(instrument, float(open_price), weight_value, total_value)
+            if qty > 0:
+                result[instrument_id_text] = qty
+        return result
+
+    def _quantity_from_value(
+        self,
+        instrument: Any,
+        open_price: float,
+        target_weight: float,
+        total_value: Decimal,
+    ) -> Decimal:
+        """
+        Round a weight×value/open_price target to lot / STAR-market rules. Single
+        source of truth for both live sizing (_target_quantity) and pre-committed
+        frozen sizing (compute_target_quantities).
+        """
+        if target_weight <= 0 or open_price <= 0:
             return Decimal("0")
-        raw_qty = self._portfolio_value() * Decimal(str(target_weight)) / Decimal(str(open_price))
+        raw_qty = total_value * Decimal(str(target_weight)) / Decimal(str(open_price))
         if self._is_star_market(instrument):
             min_qty = Decimal(str(self.config.star_min_buy_qty))
             if raw_qty < min_qty:
@@ -1681,6 +1810,22 @@ class TargetWeightStrategy(Strategy):
             lot_size = Decimal("1")
         return (raw_qty // lot_size) * lot_size
 
+    def _target_quantity(self, instrument: Any, open_price: float, target_weight: float) -> Decimal:
+        if target_weight <= 0:
+            return Decimal("0")
+        # A frozen share count (固定目标股数), when set for this instrument, is the
+        # authoritative target for the day: it was already rounded to lot / STAR-market
+        # rules when committed, so return it verbatim and skip live-value re-sizing.
+        frozen_qty = self._frozen_target_qty.get(str(instrument.id))
+        if frozen_qty is not None:
+            return frozen_qty
+        return self._quantity_from_value(
+            instrument,
+            float(open_price),
+            target_weight,
+            self._portfolio_value(),
+        )
+
     @staticmethod
     def _is_star_market(instrument: Any) -> bool:
         try:
@@ -1690,6 +1835,11 @@ class TargetWeightStrategy(Strategy):
         return symbol.lstrip().startswith("688")
 
     def _portfolio_value(self) -> Decimal:
+        # A frozen total asset (set alongside 固定目标股数) pins the day's sizing
+        # denominator so weight/cash checks stay consistent with the committed target
+        # instead of drifting with live equity.
+        if self._frozen_portfolio_value is not None and self._frozen_portfolio_value > 0:
+            return self._frozen_portfolio_value
         broker_total_asset = self._broker_account_decimal("total_asset")
         if broker_total_asset is not None and broker_total_asset > 0:
             return broker_total_asset
@@ -1884,7 +2034,25 @@ class TargetWeightStrategy(Strategy):
         side = "buy" if order.side == OrderSide.BUY else "sell"
         return self._price_limit_reason(str(order.instrument_id), side) is not None
 
-    def _within_trading_window(self) -> bool:
+    def _note_quote_tick(self, tick: QuoteTick) -> None:
+        """Record that a live quote tick arrived while inside a trading window.
+
+        A single tick from any subscribed instrument is enough to unlock the
+        window for the whole trading day. The flag is reset daily by
+        ``_ensure_pricing_date``.
+        """
+        if self._quote_tick_window_date == self._clock_date():
+            return
+        if not self._within_trading_time():
+            return
+        self._quote_tick_window_date = self._clock_date()
+
+    def _within_trading_time(self) -> bool:
+        """True when the clock is inside a scheduled trading session (time only).
+
+        This is the necessary-but-not-sufficient half of ``_within_trading_window``:
+        it ignores whether live quotes have arrived.
+        """
         try:
             now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
         except Exception:
@@ -1902,6 +2070,17 @@ class TargetWeightStrategy(Strategy):
             if open_t <= now <= close_t:
                 return True
         return False
+
+    def _within_trading_window(self) -> bool:
+        # Time in the scheduled window is necessary but not sufficient: we also
+        # require at least one live quote tick received during a window today,
+        # confirming the market is actually open and streaming. In backtest no
+        # quote ticks are subscribed, so fall back to the time-only check.
+        if not self._within_trading_time():
+            return False
+        if not bool(self.config.subscribe_quote_ticks):
+            return True
+        return self._quote_tick_window_date == self._clock_date()
 
     def _stop_time_reached(self) -> bool:
         stop_time = self.config.stop_time

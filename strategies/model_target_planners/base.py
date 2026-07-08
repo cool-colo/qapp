@@ -11,6 +11,7 @@ class ModelTargetPlan:
     signal_date: date | None
     weights: dict[str, float]
     reason: str
+    request_id: str | None = None
 
 
 @dataclass(frozen=True)
