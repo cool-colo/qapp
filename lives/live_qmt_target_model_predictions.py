@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -29,6 +30,7 @@ from nautilus_trader.common.enums import LogColor
 
 QMT_CLIENT = legacy.QMT_CLIENT
 _MISSING = object()
+_DATE_TOKEN_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
 
 
 class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
@@ -171,6 +173,7 @@ def parse_args():
             os.environ.get("MODEL_PRE_OPEN_RECONCILE_TIME", "09:15"),
         )
     args.pre_open_reconcile_time = pre_open_reconcile_time
+    args.log_file_name = _resolve_daily_log_file_name(args.log_file_name, args.exchange_timezone)
     try:
         args.refresh_time = normalize_refresh_time(args.refresh_time)
         args.pre_open_reconcile_time = normalize_refresh_time(args.pre_open_reconcile_time)
@@ -200,6 +203,17 @@ def _apply_snapshot_args(args: Any) -> None:
     args.mysql_user = env("MYSQL_USER", "root")
     args.mysql_password = env("MYSQL_PASSWORD", "")
     args.mysql_database = env("MYSQL_DATABASE", "")
+
+
+def _resolve_daily_log_file_name(log_file_name: str | None, timezone_name: str) -> str:
+    base_name = (log_file_name or "model_preds").strip() or "model_preds"
+    if "{date}" in base_name:
+        date_text = pd.Timestamp.now(tz=timezone_name).strftime("%Y-%m-%d")
+        return base_name.replace("{date}", date_text)
+    if _DATE_TOKEN_RE.search(base_name):
+        return base_name
+    date_text = pd.Timestamp.now(tz=timezone_name).strftime("%Y-%m-%d")
+    return f"{base_name}-{date_text}"
 
 
 def _extract_pre_open_reconcile_time_arg(argv: list[str]) -> tuple[list[str], str | object]:
@@ -240,11 +254,40 @@ def normalize_refresh_time(value: str | None) -> str | None:
     return f"{hour:02d}:{minute:02d}"
 
 
+def _emit_snapshot_status(
+    node: Any,
+    message: str,
+    *,
+    is_warning: bool = False,
+    color: LogColor = LogColor.BLUE,
+) -> None:
+    """Mirror snapshot startup status to stdout and the Nautilus file logger."""
+    print(message, flush=True)
+    get_logger = getattr(node, "get_logger", None)
+    if get_logger is None:
+        return
+    try:
+        logger = get_logger()
+    except Exception:
+        return
+    if logger is None:
+        return
+    log_method = getattr(logger, "warning" if is_warning else "info", None)
+    if log_method is None:
+        return
+    kwargs = {"color": LogColor.YELLOW if is_warning else color}
+    try:
+        log_method(message, **kwargs)
+    except TypeError:
+        log_method(message)
+
+
 def _maybe_add_snapshot_recorder(
     args: Any,
     node: Any,
     strategy: Any,
     fetch_full_tick: Any,
+    fetch_positions: Any | None = None,
 ) -> None:
     """
     Build the MySQL-backed daily-snapshot recorder actor and add it to the node when
@@ -268,7 +311,11 @@ def _maybe_add_snapshot_recorder(
             autocommit=False,
         )
     except Exception as exc:
-        print(f"[snapshot] MySQL writer init failed, snapshots disabled: {exc}", flush=True)
+        _emit_snapshot_status(
+            node,
+            f"[snapshot] MySQL writer init failed, snapshots disabled: {exc}",
+            is_warning=True,
+        )
         return
     recorder = SnapshotRecorder(
         config=SnapshotRecorderConfig(
@@ -282,12 +329,13 @@ def _maybe_add_snapshot_recorder(
         writer=writer,
         strategy_ref=strategy,
         fetch_full_tick=fetch_full_tick,
+        fetch_positions=fetch_positions,
     )
     node.trader.add_actor(recorder)
-    print(
+    _emit_snapshot_status(
+        node,
         f"[snapshot] recorder enabled: account={args.account_id} "
         f"before={args.snapshot_before_time} after={args.snapshot_after_time}",
-        flush=True,
     )
 
 
@@ -462,9 +510,12 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             return {}
         return loader.full_tick_snapshot(sorted(stock_codes))
 
+    def _fetch_positions() -> dict[str, dict[str, Any]]:
+        return loader.broker_position_snapshot()
+
     strategy.configure_full_tick_source(fetch_full_tick=_fetch_full_tick)
     node.trader.add_strategy(strategy)
-    _maybe_add_snapshot_recorder(args, node, strategy, _fetch_full_tick)
+    _maybe_add_snapshot_recorder(args, node, strategy, _fetch_full_tick, _fetch_positions)
     if args.metrics_port and int(args.metrics_port) > 0:
         exporter = PrometheusExporter(
             config=PrometheusExporterConfig(

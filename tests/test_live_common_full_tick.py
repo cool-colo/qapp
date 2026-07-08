@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import unittest
+from unittest.mock import AsyncMock
 from unittest.mock import patch
 
 from lives.live_common import LivePredictionDataLoader
@@ -13,6 +15,8 @@ def _loader() -> LivePredictionDataLoader:
     loader.args = argparse.Namespace(
         base_url_http="http://proxy.local",
         api_key="key",
+        account_id="ACC",
+        account_type="STOCK",
         clickhouse_timeout_secs=5.0,
     )
     return loader
@@ -43,6 +47,27 @@ class FullTickSnapshotTest(unittest.TestCase):
         loader = _loader()
         loader.args.base_url_http = ""
         self.assertEqual(loader.full_tick_snapshot(["000001.SZ"]), {})
+
+    def test_broker_position_snapshot_keys_by_instrument_id(self) -> None:
+        loader = _loader()
+        rows = [
+            {
+                "stock_code": "000720",
+                "volume": "143100",
+                "can_use_volume": "107400",
+                "avg_price": "3.40",
+                "last_price": "3.26",
+                "market_value": "466506.00",
+            },
+        ]
+        with patch.object(loader, "_fetch_broker_positions", new=AsyncMock(return_value=rows)):
+            snapshot = asyncio.run(loader.broker_position_snapshot())
+
+        position = snapshot["000720.SZ.QMT"]
+        self.assertEqual(position["stock_code"], "000720.SZ")
+        self.assertEqual(position["volume"], "143100")
+        self.assertEqual(position["market_value"], "466506.00")
+        self.assertEqual(position["raw"]["last_price"], "3.26")
 
 
 if __name__ == "__main__":

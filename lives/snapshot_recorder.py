@@ -16,8 +16,10 @@ Design boundaries:
   authoritative values and land in the unprefixed columns; Nautilus-derived values
   land in ``nt_`` columns for comparison. Both raw payloads are kept as JSON.
 - Snapshots are idempotent: each phase (before/continuous/after-trading) writes once
-  per day, guarded by the table unique keys and pre-checks. A late start reuses any
-  persisted before-trading target; if none exists it generates and persists one.
+  per day, guarded by the table unique keys and pre-checks. If the process misses the
+  09:26-09:29 before-trading catch-up window, startup records continuous-trading
+  instead; readers that expect before-trading data should fall back to continuous-
+  trading when needed.
 """
 
 from __future__ import annotations
@@ -76,11 +78,13 @@ class SnapshotRecorder(Actor):
         writer: Any,
         strategy_ref: Any,
         fetch_full_tick: Any | None = None,
+        fetch_positions: Any | None = None,
     ) -> None:
         super().__init__(config)
         self._writer = writer
         self._strategy = strategy_ref
         self._fetch_full_tick = fetch_full_tick
+        self._fetch_positions = fetch_positions
         self._before_time = self._parse_hh_mm(config.before_time)
         self._after_time = self._parse_hh_mm(config.after_time)
         # Guards so each phase applies the frozen target to the strategy at most once
@@ -111,23 +115,24 @@ class SnapshotRecorder(Actor):
             current,
             self.config.before_catchup_start,
             self.config.before_catchup_end,
-        ) or (self._before_time is not None and current >= pd.Timestamp(self.config.before_time).time())
+        )
+        missed_before = self._past_time(current, self.config.before_catchup_end)
         try:
             self._run_full_tick_fetch()
         except Exception as exc:
             self.log.warning(f"snapshot on-start full-tick fetch failed: {exc}")
         if after_t is not None and current >= after_t:
-            # Post-close start: still ensure before-trading rows exist (fallback) and
-            # then record the after-trading snapshot.
-            self._run_before_trading(today, allow_fallback=True)
+            # Post-close start: do not backfill before-trading after the window has
+            # been missed; keep a continuous snapshot as the fallback baseline, then
+            # record the after-trading snapshot.
+            self._run_continuous_trading(today, allow_fallback=True)
             self._run_after_trading(today, allow_fallback=True)
-            return
-        if self._within_trading_window():
-            self._run_before_trading(today, allow_fallback=True)
-            self._run_continuous_trading(today)
             return
         if in_before:
             self._run_before_trading(today, allow_fallback=False)
+            return
+        if missed_before:
+            self._run_continuous_trading(today, allow_fallback=not self._within_trading_window())
 
     def _on_before_timer(self, _event: Any) -> None:
         self._schedule_daily(self._BEFORE_ALERT, self._before_time, self._on_before_timer)
@@ -150,9 +155,10 @@ class SnapshotRecorder(Actor):
         self._record_positions(trading_date, BEFORE_TRADING, source)
         self._ensure_daily_target(trading_date, BEFORE_TRADING, asset_id)
 
-    def _run_continuous_trading(self, trading_date: date) -> None:
-        asset_id = self._record_asset(trading_date, CONTINUOUS_TRADING, SOURCE_LIVE)
-        self._record_positions(trading_date, CONTINUOUS_TRADING, SOURCE_LIVE)
+    def _run_continuous_trading(self, trading_date: date, allow_fallback: bool = False) -> None:
+        source = SOURCE_FALLBACK if allow_fallback and not self._within_trading_window() else SOURCE_LIVE
+        asset_id = self._record_asset(trading_date, CONTINUOUS_TRADING, source)
+        self._record_positions(trading_date, CONTINUOUS_TRADING, source)
         # A before-trading target takes precedence; only mint a continuous_trading
         # target if before-trading never ran (e.g. started mid-session same day).
         self._ensure_daily_target(trading_date, CONTINUOUS_TRADING, asset_id)
@@ -214,22 +220,37 @@ class SnapshotRecorder(Actor):
     # ---- position snapshot ---------------------------------------------------
 
     def _record_positions(self, trading_date: date, snapshot_type: str, source: str) -> None:
-        try:
-            if self._writer.has_position_snapshot(
-                self.config.account_id, self.config.trader_id, trading_date, snapshot_type,
-            ):
-                return
-        except Exception as exc:
-            self.log.warning(f"position snapshot existence check failed: {exc}")
+        broker_positions = self._run_position_fetch(trading_date, snapshot_type, source)
+        if broker_positions is None:
+            return
+        self._record_positions_with_broker(trading_date, snapshot_type, source, broker_positions)
+
+    def _record_positions_with_broker(
+        self,
+        trading_date: date,
+        snapshot_type: str,
+        source: str,
+        broker_positions: dict[str, dict[str, Any]],
+    ) -> None:
         records: list[LivePositionSnapshotRecord] = []
         for position in self._open_positions():
             instrument_id = position.instrument_id
             instrument_id_text = str(instrument_id)
             stock_code = self._stock_code(instrument_id_text)
+            broker_position = self._broker_position_for(broker_positions, instrument_id_text, stock_code)
             can_use = self._venue_can_use(instrument_id_text)
             net_qty = self._decimal_or_none(getattr(position, "quantity", None)) or self._nt_net_qty(instrument_id)
             avg_px = self._decimal_or_none(getattr(position, "avg_px_open", None))
             last_price = self._strategy_last_close(instrument_id_text)
+            nt_market_value = self._market_value(net_qty, last_price)
+            broker_volume = self._broker_decimal(broker_position, "volume")
+            broker_can_use = self._broker_decimal(broker_position, "can_use_volume")
+            broker_avg_price = self._broker_decimal(broker_position, "avg_price")
+            broker_last_price = self._broker_decimal(broker_position, "last_price")
+            broker_market_value = (
+                self._broker_decimal(broker_position, "market_value")
+                or self._market_value(broker_volume, broker_last_price)
+            )
             records.append(
                 LivePositionSnapshotRecord(
                     trade_date=trading_date,
@@ -240,16 +261,21 @@ class SnapshotRecorder(Actor):
                     instrument_id=instrument_id_text,
                     stock_code=stock_code,
                     source=source,
-                    volume=self._int_or_none(net_qty),
-                    can_use_volume=self._int_or_none(can_use),
-                    avg_price=avg_px,
-                    market_value=self._market_value(net_qty, last_price),
+                    volume=self._int_or_none(broker_volume if broker_volume is not None else net_qty),
+                    can_use_volume=self._int_or_none(
+                        broker_can_use if broker_can_use is not None else can_use,
+                    ),
+                    avg_price=broker_avg_price if broker_avg_price is not None else avg_px,
+                    market_value=broker_market_value if broker_market_value is not None else nt_market_value,
                     nt_net_qty=self._int_or_none(net_qty),
                     nt_avg_px_open=avg_px,
-                    nt_market_value=self._market_value(net_qty, last_price),
+                    nt_market_value=nt_market_value,
                     nt_last_price=self._decimal_or_none(last_price),
                     nt_unrealized_pnl=None,
-                    qmt_raw={"can_use_volume": self._to_str(can_use)},
+                    qmt_raw=self._position_qmt_raw(
+                        broker_position,
+                        fallback_can_use=can_use,
+                    ),
                     nt_raw={
                         "net_qty": self._to_str(net_qty),
                         "avg_px_open": self._to_str(avg_px),
@@ -398,7 +424,12 @@ class SnapshotRecorder(Actor):
     def _load_target(self, trading_date: date, signal_date: date | None) -> list[dict[str, Any]]:
         try:
             return self._writer.load_target_portfolios(
-                self.config.account_id, self.config.trader_id, trading_date, signal_date,
+                self.config.account_id,
+                self.config.trader_id,
+                trading_date,
+                signal_date,
+                preferred_snapshot_type=BEFORE_TRADING,
+                fallback_to_continuous=True,
             )
         except Exception as exc:
             self.log.warning(f"target load failed: {exc}")
@@ -524,6 +555,63 @@ class SnapshotRecorder(Actor):
             return
         self._apply_full_tick(snapshot)
 
+    def _run_position_fetch(
+        self,
+        trading_date: date,
+        snapshot_type: str,
+        source: str,
+    ) -> dict[str, dict[str, Any]] | None:
+        if self._fetch_positions is None:
+            return {}
+        try:
+            result = self._fetch_positions()
+        except Exception as exc:
+            self.log.warning(f"snapshot broker-position fetch failed: {exc}")
+            return {}
+        if inspect.isawaitable(result):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    result = asyncio.run(self._await(result))
+                except Exception as exc:
+                    self.log.warning(f"snapshot broker-position fetch failed: {exc}")
+                    return {}
+            else:
+                task = asyncio.ensure_future(result, loop=loop)
+                task.add_done_callback(
+                    lambda done: self._on_position_fetch_done(
+                        done,
+                        trading_date,
+                        snapshot_type,
+                        source,
+                    ),
+                )
+                return None
+        return result if isinstance(result, dict) else {}
+
+    def _on_position_fetch_done(
+        self,
+        task: asyncio.Future[Any],
+        trading_date: date,
+        snapshot_type: str,
+        source: str,
+    ) -> None:
+        try:
+            result = task.result()
+        except Exception as exc:
+            self.log.warning(f"snapshot broker-position fetch failed: {exc}")
+            result = {}
+        try:
+            self._record_positions_with_broker(
+                trading_date,
+                snapshot_type,
+                source,
+                result if isinstance(result, dict) else {},
+            )
+        except Exception as exc:
+            self.log.warning(f"position snapshot async write failed ({snapshot_type}): {exc}")
+
     def _apply_full_tick(self, snapshot: Any) -> None:
         if not isinstance(snapshot, dict) or not snapshot:
             return
@@ -626,6 +714,33 @@ class SnapshotRecorder(Actor):
         if isinstance(closes, dict):
             return closes.get(instrument_id_text)
         return None
+
+    @staticmethod
+    def _broker_position_for(
+        broker_positions: dict[str, dict[str, Any]],
+        instrument_id_text: str,
+        stock_code: str,
+    ) -> dict[str, Any] | None:
+        position = broker_positions.get(instrument_id_text)
+        if isinstance(position, dict):
+            return position
+        position = broker_positions.get(stock_code)
+        return position if isinstance(position, dict) else None
+
+    @staticmethod
+    def _broker_decimal(position: dict[str, Any] | None, key: str) -> Decimal | None:
+        if not isinstance(position, dict):
+            return None
+        return SnapshotRecorder._decimal_or_none(position.get(key))
+
+    @staticmethod
+    def _position_qmt_raw(position: dict[str, Any] | None, fallback_can_use: Any) -> dict[str, Any]:
+        if isinstance(position, dict):
+            raw = position.get("raw")
+            if isinstance(raw, dict):
+                return SnapshotRecorder._jsonable(raw)
+            return SnapshotRecorder._jsonable(position)
+        return {"can_use_volume": SnapshotRecorder._to_str(fallback_can_use)}
 
     def _order_target_weight(self, client_order_id: str) -> Decimal | None:
         weights = getattr(self._strategy, "_order_target_weights", {})
@@ -906,6 +1021,14 @@ class SnapshotRecorder(Actor):
         except Exception:
             return False
         return start_t <= current <= end_t
+
+    @staticmethod
+    def _past_time(current: Any, boundary: str) -> bool:
+        try:
+            boundary_t = pd.Timestamp(boundary).time()
+        except Exception:
+            return False
+        return current > boundary_t
 
     def _schedule_daily(self, name: str, hh_mm: tuple[int, int] | None, callback: Any) -> None:
         if hh_mm is None:

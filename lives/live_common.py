@@ -707,6 +707,97 @@ GROUP BY source_code
             for stock_code, tick in by_stock.items()
         }
 
+    async def broker_position_snapshot(self) -> dict[str, dict[str, Any]]:
+        """
+        Broker-reported position snapshot keyed by Nautilus instrument id.
+
+        This is infrastructure plumbing for persistence only. Strategy decisions
+        continue to use the Nautilus portfolio/cache state.
+        """
+        return self._normalize_broker_positions(await self._fetch_broker_positions())
+
+    async def _fetch_broker_positions(self) -> list[dict[str, Any]]:
+        base_url = str(getattr(self.args, "base_url_http", "") or "").rstrip("/")
+        account_id = str(getattr(self.args, "account_id", "") or "").strip()
+        if not base_url or not account_id:
+            return []
+        from nautilus_trader.adapters.qmt.http import QMTHttpClient
+
+        client = QMTHttpClient(
+            base_url=base_url,
+            api_key=getattr(self.args, "api_key", None),
+            timeout_secs=float(getattr(self.args, "clickhouse_timeout_secs", 10.0) or 10.0),
+        )
+        session_id: str | None = None
+        try:
+            await client.connect()
+            session = await client.open_session(
+                account_id,
+                str(getattr(self.args, "account_type", "STOCK") or "STOCK"),
+            )
+            session_id = str(session["session_id"])
+            return list(await client.get_positions(session_id))
+        finally:
+            if session_id is not None:
+                await client.close_session(session_id)
+            await client.close()
+
+    @classmethod
+    def _normalize_broker_positions(cls, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        by_instrument: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            stock_code = cls._position_stock_code(row)
+            if not stock_code:
+                continue
+            instrument_id = str(build_bar_type(stock_code).instrument_id)
+            snapshot = {
+                "stock_code": stock_code,
+                "volume": cls._first_position_value(row, "volume", "current_amount", "total_volume"),
+                "can_use_volume": cls._first_position_value(row, "can_use_volume", "available_volume"),
+                "avg_price": cls._first_position_value(row, "avg_price", "open_price", "cost_price"),
+                "market_value": cls._first_position_value(row, "market_value"),
+                "last_price": cls._first_position_value(row, "last_price"),
+                "raw": row,
+            }
+            by_instrument[instrument_id] = snapshot
+        return by_instrument
+
+    @staticmethod
+    def _position_stock_code(row: dict[str, Any]) -> str | None:
+        for key in ("stock_code", "instrument_id", "symbol"):
+            value = row.get(key)
+            if value is None:
+                continue
+            stock_code = normalize_stock_code(str(value).strip().upper().removesuffix(".QMT"))
+            stock_code = LivePredictionDataLoader._with_inferred_exchange(stock_code)
+            if stock_code:
+                return stock_code
+        return None
+
+    @staticmethod
+    def _with_inferred_exchange(stock_code: str | None) -> str | None:
+        if not stock_code or "." in stock_code:
+            return stock_code
+        if len(stock_code) != 6 or not stock_code.isdigit():
+            return stock_code
+        if stock_code.startswith(("6", "9")):
+            return f"{stock_code}.SH"
+        if stock_code.startswith(("0", "2", "3")):
+            return f"{stock_code}.SZ"
+        if stock_code.startswith(("4", "8")):
+            return f"{stock_code}.BJ"
+        return stock_code
+
+    @staticmethod
+    def _first_position_value(row: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            value = row.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
     @staticmethod
     def _coerce_tick_fields(tick: Any) -> dict[str, float]:
         if not isinstance(tick, dict):
@@ -795,4 +886,3 @@ def subscription_signal_date(bundle: PredictionDataBundle, as_of_date: Any) -> A
 
 def chunks(values: list[str], size: int) -> list[list[str]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
-

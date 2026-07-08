@@ -9,6 +9,8 @@ from typing import Iterable
 from typing import Mapping
 from typing import Sequence
 
+from backtests.result_writers.live_records import BEFORE_TRADING
+from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveAssetSnapshotRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
@@ -292,16 +294,21 @@ class LiveSnapshotWriter:
         trader_id: str,
         trade_date: date,
         snapshot_type: str,
+        fallback_to_continuous: bool = False,
     ) -> int | None:
-        rows = self._query(
-            "SELECT `id` FROM `live_asset_snapshot` "
-            "WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s AND `snapshot_type`=%s "
-            "LIMIT 1",
-            (account_id, trader_id, trade_date, snapshot_type),
-        )
-        if not rows:
-            return None
-        return int(rows[0][0])
+        for snapshot_type_candidate in self._snapshot_type_candidates(
+            snapshot_type,
+            fallback_to_continuous=fallback_to_continuous,
+        ):
+            rows = self._query(
+                "SELECT `id` FROM `live_asset_snapshot` "
+                "WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s AND `snapshot_type`=%s "
+                "LIMIT 1",
+                (account_id, trader_id, trade_date, snapshot_type_candidate),
+            )
+            if rows:
+                return int(rows[0][0])
+        return None
 
     def has_asset_snapshot(
         self,
@@ -309,8 +316,15 @@ class LiveSnapshotWriter:
         trader_id: str,
         trade_date: date,
         snapshot_type: str,
+        fallback_to_continuous: bool = False,
     ) -> bool:
-        return self.asset_snapshot_id(account_id, trader_id, trade_date, snapshot_type) is not None
+        return self.asset_snapshot_id(
+            account_id,
+            trader_id,
+            trade_date,
+            snapshot_type,
+            fallback_to_continuous=fallback_to_continuous,
+        ) is not None
 
     def has_position_snapshot(
         self,
@@ -318,14 +332,21 @@ class LiveSnapshotWriter:
         trader_id: str,
         trade_date: date,
         snapshot_type: str,
+        fallback_to_continuous: bool = False,
     ) -> bool:
-        rows = self._query(
-            "SELECT 1 FROM `live_position_snapshot` "
-            "WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s AND `snapshot_type`=%s "
-            "LIMIT 1",
-            (account_id, trader_id, trade_date, snapshot_type),
-        )
-        return bool(rows)
+        for snapshot_type_candidate in self._snapshot_type_candidates(
+            snapshot_type,
+            fallback_to_continuous=fallback_to_continuous,
+        ):
+            rows = self._query(
+                "SELECT 1 FROM `live_position_snapshot` "
+                "WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s AND `snapshot_type`=%s "
+                "LIMIT 1",
+                (account_id, trader_id, trade_date, snapshot_type_candidate),
+            )
+            if rows:
+                return True
+        return False
 
     def load_target_portfolios(
         self,
@@ -333,6 +354,8 @@ class LiveSnapshotWriter:
         trader_id: str,
         trade_date: date,
         signal_date: date | None,
+        preferred_snapshot_type: str | None = None,
+        fallback_to_continuous: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Load persisted target rows for the (account, trader, trade_date, signal_date)
@@ -365,12 +388,27 @@ class LiveSnapshotWriter:
             "reason",
             "snapshot_type",
         ]
-        rows = self._query(
-            f"SELECT {', '.join('`' + c + '`' for c in columns)} FROM `live_target_portfolio` "
-            f"WHERE {where}",
-            params,
-        )
-        return [dict(zip(columns, row)) for row in rows]
+        base_sql = f"SELECT {', '.join('`' + c + '`' for c in columns)} FROM `live_target_portfolio` "
+        if preferred_snapshot_type is None:
+            rows = self._query(f"{base_sql}WHERE {where}", params)
+            return [dict(zip(columns, row)) for row in rows]
+        for snapshot_type_candidate in self._snapshot_type_candidates(
+            preferred_snapshot_type,
+            fallback_to_continuous=fallback_to_continuous,
+        ):
+            rows = self._query(
+                f"{base_sql}WHERE {where} AND `snapshot_type`=%s",
+                params + (snapshot_type_candidate,),
+            )
+            if rows:
+                return [dict(zip(columns, row)) for row in rows]
+        return []
+
+    @staticmethod
+    def _snapshot_type_candidates(snapshot_type: str, fallback_to_continuous: bool) -> tuple[str, ...]:
+        if fallback_to_continuous and snapshot_type == BEFORE_TRADING:
+            return (BEFORE_TRADING, CONTINUOUS_TRADING)
+        return (snapshot_type,)
 
     # ---- row builders --------------------------------------------------------
 
