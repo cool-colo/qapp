@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import random
+import threading
+import time
+from concurrent.futures import Future as ConcurrentFuture
 from dataclasses import dataclass
 from datetime import date
 from datetime import timedelta
@@ -172,6 +175,7 @@ class TargetWeightStrategy(Strategy):
         self._achieved_versions: set[str] = set()
         self._frozen_instruments: dict[str, str] = {}
         self._deferred_buys: dict[str, float] = {}
+        self._converge_lock = threading.Lock()
         self._rejected_order_ids: set[str] = set()
         self._insufficient_funds: set[str] = set()
         self._order_submit_ts: dict[str, int] = {}
@@ -195,6 +199,8 @@ class TargetWeightStrategy(Strategy):
         # previously-set fallback value.
         self._authoritative_open: set[str] = set()
         self._depth_books: dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]] = {}
+        self._subscribed_order_book_depth_instruments: set[str] = set()
+        self._sleep = time.sleep
         # Side-specific cancel counts per instrument; reset daily and on fill.
         self._cancel_count_buy: dict[str, int] = {}
         self._cancel_count_sell: dict[str, int] = {}
@@ -210,12 +216,17 @@ class TargetWeightStrategy(Strategy):
         self._pre_open_reconcile = None
         self._pre_open_reconcile_time: tuple[int, int] | None = None
         self._pre_open_reconcile_timeout_secs = 30.0
-        self._pre_open_reconcile_task: asyncio.Future[Any] | None = None
+        self._pre_open_reconcile_task: asyncio.Future[Any] | ConcurrentFuture[Any] | None = None
+        # Node event loop for marshalling async callbacks. LiveClock time-alert callbacks
+        # (pre-open reconcile, full-tick fetch) fire on the Rust timer thread, NOT the
+        # asyncio loop thread, so async work must be scheduled onto this loop via
+        # run_coroutine_threadsafe. None in backtest (callbacks never wired).
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._full_tick_source: Any | None = None
         self._full_tick_prefetch_time: tuple[int, int] | None = self._parse_hh_mm(
             config.full_tick_prefetch_time,
         )
-        self._full_tick_task: asyncio.Future[Any] | None = None
+        self._full_tick_task: asyncio.Future[Any] | ConcurrentFuture[Any] | None = None
         self._sellable_exhausted: dict[str, date] = {}
         # Broker-reported sellable quantity per instrument (QMT `can_use_volume`), refreshed
         # from execution mass-status reports. Empty in backtest (no venue reports) -> the
@@ -231,10 +242,13 @@ class TargetWeightStrategy(Strategy):
         reconcile: Any | None,
         reconcile_time: str | None,
         timeout_secs: float,
+        loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         self._pre_open_reconcile = reconcile
         self._pre_open_reconcile_time = self._parse_hh_mm(reconcile_time)
         self._pre_open_reconcile_timeout_secs = float(timeout_secs)
+        if loop is not None:
+            self._loop = loop
 
     def configure_full_tick_source(self, fetch_full_tick: Any | None) -> None:
         """
@@ -249,6 +263,14 @@ class TargetWeightStrategy(Strategy):
         self._full_tick_source = fetch_full_tick
 
     def on_start(self) -> None:
+        # Capture the node event loop while running on the loop thread. Used to
+        # marshal async callbacks (reconcile, full-tick) that later fire on the
+        # LiveClock timer thread. An explicit loop from configure_* wins if set.
+        if self._loop is None:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._loop = None
         self.log.info(
             f"target-weight executor start: instruments={len(self._instrument_ids)} "
             f"bar_types={len(self._bar_types)} target_version={self._target_version or '<none>'}",
@@ -325,17 +347,9 @@ class TargetWeightStrategy(Strategy):
         if not inspect.isawaitable(result):
             self._apply_full_tick(result, trigger)
             return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            try:
-                result = asyncio.run(_await_awaitable(result))
-            except Exception as exc:
-                self.log.warning(f"full-tick fetch failed ({trigger}): {exc}")
-                return
-            self._apply_full_tick(result, trigger)
+        task = self._schedule_on_loop(result)
+        if task is None:
             return
-        task = asyncio.ensure_future(result, loop=loop)
         self._full_tick_task = task
         task.add_done_callback(lambda t: self._on_full_tick_fetch_done(t, trigger))
 
@@ -437,6 +451,41 @@ class TargetWeightStrategy(Strategy):
             self._schedule_pre_open_reconcile()
         self._run_pre_open_reconcile()
 
+    def _schedule_on_loop(
+        self,
+        awaitable: Any,
+    ) -> asyncio.Future[Any] | ConcurrentFuture[Any] | None:
+        """
+        Schedule an awaitable onto the node's event loop and return a future.
+
+        LiveClock time-alert callbacks fire on the Rust timer thread, so there is no
+        running loop here and the awaitable's I/O (aiohttp) is bound to the node loop
+        on another thread. Marshal onto that loop with run_coroutine_threadsafe; the
+        returned concurrent.futures.Future exposes done()/result()/add_done_callback()
+        just like an asyncio.Future.
+
+        When no node loop is available (backtest/tests, or a plain-async callback whose
+        I/O is not bound to another loop) the awaitable is run synchronously to
+        completion and an already-resolved future is returned, so the caller's
+        add_done_callback still fires (immediately) and result-logging is preserved.
+        Returns None only if the awaitable could not be run at all.
+        """
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            return asyncio.run_coroutine_threadsafe(_await_awaitable(awaitable), loop)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None:
+            return asyncio.ensure_future(awaitable, loop=running)
+        resolved: ConcurrentFuture[Any] = ConcurrentFuture()
+        try:
+            resolved.set_result(asyncio.run(_await_awaitable(awaitable)))
+        except Exception as exc:  # noqa: BLE001 - surfaced via the future
+            resolved.set_exception(exc)
+        return resolved
+
     def _run_pre_open_reconcile(self) -> None:
         if self._pre_open_reconcile is None:
             self.log.warning("Pre-open execution-state reconciliation is configured but no callback is available")
@@ -450,17 +499,9 @@ class TargetWeightStrategy(Strategy):
             self.log.warning(f"Pre-open execution-state reconciliation failed to start: {exc}")
             return
         if inspect.isawaitable(result):
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                try:
-                    result = asyncio.run(_await_awaitable(result))
-                except Exception as exc:
-                    self.log.warning(f"Pre-open execution-state reconciliation failed: {exc}")
-                    return
-                self._log_pre_open_reconcile_result(bool(result))
+            task = self._schedule_on_loop(result)
+            if task is None:
                 return
-            task = asyncio.ensure_future(result, loop=loop)
             self._pre_open_reconcile_task = task
             task.add_done_callback(self._on_pre_open_reconcile_done)
             self.log.info("Started pre-open execution-state reconciliation", color=LogColor.BLUE)
@@ -533,12 +574,6 @@ class TargetWeightStrategy(Strategy):
             self.subscribe_quote_ticks(bar_type.instrument_id)
         if bool(self.config.subscribe_trade_ticks):
             self.subscribe_trade_ticks(bar_type.instrument_id)
-        if self._wants_order_book_depth_subscription():
-            self.subscribe_order_book_depth(
-                bar_type.instrument_id,
-                book_type=BookType.L2_MBP,
-                depth=10,
-            )
 
     def _unsubscribe_market_data(self, bar_type: BarType) -> None:
         if bool(self.config.subscribe_bars):
@@ -546,16 +581,6 @@ class TargetWeightStrategy(Strategy):
                 self.unsubscribe_bars(bar_type)
             except Exception as exc:
                 self.log.warning(f"Bar unsubscribe failed for {bar_type}: {exc}")
-        if self._wants_order_book_depth_subscription():
-            try:
-                self.unsubscribe_order_book_depth(bar_type.instrument_id)
-            except Exception as exc:
-                self.log.warning(
-                    f"Order-book depth unsubscribe failed for {bar_type.instrument_id}: {exc}",
-                )
-
-    def _wants_order_book_depth_subscription(self) -> bool:
-        return bool(self.config.subscribe_order_book_depth) or self._order_book_depth_logging_enabled()
 
     def update_target_weights(
         self,
@@ -572,6 +597,7 @@ class TargetWeightStrategy(Strategy):
                 continue
             normalized[instrument_id_text] = weight_value
         version_value = version or target_version(target_date, normalized, reason)
+        self._refresh_order_book_depth_subscriptions(normalized)
         if version_value == self._target_version and normalized == self._target_weights:
             return
         self._target_weights = dict(sorted(normalized.items()))
@@ -599,6 +625,40 @@ class TargetWeightStrategy(Strategy):
         if self._convergence_suspended or not self._within_trading_window():
             return
         self._converge_to_target(current_date=target_date, trigger="target_update")
+
+    def _refresh_order_book_depth_subscriptions(self, weights: dict[str, float]) -> None:
+        subscribed_ids = set(self._subscribed_order_book_depth_instruments)
+        for instrument_id_text in sorted(subscribed_ids):
+            try:
+                self.unsubscribe_order_book_depth(InstrumentId.from_str(instrument_id_text))
+            except Exception as exc:
+                self.log.warning(
+                    f"Order-book depth unsubscribe failed for {instrument_id_text}: {exc}",
+                )
+        desired_ids = set(weights).union(self._held_instrument_ids())
+        refreshed_ids: set[str] = set()
+        for instrument_id_text in sorted(desired_ids):
+            instrument_id = InstrumentId.from_str(instrument_id_text)
+            try:
+                self.subscribe_order_book_depth(
+                    instrument_id,
+                    book_type=BookType.L2_MBP,
+                    depth=10,
+                )
+            except Exception as exc:
+                self.log.warning(
+                    f"Order-book depth subscribe failed for {instrument_id_text}: {exc}",
+                )
+                continue
+            refreshed_ids.add(instrument_id_text)
+        self._subscribed_order_book_depth_instruments = refreshed_ids
+        if refreshed_ids:
+            self.log.info(
+                "Refreshed order-book depth subscriptions: "
+                f"count={len(refreshed_ids)} instruments={sorted(refreshed_ids)}",
+                color=LogColor.BLUE,
+            )
+            self._sleep(10.0)
 
     def apply_frozen_targets(
         self,
@@ -876,6 +936,15 @@ class TargetWeightStrategy(Strategy):
             self.log.warning(f"target convergence failed: {exc}")
 
     def _converge_to_target(self, current_date: date, trigger: str) -> None:
+        acquired = self._converge_lock.acquire(blocking=False)
+        if not acquired:
+            return
+        try:
+            self._converge_to_target_locked(current_date=current_date, trigger=trigger)
+        finally:
+            self._converge_lock.release()
+
+    def _converge_to_target_locked(self, current_date: date, trigger: str) -> None:
         if not self._target_version:
             return
         if self._target_version in self._achieved_versions:
@@ -2160,7 +2229,15 @@ class TargetWeightStrategy(Strategy):
         )
 
 
-_INSUFFICIENT_FUNDS_MARKERS = ("260200", "\u53ef\u7528\u8d44\u91d1\u4e0d\u8db3", "\u8d44\u91d1\u4e0d\u8db3", "insufficient")
+_INSUFFICIENT_FUNDS_MARKERS = (
+    "260200",
+    "\u53ef\u7528\u8d44\u91d1\u4e0d\u8db3",
+    "\u8d44\u91d1\u4e0d\u8db3",
+    "insufficient",
+    "free_balance",
+    "free balance",
+    "cum_notional_exceeds_free_balance",
+)
 _SELLABLE_POSITION_MARKERS = (
     "251005",
     "sellable volume",

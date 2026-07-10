@@ -385,7 +385,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Live-only: comma-separated HH:MM-HH:MM order sessions (exchange tz). "
             "Orders submit only inside these ranges; the lunch break is excluded. "
-            "Default '09:30-11:30,13:00-14:55'."
+            "Default '09:31-11:30,13:00-14:55'."
         ),
     )
     parser.add_argument("--price-precision", type=int, default=int(env("QMT_PRICE_PRECISION", "2")))

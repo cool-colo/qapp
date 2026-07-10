@@ -254,6 +254,54 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(rows[0]["snapshot_type"], CONTINUOUS_TRADING)
         self.assertEqual(writer._query.call_count, 2)
 
+    def test_writer_execute_retries_once_after_connection_lost(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._commit = False
+
+        cursor = MagicMock()
+        # First cursor.execute raises the classic dropped-connection error, second succeeds.
+        cursor.execute.side_effect = [Exception(0, ""), None]
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        writer._connection = connection
+
+        writer._execute("INSERT INTO t VALUES (%s)", (1,))
+
+        self.assertEqual(cursor.execute.call_count, 2)
+        connection.ping.assert_called_once_with(reconnect=True)
+
+    def test_writer_execute_does_not_retry_on_non_connection_error(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._commit = False
+
+        cursor = MagicMock()
+        cursor.execute.side_effect = Exception(1062, "Duplicate entry")
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        writer._connection = connection
+
+        with self.assertRaises(Exception):
+            writer._execute("INSERT INTO t VALUES (%s)", (1,))
+
+        self.assertEqual(cursor.execute.call_count, 1)
+        connection.ping.assert_not_called()
+
+    def test_writer_query_retries_once_after_connection_lost(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+
+        cursor = MagicMock()
+        cursor.execute.side_effect = [Exception(2013, "Lost connection"), None]
+        cursor.fetchall.return_value = [(7,)]
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        writer._connection = connection
+
+        rows = writer._query("SELECT 1", ())
+
+        self.assertEqual(rows, [(7,)])
+        self.assertEqual(cursor.execute.call_count, 2)
+        connection.ping.assert_called_once_with(reconnect=True)
+
     def test_position_snapshot_uses_qmt_market_value_for_unprefixed_columns(self) -> None:
         writer = SimpleNamespace(
             has_position_snapshot=MagicMock(return_value=False),
@@ -343,6 +391,61 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder._on_position_fetch_done.assert_called_once()
         task = recorder._on_position_fetch_done.call_args.args[0]
         self.assertEqual(task.result(), {"000720.SZ.QMT": {"market_value": "466506.00"}})
+
+    def test_order_event_truncates_reason_for_live_order_but_keeps_full_payload(self) -> None:
+        writer = SimpleNamespace(upsert_order=MagicMock())
+        recorder = SimpleNamespace()
+        recorder.config = SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER")
+        recorder._writer = writer
+        recorder._strategy = SimpleNamespace(
+            _stock_by_instrument={},
+            _order_target_weights={},
+            _order_target_versions={},
+        )
+        recorder.cache = SimpleNamespace(order=MagicMock(return_value=None))
+        recorder._now_naive = MagicMock(return_value=datetime(2026, 7, 9, 13, 21, 43))
+        recorder._event_date = MagicMock(return_value=date(2026, 7, 9))
+        recorder._stock_code = lambda instrument_id: SnapshotRecorder._stock_code(recorder, instrument_id)
+        recorder._order_target_weight = lambda client_order_id: SnapshotRecorder._order_target_weight(
+            recorder,
+            client_order_id,
+        )
+        recorder._order_target_version = lambda client_order_id: SnapshotRecorder._order_target_version(
+            recorder,
+            client_order_id,
+        )
+        recorder._decimal_or_none = SnapshotRecorder._decimal_or_none
+        recorder._int_or_none = SnapshotRecorder._int_or_none
+        recorder._maybe_str = SnapshotRecorder._maybe_str
+        recorder._order_side_text = SnapshotRecorder._order_side_text
+        recorder._order_type_text = SnapshotRecorder._order_type_text
+        recorder._order_status_text = SnapshotRecorder._order_status_text
+        recorder._bounded_order_reason = SnapshotRecorder._bounded_order_reason
+        recorder._order_event_payload = SnapshotRecorder._order_event_payload
+
+        long_reason = (
+            "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE: free=21642.68 CNY, "
+            "cum_notional=299052.00 CNY"
+        )
+        event = type(
+            "OrderDeniedEvent",
+            (),
+            {
+                "client_order_id": "O-1",
+                "instrument_id": "001202.SZ.QMT",
+                "reason": long_reason,
+                "info": {"broker_code": "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE"},
+            },
+        )()
+
+        SnapshotRecorder._upsert_order_from_event(recorder, event)
+
+        record = writer.upsert_order.call_args.args[0]
+        self.assertEqual(record.client_order_id, "O-1")
+        self.assertEqual(len(record.reason), SnapshotRecorder._LIVE_ORDER_REASON_MAX_LEN)
+        self.assertTrue(record.reason.endswith("..."))
+        self.assertEqual(record.qmt_raw["reason"], long_reason)
+        self.assertEqual(record.qmt_raw["broker_code"], "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE")
 
     @staticmethod
     def _make_snapshot_recorder_stub(now_text: str) -> SimpleNamespace:

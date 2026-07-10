@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from dataclasses import dataclass
 from dataclasses import field
@@ -9,6 +10,7 @@ from decimal import Decimal
 import pandas as pd
 
 from nautilus_trader.model.data import BarType
+from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.identifiers import InstrumentId
@@ -249,7 +251,7 @@ class TestableTargetWeightStrategy:
     refresh_target_instruments = TargetWeightStrategy.refresh_target_instruments
     _subscribe_market_data = TargetWeightStrategy._subscribe_market_data
     _unsubscribe_market_data = TargetWeightStrategy._unsubscribe_market_data
-    _wants_order_book_depth_subscription = TargetWeightStrategy._wants_order_book_depth_subscription
+    _refresh_order_book_depth_subscriptions = TargetWeightStrategy._refresh_order_book_depth_subscriptions
     update_target_weights = TargetWeightStrategy.update_target_weights
     _target_weights_log_detail = staticmethod(TargetWeightStrategy._target_weights_log_detail)
     on_bar = TargetWeightStrategy.on_bar
@@ -260,6 +262,7 @@ class TestableTargetWeightStrategy:
     on_order_rejected = TargetWeightStrategy.on_order_rejected
     _handle_order_not_accepted = TargetWeightStrategy._handle_order_not_accepted
     _converge_to_target = TargetWeightStrategy._converge_to_target
+    _converge_to_target_locked = TargetWeightStrategy._converge_to_target_locked
     _order_book_depth_logging_enabled = TargetWeightStrategy._order_book_depth_logging_enabled
     _should_log_sample = staticmethod(TargetWeightStrategy._should_log_sample)
     _on_converge_timer = TargetWeightStrategy._on_converge_timer
@@ -327,6 +330,8 @@ class TestableTargetWeightStrategy:
     _schedule_pre_open_reconcile = TargetWeightStrategy._schedule_pre_open_reconcile
     _on_pre_open_reconcile_timer = TargetWeightStrategy._on_pre_open_reconcile_timer
     _run_pre_open_reconcile = TargetWeightStrategy._run_pre_open_reconcile
+    _schedule_on_loop = TargetWeightStrategy._schedule_on_loop
+    _on_pre_open_reconcile_done = TargetWeightStrategy._on_pre_open_reconcile_done
     _log_pre_open_reconcile_result = TargetWeightStrategy._log_pre_open_reconcile_result
     _ensure_pricing_date = TargetWeightStrategy._ensure_pricing_date
     _update_price_state = TargetWeightStrategy._update_price_state
@@ -463,6 +468,9 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy._full_tick_prefetch_time = None
         strategy._full_tick_task = None
         strategy._depth_books = {}
+        strategy._subscribed_order_book_depth_instruments = set()
+        strategy._sleep_calls = []
+        strategy._sleep = lambda seconds: strategy._sleep_calls.append(seconds)
         strategy._cancel_count_buy = {}
         strategy._cancel_count_sell = {}
         strategy._pricing_date = None
@@ -475,10 +483,12 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy._frozen_target_qty = {}
         strategy._frozen_portfolio_value = None
         strategy._convergence_suspended = False
+        strategy._converge_lock = threading.Lock()
         strategy._pre_open_reconcile = None
         strategy._pre_open_reconcile_time = None
         strategy._pre_open_reconcile_timeout_secs = 30.0
         strategy._pre_open_reconcile_task = None
+        strategy._loop = None
         strategy._sellable_exhausted = {}
         strategy._venue_sellable = {}
         strategy._venue_sellable_ts = 0
@@ -629,6 +639,43 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertNotIn(str(INST_A), strategy._deferred_buys)
         self.assertEqual(strategy._deferred_buys, {str(INST_B): 0.4})
         self.assertEqual(strategy._target_weights, {str(INST_B): 0.4})
+
+    def test_update_target_refreshes_depth_subscriptions_from_targets_and_holdings(self) -> None:
+        strategy = self.make_strategy(positions={INST_B: Decimal("100")})
+        strategy._subscribed_order_book_depth_instruments = {str(INST_C)}
+
+        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "depth_refresh")
+
+        self.assertEqual(strategy.unsubscribed_order_book_depths, [INST_C])
+        self.assertEqual(
+            strategy.subscribed_order_book_depths,
+            [
+                (INST_A, {"book_type": BookType.L2_MBP, "depth": 10}),
+                (INST_B, {"book_type": BookType.L2_MBP, "depth": 10}),
+            ],
+        )
+        self.assertEqual(
+            strategy._subscribed_order_book_depth_instruments,
+            {str(INST_A), str(INST_B)},
+        )
+        self.assertEqual(strategy._sleep_calls, [10.0])
+
+    def test_update_target_refreshes_depth_subscriptions_even_when_target_unchanged(self) -> None:
+        strategy = self.make_strategy()
+
+        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "depth_refresh")
+        strategy.subscribed_order_book_depths = []
+        strategy.unsubscribed_order_book_depths = []
+        strategy._sleep_calls = []
+
+        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "depth_refresh")
+
+        self.assertEqual(strategy.unsubscribed_order_book_depths, [INST_A])
+        self.assertEqual(
+            strategy.subscribed_order_book_depths,
+            [(INST_A, {"book_type": BookType.L2_MBP, "depth": 10})],
+        )
+        self.assertEqual(strategy._sleep_calls, [10.0])
 
     def test_update_target_logs_target_weight_detail(self) -> None:
         strategy = self.make_strategy()
@@ -848,6 +895,45 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(len(strategy.submitted_orders), 1)
         self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("1200"))
         self.assertEqual(strategy._open_order_instruments(), {str(INST_A)})
+
+    def test_reentrant_convergence_is_skipped_while_in_progress(self) -> None:
+        # Reproduces the duplicate-sell race: a second convergence trigger arrives on
+        # another thread while the first pass is between reading open orders and having
+        # its submitted order become visible. The just-submitted order is INITIALIZED and
+        # not yet in the cache's open index, so without the lock the second pass would
+        # re-submit the same full-exit. The non-blocking lock makes the reentrant pass
+        # skip, so exactly one sell is submitted.
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(
+            positions={INST_A: Decimal("300")},
+            equity="1000000",
+            free_cash="0",
+            prices={INST_A: 859.56},
+        )
+        # Submitted orders are NOT reflected in the open-orders view (INITIALIZED not
+        # yet routed), exactly as during the live race window.
+        strategy.submit_orders_to_cache = False
+
+        reentered: list[int] = []
+        original_submit = strategy.submit_order.__func__
+
+        def submit_and_reenter(order) -> None:
+            original_submit(strategy, order)
+            # Simulate a concurrent timer/full-tick callback firing mid-submit. The
+            # lock is already held by the outer pass, so this must be a no-op.
+            before = len(strategy.submitted_orders)
+            strategy._converge_to_target(trading_date, "reentrant")
+            reentered.append(len(strategy.submitted_orders) - before)
+
+        strategy.submit_order = submit_and_reenter
+
+        strategy.update_target_weights({INST_A: 0.0}, trading_date, "exit")
+
+        self.assertEqual(len(strategy.submitted_orders), 1)
+        self.assertEqual(strategy.submitted_orders[0].side, OrderSide.SELL)
+        self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("300"))
+        # The reentrant pass ran but submitted nothing.
+        self.assertEqual(reentered, [0])
 
     def test_weight_tolerance_skips_tiny_residual_buy(self) -> None:
         strategy = self.make_strategy(
@@ -1117,6 +1203,24 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy.on_order_rejected(event)
 
         self.assertEqual(strategy._sellable_exhausted, {str(INST_A): date(2026, 7, 2)})
+
+    def test_cum_notional_exceeds_free_balance_denial_is_treated_as_insufficient_funds(self) -> None:
+        strategy = self.make_strategy()
+        strategy._target_weights = {str(INST_A): 0.5}
+        event = type(
+            "DeniedEvent",
+            (),
+            {
+                "client_order_id": "O-1",
+                "instrument_id": INST_A,
+                "reason": "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE: free=21642.68 CNY, cum_notional=299052.00 CNY",
+            },
+        )()
+
+        strategy.on_order_denied(event)
+
+        self.assertEqual(strategy._insufficient_funds, {str(INST_A)})
+        self.assertEqual(strategy._deferred_buys, {str(INST_A): 0.5})
 
     def test_sellable_exhaustion_does_not_block_later_buy_target(self) -> None:
         trading_date = date(2026, 7, 2)

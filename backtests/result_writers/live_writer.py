@@ -678,34 +678,100 @@ class LiveSnapshotWriter:
         self._executemany(sql, params)
 
     def _query(self, sql: str, params: Sequence[Any]) -> list[tuple[Any, ...]]:
-        cursor = self._connection.cursor()
-        try:
-            cursor.execute(sql, params)
-            return list(cursor.fetchall())
-        finally:
-            self._close_cursor(cursor)
+        def run():
+            cursor = self._connection.cursor()
+            try:
+                cursor.execute(sql, params)
+                return list(cursor.fetchall())
+            finally:
+                self._close_cursor(cursor)
+
+        return self._with_reconnect(run)
 
     def _execute(self, sql: str, params: Sequence[Any]) -> None:
-        cursor = self._connection.cursor()
-        try:
-            cursor.execute(sql, params)
-            self._commit_if_needed()
-        except Exception:
-            self._rollback_if_needed()
-            raise
-        finally:
-            self._close_cursor(cursor)
+        def run():
+            cursor = self._connection.cursor()
+            try:
+                cursor.execute(sql, params)
+                self._commit_if_needed()
+            except Exception:
+                self._rollback_if_needed()
+                raise
+            finally:
+                self._close_cursor(cursor)
+
+        self._with_reconnect(run)
 
     def _executemany(self, sql: str, params: Iterable[Sequence[Any]]) -> None:
-        cursor = self._connection.cursor()
+        materialized = list(params)
+
+        def run():
+            cursor = self._connection.cursor()
+            try:
+                cursor.executemany(sql, materialized)
+                self._commit_if_needed()
+            except Exception:
+                self._rollback_if_needed()
+                raise
+            finally:
+                self._close_cursor(cursor)
+
+        self._with_reconnect(run)
+
+    def _with_reconnect(self, run):
+        """
+        Run a DB operation, transparently recovering from a dropped connection.
+
+        A long-running live process leaves the MySQL connection idle between events;
+        the server (or an intervening proxy) eventually closes it, after which PyMySQL
+        raises a connection-level error — commonly ``(0, '')`` — on the next cursor
+        use. On such an error, re-establish the socket and retry once. Non-connection
+        errors (bad SQL, constraint violations) are not retried. Avoids a ping
+        round-trip on every healthy write (order events fire in bursts).
+        """
         try:
-            cursor.executemany(sql, list(params))
-            self._commit_if_needed()
+            return run()
+        except Exception as exc:
+            if not self._is_connection_lost(exc):
+                raise
+            if not self._reconnect():
+                raise
+            return run()
+
+    def _reconnect(self) -> bool:
+        # Prefer ping(reconnect=True) — it re-establishes the socket and is the
+        # documented PyMySQL recovery path; fall back to connect().
+        ping = getattr(self._connection, "ping", None)
+        if ping is not None:
+            try:
+                ping(reconnect=True)
+                return True
+            except TypeError:
+                pass
+            except Exception:
+                pass
+        connect = getattr(self._connection, "connect", None)
+        if connect is None:
+            return False
+        try:
+            connect()
+            return True
         except Exception:
-            self._rollback_if_needed()
-            raise
-        finally:
-            self._close_cursor(cursor)
+            return False
+
+    @staticmethod
+    def _is_connection_lost(exc: Exception) -> bool:
+        # PyMySQL surfaces a lost connection as OperationalError/InterfaceError whose
+        # first arg is an errno. 0 (with an empty message) and the classic
+        # 2006/2013 (server gone away / lost connection during query) all mean the
+        # socket must be re-established.
+        args = getattr(exc, "args", ())
+        code = args[0] if args else None
+        if code in (0, 2006, 2013, 2055):
+            return True
+        # Fall back to class-name matching so we don't hard-depend on pymysql types.
+        name = type(exc).__name__
+        return name in ("InterfaceError", "OperationalError") and code in (None, 0)
 
     def _commit_if_needed(self) -> None:
         if self._commit:

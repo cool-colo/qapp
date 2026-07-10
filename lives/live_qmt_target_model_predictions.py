@@ -496,6 +496,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             reconcile=node.kernel.exec_engine.reconcile_execution_state,
             reconcile_time=args.pre_open_reconcile_time,
             timeout_secs=config_node.timeout_reconciliation,
+            loop=node.kernel.exec_engine._loop,
         )
 
     def _fetch_full_tick() -> dict[str, dict[str, float]]:

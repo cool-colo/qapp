@@ -71,6 +71,7 @@ class SnapshotRecorder(Actor):
 
     _BEFORE_ALERT = "SNAPSHOT-BEFORE-TRADING"
     _AFTER_ALERT = "SNAPSHOT-AFTER-TRADING"
+    _LIVE_ORDER_REASON_MAX_LEN = 64
 
     def __init__(
         self,
@@ -560,8 +561,8 @@ class SnapshotRecorder(Actor):
             status=self._order_status_text(order, event),
             target_weight=self._order_target_weight(client_order_id),
             target_version=self._order_target_version(client_order_id),
-            reason=self._maybe_str(getattr(event, "reason", None)),
-            qmt_raw=self._event_info(event),
+            reason=self._bounded_order_reason(getattr(event, "reason", None)),
+            qmt_raw=self._order_event_payload(event),
             created_at=self._now_naive(),
             updated_at=self._now_naive(),
         )
@@ -928,6 +929,28 @@ class SnapshotRecorder(Actor):
         if isinstance(info, dict) and info:
             return SnapshotRecorder._jsonable(info)
         return None
+
+    @classmethod
+    def _bounded_order_reason(cls, value: Any) -> str | None:
+        text = cls._maybe_str(value)
+        if text is None:
+            return None
+        max_len = cls._LIVE_ORDER_REASON_MAX_LEN
+        if len(text) <= max_len:
+            return text
+        if max_len <= 3:
+            return text[:max_len]
+        return text[: max_len - 3] + "..."
+
+    @classmethod
+    def _order_event_payload(cls, event: Any) -> dict[str, Any] | None:
+        payload = dict(cls._event_info(event) or {})
+        reason = cls._maybe_str(getattr(event, "reason", None))
+        if reason is not None:
+            payload["reason"] = reason
+        if not payload:
+            return None
+        return payload
 
     @staticmethod
     def _info_decimal(info: dict[str, Any], *keys: str) -> Decimal | None:

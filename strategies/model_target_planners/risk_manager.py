@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import date
 import json
 from typing import Any
+from uuid import uuid4
 from urllib.error import HTTPError
 from urllib.error import URLError
 from urllib.request import Request
@@ -40,7 +42,9 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             return ModelTargetPlan(request.trading_date, request.signal_date, {}, self.reason)
         if not request.candidates:
             raise RuntimeError("risk-manager optimize requires active positions mapped to stock codes")
-        response = self._post_json(self._payload(request))
+        request.signal_date = date.fromisoformat("2026-06-24")  #TODO Replace with actual date if needed
+        request_id = self._request_id(request)
+        response = self._post_json(self._payload(request, request_id))
         if not bool(response.get("success")):
             status = response.get("status")
             failure_reason = response.get("failure_reason")
@@ -54,11 +58,11 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             signal_date=request.signal_date,
             weights=weights,
             reason=self.reason,
-            request_id=self._request_id(request),
+            request_id=request_id,
             target_qty=target_qty,
         )
 
-    def _payload(self, request: ModelTargetPlanningRequest) -> dict[str, Any]:
+    def _payload(self, request: ModelTargetPlanningRequest, request_id: str) -> dict[str, Any]:
         asof_date = request.signal_date or request.trading_date
         current_weights = [
             {"stock_code": stock_code, "current_weight": weight}
@@ -66,7 +70,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         ]
         previous_position_total = sum(max(0.0, weight) for weight in request.current_weights.values())
         payload: dict[str, Any] = {
-            "request_id": self._request_id(request),
+            "request_id": request_id,
             "mode": self.mode,
             "risk_model_id": self.risk_model_id,
             "asof_date": asof_date.isoformat(),
@@ -99,7 +103,10 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
 
     def _request_id(self, request: ModelTargetPlanningRequest) -> str:
         signal_text = "none" if request.signal_date is None else request.signal_date.isoformat()
-        return f"qapp-model-target-{request.trading_date.isoformat()}-{signal_text}-{len(request.candidates)}"
+        return (
+            f"qapp-model-target-{request.trading_date.isoformat()}-{signal_text}"
+            f"-{len(request.candidates)}-{uuid4().hex}"
+        )
 
     def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         endpoint = f"{self.base_url}/v1/portfolio/optimize"
