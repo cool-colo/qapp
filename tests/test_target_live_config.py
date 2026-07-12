@@ -18,6 +18,7 @@ import pandas as pd
 from backtests.result_writers.live_records import AFTER_TRADING
 from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
+from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_writer import LiveSnapshotWriter
 from nautilus_trader.common.enums import LogColor
 
@@ -302,6 +303,132 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(cursor.execute.call_count, 2)
         connection.ping.assert_called_once_with(reconnect=True)
 
+    def test_writer_execute_logs_reconnect_failure_details(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._commit = False
+
+        cursor = MagicMock()
+        cursor.execute.side_effect = Exception(0, "")
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        connection.ping.side_effect = Exception(2006, "server has gone away")
+        connection.connect.side_effect = Exception(2003, "can't connect")
+        writer._connection = connection
+
+        with patch("backtests.result_writers.live_writer._LOGGER") as logger:
+            with self.assertRaises(Exception):
+                writer._execute("INSERT INTO t VALUES (%s)", (1,))
+
+        logger.warning.assert_any_call(
+            "LiveSnapshotWriter ping(reconnect=True) failed: %r",
+            connection.ping.side_effect,
+        )
+        logger.warning.assert_any_call(
+            "LiveSnapshotWriter connect() failed during reconnect: %r",
+            connection.connect.side_effect,
+        )
+        logger.warning.assert_any_call(
+            "LiveSnapshotWriter failed to reconnect after connection-lost error: %r",
+            cursor.execute.side_effect,
+        )
+
+    def test_writer_execute_logs_retry_failure_after_reconnect(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._commit = False
+
+        first_exc = Exception(0, "")
+        retry_exc = Exception(1064, "bad sql")
+        cursor = MagicMock()
+        cursor.execute.side_effect = [first_exc, retry_exc]
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        writer._connection = connection
+
+        with patch("backtests.result_writers.live_writer._LOGGER") as logger:
+            with self.assertRaises(Exception):
+                writer._execute("INSERT INTO t VALUES (%s)", (1,))
+
+        logger.warning.assert_any_call(
+            "LiveSnapshotWriter retry after reconnect failed; original=%r retry=%r",
+            first_exc,
+            retry_exc,
+        )
+        connection.ping.assert_called_once_with(reconnect=True)
+
+    def test_writer_write_target_portfolios_keys_by_snapshot_type(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._upsert_many = MagicMock()
+
+        writer.write_target_portfolios(
+            [
+                LiveTargetRecord(
+                    trade_date=date(2026, 7, 10),
+                    write_time=datetime(2026, 7, 10, 9, 27),
+                    snapshot_type=BEFORE_TRADING,
+                    account_id="ACC",
+                    trader_id="TRADER",
+                    signal_date=date(2026, 7, 9),
+                    asset_snapshot_id=1,
+                    position_snapshot_id=2,
+                    total_asset=Decimal("1000000"),
+                    investable_asset=Decimal("950000"),
+                    request_id="req-1",
+                    target_version="ver-1",
+                    instrument_id="000001.SZ.QMT",
+                    stock_code="000001.SZ",
+                    target_weight=Decimal("0.1"),
+                    open_price=Decimal("10.0"),
+                    price_source="open",
+                    target_qty=10000,
+                    score=Decimal("0.5"),
+                    reason="risk_manager_optimize",
+                    extra={},
+                    created_at=datetime(2026, 7, 10, 9, 27),
+                ),
+            ],
+        )
+
+        self.assertEqual(writer._upsert_many.call_count, 1)
+        self.assertEqual(
+            writer._upsert_many.call_args.kwargs["key_columns"],
+            (
+                "account_id",
+                "trader_id",
+                "trade_date",
+                "signal_date",
+                "snapshot_type",
+                "instrument_id",
+            ),
+        )
+
+    def test_writer_ensure_target_indexes_upgrades_uk_target_to_include_snapshot_type(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._query = MagicMock(
+            return_value=[
+                ("live_target_portfolio", 0, "uk_target", 1, "account_id"),
+                ("live_target_portfolio", 0, "uk_target", 2, "trader_id"),
+                ("live_target_portfolio", 0, "uk_target", 3, "trade_date"),
+                ("live_target_portfolio", 0, "uk_target", 4, "signal_date"),
+                ("live_target_portfolio", 0, "uk_target", 5, "instrument_id"),
+            ],
+        )
+        writer._execute = MagicMock()
+
+        writer._ensure_target_indexes()
+
+        self.assertEqual(
+            writer._execute.call_args_list,
+            [
+                call("ALTER TABLE `live_target_portfolio` DROP INDEX `uk_target`", ()),
+                call(
+                    "ALTER TABLE `live_target_portfolio` "
+                    "ADD UNIQUE KEY `uk_target` "
+                    "(`account_id`,`trader_id`,`trade_date`,`signal_date`,`snapshot_type`,`instrument_id`)",
+                    (),
+                ),
+            ],
+        )
+
     def test_position_snapshot_uses_qmt_market_value_for_unprefixed_columns(self) -> None:
         writer = SimpleNamespace(
             has_position_snapshot=MagicMock(return_value=False),
@@ -446,6 +573,34 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertTrue(record.reason.endswith("..."))
         self.assertEqual(record.qmt_raw["reason"], long_reason)
         self.assertEqual(record.qmt_raw["broker_code"], "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE")
+
+    def test_order_status_uses_enum_name_for_live_order_status(self) -> None:
+        class EnumLikeStatus:
+            name = "ACCEPTED"
+
+            def __str__(self) -> str:
+                return "7"
+
+        status = EnumLikeStatus()
+
+        text = SnapshotRecorder._order_status_text(
+            SimpleNamespace(status=status),
+            SimpleNamespace(),
+        )
+
+        self.assertEqual(text, "accepted")
+
+    def test_order_status_falls_back_to_string_when_name_missing(self) -> None:
+        class StatusWithoutName:
+            def __str__(self) -> str:
+                return "pending_review"
+
+        text = SnapshotRecorder._order_status_text(
+            SimpleNamespace(status=StatusWithoutName()),
+            SimpleNamespace(),
+        )
+
+        self.assertEqual(text, "pending_review")
 
     @staticmethod
     def _make_snapshot_recorder_stub(now_text: str) -> SimpleNamespace:

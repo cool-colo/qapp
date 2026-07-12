@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date
 from datetime import datetime
 from decimal import Decimal
@@ -17,6 +18,9 @@ from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveTradeRecord
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _json_default(value: Any) -> Any:
@@ -129,7 +133,7 @@ CREATE TABLE IF NOT EXISTS `live_target_portfolio` (
   `created_at`    DATETIME     NOT NULL,
   `schema_version` INT         NOT NULL DEFAULT 1,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_target` (`account_id`,`trader_id`,`trade_date`,`signal_date`,`instrument_id`)
+  UNIQUE KEY `uk_target` (`account_id`,`trader_id`,`trade_date`,`signal_date`,`snapshot_type`,`instrument_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
@@ -234,6 +238,7 @@ class LiveSnapshotWriter:
         for statement in CREATE_TABLES_SQL:
             self._execute(statement, ())
         self._ensure_target_columns()
+        self._ensure_target_indexes()
 
     def _ensure_target_columns(self) -> None:
         """
@@ -264,6 +269,50 @@ class LiveSnapshotWriter:
             except Exception:
                 # Concurrent add or insufficient privilege — leave as-is.
                 pass
+
+    def _ensure_target_indexes(self) -> None:
+        """
+        Keep the target table unique key aligned with the phase-aware write path.
+
+        Early deployments keyed ``live_target_portfolio`` only by
+        ``(account_id, trader_id, trade_date, signal_date, instrument_id)``, which lets
+        a later ``continuous_trading`` write overwrite the earlier ``before_trading``
+        row for the same instrument. The recorder and readers both treat snapshot phase
+        as part of the identity, so include ``snapshot_type`` in ``uk_target``.
+        """
+        expected = (
+            "account_id",
+            "trader_id",
+            "trade_date",
+            "signal_date",
+            "snapshot_type",
+            "instrument_id",
+        )
+        try:
+            rows = self._query("SHOW INDEX FROM `live_target_portfolio`", ())
+        except Exception:
+            return
+        current = tuple(
+            str(row[4])
+            for row in sorted(
+                (row for row in rows if len(row) >= 5 and str(row[2]) == "uk_target"),
+                key=lambda row: int(row[3]),
+            )
+        )
+        if current == expected:
+            return
+        try:
+            if current:
+                self._execute("ALTER TABLE `live_target_portfolio` DROP INDEX `uk_target`", ())
+            self._execute(
+                "ALTER TABLE `live_target_portfolio` "
+                "ADD UNIQUE KEY `uk_target` "
+                "(`account_id`,`trader_id`,`trade_date`,`signal_date`,`snapshot_type`,`instrument_id`)",
+                (),
+            )
+        except Exception:
+            # Concurrent DDL or insufficient privilege — leave as-is.
+            pass
 
     # ---- writes --------------------------------------------------------------
 
@@ -301,7 +350,14 @@ class LiveSnapshotWriter:
         self._upsert_many(
             "live_target_portfolio",
             [self._target_row(record) for record in records],
-            key_columns=("account_id", "trader_id", "trade_date", "signal_date", "instrument_id"),
+            key_columns=(
+                "account_id",
+                "trader_id",
+                "trade_date",
+                "signal_date",
+                "snapshot_type",
+                "instrument_id",
+            ),
             preserve_columns=("created_at",),
         )
 
@@ -735,8 +791,20 @@ class LiveSnapshotWriter:
             if not self._is_connection_lost(exc):
                 raise
             if not self._reconnect():
+                _LOGGER.warning(
+                    "LiveSnapshotWriter failed to reconnect after connection-lost error: %r",
+                    exc,
+                )
                 raise
-            return run()
+            try:
+                return run()
+            except Exception as retry_exc:
+                _LOGGER.warning(
+                    "LiveSnapshotWriter retry after reconnect failed; original=%r retry=%r",
+                    exc,
+                    retry_exc,
+                )
+                raise
 
     def _reconnect(self) -> bool:
         # Prefer ping(reconnect=True) — it re-establishes the socket and is the
@@ -748,15 +816,26 @@ class LiveSnapshotWriter:
                 return True
             except TypeError:
                 pass
-            except Exception:
+            except Exception as exc:
+                _LOGGER.warning(
+                    "LiveSnapshotWriter ping(reconnect=True) failed: %r",
+                    exc,
+                )
                 pass
         connect = getattr(self._connection, "connect", None)
         if connect is None:
+            _LOGGER.warning(
+                "LiveSnapshotWriter connection object has no connect() after reconnect failure",
+            )
             return False
         try:
             connect()
             return True
-        except Exception:
+        except Exception as exc:
+            _LOGGER.warning(
+                "LiveSnapshotWriter connect() failed during reconnect: %r",
+                exc,
+            )
             return False
 
     @staticmethod

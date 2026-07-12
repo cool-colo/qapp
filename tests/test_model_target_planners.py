@@ -118,6 +118,8 @@ class ModelTargetPlannerTest(unittest.TestCase):
         )
         self.assertAlmostEqual(captured["payload"]["previous_position_total"], 0.30)
         self.assertEqual(plan.reason, "risk_manager_optimize")
+        self.assertEqual(plan.signal_date, date(2026, 7, 1))
+        self.assertEqual(request.signal_date, date(2026, 7, 1))
         # Weights map to instrument ids for the two known candidates; the unknown
         # 999999.SZ is dropped.
         self.assertEqual(

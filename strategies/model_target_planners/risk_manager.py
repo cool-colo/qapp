@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import date
 import json
 from typing import Any
 from uuid import uuid4
@@ -42,7 +41,6 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             return ModelTargetPlan(request.trading_date, request.signal_date, {}, self.reason)
         if not request.candidates:
             raise RuntimeError("risk-manager optimize requires active positions mapped to stock codes")
-        request.signal_date = date.fromisoformat("2026-06-24")  #TODO Replace with actual date if needed
         request_id = self._request_id(request)
         response = self._post_json(self._payload(request, request_id))
         if not bool(response.get("success")):

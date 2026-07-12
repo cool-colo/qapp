@@ -1035,6 +1035,18 @@ class SnapshotRecorder(Actor):
         return text or None
 
     @staticmethod
+    def _enum_name_text(value: Any, lowercase: bool = True) -> str | None:
+        if value is None:
+            return None
+        name = getattr(value, "name", None)
+        if isinstance(name, str) and name:
+            return name.lower() if lowercase else name
+        text = str(value)
+        if not text:
+            return None
+        return text.lower() if lowercase else text
+
+    @staticmethod
     def _order_side_text(order: Any, event: Any) -> str | None:
         side = getattr(order, "side", None) if order is not None else None
         if side is None:
@@ -1056,7 +1068,7 @@ class SnapshotRecorder(Actor):
     def _order_status_text(order: Any, event: Any) -> str:
         status = getattr(order, "status", None) if order is not None else None
         if status is not None:
-            return str(status)
+            return SnapshotRecorder._enum_name_text(status) or "unknown"
         # Fall back to the event class name (e.g. OrderRejected) before the cache order
         # is available.
         return type(event).__name__.replace("Order", "").lower() or "unknown"
