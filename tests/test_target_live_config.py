@@ -429,6 +429,60 @@ class TargetLiveConfigTest(unittest.TestCase):
             ],
         )
 
+    def test_writer_ensure_order_columns_adds_open_price_and_book_snapshot(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._query = MagicMock(
+            return_value=[
+                ("id",),
+                ("trade_date",),
+                ("client_order_id",),
+            ],
+        )
+
+    def test_writer_ensure_position_columns_adds_open_price_and_close_price(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._query = MagicMock(
+            return_value=[
+                ("id",),
+                ("trade_date",),
+                ("instrument_id",),
+            ],
+        )
+        writer._execute = MagicMock()
+
+        writer._ensure_position_columns()
+
+        self.assertEqual(
+            writer._execute.call_args_list,
+            [
+                call(
+                    "ALTER TABLE `live_position_snapshot` ADD COLUMN `open_price` DECIMAL(20,4) NULL",
+                    (),
+                ),
+                call(
+                    "ALTER TABLE `live_position_snapshot` ADD COLUMN `close_price` DECIMAL(20,4) NULL",
+                    (),
+                ),
+            ],
+        )
+        writer._execute = MagicMock()
+
+        writer._ensure_order_columns()
+
+        self.assertEqual(
+            writer._execute.call_args_list,
+            [
+                call(
+                    "ALTER TABLE `live_order` ADD COLUMN `open_price` DECIMAL(20,4) NULL",
+                    (),
+                ),
+                call(
+                    "ALTER TABLE `live_order` ADD COLUMN `book_snapshot` JSON NULL",
+                    (),
+                ),
+            ],
+        )
+
     def test_position_snapshot_uses_qmt_market_value_for_unprefixed_columns(self) -> None:
         writer = SimpleNamespace(
             has_position_snapshot=MagicMock(return_value=False),
@@ -472,12 +526,22 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder._decimal_or_none = SnapshotRecorder._decimal_or_none
         recorder._nt_net_qty = MagicMock(return_value=None)
         recorder._strategy_last_close = MagicMock(return_value=3.32)
+        recorder._position_open_price = lambda instrument_id: SnapshotRecorder._position_open_price(
+            recorder,
+            instrument_id,
+        )
+        recorder._position_close_price = lambda snapshot_type, strategy_last_close: SnapshotRecorder._position_close_price(
+            recorder,
+            snapshot_type,
+            strategy_last_close,
+        )
         recorder._market_value = SnapshotRecorder._market_value
         recorder._broker_position_for = SnapshotRecorder._broker_position_for
         recorder._broker_decimal = SnapshotRecorder._broker_decimal
         recorder._int_or_none = SnapshotRecorder._int_or_none
         recorder._position_qmt_raw = SnapshotRecorder._position_qmt_raw
         recorder._to_str = SnapshotRecorder._to_str
+        recorder._strategy._today_open = {"000720.SZ.QMT": 3.21}
         recorder._record_positions_with_broker = (
             lambda trading_date, snapshot_type, source, broker_positions:
             SnapshotRecorder._record_positions_with_broker(
@@ -495,6 +559,8 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(record.market_value, Decimal("466506.00"))
         self.assertEqual(record.nt_market_value, Decimal("475092.00"))
         self.assertEqual(record.nt_last_price, Decimal("3.32"))
+        self.assertEqual(record.open_price, Decimal("3.21"))
+        self.assertEqual(record.close_price, Decimal("3.32"))
         self.assertEqual(record.qmt_raw["market_value"], "466506.00")
 
     def test_position_fetch_schedules_awaitable_on_running_loop(self) -> None:
@@ -549,6 +615,18 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder._order_status_text = SnapshotRecorder._order_status_text
         recorder._bounded_order_reason = SnapshotRecorder._bounded_order_reason
         recorder._order_event_payload = SnapshotRecorder._order_event_payload
+        recorder._order_open_price = lambda instrument_id: SnapshotRecorder._order_open_price(
+            recorder,
+            instrument_id,
+        )
+        recorder._order_book_snapshot = lambda instrument_id, instrument_id_text: SnapshotRecorder._order_book_snapshot(
+            recorder,
+            instrument_id,
+            instrument_id_text,
+        )
+        recorder._book_snapshot_payload = SnapshotRecorder._book_snapshot_payload
+        recorder._book_side_payload = SnapshotRecorder._book_side_payload
+        recorder._float_or_none = SnapshotRecorder._float_or_none
 
         long_reason = (
             "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE: free=21642.68 CNY, "
@@ -564,6 +642,15 @@ class TargetLiveConfigTest(unittest.TestCase):
                 "info": {"broker_code": "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE"},
             },
         )()
+        recorder._strategy._today_open = {"001202.SZ.QMT": 19.87}
+        recorder._strategy._book_snapshot = MagicMock(
+            return_value=(
+                19.85,
+                19.88,
+                [(19.85, 2100.0), (19.84, 1000.0)],
+                [(19.88, 1800.0), (19.89, 2600.0)],
+            ),
+        )
 
         SnapshotRecorder._upsert_order_from_event(recorder, event)
 
@@ -571,6 +658,22 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(record.client_order_id, "O-1")
         self.assertEqual(len(record.reason), SnapshotRecorder._LIVE_ORDER_REASON_MAX_LEN)
         self.assertTrue(record.reason.endswith("..."))
+        self.assertEqual(record.open_price, Decimal("19.87"))
+        self.assertEqual(
+            record.book_snapshot,
+            {
+                "best_bid": 19.85,
+                "best_ask": 19.88,
+                "bids": [
+                    {"price": 19.85, "size": 2100.0},
+                    {"price": 19.84, "size": 1000.0},
+                ],
+                "asks": [
+                    {"price": 19.88, "size": 1800.0},
+                    {"price": 19.89, "size": 2600.0},
+                ],
+            },
+        )
         self.assertEqual(record.qmt_raw["reason"], long_reason)
         self.assertEqual(record.qmt_raw["broker_code"], "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE")
 

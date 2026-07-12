@@ -90,6 +90,8 @@ CREATE TABLE IF NOT EXISTS `live_position_snapshot` (
   `volume`         BIGINT       NULL,
   `can_use_volume` BIGINT       NULL,
   `avg_price`      DECIMAL(20,4) NULL,
+  `open_price`     DECIMAL(20,4) NULL,
+  `close_price`    DECIMAL(20,4) NULL,
   `market_value`   DECIMAL(20,4) NULL,
   `nt_net_qty`        BIGINT       NULL,
   `nt_avg_px_open`    DECIMAL(20,4) NULL,
@@ -156,6 +158,8 @@ CREATE TABLE IF NOT EXISTS `live_order` (
   `status`        VARCHAR(24)  NOT NULL,
   `target_weight` DECIMAL(12,8) NULL,
   `target_version` VARCHAR(128) NULL,
+  `open_price`    DECIMAL(20,4) NULL,
+  `book_snapshot` JSON         NULL,
   `reason`        VARCHAR(64)  NULL,
   `qmt_raw`       JSON         NULL,
   `created_at`    DATETIME     NOT NULL,
@@ -238,6 +242,8 @@ class LiveSnapshotWriter:
         for statement in CREATE_TABLES_SQL:
             self._execute(statement, ())
         self._ensure_target_columns()
+        self._ensure_position_columns()
+        self._ensure_order_columns()
         self._ensure_target_indexes()
 
     def _ensure_target_columns(self) -> None:
@@ -264,6 +270,62 @@ class LiveSnapshotWriter:
             try:
                 self._execute(
                     f"ALTER TABLE `live_target_portfolio` ADD COLUMN `{column}` {ddl}",
+                    (),
+                )
+            except Exception:
+                # Concurrent add or insufficient privilege — leave as-is.
+                pass
+
+    def _ensure_position_columns(self) -> None:
+        """
+        Add position columns introduced after the initial live_position_snapshot
+        deployment. Best-effort only.
+        """
+        additions = {
+            "open_price": "DECIMAL(20,4) NULL",
+            "close_price": "DECIMAL(20,4) NULL",
+        }
+        try:
+            existing = {
+                str(row[0])
+                for row in self._query("SHOW COLUMNS FROM `live_position_snapshot`", ())
+            }
+        except Exception:
+            return
+        for column, ddl in additions.items():
+            if column in existing:
+                continue
+            try:
+                self._execute(
+                    f"ALTER TABLE `live_position_snapshot` ADD COLUMN `{column}` {ddl}",
+                    (),
+                )
+            except Exception:
+                # Concurrent add or insufficient privilege — leave as-is.
+                pass
+
+    def _ensure_order_columns(self) -> None:
+        """
+        Add order columns introduced after the initial live_order deployment.
+        Failures only warn implicitly via the caller's best-effort behavior.
+        """
+        additions = {
+            "open_price": "DECIMAL(20,4) NULL",
+            "book_snapshot": "JSON NULL",
+        }
+        try:
+            existing = {
+                str(row[0])
+                for row in self._query("SHOW COLUMNS FROM `live_order`", ())
+            }
+        except Exception:
+            return
+        for column, ddl in additions.items():
+            if column in existing:
+                continue
+            try:
+                self._execute(
+                    f"ALTER TABLE `live_order` ADD COLUMN `{column}` {ddl}",
                     (),
                 )
             except Exception:
@@ -615,6 +677,8 @@ class LiveSnapshotWriter:
             "volume": record.volume,
             "can_use_volume": record.can_use_volume,
             "avg_price": record.avg_price,
+            "open_price": record.open_price,
+            "close_price": record.close_price,
             "market_value": record.market_value,
             "nt_net_qty": record.nt_net_qty,
             "nt_avg_px_open": record.nt_avg_px_open,
@@ -677,6 +741,8 @@ class LiveSnapshotWriter:
             "status": record.status,
             "target_weight": record.target_weight,
             "target_version": record.target_version,
+            "open_price": record.open_price,
+            "book_snapshot": _json_dumps(record.book_snapshot),
             "reason": record.reason,
             "qmt_raw": _json_dumps(record.qmt_raw),
             "created_at": _timestamp(record.created_at),

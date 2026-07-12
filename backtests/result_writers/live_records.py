@@ -67,6 +67,8 @@ class LivePositionSnapshotRecord:
     volume: int | None = None
     can_use_volume: int | None = None
     avg_price: Decimal | None = None
+    open_price: Decimal | None = None
+    close_price: Decimal | None = None
     market_value: Decimal | None = None
     # Nautilus comparison fields.
     nt_net_qty: int | None = None
@@ -127,6 +129,8 @@ class LiveOrderRecord:
     avg_fill_price: Decimal | None = None
     target_weight: Decimal | None = None
     target_version: str | None = None
+    open_price: Decimal | None = None
+    book_snapshot: JsonMapping | None = None
     reason: str | None = None
     qmt_raw: JsonMapping | None = None
     created_at: datetime | None = None

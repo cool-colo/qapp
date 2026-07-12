@@ -243,6 +243,8 @@ class SnapshotRecorder(Actor):
             net_qty = self._decimal_or_none(getattr(position, "quantity", None)) or self._nt_net_qty(instrument_id)
             avg_px = self._decimal_or_none(getattr(position, "avg_px_open", None))
             last_price = self._strategy_last_close(instrument_id_text)
+            open_price = self._position_open_price(instrument_id_text)
+            close_price = self._position_close_price(snapshot_type, last_price)
             nt_market_value = self._market_value(net_qty, last_price)
             broker_volume = self._broker_decimal(broker_position, "volume")
             broker_can_use = self._broker_decimal(broker_position, "can_use_volume")
@@ -267,6 +269,8 @@ class SnapshotRecorder(Actor):
                         broker_can_use if broker_can_use is not None else can_use,
                     ),
                     avg_price=broker_avg_price if broker_avg_price is not None else avg_px,
+                    open_price=open_price,
+                    close_price=close_price,
                     market_value=broker_market_value if broker_market_value is not None else nt_market_value,
                     nt_net_qty=self._int_or_none(net_qty),
                     nt_avg_px_open=avg_px,
@@ -538,9 +542,11 @@ class SnapshotRecorder(Actor):
             order = self.cache.order(getattr(event, "client_order_id"))
         except Exception:
             order = None
-        instrument_id_text = str(getattr(event, "instrument_id", "") or "")
+        instrument_id = getattr(event, "instrument_id", None)
+        instrument_id_text = str(instrument_id or "")
         if order is not None:
-            instrument_id_text = str(order.instrument_id)
+            instrument_id = getattr(order, "instrument_id", instrument_id)
+            instrument_id_text = str(instrument_id)
         trading_date = self._event_date(event)
         record = LiveOrderRecord(
             trade_date=trading_date,
@@ -561,6 +567,8 @@ class SnapshotRecorder(Actor):
             status=self._order_status_text(order, event),
             target_weight=self._order_target_weight(client_order_id),
             target_version=self._order_target_version(client_order_id),
+            open_price=self._order_open_price(instrument_id_text),
+            book_snapshot=self._order_book_snapshot(instrument_id, instrument_id_text),
             reason=self._bounded_order_reason(getattr(event, "reason", None)),
             qmt_raw=self._order_event_payload(event),
             created_at=self._now_naive(),
@@ -808,6 +816,21 @@ class SnapshotRecorder(Actor):
             return closes.get(instrument_id_text)
         return None
 
+    def _position_open_price(self, instrument_id_text: str) -> Decimal | None:
+        opens = getattr(self._strategy, "_today_open", None)
+        if not isinstance(opens, dict):
+            return None
+        return self._decimal_or_none(opens.get(instrument_id_text))
+
+    def _position_close_price(
+        self,
+        snapshot_type: str,
+        strategy_last_close: Any,
+    ) -> Decimal | None:
+        if snapshot_type != AFTER_TRADING:
+            return None
+        return self._decimal_or_none(strategy_last_close)
+
     @staticmethod
     def _broker_position_for(
         broker_positions: dict[str, dict[str, Any]],
@@ -849,6 +872,108 @@ class SnapshotRecorder(Actor):
         if isinstance(versions, dict):
             return versions.get(client_order_id)
         return None
+
+    def _order_open_price(self, instrument_id_text: str) -> Decimal | None:
+        opens = getattr(self._strategy, "_today_open", None)
+        if not isinstance(opens, dict):
+            return None
+        return self._decimal_or_none(opens.get(instrument_id_text))
+
+    def _order_book_snapshot(
+        self,
+        instrument_id: Any,
+        instrument_id_text: str,
+    ) -> dict[str, Any] | None:
+        resolved_instrument = instrument_id
+        if resolved_instrument is None or isinstance(resolved_instrument, str):
+            try:
+                resolved_instrument = InstrumentId.from_str(instrument_id_text)
+            except Exception:
+                resolved_instrument = instrument_id
+
+        book_snapshot = getattr(self._strategy, "_book_snapshot", None)
+        if callable(book_snapshot):
+            try:
+                payload = self._book_snapshot_payload(book_snapshot(resolved_instrument))
+                if payload is not None:
+                    return payload
+            except Exception:
+                pass
+
+        depth_books = getattr(self._strategy, "_depth_books", None)
+        if isinstance(depth_books, dict):
+            payload = self._book_snapshot_payload(depth_books.get(instrument_id_text))
+            if payload is not None:
+                return payload
+
+        quote_snapshot = getattr(self._strategy, "_quote_snapshot", None)
+        if callable(quote_snapshot):
+            try:
+                best_bid, best_ask = quote_snapshot(resolved_instrument)
+            except Exception:
+                return None
+            return self._book_snapshot_payload(
+                (
+                    best_bid,
+                    best_ask,
+                    [(best_bid, 0.0)] if best_bid is not None else [],
+                    [(best_ask, 0.0)] if best_ask is not None else [],
+                ),
+            )
+        return None
+
+    @classmethod
+    def _book_snapshot_payload(cls, snapshot: Any) -> dict[str, Any] | None:
+        if snapshot is None:
+            return None
+        if isinstance(snapshot, tuple) and len(snapshot) == 2:
+            bids, asks = snapshot
+            best_bid = bids[0][0] if bids else None
+            best_ask = asks[0][0] if asks else None
+        elif isinstance(snapshot, tuple) and len(snapshot) == 4:
+            best_bid, best_ask, bids, asks = snapshot
+        else:
+            return None
+        bid_levels = cls._book_side_payload(bids)
+        ask_levels = cls._book_side_payload(asks)
+        best_bid_value = cls._float_or_none(best_bid)
+        best_ask_value = cls._float_or_none(best_ask)
+        if (
+            best_bid_value is None
+            and best_ask_value is None
+            and not bid_levels
+            and not ask_levels
+        ):
+            return None
+        return {
+            "best_bid": best_bid_value,
+            "best_ask": best_ask_value,
+            "bids": bid_levels,
+            "asks": ask_levels,
+        }
+
+    @classmethod
+    def _book_side_payload(cls, levels: Any) -> list[dict[str, float]]:
+        payload: list[dict[str, float]] = []
+        for level in levels or []:
+            price = None
+            size = None
+            if isinstance(level, (tuple, list)) and len(level) >= 2:
+                price, size = level[0], level[1]
+            else:
+                price = getattr(level, "price", None)
+                size = getattr(level, "size", None)
+            price_value = cls._float_or_none(price)
+            size_value = cls._float_or_none(size)
+            if price_value is None:
+                continue
+            payload.append(
+                {
+                    "price": price_value,
+                    "size": 0.0 if size_value is None else size_value,
+                },
+            )
+        return payload
 
     def _nt_net_qty(self, instrument_id: InstrumentId) -> Decimal | None:
         try:
@@ -1011,6 +1136,11 @@ class SnapshotRecorder(Actor):
     def _int_or_none(value: Any) -> int | None:
         dec = SnapshotRecorder._decimal_or_none(value)
         return None if dec is None else int(dec)
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        dec = SnapshotRecorder._decimal_or_none(value)
+        return None if dec is None else float(dec)
 
     @staticmethod
     def _market_value(qty: Any, price: Any) -> Decimal | None:
