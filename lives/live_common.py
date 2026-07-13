@@ -294,12 +294,6 @@ def parse_args() -> argparse.Namespace:
         help="Limit-order offset in ticks past the touch: buy at ask+N*tick, sell at bid-N*tick.",
     )
     parser.add_argument(
-        "--quote-tick-log-sample-rate",
-        type=float,
-        default=float(env("MODEL_QUOTE_TICK_LOG_SAMPLE_RATE", "0.0") or "0.0"),
-        help="Fraction (0.0-1.0) of quote ticks to log. 0 disables quote-tick logging.",
-    )
-    parser.add_argument(
         "--trade-tick-log-sample-rate",
         type=float,
         default=float(env("MODEL_TRADE_TICK_LOG_SAMPLE_RATE", "0.0") or "0.0"),
@@ -381,11 +375,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exchange-timezone", default=env("QMT_EXCHANGE_TIMEZONE", "Asia/Shanghai"))
     parser.add_argument(
         "--trading-windows",
-        default=env("QMT_TRADING_WINDOWS", "09:30-11:30,13:00-14:55"),
+        default=env("QMT_TRADING_WINDOWS", "09:29-11:30,13:00-14:55"),
         help=(
             "Live-only: comma-separated HH:MM-HH:MM order sessions (exchange tz). "
             "Orders submit only inside these ranges; the lunch break is excluded. "
-            "Default '09:31-11:30,13:00-14:55'."
+            "Default '09:29-11:30,13:00-14:55'."
         ),
     )
     parser.add_argument("--price-precision", type=int, default=int(env("QMT_PRICE_PRECISION", "2")))

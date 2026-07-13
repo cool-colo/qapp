@@ -253,6 +253,7 @@ class TestableTargetWeightStrategy:
     _unsubscribe_market_data = TargetWeightStrategy._unsubscribe_market_data
     _refresh_order_book_depth_subscriptions = TargetWeightStrategy._refresh_order_book_depth_subscriptions
     update_target_weights = TargetWeightStrategy.update_target_weights
+    apply_frozen_targets = TargetWeightStrategy.apply_frozen_targets
     _target_weights_log_detail = staticmethod(TargetWeightStrategy._target_weights_log_detail)
     on_bar = TargetWeightStrategy.on_bar
     on_order_book_depth = TargetWeightStrategy.on_order_book_depth
@@ -268,6 +269,8 @@ class TestableTargetWeightStrategy:
     _on_converge_timer = TargetWeightStrategy._on_converge_timer
     _desired_weights = TargetWeightStrategy._desired_weights
     _held_instrument_ids = TargetWeightStrategy._held_instrument_ids
+    _log_convergence_summary = TargetWeightStrategy._log_convergence_summary
+    _instrument_list_sample = staticmethod(TargetWeightStrategy._instrument_list_sample)
     _refresh_symbol_freezes = TargetWeightStrategy._refresh_symbol_freezes
     _price_limit_reason = TargetWeightStrategy._price_limit_reason
     _target_achieved = TargetWeightStrategy._target_achieved
@@ -316,8 +319,11 @@ class TestableTargetWeightStrategy:
     _stop_time_reached = TargetWeightStrategy._stop_time_reached
     _within_trading_window = TargetWeightStrategy._within_trading_window
     _within_trading_time = TargetWeightStrategy._within_trading_time
+    _within_pre_open_quote_log_window = TargetWeightStrategy._within_pre_open_quote_log_window
+    _quote_tick_window_gate_enabled = TargetWeightStrategy._quote_tick_window_gate_enabled
     _note_quote_tick = TargetWeightStrategy._note_quote_tick
     on_quote_tick = TargetWeightStrategy.on_quote_tick
+    _subscribe_quote_tick_window_probes = TargetWeightStrategy._subscribe_quote_tick_window_probes
     _quantity_from_value = TargetWeightStrategy._quantity_from_value
     investable_total_asset = TargetWeightStrategy.investable_total_asset
     _clock_date = TargetWeightStrategy._clock_date
@@ -474,6 +480,8 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy._cancel_count_buy = {}
         strategy._cancel_count_sell = {}
         strategy._pricing_date = None
+        strategy._quote_tick_window_probe_ids = set()
+        strategy._subscribed_quote_tick_probe_instruments = set()
         # Mark the trading window as already unlocked by a live quote tick (the runtime
         # state during a trading session). The window gate now requires a tick when
         # subscribe_quote_ticks is on; these tests exercise convergence, not the gate.
@@ -544,6 +552,25 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(strategy.subscribed_trade_ticks, [])
         self.assertEqual(strategy.subscribed_order_book_depths, [])
         self.assertEqual(len(strategy.clock.timers), 1)
+
+    def test_on_start_subscribes_quote_tick_window_probes_when_quote_ticks_disabled(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetWeightStrategyConfig(
+            instrument_ids=[INST_A, INST_B, INST_C],
+            bar_types={},
+            subscribe_bars=False,
+            subscribe_quote_ticks=False,
+            subscribe_trade_ticks=False,
+            quote_tick_window_probe_instrument_ids=(INST_A, INST_B),
+            unfilled_timeout_secs=1.0,
+            resubmit_check_interval_secs=10.0,
+        )
+        strategy._quote_tick_window_probe_ids = {str(INST_A), str(INST_B)}
+
+        strategy.on_start()
+
+        self.assertEqual(strategy.subscribed_quote_ticks, [INST_A, INST_B])
+        self.assertEqual(strategy.subscribed_trade_ticks, [])
 
     def test_refresh_target_instruments_subscribes_trade_ticks_for_new_bars(self) -> None:
         bar_type = BarType.from_str(f"{INST_B}-1-MINUTE-LAST-EXTERNAL")
@@ -619,6 +646,69 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         self.assertEqual(len(strategy.log.infos), 1)
         self.assertIn("Trade tick sample", strategy.log.infos[0][0][0])
+
+    def test_quote_tick_0925_logs_but_does_not_unlock_window(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetWeightStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            subscribe_quote_ticks=False,
+            quote_tick_window_probe_instrument_ids=(INST_A,),
+            trading_windows="09:29-11:30,13:00-14:55",
+        )
+        strategy._quote_tick_window_probe_ids = {str(INST_A)}
+        strategy._quote_tick_window_date = None
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:25:00", tz="UTC")
+        tick = type(
+            "Tick",
+            (),
+            {
+                "instrument_id": INST_A,
+                "bid_price": Decimal("10.00"),
+                "bid_size": Decimal("100"),
+                "ask_price": Decimal("10.01"),
+                "ask_size": Decimal("100"),
+                "ts_event": 1,
+                "ts_init": 2,
+            },
+        )()
+
+        strategy.on_quote_tick(tick)
+
+        self.assertIsNone(strategy._quote_tick_window_date)
+        self.assertEqual(len(strategy.log.infos), 1)
+        self.assertIn("forced pre-open diagnostics", strategy.log.infos[0][0][0])
+
+    def test_quote_tick_0929_unlocks_window(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetWeightStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            subscribe_quote_ticks=False,
+            quote_tick_window_probe_instrument_ids=(INST_A,),
+            trading_windows="09:29-11:30,13:00-14:55",
+        )
+        strategy._quote_tick_window_probe_ids = {str(INST_A)}
+        strategy._quote_tick_window_date = None
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:29:00", tz="UTC")
+        tick = type(
+            "Tick",
+            (),
+            {
+                "instrument_id": INST_A,
+                "bid_price": Decimal("10.00"),
+                "bid_size": Decimal("100"),
+                "ask_price": Decimal("10.01"),
+                "ask_size": Decimal("100"),
+                "ts_event": 1,
+                "ts_init": 2,
+            },
+        )()
+
+        strategy.on_quote_tick(tick)
+
+        self.assertEqual(strategy._quote_tick_window_date, date(2026, 7, 2))
+        self.assertTrue(strategy._within_trading_window())
 
     def test_desired_weights_exit_non_targets_by_default(self) -> None:
         strategy = self.make_strategy(positions={INST_A: Decimal("100"), INST_C: Decimal("200")})
@@ -703,6 +793,68 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(strategy.submitted_orders[0].instrument_id, INST_C)
         self.assertEqual(strategy.submitted_orders[0].side, OrderSide.SELL)
         self.assertEqual(strategy._deferred_buys, {str(INST_A): 0.5})
+
+    def test_convergence_summary_logs_missing_today_open_skip(self) -> None:
+        strategy = self.make_strategy(
+            positions={INST_A: Decimal("1000")},
+            free_cash="1000000",
+            prices={INST_A: 10.0},
+            open_prices={},
+        )
+
+        strategy.update_target_weights({INST_A: 0.2}, date(2026, 7, 2), "missing_open")
+
+        summary_logs = [
+            args[0]
+            for args, _kwargs in strategy.log.infos
+            if args and str(args[0]).startswith("Target convergence summary ")
+        ]
+        self.assertEqual(len(summary_logs), 1)
+        self.assertIn("missing_open=1", summary_logs[0])
+        self.assertIn(f"missing_open_instruments=[{INST_A}]", summary_logs[0])
+        self.assertIn("sell_targets=0 buy_targets=0", summary_logs[0])
+        self.assertEqual(strategy.submitted_orders, [])
+
+    def test_convergence_summary_logs_cash_gap_for_buy_candidates(self) -> None:
+        strategy = self.make_strategy(
+            free_cash="1000",
+            equity="1000000",
+            prices={INST_A: 10.0},
+        )
+
+        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "cash_gap")
+
+        summary_logs = [
+            args[0]
+            for args, _kwargs in strategy.log.infos
+            if args and str(args[0]).startswith("Target convergence summary ")
+        ]
+        self.assertEqual(len(summary_logs), 1)
+        self.assertIn("sell_targets=0 buy_targets=1", summary_logs[0])
+        self.assertIn("estimated_buy_cost=500000.0", summary_logs[0])
+        self.assertIn("available_buy_cash=1000.0", summary_logs[0])
+        self.assertIn("cash_gap=499000.0", summary_logs[0])
+
+    def test_apply_frozen_targets_does_not_converge_before_frozen_quantities_are_loaded(self) -> None:
+        strategy = self.make_strategy(
+            positions={INST_A: Decimal("1000")},
+            free_cash="1000000",
+            equity="1000000",
+            prices={INST_A: 10.0},
+        )
+
+        strategy.apply_frozen_targets(
+            target_date=date(2026, 7, 2),
+            weights={INST_A: 0.02},
+            target_qty={INST_A: Decimal("1000")},
+            total_asset=Decimal("500000"),
+            reason="restart_frozen",
+            version="frozen-v1",
+        )
+
+        self.assertEqual(strategy._frozen_target_qty, {str(INST_A): Decimal("1000")})
+        self.assertEqual(strategy._frozen_portfolio_value, Decimal("500000"))
+        self.assertEqual(strategy.submitted_orders, [])
 
     def test_limit_up_freezes_only_affected_buy_symbol(self) -> None:
         strategy = self.make_strategy(
@@ -1358,6 +1510,23 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         self.assertEqual(strategy._today_open[str(INST_A)], 53.09)
         self.assertIn(str(INST_A), strategy._authoritative_open)
+
+    def test_full_tick_update_does_not_trigger_convergence(self) -> None:
+        strategy = self.make_strategy(
+            free_cash="1000000",
+            equity="1000000",
+            prices={INST_A: 10.0},
+            open_prices={},
+        )
+        strategy._target_weights = {str(INST_A): 0.5}
+        strategy._target_date = date(2026, 7, 2)
+        strategy._target_reason = "loaded_target"
+        strategy._target_version = "loaded-v1"
+
+        strategy._apply_full_tick({str(INST_A): {"open": 10.0}}, "refresh")
+
+        self.assertEqual(strategy._today_open[str(INST_A)], 10.0)
+        self.assertEqual(strategy.submitted_orders, [])
 
     def test_full_tick_async_source_runs_without_running_loop(self) -> None:
         strategy = self.make_strategy()

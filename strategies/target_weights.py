@@ -11,6 +11,8 @@ from datetime import date
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
+from typing import Literal
+from typing import overload
 
 import pandas as pd
 
@@ -96,7 +98,7 @@ class TargetWeightStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     bar_types: dict[str, BarType]
     initial_cash: Decimal = Decimal("1000000")
     timezone_name: str = "Asia/Shanghai"
-    trading_windows: str = "09:30-11:30,13:00-14:55"
+    trading_windows: str = "09:29-11:30,13:00-14:55"
     stop_time: str | None = "14:55"
     initial_last_closes: dict[str, float] | None = None
     star_min_buy_qty: int = 200
@@ -115,12 +117,12 @@ class TargetWeightStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     limit_stop_mode: str = "freeze_symbol"
     order_slice_notional: Decimal = Decimal("300000")
     require_account_cash: bool = True
-    quote_tick_log_sample_rate: float = 0.0
     trade_tick_log_sample_rate: float = 0.0
     order_book_depth_log_sample_rate: float = 0.0
     subscribe_bars: bool = True
     subscribe_quote_ticks: bool = True
     subscribe_trade_ticks: bool = True
+    quote_tick_window_probe_instrument_ids: tuple[InstrumentId, ...] = ()
     subscribe_order_book_depth: bool = False
     seed_open_from_last_close: bool = False
     full_tick_refresh_secs: float = 60.0
@@ -207,11 +209,16 @@ class TargetWeightStrategy(Strategy):
         self._pricing_date: date | None = None
         # Trading-day (in config timezone) on which we have received at least one
         # quote tick while the clock was inside a scheduled trading window. Time
-        # in the window is necessary but not sufficient to trade/converge: we also
-        # require live quotes, since ticks confirm the market is actually open and
-        # streaming. Reset daily via _ensure_pricing_date. A single subscribed
+        # in the window is necessary but not sufficient to trade/converge when
+        # quote subscriptions/probes are configured: live quotes confirm the
+        # market is actually open and streaming. A single subscribed/probe
         # instrument's tick is enough to unlock the whole window.
         self._quote_tick_window_date: date | None = None
+        self._quote_tick_window_probe_ids = {
+            str(instrument_id)
+            for instrument_id in config.quote_tick_window_probe_instrument_ids
+        }
+        self._subscribed_quote_tick_probe_instruments: set[str] = set()
         self._convergence_suspended = False
         self._pre_open_reconcile = None
         self._pre_open_reconcile_time: tuple[int, int] | None = None
@@ -283,6 +290,7 @@ class TargetWeightStrategy(Strategy):
             self.log.warning("target-weight executor has no bar_types configured")
         for bar_type in self._bar_types.values():
             self._subscribe_market_data(bar_type)
+        self._subscribe_quote_tick_window_probes()
         interval_secs = float(self.config.resubmit_check_interval_secs)
         if float(self.config.unfilled_timeout_secs) > 0 and interval_secs > 0:
             self.clock.set_timer(
@@ -386,8 +394,6 @@ class TargetWeightStrategy(Strategy):
                 f"date={trading_date} count={updated}",
                 color=LogColor.BLUE,
             )
-            if self._within_trading_window():
-                self._converge_to_target(current_date=trading_date, trigger="full_tick")
 
     @staticmethod
     def _full_tick_open(fields: Any) -> float | None:
@@ -575,6 +581,27 @@ class TargetWeightStrategy(Strategy):
         if bool(self.config.subscribe_trade_ticks):
             self.subscribe_trade_ticks(bar_type.instrument_id)
 
+    def _subscribe_quote_tick_window_probes(self) -> None:
+        if bool(self.config.subscribe_quote_ticks):
+            return
+        for instrument_id_text in sorted(self._quote_tick_window_probe_ids):
+            if instrument_id_text in self._subscribed_quote_tick_probe_instruments:
+                continue
+            instrument_id = InstrumentId.from_str(instrument_id_text)
+            try:
+                self.subscribe_quote_ticks(instrument_id)
+            except Exception as exc:
+                self.log.warning(f"Quote-tick window probe subscribe failed for {instrument_id}: {exc}")
+                continue
+            self._subscribed_quote_tick_probe_instruments.add(instrument_id_text)
+        if self._subscribed_quote_tick_probe_instruments:
+            self.log.info(
+                "Subscribed quote-tick window probes: "
+                f"count={len(self._subscribed_quote_tick_probe_instruments)} "
+                f"instruments={sorted(self._subscribed_quote_tick_probe_instruments)}",
+                color=LogColor.BLUE,
+            )
+
     def _unsubscribe_market_data(self, bar_type: BarType) -> None:
         if bool(self.config.subscribe_bars):
             try:
@@ -682,13 +709,21 @@ class TargetWeightStrategy(Strategy):
         MySQL on restart.
         """
         # Delegating clears _frozen_target_qty/_frozen_portfolio_value (a plain weight
-        # update supersedes stale freezes); re-populate them below for this version.
-        self.update_target_weights(
-            weights=weights,
-            target_date=target_date,
-            reason=reason,
-            version=version,
-        )
+        # update supersedes stale freezes), but it must not converge until the frozen
+        # quantities below are installed. On a mid-session restart, an intermediate
+        # live-weight convergence can submit a buy using drifting account value, then
+        # the frozen target immediately makes the same symbol look overweight.
+        was_suspended = self._convergence_suspended
+        self._convergence_suspended = True
+        try:
+            self.update_target_weights(
+                weights=weights,
+                target_date=target_date,
+                reason=reason,
+                version=version,
+            )
+        finally:
+            self._convergence_suspended = was_suspended
         frozen: dict[str, Decimal] = {}
         for instrument_id, quantity in target_qty.items():
             try:
@@ -800,10 +835,10 @@ class TargetWeightStrategy(Strategy):
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         self._note_quote_tick(tick)
-        if not self._should_log_sample(self.config.quote_tick_log_sample_rate):
+        if not self._within_pre_open_quote_log_window():
             return
         self.log.info(
-            "Quote tick order-book sample, "
+            "Quote tick order-book sample (forced pre-open diagnostics), "
             f"instrument_id={tick.instrument_id}, "
             f"bid_price={tick.bid_price}, bid_size={tick.bid_size}, "
             f"ask_price={tick.ask_price}, ask_size={tick.ask_size}, "
@@ -968,18 +1003,59 @@ class TargetWeightStrategy(Strategy):
         self._refresh_symbol_freezes(desired)
         sell_targets: dict[str, float] = {}
         buy_targets: dict[str, float] = {}
+        # Per-instrument classification tally for the convergence summary log below.
+        # Every desired instrument lands in exactly one action/skip bucket so we can
+        # explain each cycle, including the common silent-stall cause: a held target
+        # with no today-open price, which makes sizing skip it.
+        skip_open_order: list[str] = []
+        skip_frozen: list[str] = []
+        skip_sellable_exhausted: list[str] = []
+        skip_missing_open: list[str] = []
+        skip_missing_instrument: list[str] = []
+        skip_on_target: list[str] = []
+        buy_missing_open: list[str] = []
         for instrument_id_text, target_weight in desired.items():
             if instrument_id_text in open_order_instruments:
+                skip_open_order.append(instrument_id_text)
                 continue
             if instrument_id_text in self._frozen_instruments:
+                skip_frozen.append(instrument_id_text)
                 continue
-            side = self._target_side(instrument_id_text, target_weight)
+            side, reason = self._target_side(
+                instrument_id_text,
+                target_weight,
+                return_reason=True,
+            )
             if side == "sell":
                 if self._sellable_exhausted.get(instrument_id_text) == current_date:
+                    skip_sellable_exhausted.append(instrument_id_text)
                     continue
                 sell_targets[instrument_id_text] = target_weight
             elif side == "buy":
+                if reason == "missing_open":
+                    buy_missing_open.append(instrument_id_text)
                 buy_targets[instrument_id_text] = target_weight
+            else:
+                if reason == "missing_open":
+                    skip_missing_open.append(instrument_id_text)
+                elif reason == "missing_instrument":
+                    skip_missing_instrument.append(instrument_id_text)
+                else:
+                    skip_on_target.append(instrument_id_text)
+
+        self._log_convergence_summary(
+            trigger=trigger,
+            desired_count=len(desired),
+            sell_targets=sell_targets,
+            buy_targets=buy_targets,
+            skip_open_order=skip_open_order,
+            skip_frozen=skip_frozen,
+            skip_sellable_exhausted=skip_sellable_exhausted,
+            skip_missing_open=skip_missing_open,
+            skip_missing_instrument=skip_missing_instrument,
+            skip_on_target=skip_on_target,
+            buy_missing_open=buy_missing_open,
+        )
 
         for instrument_id_text, target_weight in sorted(sell_targets.items()):
             self._record_target(current_date, instrument_id_text, target_weight, self._target_reason)
@@ -1023,27 +1099,133 @@ class TargetWeightStrategy(Strategy):
                 result.add(str(instrument_id))
         return result
 
-    def _target_side(self, instrument_id_text: str, target_weight: float) -> str | None:
+    def _log_convergence_summary(
+        self,
+        *,
+        trigger: str,
+        desired_count: int,
+        sell_targets: dict[str, float],
+        buy_targets: dict[str, float],
+        skip_open_order: list[str],
+        skip_frozen: list[str],
+        skip_sellable_exhausted: list[str],
+        skip_missing_open: list[str],
+        skip_missing_instrument: list[str],
+        skip_on_target: list[str],
+        buy_missing_open: list[str],
+    ) -> None:
+        estimated_buy_cost = Decimal("0")
+        unknown_buy_cost = 0
+        for instrument_id_text, target_weight in buy_targets.items():
+            cost = self._estimated_buy_cost(instrument_id_text, target_weight)
+            if cost is None:
+                unknown_buy_cost += 1
+                continue
+            estimated_buy_cost += cost
+
+        free_cash = self._free_cash()
+        reserved_buy_cash = self._open_buy_order_notional()
+        available_buy_cash: Decimal | None
+        cash_gap: Decimal | None
+        if free_cash is None:
+            available_buy_cash = None
+            cash_gap = None
+        else:
+            buffer_pct = max(0.0, float(self.config.cash_buffer_percent))
+            available_buy_cash = free_cash * Decimal(str(1.0 - min(buffer_pct, 1.0)))
+            if reserved_buy_cash > 0:
+                available_buy_cash = max(Decimal("0"), available_buy_cash - reserved_buy_cash)
+            cash_gap = max(Decimal("0"), estimated_buy_cost - available_buy_cash)
+
+        missing_open_instruments = sorted(set(skip_missing_open).union(buy_missing_open))
+        self.log.info(
+            "Target convergence summary "
+            f"trigger={trigger} version={self._target_version} desired={desired_count} "
+            f"sell_targets={len(sell_targets)} buy_targets={len(buy_targets)} "
+            f"open_order={len(skip_open_order)} frozen={len(skip_frozen)} "
+            f"sellable_exhausted={len(skip_sellable_exhausted)} "
+            f"missing_open={len(missing_open_instruments)} "
+            f"missing_instrument={len(skip_missing_instrument)} "
+            f"on_target={len(skip_on_target)} "
+            f"deferred_buys={len(self._deferred_buys)} "
+            f"insufficient_funds={len(self._insufficient_funds)} "
+            f"estimated_buy_cost={estimated_buy_cost} unknown_buy_cost={unknown_buy_cost} "
+            f"free_cash={free_cash} reserved_buy_cash={reserved_buy_cash} "
+            f"available_buy_cash={available_buy_cash} cash_gap={cash_gap} "
+            f"missing_open_instruments={self._instrument_list_sample(missing_open_instruments)} "
+            f"open_order_instruments={self._instrument_list_sample(skip_open_order)} "
+            f"frozen_instruments={self._instrument_list_sample(skip_frozen)} "
+            f"sellable_exhausted_instruments={self._instrument_list_sample(skip_sellable_exhausted)}",
+            color=LogColor.BLUE,
+        )
+
+    @staticmethod
+    def _instrument_list_sample(instruments: list[str], limit: int = 8) -> str:
+        if not instruments:
+            return "[]"
+        ordered = sorted(instruments)
+        shown = ", ".join(ordered[:limit])
+        remaining = len(ordered) - limit
+        if remaining > 0:
+            shown = f"{shown}, ...(+{remaining})"
+        return f"[{shown}]"
+
+    @overload
+    def _target_side(
+        self,
+        instrument_id_text: str,
+        target_weight: float,
+        *,
+        return_reason: Literal[False] = False,
+    ) -> str | None:
+        ...
+
+    @overload
+    def _target_side(
+        self,
+        instrument_id_text: str,
+        target_weight: float,
+        *,
+        return_reason: Literal[True],
+    ) -> tuple[str | None, str]:
+        ...
+
+    def _target_side(
+        self,
+        instrument_id_text: str,
+        target_weight: float,
+        *,
+        return_reason: bool = False,
+    ) -> str | None | tuple[str | None, str]:
+        def result(side: str | None, reason: str) -> str | None | tuple[str | None, str]:
+            if return_reason:
+                return side, reason
+            return side
+
         instrument_id = InstrumentId.from_str(instrument_id_text)
         current_qty = self._current_quantity(instrument_id)
         if target_weight <= 0:
-            return "sell" if current_qty > 0 else None
+            if current_qty > 0:
+                return result("sell", "exit")
+            return result(None, "on_target")
         instrument = self.cache.instrument(instrument_id)
         open_price = self._today_open.get(instrument_id_text)
-        if instrument is None or open_price is None or open_price <= 0:
-            return "buy" if current_qty <= 0 else None
+        if instrument is None:
+            return result("buy" if current_qty <= 0 else None, "missing_instrument")
+        if open_price is None or open_price <= 0:
+            return result("buy" if current_qty <= 0 else None, "missing_open")
         current_weight = self._current_weight(instrument_id_text)
         if current_weight is not None:
             tolerance = max(0.0, float(self.config.weight_tolerance_percent))
             if abs(current_weight - float(target_weight)) <= tolerance:
-                return None
+                return result(None, "on_target")
         target_qty = self._target_quantity(instrument, open_price, target_weight)
         delta_qty = target_qty - current_qty
         if delta_qty > 0:
-            return "buy"
+            return result("buy", "underweight")
         if delta_qty < 0:
-            return "sell"
-        return None
+            return result("sell", "overweight")
+        return result(None, "on_target")
 
     def _refresh_symbol_freezes(self, desired: dict[str, float]) -> None:
         if str(self.config.limit_stop_mode) != "freeze_symbol":
@@ -2118,8 +2300,8 @@ class TargetWeightStrategy(Strategy):
     def _note_quote_tick(self, tick: QuoteTick) -> None:
         """Record that a live quote tick arrived while inside a trading window.
 
-        A single tick from any subscribed instrument is enough to unlock the
-        window for the whole trading day. The flag is reset daily by
+        A single tick from any subscribed/probe instrument is enough to unlock
+        the window for the whole trading day. The flag is reset daily by
         ``_ensure_pricing_date``.
         """
         if self._quote_tick_window_date == self._clock_date():
@@ -2127,6 +2309,18 @@ class TargetWeightStrategy(Strategy):
         if not self._within_trading_time():
             return
         self._quote_tick_window_date = self._clock_date()
+
+    def _quote_tick_window_gate_enabled(self) -> bool:
+        return bool(self.config.subscribe_quote_ticks) or bool(self._quote_tick_window_probe_ids)
+
+    def _within_pre_open_quote_log_window(self) -> bool:
+        try:
+            now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
+            start = pd.Timestamp("09:20").time()
+            end = pd.Timestamp("09:30").time()
+        except Exception:
+            return False
+        return start <= now < end
 
     def _within_trading_time(self) -> bool:
         """True when the clock is inside a scheduled trading session (time only).
@@ -2155,11 +2349,12 @@ class TargetWeightStrategy(Strategy):
     def _within_trading_window(self) -> bool:
         # Time in the scheduled window is necessary but not sufficient: we also
         # require at least one live quote tick received during a window today,
-        # confirming the market is actually open and streaming. In backtest no
-        # quote ticks are subscribed, so fall back to the time-only check.
+        # confirming the market is actually open and streaming. If neither full
+        # quote subscriptions nor quote probes are configured, fall back to the
+        # time-only check.
         if not self._within_trading_time():
             return False
-        if not bool(self.config.subscribe_quote_ticks):
+        if not self._quote_tick_window_gate_enabled():
             return True
         return self._quote_tick_window_date == self._clock_date()
 
