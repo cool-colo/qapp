@@ -483,7 +483,6 @@ def parse_args() -> argparse.Namespace:
         help="Replay persisted Nautilus execution cache before live reconciliation. Defaults off for QMT live runs.",
     )
     parser.add_argument("--no-sellable-check", action="store_true")
-    parser.add_argument("--no-reconciliation", action="store_true")
     parser.add_argument(
         "--restrict-reconciliation",
         action="store_true",

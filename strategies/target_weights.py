@@ -246,13 +246,16 @@ class TargetWeightStrategy(Strategy):
 
     def configure_pre_open_reconciliation(
         self,
-        reconcile: Any | None,
-        reconcile_time: str | None,
+        reconcile: Any,
+        reconcile_time: str,
         timeout_secs: float,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         self._pre_open_reconcile = reconcile
-        self._pre_open_reconcile_time = self._parse_hh_mm(reconcile_time)
+        parsed_time = self._parse_hh_mm(reconcile_time)
+        if parsed_time is None:
+            raise ValueError("pre-open reconcile time is required")
+        self._pre_open_reconcile_time = parsed_time
         self._pre_open_reconcile_timeout_secs = float(timeout_secs)
         if loop is not None:
             self._loop = loop
@@ -283,8 +286,7 @@ class TargetWeightStrategy(Strategy):
             f"bar_types={len(self._bar_types)} target_version={self._target_version or '<none>'}",
             color=LogColor.BLUE,
         )
-        if self._pre_open_reconcile_time is not None:
-            self._schedule_pre_open_reconcile()
+        self._schedule_pre_open_reconcile()
         self._subscribe_execution_mass_status()
         if not self._bar_types:
             self.log.warning("target-weight executor has no bar_types configured")
@@ -453,8 +455,7 @@ class TargetWeightStrategy(Strategy):
         )
 
     def _on_pre_open_reconcile_timer(self, _event: Any) -> None:
-        if self._pre_open_reconcile_time is not None:
-            self._schedule_pre_open_reconcile()
+        self._schedule_pre_open_reconcile()
         self._run_pre_open_reconcile()
 
     def _schedule_on_loop(
@@ -493,9 +494,6 @@ class TargetWeightStrategy(Strategy):
         return resolved
 
     def _run_pre_open_reconcile(self) -> None:
-        if self._pre_open_reconcile is None:
-            self.log.warning("Pre-open execution-state reconciliation is configured but no callback is available")
-            return
         if self._pre_open_reconcile_task is not None and not self._pre_open_reconcile_task.done():
             self.log.warning("Previous pre-open execution-state reconciliation is still running; skipping")
             return
@@ -519,10 +517,8 @@ class TargetWeightStrategy(Strategy):
         Trigger an execution-state reconcile using the configured pre-open callback,
         if available. Used to refresh the broker sellable map (``_venue_sellable``)
         outside the scheduled pre-open window (e.g. on the periodic refresh timer).
-        Inert when no callback is configured (backtest / reconciliation disabled).
+        Live target-model nodes configure this callback during startup.
         """
-        if self._pre_open_reconcile is None:
-            return
         self._run_pre_open_reconcile()
 
     def _on_pre_open_reconcile_done(self, task: asyncio.Future[Any]) -> None:

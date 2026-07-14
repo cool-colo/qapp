@@ -21,6 +21,7 @@ if NAUTILUS_TRADER_PATH.exists() and str(NAUTILUS_TRADER_PATH) not in sys.path:
     sys.path.insert(0, str(NAUTILUS_TRADER_PATH))
 
 from lives import live_common as legacy
+from lives.live_reconciliation import LiveExecutionReconciliation
 from lives.monitoring import PrometheusExporter
 from lives.monitoring import PrometheusExporterConfig
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
@@ -47,6 +48,10 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         self._refresh_context = refresh_context
         self._refresh_interval_secs = float(refresh_interval_secs)
         self._refresh_time = self._parse_hh_mm(refresh_time)
+        self._execution_reconciliation = LiveExecutionReconciliation(
+            request_reconcile=self.request_execution_reconcile,
+            warn=lambda message: self.log.warning(message),
+        )
 
     @staticmethod
     def _parse_hh_mm(value: str | None) -> tuple[int, int] | None:
@@ -66,14 +71,7 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
 
     def on_start(self) -> None:
         super().on_start()
-        # Startup reconciliation runs before the trader (and thus this on_start) starts, so the
-        # mass status it publishes is emitted before our subscription exists and is missed.
-        # Trigger a fresh reconcile now that the subscription is active, to republish the mass
-        # status and populate the broker sellable (can_use_volume) map before the first sell.
-        try:
-            self.request_execution_reconcile()
-        except Exception as exc:
-            self.log.warning(f"Execution reconcile request on start failed: {exc}")
+        self._execution_reconciliation.request_after_strategy_start()
         if self._refresh_time is not None:
             self._schedule_daily_refresh()
         elif self._refresh_interval_secs > 0:
@@ -125,13 +123,7 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
             )
         except Exception as exc:
             self.log.warning(f"Target-model data refresh failed, keeping previous data: {exc}")
-        # Also refresh the broker sellable map (can_use_volume) by requesting an execution
-        # reconcile; the resulting mass status repopulates _venue_sellable. Inert if the
-        # reconcile callback is not configured.
-        try:
-            self.request_execution_reconcile()
-        except Exception as exc:
-            self.log.warning(f"Execution reconcile request on refresh failed: {exc}")
+        self._execution_reconciliation.request_after_target_refresh()
 
     def _active_stock_codes(self) -> set[str]:
         stock_codes = set()
@@ -179,6 +171,8 @@ def parse_args():
         args.pre_open_reconcile_time = normalize_refresh_time(args.pre_open_reconcile_time)
     except ValueError as exc:
         raise SystemExit(f"invalid configured HH:MM time: {exc}") from exc
+    if args.pre_open_reconcile_time is None:
+        raise SystemExit("pre-open reconcile time is required")
     _apply_snapshot_args(args)
     return args
 
@@ -189,13 +183,9 @@ def _apply_snapshot_args(args: Any) -> None:
 
     These are target-model-specific and not defined by the shared
     ``live_common.parse_args()``, so — like ``--pre-open-reconcile-time`` — they are
-    resolved here rather than added to the shared parser. Snapshots are opt-in via
-    ``MODEL_SNAPSHOTS_ENABLED``; when disabled no MySQL connection is made.
+    resolved here rather than added to the shared parser.
     """
     env = os.environ.get
-    args.snapshots_enabled = str(env("MODEL_SNAPSHOTS_ENABLED", "") or "").lower() in {
-        "1", "true", "yes", "on",
-    }
     args.snapshot_before_time = env("MODEL_SNAPSHOT_BEFORE_TIME", "09:27")
     args.snapshot_after_time = env("MODEL_SNAPSHOT_AFTER_TIME", "15:40")
     args.mysql_host = env("MYSQL_HOST", "127.0.0.1")
@@ -282,20 +272,14 @@ def _emit_snapshot_status(
         log_method(message)
 
 
-def _maybe_add_snapshot_recorder(
+def _add_snapshot_recorder(
     args: Any,
     node: Any,
     strategy: Any,
     fetch_full_tick: Any,
     fetch_positions: Any | None = None,
 ) -> None:
-    """
-    Build the MySQL-backed daily-snapshot recorder actor and add it to the node when
-    snapshots are enabled. No-op (and no MySQL connection) when disabled, so the node
-    runs without pymysql installed.
-    """
-    if not getattr(args, "snapshots_enabled", False):
-        return
+    """Build the MySQL-backed daily-snapshot recorder actor and add it to the node."""
     from backtests.result_writers.live_writer import LiveSnapshotWriter
     from lives.snapshot_recorder import SnapshotRecorder
     from lives.snapshot_recorder import SnapshotRecorderConfig
@@ -313,10 +297,10 @@ def _maybe_add_snapshot_recorder(
     except Exception as exc:
         _emit_snapshot_status(
             node,
-            f"[snapshot] MySQL writer init failed, snapshots disabled: {exc}",
+            f"[snapshot] MySQL writer init failed: {exc}",
             is_warning=True,
         )
-        return
+        raise
     recorder = SnapshotRecorder(
         config=SnapshotRecorderConfig(
             account_id=str(args.account_id),
@@ -392,7 +376,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
         ),
         exec_engine=LiveExecEngineConfig(
             load_cache=args.load_cache_on_start,
-            reconciliation=not args.no_reconciliation,
+            reconciliation=True,
             reconciliation_lookback_mins=1440,
             reconciliation_instrument_ids=reconciliation_ids,
             filter_unclaimed_external_orders=not args.load_all_instruments,
@@ -486,18 +470,17 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
         refresh_interval_secs=args.refresh_interval_secs,
         refresh_time=args.refresh_time,
     )
-    if not args.no_reconciliation:
-        # Always wire the reconcile callback (not only when a pre-open time is configured):
-        # the strategy triggers a reconcile on start and on each refresh to republish the
-        # execution mass status — which carries the broker sellable (can_use_volume) map —
-        # to the strategy's subscription. reconcile_time may be None (no scheduled pre-open
-        # run); on-demand triggering via request_execution_reconcile() still works.
-        strategy.configure_pre_open_reconciliation(
-            reconcile=node.kernel.exec_engine.reconcile_execution_state,
-            reconcile_time=args.pre_open_reconcile_time,
-            timeout_secs=config_node.timeout_reconciliation,
-            loop=node.kernel.exec_engine._loop,
-        )
+    # Always wire the reconcile callback: the strategy triggers a reconcile on start
+    # and on each refresh to republish the execution mass status — which carries the
+    # broker sellable (can_use_volume) map — to the strategy's subscription.
+    # The pre-open reconcile time is required so the scheduled daily run is always
+    # installed as well.
+    strategy.configure_pre_open_reconciliation(
+        reconcile=node.kernel.exec_engine.reconcile_execution_state,
+        reconcile_time=args.pre_open_reconcile_time,
+        timeout_secs=config_node.timeout_reconciliation,
+        loop=node.kernel.exec_engine._loop,
+    )
 
     def _fetch_full_tick() -> dict[str, dict[str, float]]:
         # Today's authoritative full-tick snapshot per instrument from the QMT
@@ -516,7 +499,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
 
     strategy.configure_full_tick_source(fetch_full_tick=_fetch_full_tick)
     node.trader.add_strategy(strategy)
-    _maybe_add_snapshot_recorder(args, node, strategy, _fetch_full_tick, _fetch_positions)
+    _add_snapshot_recorder(args, node, strategy, _fetch_full_tick, _fetch_positions)
     if args.metrics_port and int(args.metrics_port) > 0:
         exporter = PrometheusExporter(
             config=PrometheusExporterConfig(

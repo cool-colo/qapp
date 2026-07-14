@@ -6,6 +6,7 @@ import sys
 import unittest
 from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -65,12 +66,6 @@ class TargetLiveConfigTest(unittest.TestCase):
             with patch.object(sys, "argv", ["test"]):
                 args = parse_args()
         self.assertEqual(args.pre_open_reconcile_time, "09:15")
-
-    def test_pre_open_reconcile_time_can_be_disabled(self) -> None:
-        with patch.dict(os.environ, {"QMT_ACCOUNT_ID": "TEST"}, clear=False):
-            with patch.object(sys, "argv", ["test", "--pre-open-reconcile-time", ""]):
-                args = parse_args()
-        self.assertIsNone(args.pre_open_reconcile_time)
 
     def test_full_tick_args_default(self) -> None:
         with patch.dict(os.environ, {"QMT_ACCOUNT_ID": "TEST"}, clear=False):
@@ -185,6 +180,50 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
         recorder._run_after_trading.assert_called_once_with(date(2026, 7, 8), allow_fallback=True)
 
+    def test_snapshot_recorder_schedules_keepalive_timer(self) -> None:
+        recorder = SimpleNamespace()
+        recorder.config = SnapshotRecorderConfig(
+            account_id="ACC",
+            trader_id="TRADER",
+            keepalive_secs=240,
+        )
+        recorder.clock = MagicMock()
+        recorder.log = MagicMock()
+        recorder._KEEPALIVE_TIMER = SnapshotRecorder._KEEPALIVE_TIMER
+        recorder._on_keepalive = object()
+
+        SnapshotRecorder._schedule_keepalive(recorder)
+
+        recorder.clock.set_timer.assert_called_once()
+        kwargs = recorder.clock.set_timer.call_args.kwargs
+        self.assertEqual(kwargs["name"], SnapshotRecorder._KEEPALIVE_TIMER)
+        self.assertEqual(kwargs["interval"], timedelta(seconds=240))
+        self.assertEqual(kwargs["callback"], recorder._on_keepalive)
+        self.assertFalse(kwargs["fire_immediately"])
+
+    def test_snapshot_recorder_keepalive_disabled_when_non_positive(self) -> None:
+        recorder = SimpleNamespace()
+        recorder.config = SnapshotRecorderConfig(
+            account_id="ACC",
+            trader_id="TRADER",
+            keepalive_secs=0,
+        )
+        recorder.clock = MagicMock()
+        recorder.log = MagicMock()
+
+        SnapshotRecorder._schedule_keepalive(recorder)
+
+        recorder.clock.set_timer.assert_not_called()
+
+    def test_snapshot_recorder_keepalive_pings_writer(self) -> None:
+        recorder = SimpleNamespace()
+        recorder._writer = MagicMock()
+        recorder.log = MagicMock()
+
+        SnapshotRecorder._on_keepalive(recorder, None)
+
+        recorder._writer.ping.assert_called_once_with()
+
     def test_writer_asset_snapshot_id_falls_back_to_continuous(self) -> None:
         writer = object.__new__(LiveSnapshotWriter)
         writer._query = MagicMock(side_effect=[[], [(7,)]])
@@ -256,15 +295,12 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(writer._query.call_count, 2)
 
     def test_writer_execute_retries_once_after_connection_lost(self) -> None:
-        writer = object.__new__(LiveSnapshotWriter)
-        writer._commit = False
-
         cursor = MagicMock()
         # First cursor.execute raises the classic dropped-connection error, second succeeds.
         cursor.execute.side_effect = [Exception(0, ""), None]
         connection = MagicMock()
         connection.cursor.return_value = cursor
-        writer._connection = connection
+        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=False)
 
         writer._execute("INSERT INTO t VALUES (%s)", (1,))
 
@@ -272,14 +308,11 @@ class TargetLiveConfigTest(unittest.TestCase):
         connection.ping.assert_called_once_with(reconnect=True)
 
     def test_writer_execute_does_not_retry_on_non_connection_error(self) -> None:
-        writer = object.__new__(LiveSnapshotWriter)
-        writer._commit = False
-
         cursor = MagicMock()
         cursor.execute.side_effect = Exception(1062, "Duplicate entry")
         connection = MagicMock()
         connection.cursor.return_value = cursor
-        writer._connection = connection
+        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=False)
 
         with self.assertRaises(Exception):
             writer._execute("INSERT INTO t VALUES (%s)", (1,))
@@ -288,14 +321,12 @@ class TargetLiveConfigTest(unittest.TestCase):
         connection.ping.assert_not_called()
 
     def test_writer_query_retries_once_after_connection_lost(self) -> None:
-        writer = object.__new__(LiveSnapshotWriter)
-
         cursor = MagicMock()
         cursor.execute.side_effect = [Exception(2013, "Lost connection"), None]
         cursor.fetchall.return_value = [(7,)]
         connection = MagicMock()
         connection.cursor.return_value = cursor
-        writer._connection = connection
+        writer = LiveSnapshotWriter.for_testing(connection=connection)
 
         rows = writer._query("SELECT 1", ())
 
@@ -304,16 +335,13 @@ class TargetLiveConfigTest(unittest.TestCase):
         connection.ping.assert_called_once_with(reconnect=True)
 
     def test_writer_execute_logs_reconnect_failure_details(self) -> None:
-        writer = object.__new__(LiveSnapshotWriter)
-        writer._commit = False
-
         cursor = MagicMock()
         cursor.execute.side_effect = Exception(0, "")
         connection = MagicMock()
         connection.cursor.return_value = cursor
         connection.ping.side_effect = Exception(2006, "server has gone away")
         connection.connect.side_effect = Exception(2003, "can't connect")
-        writer._connection = connection
+        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=False)
 
         with patch("backtests.result_writers.live_writer._LOGGER") as logger:
             with self.assertRaises(Exception):
@@ -333,16 +361,13 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
 
     def test_writer_execute_logs_retry_failure_after_reconnect(self) -> None:
-        writer = object.__new__(LiveSnapshotWriter)
-        writer._commit = False
-
         first_exc = Exception(0, "")
         retry_exc = Exception(1064, "bad sql")
         cursor = MagicMock()
         cursor.execute.side_effect = [first_exc, retry_exc]
         connection = MagicMock()
         connection.cursor.return_value = cursor
-        writer._connection = connection
+        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=False)
 
         with patch("backtests.result_writers.live_writer._LOGGER") as logger:
             with self.assertRaises(Exception):
@@ -354,6 +379,55 @@ class TargetLiveConfigTest(unittest.TestCase):
             retry_exc,
         )
         connection.ping.assert_called_once_with(reconnect=True)
+
+    def test_writer_reconnect_rebuilds_from_connect_kwargs(self) -> None:
+        # With connect kwargs on hand, a dropped socket must be rebuilt from scratch
+        # (a fresh connection), not poked via ping()/connect() on the dead object.
+        dead_cursor = MagicMock()
+        dead_cursor.execute.side_effect = Exception(2013, "Lost connection")
+        dead_connection = MagicMock()
+        dead_connection.cursor.return_value = dead_cursor
+
+        fresh_cursor = MagicMock()
+        fresh_cursor.execute.return_value = None
+        fresh_connection = MagicMock()
+        fresh_connection.cursor.return_value = fresh_cursor
+
+        writer = LiveSnapshotWriter.for_testing(connection=dead_connection, commit=False)
+        writer._connect_kwargs = {"host": "127.0.0.1"}
+
+        with patch.object(
+            LiveSnapshotWriter,
+            "_create_connection",
+            return_value=fresh_connection,
+        ) as create:
+            writer._execute("INSERT INTO t VALUES (%s)", (1,))
+
+        create.assert_called_once_with({"host": "127.0.0.1"})
+        self.assertIs(writer._connection, fresh_connection)
+        # The dead connection is never pinged/reconnected when a rebuild is possible.
+        dead_connection.ping.assert_not_called()
+        dead_connection.connect.assert_not_called()
+        fresh_cursor.execute.assert_called_once()
+
+    def test_writer_ping_runs_select_and_returns_true(self) -> None:
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [(1,)]
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        writer = LiveSnapshotWriter.for_testing(connection=connection)
+
+        self.assertTrue(writer.ping())
+        cursor.execute.assert_called_once_with("SELECT 1", ())
+
+    def test_writer_ping_swallows_failure_and_returns_false(self) -> None:
+        cursor = MagicMock()
+        cursor.execute.side_effect = Exception(1064, "bad sql")
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        writer = LiveSnapshotWriter.for_testing(connection=connection)
+
+        self.assertFalse(writer.ping())
 
     def test_writer_write_target_portfolios_keys_by_snapshot_type(self) -> None:
         writer = object.__new__(LiveSnapshotWriter)

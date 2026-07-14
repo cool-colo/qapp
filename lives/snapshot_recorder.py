@@ -64,6 +64,10 @@ class SnapshotRecorderConfig(ActorConfig, frozen=True):
     # still runs the before-trading phase even if before_time already passed.
     before_catchup_start: str = "09:26"
     before_catchup_end: str = "09:29"
+    # Keep the MySQL connection warm between trading sessions so the server doesn't
+    # close the idle socket and make the next order-event burst each hit a
+    # connection-lost error. 4 min is well under a typical wait_timeout.
+    keepalive_secs: int = 240
 
 
 class SnapshotRecorder(Actor):
@@ -71,6 +75,7 @@ class SnapshotRecorder(Actor):
 
     _BEFORE_ALERT = "SNAPSHOT-BEFORE-TRADING"
     _AFTER_ALERT = "SNAPSHOT-AFTER-TRADING"
+    _KEEPALIVE_TIMER = "SNAPSHOT-DB-KEEPALIVE"
     _LIVE_ORDER_REASON_MAX_LEN = 64
 
     def __init__(
@@ -96,6 +101,7 @@ class SnapshotRecorder(Actor):
 
     def on_start(self) -> None:
         self._subscribe_order_events()
+        self._schedule_keepalive()
         if self._before_time is not None:
             self._schedule_daily(self._BEFORE_ALERT, self._before_time, self._on_before_timer)
         if self._after_time is not None:
@@ -147,6 +153,27 @@ class SnapshotRecorder(Actor):
     def _on_after_timer(self, _event: Any) -> None:
         self._schedule_daily(self._AFTER_ALERT, self._after_time, self._on_after_timer)
         self._run_after_trading(self._now().date(), allow_fallback=False)
+
+    def _schedule_keepalive(self) -> None:
+        interval = int(self.config.keepalive_secs)
+        if interval <= 0:
+            return
+        self.clock.set_timer(
+            name=self._KEEPALIVE_TIMER,
+            interval=timedelta(seconds=interval),
+            callback=self._on_keepalive,
+            fire_immediately=False,
+        )
+        self.log.info(
+            f"snapshot DB keepalive scheduled every {interval}s",
+            color=LogColor.BLUE,
+        )
+
+    def _on_keepalive(self, _event: Any) -> None:
+        try:
+            self._writer.ping()
+        except Exception as exc:
+            self.log.warning(f"snapshot DB keepalive failed: {exc}")
 
     # ---- phase runners -------------------------------------------------------
 

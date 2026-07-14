@@ -492,8 +492,8 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy._frozen_portfolio_value = None
         strategy._convergence_suspended = False
         strategy._converge_lock = threading.Lock()
-        strategy._pre_open_reconcile = None
-        strategy._pre_open_reconcile_time = None
+        strategy._pre_open_reconcile = lambda timeout_secs: True
+        strategy._pre_open_reconcile_time = (9, 15)
         strategy._pre_open_reconcile_timeout_secs = 30.0
         strategy._pre_open_reconcile_task = None
         strategy._loop = None
@@ -1414,7 +1414,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         strategy.configure_pre_open_reconciliation(
             reconcile=reconcile,
-            reconcile_time=None,
+            reconcile_time="09:15",
             timeout_secs=30.0,
         )
 

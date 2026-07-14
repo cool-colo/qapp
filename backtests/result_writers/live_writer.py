@@ -216,7 +216,11 @@ class LiveSnapshotWriter:
         commit: bool = True,
         create_tables: bool = True,
     ) -> None:
-        self._connection = connection or self._create_connection(connect_kwargs or {})
+        # Keep the connect kwargs so a dropped socket can be rebuilt from scratch.
+        # Empty dict means "no way to rebuild" (an externally supplied connection);
+        # _reconnect then falls back to ping()/connect() on the existing object.
+        self._connect_kwargs = dict(connect_kwargs or {})
+        self._connection = connection or self._create_connection(self._connect_kwargs)
         self._commit = commit
         if create_tables:
             self.create_tables()
@@ -224,6 +228,19 @@ class LiveSnapshotWriter:
     @classmethod
     def from_pymysql_kwargs(cls, **connect_kwargs: Any) -> "LiveSnapshotWriter":
         return cls(connect_kwargs=connect_kwargs)
+
+    @classmethod
+    def for_testing(cls, connection: Any, commit: bool = False) -> "LiveSnapshotWriter":
+        """
+        Build a writer around an already-constructed (mock) connection without touching
+        a live DB. Sets every field ``__init__`` would, so runtime code can rely on
+        ``self._connect_kwargs`` existing rather than guarding for it.
+        """
+        writer = cls.__new__(cls)
+        writer._connect_kwargs = {}
+        writer._connection = connection
+        writer._commit = commit
+        return writer
 
     @staticmethod
     def _create_connection(connect_kwargs: Mapping[str, Any]):
@@ -237,6 +254,7 @@ class LiveSnapshotWriter:
         close = getattr(self._connection, "close", None)
         if close is not None:
             close()
+        self._connection = None
 
     def create_tables(self) -> None:
         for statement in CREATE_TABLES_SQL:
@@ -873,8 +891,22 @@ class LiveSnapshotWriter:
                 raise
 
     def _reconnect(self) -> bool:
-        # Prefer ping(reconnect=True) — it re-establishes the socket and is the
-        # documented PyMySQL recovery path; fall back to connect().
+        # When we hold the connect kwargs, the only reliable recovery is to discard the
+        # dropped socket and build a brand-new connection — poking ping()/connect() on a
+        # half-dead PyMySQL object fails with "'NoneType' object has no attribute
+        # 'settimeout'" once its internal socket is None.
+        if self._connect_kwargs:
+            try:
+                self._connection = self._create_connection(self._connect_kwargs)
+                return True
+            except Exception as exc:
+                _LOGGER.warning(
+                    "LiveSnapshotWriter rebuild connection failed during reconnect: %r",
+                    exc,
+                )
+                return False
+        # No kwargs to rebuild from (externally injected connection). Fall back to the
+        # documented PyMySQL recovery path: ping(reconnect=True), then connect().
         ping = getattr(self._connection, "ping", None)
         if ping is not None:
             try:
@@ -887,7 +919,6 @@ class LiveSnapshotWriter:
                     "LiveSnapshotWriter ping(reconnect=True) failed: %r",
                     exc,
                 )
-                pass
         connect = getattr(self._connection, "connect", None)
         if connect is None:
             _LOGGER.warning(
@@ -902,6 +933,21 @@ class LiveSnapshotWriter:
                 "LiveSnapshotWriter connect() failed during reconnect: %r",
                 exc,
             )
+            return False
+
+    def ping(self) -> bool:
+        """
+        Keep the connection warm. A long-idle socket gets closed by the server between
+        trading sessions; a periodic ping re-establishes it before the next burst of
+        order events, so the burst doesn't each individually eat a connection-lost
+        error. Runs through ``_with_reconnect`` so a dropped socket is rebuilt here
+        rather than on the first live write. Never raises.
+        """
+        try:
+            self._query("SELECT 1", ())
+            return True
+        except Exception as exc:
+            _LOGGER.warning("LiveSnapshotWriter keepalive ping failed: %r", exc)
             return False
 
     @staticmethod
