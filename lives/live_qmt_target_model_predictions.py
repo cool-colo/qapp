@@ -444,8 +444,6 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             resubmit_check_interval_secs=args.resubmit_interval_secs,
             cash_buffer_percent=args.cash_buffer_percent,
             target_cash_buffer_percent=args.target_cash_buffer_percent,
-            weight_tolerance_percent=args.weight_tolerance_percent,
-            cash_tolerance_percent=args.cash_tolerance_percent,
             stop_time=args.stop_time,
             limit_stop_mode=args.limit_stop_mode,
             exit_non_targets=not args.leave_non_targets,

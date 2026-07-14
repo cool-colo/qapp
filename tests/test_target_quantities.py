@@ -15,10 +15,10 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.identifiers import InstrumentId
 
-from strategies.target_weights import TargetWeightStrategyConfig
-from strategies.target_weights import TargetWeightStrategy
-from strategies.target_weights import TodayFillSnapshot
-from strategies.target_weights import NotionalOrderSplitter
+from strategies.target_quantities import TargetQuantityStrategyConfig
+from strategies.target_quantities import TargetQuantityStrategy
+from strategies.target_quantities import TodayFillSnapshot
+from strategies.target_quantities import NotionalOrderSplitter
 from strategies.pricing import OpenOffsetBuyPriceStrategy
 from strategies.pricing import OpenOffsetSellPriceStrategy
 
@@ -242,116 +242,112 @@ class FakeLog:
         self.warnings.append((args, kwargs))
 
 
-class TestableTargetWeightStrategy:
-    _UP_LIMIT_KEYS = TargetWeightStrategy._UP_LIMIT_KEYS
-    _DOWN_LIMIT_KEYS = TargetWeightStrategy._DOWN_LIMIT_KEYS
-    _PRE_OPEN_RECONCILE_ALERT = TargetWeightStrategy._PRE_OPEN_RECONCILE_ALERT
-    _TERMINAL_ORDER_STATUSES = TargetWeightStrategy._TERMINAL_ORDER_STATUSES
-    on_start = TargetWeightStrategy.on_start
-    refresh_target_instruments = TargetWeightStrategy.refresh_target_instruments
-    _subscribe_market_data = TargetWeightStrategy._subscribe_market_data
-    _unsubscribe_market_data = TargetWeightStrategy._unsubscribe_market_data
-    _refresh_order_book_depth_subscriptions = TargetWeightStrategy._refresh_order_book_depth_subscriptions
-    update_target_weights = TargetWeightStrategy.update_target_weights
-    apply_frozen_targets = TargetWeightStrategy.apply_frozen_targets
-    _target_weights_log_detail = staticmethod(TargetWeightStrategy._target_weights_log_detail)
-    on_bar = TargetWeightStrategy.on_bar
-    on_order_book_depth = TargetWeightStrategy.on_order_book_depth
-    on_trade_tick = TargetWeightStrategy.on_trade_tick
-    on_order_filled = TargetWeightStrategy.on_order_filled
-    on_order_denied = TargetWeightStrategy.on_order_denied
-    on_order_rejected = TargetWeightStrategy.on_order_rejected
-    _handle_order_not_accepted = TargetWeightStrategy._handle_order_not_accepted
-    _converge_to_target = TargetWeightStrategy._converge_to_target
-    _converge_to_target_locked = TargetWeightStrategy._converge_to_target_locked
-    _order_book_depth_logging_enabled = TargetWeightStrategy._order_book_depth_logging_enabled
-    _should_log_sample = staticmethod(TargetWeightStrategy._should_log_sample)
-    _on_converge_timer = TargetWeightStrategy._on_converge_timer
-    _desired_weights = TargetWeightStrategy._desired_weights
-    _held_instrument_ids = TargetWeightStrategy._held_instrument_ids
-    _log_convergence_summary = TargetWeightStrategy._log_convergence_summary
-    _instrument_list_sample = staticmethod(TargetWeightStrategy._instrument_list_sample)
-    _refresh_symbol_freezes = TargetWeightStrategy._refresh_symbol_freezes
-    _price_limit_reason = TargetWeightStrategy._price_limit_reason
-    _target_achieved = TargetWeightStrategy._target_achieved
-    _reconcile_unfilled_orders = TargetWeightStrategy._reconcile_unfilled_orders
-    _submit_buys_within_cash = TargetWeightStrategy._submit_buys_within_cash
-    _target_order_intent = TargetWeightStrategy._target_order_intent
-    _order_slices = TargetWeightStrategy._order_slices
-    _estimated_order_cost = staticmethod(TargetWeightStrategy._estimated_order_cost)
-    _estimated_buy_cost = TargetWeightStrategy._estimated_buy_cost
-    _submit_target_weight = TargetWeightStrategy._submit_target_weight
-    _submit_full_exit = TargetWeightStrategy._submit_full_exit
-    _submit_order_quantity = TargetWeightStrategy._submit_order_quantity
-    _clamp_sell_quantity = TargetWeightStrategy._clamp_sell_quantity
-    _subscribe_execution_mass_status = TargetWeightStrategy._subscribe_execution_mass_status
-    _today_fill_snapshot = TargetWeightStrategy._today_fill_snapshot
-    _event_trading_date = TargetWeightStrategy._event_trading_date
-    _is_reconciliation_order = staticmethod(TargetWeightStrategy._is_reconciliation_order)
-    _open_sell_quantity = TargetWeightStrategy._open_sell_quantity
-    _open_buy_order_notional = TargetWeightStrategy._open_buy_order_notional
-    _decimal_quantity = staticmethod(TargetWeightStrategy._decimal_quantity)
-    _track_submitted_order = TargetWeightStrategy._track_submitted_order
-    _forget_submitted_order = TargetWeightStrategy._forget_submitted_order
-    _active_orders = TargetWeightStrategy._active_orders
-    _is_active_order = TargetWeightStrategy._is_active_order
-    _limit_price = TargetWeightStrategy._limit_price
-    _build_price_context = TargetWeightStrategy._build_price_context
-    _quote_snapshot = TargetWeightStrategy._quote_snapshot
-    _book_snapshot = TargetWeightStrategy._book_snapshot
-    _ladder_levels = staticmethod(TargetWeightStrategy._ladder_levels)
-    _at_buy_price_cap = TargetWeightStrategy._at_buy_price_cap
-    _target_quantity = TargetWeightStrategy._target_quantity
-    _portfolio_value = TargetWeightStrategy._portfolio_value
-    _nautilus_portfolio_equity = TargetWeightStrategy._nautilus_portfolio_equity
-    _free_cash = TargetWeightStrategy._free_cash
-    _nautilus_free_cash = TargetWeightStrategy._nautilus_free_cash
-    _log_account_sizing_snapshot = TargetWeightStrategy._log_account_sizing_snapshot
-    _broker_account_decimal = TargetWeightStrategy._broker_account_decimal
-    _broker_accounts = TargetWeightStrategy._broker_accounts
-    _account_info = staticmethod(TargetWeightStrategy._account_info)
-    _current_quantity = TargetWeightStrategy._current_quantity
-    _current_weight = TargetWeightStrategy._current_weight
-    _open_order_instruments = TargetWeightStrategy._open_order_instruments
-    _price_limits = TargetWeightStrategy._price_limits
-    _at_price_limit = TargetWeightStrategy._at_price_limit
-    _target_side = TargetWeightStrategy._target_side
-    _stop_time_reached = TargetWeightStrategy._stop_time_reached
-    _within_trading_window = TargetWeightStrategy._within_trading_window
-    _within_trading_time = TargetWeightStrategy._within_trading_time
-    _within_pre_open_quote_log_window = TargetWeightStrategy._within_pre_open_quote_log_window
-    _quote_tick_window_gate_enabled = TargetWeightStrategy._quote_tick_window_gate_enabled
-    _note_quote_tick = TargetWeightStrategy._note_quote_tick
-    on_quote_tick = TargetWeightStrategy.on_quote_tick
-    _subscribe_quote_tick_window_probes = TargetWeightStrategy._subscribe_quote_tick_window_probes
-    _quantity_from_value = TargetWeightStrategy._quantity_from_value
-    investable_total_asset = TargetWeightStrategy.investable_total_asset
-    _clock_date = TargetWeightStrategy._clock_date
-    _record_target = TargetWeightStrategy._record_target
-    _record_order = TargetWeightStrategy._record_order
-    _is_star_market = staticmethod(TargetWeightStrategy._is_star_market)
-    configure_pre_open_reconciliation = TargetWeightStrategy.configure_pre_open_reconciliation
-    _parse_hh_mm = staticmethod(TargetWeightStrategy._parse_hh_mm)
-    _next_daily_time = TargetWeightStrategy._next_daily_time
-    _schedule_pre_open_reconcile = TargetWeightStrategy._schedule_pre_open_reconcile
-    _on_pre_open_reconcile_timer = TargetWeightStrategy._on_pre_open_reconcile_timer
-    _run_pre_open_reconcile = TargetWeightStrategy._run_pre_open_reconcile
-    _schedule_on_loop = TargetWeightStrategy._schedule_on_loop
-    _on_pre_open_reconcile_done = TargetWeightStrategy._on_pre_open_reconcile_done
-    _log_pre_open_reconcile_result = TargetWeightStrategy._log_pre_open_reconcile_result
-    _ensure_pricing_date = TargetWeightStrategy._ensure_pricing_date
-    _update_price_state = TargetWeightStrategy._update_price_state
-    _seed_open_prices_from_last_close = TargetWeightStrategy._seed_open_prices_from_last_close
-    _set_authoritative_open = TargetWeightStrategy._set_authoritative_open
-    _apply_full_tick = TargetWeightStrategy._apply_full_tick
-    _full_tick_open = staticmethod(TargetWeightStrategy._full_tick_open)
-    configure_full_tick_source = TargetWeightStrategy.configure_full_tick_source
-    _start_full_tick_refresh = TargetWeightStrategy._start_full_tick_refresh
-    _schedule_full_tick_prefetch = TargetWeightStrategy._schedule_full_tick_prefetch
-    _on_full_tick_prefetch_timer = TargetWeightStrategy._on_full_tick_prefetch_timer
-    _on_full_tick_refresh_timer = TargetWeightStrategy._on_full_tick_refresh_timer
-    _run_full_tick_fetch = TargetWeightStrategy._run_full_tick_fetch
-    _on_full_tick_fetch_done = TargetWeightStrategy._on_full_tick_fetch_done
+class TestableTargetQuantityStrategy:
+    _UP_LIMIT_KEYS = TargetQuantityStrategy._UP_LIMIT_KEYS
+    _DOWN_LIMIT_KEYS = TargetQuantityStrategy._DOWN_LIMIT_KEYS
+    _PRE_OPEN_RECONCILE_ALERT = TargetQuantityStrategy._PRE_OPEN_RECONCILE_ALERT
+    _TERMINAL_ORDER_STATUSES = TargetQuantityStrategy._TERMINAL_ORDER_STATUSES
+    on_start = TargetQuantityStrategy.on_start
+    refresh_target_instruments = TargetQuantityStrategy.refresh_target_instruments
+    _subscribe_market_data = TargetQuantityStrategy._subscribe_market_data
+    _unsubscribe_market_data = TargetQuantityStrategy._unsubscribe_market_data
+    _refresh_order_book_depth_subscriptions = TargetQuantityStrategy._refresh_order_book_depth_subscriptions
+    update_target_quantities = TargetQuantityStrategy.update_target_quantities
+    _target_quantities_log_detail = staticmethod(TargetQuantityStrategy._target_quantities_log_detail)
+    on_order_book_depth = TargetQuantityStrategy.on_order_book_depth
+    on_trade_tick = TargetQuantityStrategy.on_trade_tick
+    on_order_filled = TargetQuantityStrategy.on_order_filled
+    on_order_denied = TargetQuantityStrategy.on_order_denied
+    on_order_rejected = TargetQuantityStrategy.on_order_rejected
+    _handle_order_not_accepted = TargetQuantityStrategy._handle_order_not_accepted
+    _converge_to_target = TargetQuantityStrategy._converge_to_target
+    _converge_to_target_locked = TargetQuantityStrategy._converge_to_target_locked
+    _order_book_depth_logging_enabled = TargetQuantityStrategy._order_book_depth_logging_enabled
+    _should_log_sample = staticmethod(TargetQuantityStrategy._should_log_sample)
+    _on_converge_timer = TargetQuantityStrategy._on_converge_timer
+    _desired_quantities = TargetQuantityStrategy._desired_quantities
+    _held_instrument_ids = TargetQuantityStrategy._held_instrument_ids
+    _log_convergence_summary = TargetQuantityStrategy._log_convergence_summary
+    _instrument_list_sample = staticmethod(TargetQuantityStrategy._instrument_list_sample)
+    _refresh_symbol_freezes = TargetQuantityStrategy._refresh_symbol_freezes
+    _price_limit_reason = TargetQuantityStrategy._price_limit_reason
+    _target_achieved = TargetQuantityStrategy._target_achieved
+    _reconcile_unfilled_orders = TargetQuantityStrategy._reconcile_unfilled_orders
+    _submit_buys_within_cash = TargetQuantityStrategy._submit_buys_within_cash
+    _target_order_intent = TargetQuantityStrategy._target_order_intent
+    _order_slices = TargetQuantityStrategy._order_slices
+    _estimated_order_cost = staticmethod(TargetQuantityStrategy._estimated_order_cost)
+    _estimated_buy_cost = TargetQuantityStrategy._estimated_buy_cost
+    _submit_target_quantity = TargetQuantityStrategy._submit_target_quantity
+    _submit_full_exit = TargetQuantityStrategy._submit_full_exit
+    _submit_order_quantity = TargetQuantityStrategy._submit_order_quantity
+    _clamp_sell_quantity = TargetQuantityStrategy._clamp_sell_quantity
+    _subscribe_execution_mass_status = TargetQuantityStrategy._subscribe_execution_mass_status
+    _today_fill_snapshot = TargetQuantityStrategy._today_fill_snapshot
+    _event_trading_date = TargetQuantityStrategy._event_trading_date
+    _is_reconciliation_order = staticmethod(TargetQuantityStrategy._is_reconciliation_order)
+    _open_sell_quantity = TargetQuantityStrategy._open_sell_quantity
+    _open_buy_order_notional = TargetQuantityStrategy._open_buy_order_notional
+    _decimal_quantity = staticmethod(TargetQuantityStrategy._decimal_quantity)
+    _track_submitted_order = TargetQuantityStrategy._track_submitted_order
+    _forget_submitted_order = TargetQuantityStrategy._forget_submitted_order
+    _active_orders = TargetQuantityStrategy._active_orders
+    _is_active_order = TargetQuantityStrategy._is_active_order
+    _limit_price = TargetQuantityStrategy._limit_price
+    _build_price_context = TargetQuantityStrategy._build_price_context
+    _quote_snapshot = TargetQuantityStrategy._quote_snapshot
+    _book_snapshot = TargetQuantityStrategy._book_snapshot
+    _ladder_levels = staticmethod(TargetQuantityStrategy._ladder_levels)
+    _at_buy_price_cap = TargetQuantityStrategy._at_buy_price_cap
+    _target_quantity = TargetQuantityStrategy._target_quantity
+    _portfolio_value = TargetQuantityStrategy._portfolio_value
+    _nautilus_portfolio_equity = TargetQuantityStrategy._nautilus_portfolio_equity
+    _free_cash = TargetQuantityStrategy._free_cash
+    _nautilus_free_cash = TargetQuantityStrategy._nautilus_free_cash
+    _log_account_sizing_snapshot = TargetQuantityStrategy._log_account_sizing_snapshot
+    _broker_account_decimal = TargetQuantityStrategy._broker_account_decimal
+    _broker_accounts = TargetQuantityStrategy._broker_accounts
+    _account_info = staticmethod(TargetQuantityStrategy._account_info)
+    _current_quantity = TargetQuantityStrategy._current_quantity
+    _current_weight = TargetQuantityStrategy._current_weight
+    _open_order_instruments = TargetQuantityStrategy._open_order_instruments
+    _price_limits = TargetQuantityStrategy._price_limits
+    _at_price_limit = TargetQuantityStrategy._at_price_limit
+    _target_side = TargetQuantityStrategy._target_side
+    _stop_time_reached = TargetQuantityStrategy._stop_time_reached
+    _within_trading_window = TargetQuantityStrategy._within_trading_window
+    _within_trading_time = TargetQuantityStrategy._within_trading_time
+    _within_pre_open_quote_log_window = TargetQuantityStrategy._within_pre_open_quote_log_window
+    _quote_tick_window_gate_enabled = TargetQuantityStrategy._quote_tick_window_gate_enabled
+    _note_quote_tick = TargetQuantityStrategy._note_quote_tick
+    on_quote_tick = TargetQuantityStrategy.on_quote_tick
+    _subscribe_quote_tick_window_probes = TargetQuantityStrategy._subscribe_quote_tick_window_probes
+    investable_total_asset = TargetQuantityStrategy.investable_total_asset
+    _clock_date = TargetQuantityStrategy._clock_date
+    _record_target = TargetQuantityStrategy._record_target
+    _record_order = TargetQuantityStrategy._record_order
+    configure_pre_open_reconciliation = TargetQuantityStrategy.configure_pre_open_reconciliation
+    _parse_hh_mm = staticmethod(TargetQuantityStrategy._parse_hh_mm)
+    _next_daily_time = TargetQuantityStrategy._next_daily_time
+    _schedule_pre_open_reconcile = TargetQuantityStrategy._schedule_pre_open_reconcile
+    _on_pre_open_reconcile_timer = TargetQuantityStrategy._on_pre_open_reconcile_timer
+    _run_pre_open_reconcile = TargetQuantityStrategy._run_pre_open_reconcile
+    _schedule_on_loop = TargetQuantityStrategy._schedule_on_loop
+    _on_pre_open_reconcile_done = TargetQuantityStrategy._on_pre_open_reconcile_done
+    _log_pre_open_reconcile_result = TargetQuantityStrategy._log_pre_open_reconcile_result
+    _ensure_pricing_date = TargetQuantityStrategy._ensure_pricing_date
+    _update_price_state = TargetQuantityStrategy._update_price_state
+    _seed_open_prices_from_last_close = TargetQuantityStrategy._seed_open_prices_from_last_close
+    _set_authoritative_open = TargetQuantityStrategy._set_authoritative_open
+    _apply_full_tick = TargetQuantityStrategy._apply_full_tick
+    _full_tick_open = staticmethod(TargetQuantityStrategy._full_tick_open)
+    configure_full_tick_source = TargetQuantityStrategy.configure_full_tick_source
+    _start_full_tick_refresh = TargetQuantityStrategy._start_full_tick_refresh
+    _schedule_full_tick_prefetch = TargetQuantityStrategy._schedule_full_tick_prefetch
+    _on_full_tick_prefetch_timer = TargetQuantityStrategy._on_full_tick_prefetch_timer
+    _on_full_tick_refresh_timer = TargetQuantityStrategy._on_full_tick_refresh_timer
+    _run_full_tick_fetch = TargetQuantityStrategy._run_full_tick_fetch
+    _on_full_tick_fetch_done = TargetQuantityStrategy._on_full_tick_fetch_done
 
     def request_instrument(self, instrument_id) -> None:
         self.requested_instruments.append(instrument_id)
@@ -390,11 +386,7 @@ class TestableTargetWeightStrategy:
             if existing.client_order_id != order.client_order_id
         ]
 
-    def on_target_bar(self, _bar) -> None:
-        self.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "bar")
-
-
-class TargetWeightStrategyTest(unittest.TestCase):
+class TargetQuantityStrategyTest(unittest.TestCase):
     def make_strategy(
         self,
         *,
@@ -408,21 +400,19 @@ class TargetWeightStrategyTest(unittest.TestCase):
         order_slice_notional: Decimal | str = "300000",
         require_account_cash: bool = True,
         account_info: dict | None = None,
-    ) -> TestableTargetWeightStrategy:
+    ) -> TestableTargetQuantityStrategy:
         instruments = {
             instrument_id: FakeInstrument(instrument_id, fields=(fields or {}).get(instrument_id))
             for instrument_id in (INST_A, INST_B, INST_C)
         }
-        strategy = TestableTargetWeightStrategy()
-        strategy.config = TargetWeightStrategyConfig(
+        strategy = TestableTargetQuantityStrategy()
+        strategy.config = TargetQuantityStrategyConfig(
             instrument_ids=[INST_A, INST_B, INST_C],
             bar_types={},
             initial_cash=Decimal(str(equity)),
             target_cash_buffer_percent=target_cash_buffer_percent,
             cash_buffer_percent=0.0,
             unfilled_timeout_secs=1.0,
-            weight_tolerance_percent=0.003,
-            cash_tolerance_percent=0.01,
             stop_time=None,
             order_slice_notional=Decimal(str(order_slice_notional)),
             require_account_cash=require_account_cash,
@@ -441,17 +431,18 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy.log = FakeLog()
         strategy._instrument_ids = [INST_A, INST_B, INST_C]
         strategy._bar_types = {}
-        strategy._target_weights = {}
+        strategy._target_quantities = {}
         strategy._target_date = None
-        strategy._target_reason = "target_weight"
+        strategy._target_reason = "target_quantity"
         strategy._target_version = ""
+        strategy._target_total_asset = None
         strategy._achieved_versions = set()
         strategy._frozen_instruments = {}
         strategy._deferred_buys = {}
         strategy._rejected_order_ids = set()
         strategy._insufficient_funds = set()
         strategy._order_submit_ts = {}
-        strategy._order_target_weights = {}
+        strategy._order_target_qty = {}
         strategy._order_target_versions = {}
         strategy._order_splitter = NotionalOrderSplitter(Decimal(str(order_slice_notional)))
         strategy._buy_pricer = OpenOffsetBuyPriceStrategy(
@@ -488,8 +479,6 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy._quote_tick_window_date = pd.Timestamp(
             strategy.clock.utc_now(),
         ).tz_convert(strategy.config.timezone_name).date()
-        strategy._frozen_target_qty = {}
-        strategy._frozen_portfolio_value = None
         strategy._convergence_suspended = False
         strategy._converge_lock = threading.Lock()
         strategy._pre_open_reconcile = lambda timeout_secs: True
@@ -519,21 +508,27 @@ class TargetWeightStrategyTest(unittest.TestCase):
         }
         return strategy
 
-    def test_on_start_subscribes_trade_ticks_with_quote_ticks(self) -> None:
+    def test_on_start_subscribes_ticks_for_configured_instruments(self) -> None:
         bar_type = BarType.from_str(f"{INST_A}-1-MINUTE-LAST-EXTERNAL")
         strategy = self.make_strategy()
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={str(INST_A): bar_type},
+            subscribe_bars=False,
+            unfilled_timeout_secs=1.0,
+            resubmit_check_interval_secs=10.0,
+        )
         strategy._bar_types = {str(INST_A): bar_type}
 
         strategy.on_start()
 
-        self.assertEqual(strategy.subscribed_bars, [bar_type])
         self.assertEqual(strategy.subscribed_quote_ticks, [INST_A])
         self.assertEqual(strategy.subscribed_trade_ticks, [INST_A])
 
     def test_on_start_can_disable_market_data_subscriptions(self) -> None:
         bar_type = BarType.from_str(f"{INST_A}-1-MINUTE-LAST-EXTERNAL")
         strategy = self.make_strategy()
-        strategy.config = TargetWeightStrategyConfig(
+        strategy.config = TargetQuantityStrategyConfig(
             instrument_ids=[INST_A],
             bar_types={str(INST_A): bar_type},
             subscribe_bars=False,
@@ -547,7 +542,6 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         strategy.on_start()
 
-        self.assertEqual(strategy.subscribed_bars, [])
         self.assertEqual(strategy.subscribed_quote_ticks, [])
         self.assertEqual(strategy.subscribed_trade_ticks, [])
         self.assertEqual(strategy.subscribed_order_book_depths, [])
@@ -555,7 +549,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
     def test_on_start_subscribes_quote_tick_window_probes_when_quote_ticks_disabled(self) -> None:
         strategy = self.make_strategy()
-        strategy.config = TargetWeightStrategyConfig(
+        strategy.config = TargetQuantityStrategyConfig(
             instrument_ids=[INST_A, INST_B, INST_C],
             bar_types={},
             subscribe_bars=False,
@@ -572,21 +566,25 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(strategy.subscribed_quote_ticks, [INST_A, INST_B])
         self.assertEqual(strategy.subscribed_trade_ticks, [])
 
-    def test_refresh_target_instruments_subscribes_trade_ticks_for_new_bars(self) -> None:
+    def test_refresh_target_instruments_subscribes_ticks_for_new_instruments(self) -> None:
         bar_type = BarType.from_str(f"{INST_B}-1-MINUTE-LAST-EXTERNAL")
         strategy = self.make_strategy()
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A, INST_B, INST_C],
+            bar_types={},
+            subscribe_bars=False,
+        )
 
         strategy.refresh_target_instruments([INST_B], {str(INST_B): bar_type})
 
         self.assertEqual(strategy.requested_instruments, [INST_B])
-        self.assertEqual(strategy.subscribed_bars, [bar_type])
         self.assertEqual(strategy.subscribed_quote_ticks, [INST_B])
         self.assertEqual(strategy.subscribed_trade_ticks, [INST_B])
 
     def test_refresh_target_instruments_respects_disabled_subscriptions(self) -> None:
         bar_type = BarType.from_str(f"{INST_B}-1-MINUTE-LAST-EXTERNAL")
         strategy = self.make_strategy()
-        strategy.config = TargetWeightStrategyConfig(
+        strategy.config = TargetQuantityStrategyConfig(
             instrument_ids=[INST_A],
             bar_types={},
             subscribe_bars=False,
@@ -598,14 +596,13 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy.refresh_target_instruments([INST_B], {str(INST_B): bar_type})
 
         self.assertEqual(strategy.requested_instruments, [INST_B])
-        self.assertEqual(strategy.subscribed_bars, [])
         self.assertEqual(strategy.subscribed_quote_ticks, [])
         self.assertEqual(strategy.subscribed_trade_ticks, [])
         self.assertEqual(strategy.subscribed_order_book_depths, [])
 
     def test_seed_open_prices_from_last_close_resets_new_day_counts(self) -> None:
         strategy = self.make_strategy(prices={INST_A: 10.0, INST_B: 20.0})
-        strategy.config = TargetWeightStrategyConfig(
+        strategy.config = TargetQuantityStrategyConfig(
             instrument_ids=[INST_A, INST_B],
             bar_types={},
             seed_open_from_last_close=True,
@@ -623,7 +620,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
     def test_trade_tick_logging_uses_sample_rate_like_quote_ticks(self) -> None:
         strategy = self.make_strategy()
-        strategy.config = TargetWeightStrategyConfig(
+        strategy.config = TargetQuantityStrategyConfig(
             instrument_ids=[INST_A],
             bar_types={},
             trade_tick_log_sample_rate=1.0,
@@ -649,7 +646,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
     def test_quote_tick_0925_logs_but_does_not_unlock_window(self) -> None:
         strategy = self.make_strategy()
-        strategy.config = TargetWeightStrategyConfig(
+        strategy.config = TargetQuantityStrategyConfig(
             instrument_ids=[INST_A],
             bar_types={},
             subscribe_quote_ticks=False,
@@ -681,7 +678,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
     def test_quote_tick_0929_unlocks_window(self) -> None:
         strategy = self.make_strategy()
-        strategy.config = TargetWeightStrategyConfig(
+        strategy.config = TargetQuantityStrategyConfig(
             instrument_ids=[INST_A],
             bar_types={},
             subscribe_quote_ticks=False,
@@ -710,31 +707,31 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(strategy._quote_tick_window_date, date(2026, 7, 2))
         self.assertTrue(strategy._within_trading_window())
 
-    def test_desired_weights_exit_non_targets_by_default(self) -> None:
+    def test_desired_quantities_exit_non_targets_by_default(self) -> None:
         strategy = self.make_strategy(positions={INST_A: Decimal("100"), INST_C: Decimal("200")})
-        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "test")
+        strategy.update_target_quantities({INST_A: 500}, date(2026, 7, 2), "test")
 
-        desired = strategy._desired_weights()
+        desired = strategy._desired_quantities()
 
-        self.assertEqual(desired[str(INST_A)], 0.5)
-        self.assertEqual(desired[str(INST_C)], 0.0)
+        self.assertEqual(desired[str(INST_A)], Decimal("500"))
+        self.assertEqual(desired[str(INST_C)], Decimal("0"))
 
     def test_update_target_replaces_deferred_buy_intent(self) -> None:
         strategy = self.make_strategy(free_cash="0")
-        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "first")
-        self.assertEqual(strategy._deferred_buys, {str(INST_A): 0.5})
+        strategy.update_target_quantities({INST_A: 500}, date(2026, 7, 2), "first")
+        self.assertEqual(strategy._deferred_buys, {str(INST_A): Decimal("500")})
 
-        strategy.update_target_weights({INST_B: 0.4}, date(2026, 7, 2), "second")
+        strategy.update_target_quantities({INST_B: 400}, date(2026, 7, 2), "second")
 
         self.assertNotIn(str(INST_A), strategy._deferred_buys)
-        self.assertEqual(strategy._deferred_buys, {str(INST_B): 0.4})
-        self.assertEqual(strategy._target_weights, {str(INST_B): 0.4})
+        self.assertEqual(strategy._deferred_buys, {str(INST_B): Decimal("400")})
+        self.assertEqual(strategy._target_quantities, {str(INST_B): Decimal("400")})
 
     def test_update_target_refreshes_depth_subscriptions_from_targets_and_holdings(self) -> None:
         strategy = self.make_strategy(positions={INST_B: Decimal("100")})
         strategy._subscribed_order_book_depth_instruments = {str(INST_C)}
 
-        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "depth_refresh")
+        strategy.update_target_quantities({INST_A: 500}, date(2026, 7, 2), "depth_refresh")
 
         self.assertEqual(strategy.unsubscribed_order_book_depths, [INST_C])
         self.assertEqual(
@@ -753,12 +750,12 @@ class TargetWeightStrategyTest(unittest.TestCase):
     def test_update_target_refreshes_depth_subscriptions_even_when_target_unchanged(self) -> None:
         strategy = self.make_strategy()
 
-        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "depth_refresh")
+        strategy.update_target_quantities({INST_A: 500}, date(2026, 7, 2), "depth_refresh")
         strategy.subscribed_order_book_depths = []
         strategy.unsubscribed_order_book_depths = []
         strategy._sleep_calls = []
 
-        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "depth_refresh")
+        strategy.update_target_quantities({INST_A: 500}, date(2026, 7, 2), "depth_refresh")
 
         self.assertEqual(strategy.unsubscribed_order_book_depths, [INST_A])
         self.assertEqual(
@@ -767,18 +764,18 @@ class TargetWeightStrategyTest(unittest.TestCase):
         )
         self.assertEqual(strategy._sleep_calls, [10.0])
 
-    def test_update_target_logs_target_weight_detail(self) -> None:
+    def test_update_target_logs_target_quantity_detail(self) -> None:
         strategy = self.make_strategy()
 
-        strategy.update_target_weights({INST_B: 0.2, INST_A: 0.1}, date(2026, 7, 2), "detail")
+        strategy.update_target_quantities({INST_B: 200, INST_A: 100}, date(2026, 7, 2), "detail")
 
         accepted_logs = [
             args[0]
             for args, _kwargs in strategy.log.infos
-            if args and str(args[0]).startswith("accepted target weights version=")
+            if args and str(args[0]).startswith("accepted target quantities version=")
         ]
         self.assertEqual(len(accepted_logs), 1)
-        self.assertIn("detail=[000001.SZ.QMT=0.100000, 000002.SZ.QMT=0.200000]", accepted_logs[0])
+        self.assertIn("detail=[000001.SZ.QMT=100, 000002.SZ.QMT=200]", accepted_logs[0])
 
     def test_convergence_submits_sell_before_cash_gated_buy(self) -> None:
         strategy = self.make_strategy(
@@ -787,22 +784,21 @@ class TargetWeightStrategyTest(unittest.TestCase):
             prices={INST_A: 10.0, INST_C: 25.0},
         )
 
-        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "rebalance")
+        strategy.update_target_quantities({INST_A: 50000}, date(2026, 7, 2), "rebalance")
 
         self.assertGreaterEqual(len(strategy.submitted_orders), 1)
         self.assertEqual(strategy.submitted_orders[0].instrument_id, INST_C)
         self.assertEqual(strategy.submitted_orders[0].side, OrderSide.SELL)
-        self.assertEqual(strategy._deferred_buys, {str(INST_A): 0.5})
+        self.assertEqual(strategy._deferred_buys, {str(INST_A): Decimal("50000")})
 
-    def test_convergence_summary_logs_missing_today_open_skip(self) -> None:
+    def test_convergence_summary_logs_missing_price_for_buy_candidate(self) -> None:
         strategy = self.make_strategy(
-            positions={INST_A: Decimal("1000")},
             free_cash="1000000",
             prices={INST_A: 10.0},
             open_prices={},
         )
 
-        strategy.update_target_weights({INST_A: 0.2}, date(2026, 7, 2), "missing_open")
+        strategy.update_target_quantities({INST_A: 500}, date(2026, 7, 2), "missing_price")
 
         summary_logs = [
             args[0]
@@ -810,10 +806,11 @@ class TargetWeightStrategyTest(unittest.TestCase):
             if args and str(args[0]).startswith("Target convergence summary ")
         ]
         self.assertEqual(len(summary_logs), 1)
-        self.assertIn("missing_open=1", summary_logs[0])
-        self.assertIn(f"missing_open_instruments=[{INST_A}]", summary_logs[0])
-        self.assertIn("sell_targets=0 buy_targets=0", summary_logs[0])
-        self.assertEqual(strategy.submitted_orders, [])
+        self.assertIn("missing_price=1", summary_logs[0])
+        self.assertIn(f"missing_price_instruments=[{INST_A}]", summary_logs[0])
+        self.assertIn("sell_targets=0 buy_targets=1", summary_logs[0])
+        self.assertEqual(len(strategy.submitted_orders), 1)
+        self.assertEqual(strategy.submitted_orders[0].side, OrderSide.BUY)
 
     def test_convergence_summary_logs_cash_gap_for_buy_candidates(self) -> None:
         strategy = self.make_strategy(
@@ -822,7 +819,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
             prices={INST_A: 10.0},
         )
 
-        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "cash_gap")
+        strategy.update_target_quantities({INST_A: 50000}, date(2026, 7, 2), "cash_gap")
 
         summary_logs = [
             args[0]
@@ -835,7 +832,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertIn("available_buy_cash=1000.0", summary_logs[0])
         self.assertIn("cash_gap=499000.0", summary_logs[0])
 
-    def test_apply_frozen_targets_does_not_converge_before_frozen_quantities_are_loaded(self) -> None:
+    def test_update_target_quantities_accepts_loaded_frozen_total_asset(self) -> None:
         strategy = self.make_strategy(
             positions={INST_A: Decimal("1000")},
             free_cash="1000000",
@@ -843,17 +840,16 @@ class TargetWeightStrategyTest(unittest.TestCase):
             prices={INST_A: 10.0},
         )
 
-        strategy.apply_frozen_targets(
+        strategy.update_target_quantities(
+            quantities={INST_A: Decimal("1000")},
             target_date=date(2026, 7, 2),
-            weights={INST_A: 0.02},
-            target_qty={INST_A: Decimal("1000")},
-            total_asset=Decimal("500000"),
             reason="restart_frozen",
+            total_asset=Decimal("500000"),
             version="frozen-v1",
         )
 
-        self.assertEqual(strategy._frozen_target_qty, {str(INST_A): Decimal("1000")})
-        self.assertEqual(strategy._frozen_portfolio_value, Decimal("500000"))
+        self.assertEqual(strategy._target_quantities, {str(INST_A): Decimal("1000")})
+        self.assertEqual(strategy._target_total_asset, Decimal("500000"))
         self.assertEqual(strategy.submitted_orders, [])
 
     def test_limit_up_freezes_only_affected_buy_symbol(self) -> None:
@@ -863,8 +859,8 @@ class TargetWeightStrategyTest(unittest.TestCase):
             fields={INST_A: {"UpStopPrice": 10.0}},
         )
 
-        strategy.update_target_weights(
-            {INST_A: 0.3, INST_B: 0.3},
+        strategy.update_target_quantities(
+            {INST_A: 30000, INST_B: 15000},
             date(2026, 7, 2),
             "limit_test",
         )
@@ -874,27 +870,27 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertNotIn(INST_A, submitted_instruments)
         self.assertIn(INST_B, submitted_instruments)
 
-    def test_practical_achievement_accepts_cash_buffer_and_weight_tolerance(self) -> None:
+    def test_achievement_accepts_exact_target_quantity(self) -> None:
         strategy = self.make_strategy(
             positions={INST_A: Decimal("95000")},
             equity="1000000",
             free_cash="50000",
             prices={INST_A: 10.0},
         )
-        strategy._target_weights = {str(INST_A): 0.95}
+        strategy._target_quantities = {str(INST_A): Decimal("95000")}
         strategy._target_version = "achieved"
         strategy._target_date = date(2026, 7, 2)
 
         self.assertTrue(strategy._target_achieved())
 
-    def test_practical_achievement_rejects_excess_cash(self) -> None:
+    def test_achievement_rejects_quantity_mismatch(self) -> None:
         strategy = self.make_strategy(
             positions={INST_A: Decimal("90000")},
             equity="1000000",
             free_cash="100000",
             prices={INST_A: 10.0},
         )
-        strategy._target_weights = {str(INST_A): 0.95}
+        strategy._target_quantities = {str(INST_A): Decimal("95000")}
         strategy._target_version = "not-achieved"
         strategy._target_date = date(2026, 7, 2)
 
@@ -907,7 +903,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
             prices={INST_A: 25.0},
         )
 
-        strategy.update_target_weights({INST_A: 0.03}, date(2026, 7, 2), "small")
+        strategy.update_target_quantities({INST_A: 1200}, date(2026, 7, 2), "small")
 
         self.assertEqual(len(strategy.submitted_orders), 1)
         self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("1200"))
@@ -919,7 +915,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
             prices={INST_A: 10.0},
         )
 
-        strategy.update_target_weights({INST_A: 0.95}, date(2026, 7, 2), "large")
+        strategy.update_target_quantities({INST_A: 95000}, date(2026, 7, 2), "large")
 
         self.assertEqual([order.quantity for order in strategy.submitted_orders], [
             Decimal("29900"),
@@ -939,12 +935,12 @@ class TargetWeightStrategyTest(unittest.TestCase):
         )
 
         self.assertEqual(strategy._current_weight(str(INST_A)), 0.075)
-        self.assertEqual(strategy._target_side(str(INST_A), 0.1), "buy")
-        intent = strategy._target_order_intent(str(INST_A), 0.1)
+        self.assertEqual(strategy._target_side(str(INST_A), Decimal("10000")), "buy")
+        intent = strategy._target_order_intent(str(INST_A), Decimal("10000"))
         self.assertIsNotNone(intent)
         self.assertEqual(intent.side, OrderSide.BUY)
         self.assertEqual(intent.quantity, Decimal("2500"))
-        self.assertEqual(strategy._estimated_buy_cost(str(INST_A), 0.1), Decimal("25000.0"))
+        self.assertEqual(strategy._estimated_buy_cost(str(INST_A), Decimal("10000")), Decimal("25000.0"))
 
     def test_live_sizing_prefers_broker_total_asset_over_cash_only_equity(self) -> None:
         strategy = self.make_strategy(
@@ -959,9 +955,9 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         self.assertEqual(strategy._portfolio_value(), Decimal("10007406.36"))
         self.assertEqual(strategy._nautilus_portfolio_equity(), Decimal("3352261.79"))
-        self.assertIsNone(strategy._target_side(str(INST_A), 0.05))
+        self.assertIsNone(strategy._target_side(str(INST_A), Decimal("143100")))
 
-        strategy.update_target_weights({INST_A: 0.05}, date(2026, 7, 2), "broker_total_asset")
+        strategy.update_target_quantities({INST_A: 143100}, date(2026, 7, 2), "broker_total_asset")
 
         self.assertEqual(strategy.submitted_orders, [])
         sizing_logs = [
@@ -986,9 +982,9 @@ class TargetWeightStrategyTest(unittest.TestCase):
             order_slice_notional="1000000",
         )
 
-        self.assertEqual(strategy._target_side(str(INST_A), 0.05), "buy")
+        self.assertEqual(strategy._target_side(str(INST_A), Decimal("147100")), "buy")
 
-        strategy.update_target_weights({INST_A: 0.05}, date(2026, 7, 2), "broker_total_asset")
+        strategy.update_target_quantities({INST_A: 147100}, date(2026, 7, 2), "broker_total_asset")
 
         self.assertEqual(len(strategy.submitted_orders), 1)
         self.assertEqual(strategy.submitted_orders[0].side, OrderSide.BUY)
@@ -1001,10 +997,10 @@ class TargetWeightStrategyTest(unittest.TestCase):
             prices={INST_A: 10.0},
         )
 
-        strategy.update_target_weights({INST_A: 0.95}, date(2026, 7, 2), "partial")
+        strategy.update_target_quantities({INST_A: 95000}, date(2026, 7, 2), "partial")
 
         self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("29900")])
-        self.assertEqual(strategy._deferred_buys, {str(INST_A): 0.95})
+        self.assertEqual(strategy._deferred_buys, {str(INST_A): Decimal("95000")})
 
     def test_buy_cash_gate_reserves_open_buy_notional(self) -> None:
         strategy = self.make_strategy(
@@ -1025,12 +1021,12 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         strategy._submit_buys_within_cash(
             date(2026, 7, 2),
-            {str(INST_B): 0.1},
+            {str(INST_B): Decimal("10000")},
             "cash_reserved",
         )
 
         self.assertEqual(strategy.submitted_orders, [])
-        self.assertEqual(strategy._deferred_buys, {str(INST_B): 0.1})
+        self.assertEqual(strategy._deferred_buys, {str(INST_B): Decimal("10000")})
 
     def test_initialized_buy_in_cache_blocks_cache_lag_duplicate_convergence(self) -> None:
         trading_date = date(2026, 7, 2)
@@ -1041,7 +1037,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
         )
         strategy.submit_orders_to_cache = False
 
-        strategy.update_target_weights({INST_A: 0.03}, trading_date, "cache_lag")
+        strategy.update_target_quantities({INST_A: 1200}, trading_date, "cache_lag")
         strategy._converge_to_target(trading_date, "timer")
 
         self.assertEqual(len(strategy.submitted_orders), 1)
@@ -1079,7 +1075,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         strategy.submit_order = submit_and_reenter
 
-        strategy.update_target_weights({INST_A: 0.0}, trading_date, "exit")
+        strategy.update_target_quantities({INST_A: 0}, trading_date, "exit")
 
         self.assertEqual(len(strategy.submitted_orders), 1)
         self.assertEqual(strategy.submitted_orders[0].side, OrderSide.SELL)
@@ -1087,7 +1083,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
         # The reentrant pass ran but submitted nothing.
         self.assertEqual(reentered, [0])
 
-    def test_weight_tolerance_skips_tiny_residual_buy(self) -> None:
+    def test_quantity_delta_submits_tiny_residual_buy(self) -> None:
         strategy = self.make_strategy(
             positions={INST_A: Decimal("94800")},
             equity="1000000",
@@ -1095,27 +1091,28 @@ class TargetWeightStrategyTest(unittest.TestCase):
             prices={INST_A: 10.0},
         )
 
-        strategy.update_target_weights({INST_A: 0.95}, date(2026, 7, 2), "tiny")
+        strategy.update_target_quantities({INST_A: 95000}, date(2026, 7, 2), "tiny")
 
-        self.assertEqual(strategy.submitted_orders, [])
+        self.assertEqual(len(strategy.submitted_orders), 1)
+        self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("200"))
 
     def test_update_target_does_not_converge_when_suspended_outside_window(self) -> None:
         strategy = self.make_strategy(free_cash="1000000")
         strategy._convergence_suspended = True
 
-        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "preopen")
+        strategy.update_target_quantities({INST_A: 500}, date(2026, 7, 2), "preopen")
 
         self.assertEqual(strategy.submitted_orders, [])
-        self.assertEqual(strategy._target_weights, {str(INST_A): 0.5})
+        self.assertEqual(strategy._target_quantities, {str(INST_A): Decimal("500")})
 
     def test_update_target_does_not_submit_before_trading_window(self) -> None:
         strategy = self.make_strategy(free_cash="1000000")
         strategy.clock.now = pd.Timestamp("2026-07-02 01:16:00", tz="UTC")
 
-        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "preopen")
+        strategy.update_target_quantities({INST_A: 500}, date(2026, 7, 2), "preopen")
 
         self.assertEqual(strategy.submitted_orders, [])
-        self.assertEqual(strategy._target_weights, {str(INST_A): 0.5})
+        self.assertEqual(strategy._target_quantities, {str(INST_A): Decimal("500")})
 
     def test_order_fill_releases_only_filled_symbol_insufficient_funds_backoff(self) -> None:
         strategy = self.make_strategy()
@@ -1130,10 +1127,10 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy = self.make_strategy(require_account_cash=True)
         strategy.portfolio.has_account = False
 
-        strategy.update_target_weights({INST_A: 0.5}, date(2026, 7, 2), "missing_cash")
+        strategy.update_target_quantities({INST_A: 50000}, date(2026, 7, 2), "missing_cash")
 
         self.assertEqual(strategy.submitted_orders, [])
-        self.assertEqual(strategy._deferred_buys, {str(INST_A): 0.5})
+        self.assertEqual(strategy._deferred_buys, {str(INST_A): Decimal("50000")})
 
     def test_sell_clamps_to_net_position_less_today_buys(self) -> None:
         trading_date = date(2026, 7, 3)
@@ -1358,7 +1355,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
     def test_cum_notional_exceeds_free_balance_denial_is_treated_as_insufficient_funds(self) -> None:
         strategy = self.make_strategy()
-        strategy._target_weights = {str(INST_A): 0.5}
+        strategy._target_quantities = {str(INST_A): Decimal("50000")}
         event = type(
             "DeniedEvent",
             (),
@@ -1372,7 +1369,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
         strategy.on_order_denied(event)
 
         self.assertEqual(strategy._insufficient_funds, {str(INST_A)})
-        self.assertEqual(strategy._deferred_buys, {str(INST_A): 0.5})
+        self.assertEqual(strategy._deferred_buys, {str(INST_A): Decimal("50000")})
 
     def test_sellable_exhaustion_does_not_block_later_buy_target(self) -> None:
         trading_date = date(2026, 7, 2)
@@ -1382,7 +1379,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
         )
         strategy._sellable_exhausted = {str(INST_A): trading_date}
 
-        strategy.update_target_weights({INST_A: 0.2}, trading_date, "revision")
+        strategy.update_target_quantities({INST_A: 200}, trading_date, "revision")
 
         self.assertGreater(len(strategy.submitted_orders), 0)
         self.assertEqual(strategy.submitted_orders[0].side, OrderSide.BUY)
@@ -1400,7 +1397,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
         self.assertEqual(len(strategy.clock.time_alerts), 1)
         alert = strategy.clock.time_alerts[0]
-        self.assertEqual(alert["name"], TargetWeightStrategy._PRE_OPEN_RECONCILE_ALERT)
+        self.assertEqual(alert["name"], TargetQuantityStrategy._PRE_OPEN_RECONCILE_ALERT)
         self.assertEqual(alert["alert_time"], pd.Timestamp("2026-07-02 09:15:00", tz="Asia/Shanghai"))
         self.assertTrue(alert["override"])
 
@@ -1428,19 +1425,6 @@ class TargetWeightStrategyTest(unittest.TestCase):
             any("Pre-open execution-state reconciliation succeeded" in args[0] for args, _kwargs in strategy.log.infos),
         )
 
-    def _make_bar(self, instrument_id: InstrumentId, open_price: float, close: float, ts: str):
-        bar_type = BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
-        return type(
-            "Bar",
-            (),
-            {
-                "bar_type": bar_type,
-                "open": Decimal(str(open_price)),
-                "close": Decimal(str(close)),
-                "ts_event": china_ts_ns(ts),
-            },
-        )()
-
     def _make_depth(self, instrument_id: InstrumentId, bid: float, ask: float, ts: str):
         def level(price: float, size: float):
             return type("DepthLevel", (), {"price": Decimal(str(price)), "size": Decimal(str(size))})()
@@ -1456,29 +1440,6 @@ class TargetWeightStrategyTest(unittest.TestCase):
                 "ts_init": china_ts_ns(ts),
             },
         )()
-
-    def test_on_bar_records_first_open_and_resets_counts_on_new_day(self) -> None:
-        strategy = self.make_strategy(free_cash="1000000")
-        strategy.on_target_bar = lambda _bar: None  # isolate open-capture behaviour
-        strategy.clock.now = pd.Timestamp("2026-07-02 02:00:00", tz="UTC")
-        strategy._cancel_count_buy = {str(INST_A): 3}
-        strategy._cancel_count_sell = {str(INST_A): 2}
-
-        strategy.on_bar(self._make_bar(INST_A, 10.0, 10.1, "2026-07-02 09:30:00"))
-        # first bar of a new date resets the side-specific cancel counts
-        self.assertEqual(strategy._cancel_count_buy, {})
-        self.assertEqual(strategy._cancel_count_sell, {})
-        self.assertEqual(strategy._today_open[str(INST_A)], 10.0)
-
-        # a later bar the same day does not overwrite the recorded open
-        strategy.on_bar(self._make_bar(INST_A, 10.5, 10.6, "2026-07-02 09:31:00"))
-        self.assertEqual(strategy._today_open[str(INST_A)], 10.0)
-
-        # a bar on the next day resets and records the new open
-        strategy._cancel_count_buy = {str(INST_A): 1}
-        strategy.on_bar(self._make_bar(INST_A, 11.0, 11.1, "2026-07-03 09:30:00"))
-        self.assertEqual(strategy._cancel_count_buy, {})
-        self.assertEqual(strategy._today_open[str(INST_A)], 11.0)
 
     def test_on_order_book_depth_captures_ladder_only(self) -> None:
         strategy = self.make_strategy()
@@ -1518,7 +1479,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
             prices={INST_A: 10.0},
             open_prices={},
         )
-        strategy._target_weights = {str(INST_A): 0.5}
+        strategy._target_quantities = {str(INST_A): Decimal("50000")}
         strategy._target_date = date(2026, 7, 2)
         strategy._target_reason = "loaded_target"
         strategy._target_version = "loaded-v1"
@@ -1546,7 +1507,7 @@ class TargetWeightStrategyTest(unittest.TestCase):
 
     def test_seed_does_not_override_authoritative_open(self) -> None:
         strategy = self.make_strategy()
-        strategy.config = TargetWeightStrategyConfig(
+        strategy.config = TargetQuantityStrategyConfig(
             instrument_ids=[INST_A],
             bar_types={},
             seed_open_from_last_close=True,
@@ -1561,11 +1522,11 @@ class TargetWeightStrategyTest(unittest.TestCase):
         self.assertEqual(strategy._today_open[str(INST_A)], 53.09)
 
     def test_full_tick_open_extraction(self) -> None:
-        self.assertEqual(TargetWeightStrategy._full_tick_open({"open": 53.09}), 53.09)
-        self.assertEqual(TargetWeightStrategy._full_tick_open(53.09), 53.09)
-        self.assertIsNone(TargetWeightStrategy._full_tick_open({"open": 0.0}))
-        self.assertIsNone(TargetWeightStrategy._full_tick_open({"open": None}))
-        self.assertIsNone(TargetWeightStrategy._full_tick_open({"last_price": 1.0}))
+        self.assertEqual(TargetQuantityStrategy._full_tick_open({"open": 53.09}), 53.09)
+        self.assertEqual(TargetQuantityStrategy._full_tick_open(53.09), 53.09)
+        self.assertIsNone(TargetQuantityStrategy._full_tick_open({"open": 0.0}))
+        self.assertIsNone(TargetQuantityStrategy._full_tick_open({"open": None}))
+        self.assertIsNone(TargetQuantityStrategy._full_tick_open({"last_price": 1.0}))
 
     def test_buy_price_uses_gap_up_open_not_stale_seed(self) -> None:
         # End-to-end: after a full-tick refresh, a gap-up open drives the buy

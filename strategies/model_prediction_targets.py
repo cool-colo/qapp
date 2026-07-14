@@ -18,18 +18,17 @@ from strategies.model_common import is_rebalance_day
 from strategies.model_common import normalize_initial_active_positions
 from strategies.model_common import normalize_signals
 from strategies.model_common import previous_trading_date
-from strategies.model_target_planners import EqualWeightModelTargetPlanner
 from strategies.model_target_planners import ModelTargetCandidate
 from strategies.model_target_planners import ModelTargetPlan
 from strategies.model_target_planners import ModelTargetPlanningRequest
 from strategies.model_target_planners import build_model_target_planner
 from strategies.model_target_planners import normalize_stock_code
-from strategies.target_weights import TargetWeightStrategy
-from strategies.target_weights import TargetWeightStrategyConfig
-from strategies.target_weights import bar_date
+from strategies.target_quantities import TargetQuantityStrategy
+from strategies.target_quantities import TargetQuantityStrategyConfig
+from strategies.target_quantities import bar_date
 
 
-class TargetModelPredictionsStrategyConfig(TargetWeightStrategyConfig, kw_only=True, frozen=True):
+class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only=True, frozen=True):
     instrument_stock_codes: dict[str, str]
     signals_by_date: dict[str, list[dict[str, Any]]]
     trading_dates: list[str]
@@ -54,12 +53,13 @@ class TargetModelPredictionsStrategyConfig(TargetWeightStrategyConfig, kw_only=T
     process_targets_on_timer: bool = False
 
 
-class TargetModelPredictionsStrategy(TargetWeightStrategy):
+class TargetModelPredictionsStrategy(TargetQuantityStrategy):
     """
-    Model-prediction target provider using the reusable target-weight executor.
+    Model-prediction target provider using the reusable target-quantity executor.
 
-    This class decides the target weights. The inherited executor decides how to
-    reach them through Nautilus account, cache, and order APIs.
+    This class decides the target share counts (via the risk-manager planner). The
+    inherited executor decides how to reach them through Nautilus account, cache, and
+    order APIs.
     """
 
     def __init__(self, config: TargetModelPredictionsStrategyConfig) -> None:
@@ -91,8 +91,7 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
             self._trading_dates,
             pd.Timestamp(config.trading_dates[0]).date() if config.trading_dates else None,
         )
-        self._equal_weight_target_planner = EqualWeightModelTargetPlanner()
-        self._target_weight_planner = build_model_target_planner(config)
+        self._target_planner = build_model_target_planner(config)
         self.signal_events: list[ModelPredictionSignalEvent] = []
 
     def refresh_reference_data(
@@ -173,23 +172,14 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
 
     def _process_trading_day(self, trading_date: date) -> None:
         plan = self.compute_daily_target_plan(trading_date)
-        if plan.target_qty:
-            # The planner (risk-manager) committed explicit share counts: pin them so
-            # the day trades fixed quantities against a frozen total asset instead of
-            # re-sizing from live equity, matching the snapshot recorder's frozen path.
-            self.apply_frozen_targets(
-                target_date=trading_date,
-                weights=plan.weights,
-                target_qty=plan.target_qty,
-                total_asset=plan.investable_asset,
-                reason=plan.reason,
-                version=self._plan_version(plan),
-            )
-            return
-        self.update_target_weights(
-            weights=plan.weights,
+        # The risk-manager planner commits explicit share counts (固定目标股数); the
+        # executor trades toward those quantities against the frozen total asset. Weights
+        # on the plan are audit-only and are not consulted for execution.
+        self.update_target_quantities(
+            quantities=plan.target_qty,
             target_date=trading_date,
             reason=plan.reason,
+            total_asset=plan.investable_asset,
             version=self._plan_version(plan),
         )
 
@@ -197,12 +187,12 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
         """
         Run the daily selection pipeline (seed positions → exits → entries → trim →
         target planner) and return the resulting plan **without submitting orders or
-        accepting the target weights**.
+        accepting the target**.
 
         The bar/timer path (_process_trading_day) uses this and then applies the plan
-        via update_target_weights. The snapshot recorder uses it before-trading to
+        via update_target_quantities. The snapshot recorder uses it before-trading to
         derive the day's frozen share counts, persist them, and then feed them back via
-        apply_frozen_targets. Both paths therefore run the same selection logic.
+        update_target_quantities. Both paths therefore run the same selection logic.
         """
         self._seed_active_positions_from_portfolio(trading_date)
         signal_date = self._resolve_signal_date(trading_date)
@@ -230,7 +220,7 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
         return self._target_plan(trading_date, signal_date)
 
     def plan_version(self, plan: ModelTargetPlan) -> str:
-        """Public alias of the version string used by update_target_weights."""
+        """Public alias of the version string used by update_target_quantities."""
         return self._plan_version(plan)
 
     def _resolve_signal_date(self, trading_date: date) -> date | None:
@@ -420,16 +410,7 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
 
     def _target_plan(self, trading_date: date, signal_date: date | None) -> ModelTargetPlan:
         request = self._target_planning_request(trading_date, signal_date)
-        try:
-            plan = self._target_weight_planner.plan(request)
-        except Exception as exc:
-            policy = str(self.config.target_weight_planner_error_policy or "raise").strip().lower()
-            if policy == "equal_weight":
-                self.log.warning(f"target weight planner failed, falling back to equal weight: {exc}")
-                plan = self._equal_weight_target_planner.plan(request)
-            else:
-                self.log.warning(f"target weight planner failed: {exc}")
-                raise
+        plan = self._target_planner.plan(request)
         return self._annotate_plan(plan, request)
 
     def _annotate_plan(
@@ -547,8 +528,8 @@ class TargetModelPredictionsStrategy(TargetWeightStrategy):
 
     def _plan_version(self, plan: ModelTargetPlan) -> str:
         signal_text = "none" if plan.signal_date is None else plan.signal_date.isoformat()
-        total = sum(plan.weights.values())
-        return f"model-{plan.trading_date.isoformat()}-{signal_text}-{len(plan.weights)}-{total:.8f}"
+        total = sum(int(qty) for qty in plan.target_qty.values())
+        return f"model-{plan.trading_date.isoformat()}-{signal_text}-{len(plan.target_qty)}-{total}"
 
     def _entry_skip_reason(self, stock_code: str, trading_date: date) -> str | None:
         name_reason = self._name_skip_reason(stock_code)

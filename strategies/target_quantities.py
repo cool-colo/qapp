@@ -42,34 +42,26 @@ async def _await_awaitable(awaitable: Any) -> Any:
 
 
 @dataclass(frozen=True)
-class TargetWeightPlan:
-    target_date: date
-    weights: dict[str, float]
-    reason: str
-    version: str
-
-
-@dataclass(frozen=True)
-class TargetWeightTargetEvent:
+class TargetQuantityTargetEvent:
     target_id: str
     target_date: date
     execute_date: date
     instrument_id: str
-    target_weight: float
-    current_weight: float | None
-    delta_weight: float | None
+    target_qty: Decimal
+    current_qty: Decimal | None
+    delta_qty: Decimal | None
     reason: str
     extra: dict[str, Any]
 
 
 @dataclass(frozen=True)
-class TargetWeightOrderEvent:
+class TargetQuantityOrderEvent:
     order_id: str
     trading_date: date
     instrument_id: str
     side: str
     quantity: int
-    target_weight: float
+    target_qty: Decimal
     status: str
     reason: str | None
     extra: dict[str, Any]
@@ -93,7 +85,7 @@ class TodayFillSnapshot:
 
 
 
-class TargetWeightStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
+class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     instrument_ids: list[InstrumentId]
     bar_types: dict[str, BarType]
     initial_cash: Decimal = Decimal("1000000")
@@ -101,13 +93,10 @@ class TargetWeightStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     trading_windows: str = "09:29-11:30,13:00-14:55"
     stop_time: str | None = "14:55"
     initial_last_closes: dict[str, float] | None = None
-    star_min_buy_qty: int = 200
     unfilled_timeout_secs: float = 60.0
     resubmit_check_interval_secs: float = 10.0
     cash_buffer_percent: float = 0.01
     target_cash_buffer_percent: float = 0.05
-    weight_tolerance_percent: float = 0.003
-    cash_tolerance_percent: float = 0.01
     buy_offset_bps: float = 5.0
     sell_offset_bps: float = 5.0
     buy_max_price_bps: float = 10.0
@@ -129,13 +118,15 @@ class TargetWeightStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     full_tick_prefetch_time: str | None = "09:27"
 
 
-class TargetWeightStrategy(Strategy):
+class TargetQuantityStrategy(Strategy):
     """
-    Nautilus-first target-weight executor.
+    Nautilus-first target-quantity executor.
 
-    Subclasses or external controllers provide target weights. This class owns
-    the account-aware convergence loop: exits, cash-gated buys, stale-order
-    cancel/resubmit, symbol freezes, and achievement checks.
+    Subclasses or external controllers provide per-instrument target share counts
+    (固定目标股数). This class owns the account-aware convergence loop: exits,
+    cash-gated buys, stale-order cancel/resubmit, symbol freezes, and achievement
+    checks. Sizing is a direct share-count delta (target_qty - current_qty); no
+    weights are consulted.
     """
 
     _UP_LIMIT_KEYS = ("UpStopPrice", "up_stop_price", "high_limit", "up_limit", "limit_up", "\u6da8\u505c\u4ef7")
@@ -158,30 +149,30 @@ class TargetWeightStrategy(Strategy):
         OrderStatus.FILLED,
     }
 
-    def __init__(self, config: TargetWeightStrategyConfig) -> None:
+    def __init__(self, config: TargetQuantityStrategyConfig) -> None:
         super().__init__(config)
         self._instrument_ids = list(config.instrument_ids)
         self._bar_types = {str(key): value for key, value in config.bar_types.items()}
         self._last_close = normalize_initial_last_closes(config.initial_last_closes)
-        self._target_weights: dict[str, float] = {}
+        # Per-instrument target share count (固定目标股数). ``0`` is a valid target
+        # (liquidate / hold-none) and is retained. This is the sole sizing input:
+        # each cycle converges current_qty -> target_qty. No weights are consulted.
+        self._target_quantities: dict[str, Decimal] = {}
         self._target_date: date | None = None
-        self._target_reason = "target_weight"
+        self._target_reason = "target_quantity"
         self._target_version = ""
-        # Frozen target quantities (固定目标股数). When populated for the current
-        # target version, sizing bypasses the live portfolio value: each instrument
-        # converges to its pre-committed share count instead of re-deriving quantity
-        # from portfolio.equity every cycle. Populated via apply_frozen_targets and
-        # cleared whenever the target version changes.
-        self._frozen_target_qty: dict[str, Decimal] = {}
-        self._frozen_portfolio_value: Decimal | None = None
+        # Frozen total asset carried alongside the quantities. Pins the sizing
+        # denominator used only for cash reporting and the account snapshot log; the
+        # per-instrument quantities are explicit, so this never re-derives share counts.
+        self._target_total_asset: Decimal | None = None
         self._achieved_versions: set[str] = set()
         self._frozen_instruments: dict[str, str] = {}
-        self._deferred_buys: dict[str, float] = {}
+        self._deferred_buys: dict[str, Decimal] = {}
         self._converge_lock = threading.Lock()
         self._rejected_order_ids: set[str] = set()
         self._insufficient_funds: set[str] = set()
         self._order_submit_ts: dict[str, int] = {}
-        self._order_target_weights: dict[str, float] = {}
+        self._order_target_qty: dict[str, Decimal] = {}
         self._order_target_versions: dict[str, str] = {}
         self._order_splitter = NotionalOrderSplitter(config.order_slice_notional)
         self._buy_pricer = OpenOffsetBuyPriceStrategy(
@@ -241,8 +232,8 @@ class TargetWeightStrategy(Strategy):
         self._venue_sellable: dict[str, Decimal] = {}
         self._venue_sellable_ts: int = 0
         self._last_account_sizing_snapshot: str | None = None
-        self.target_events: list[TargetWeightTargetEvent] = []
-        self.order_events: list[TargetWeightOrderEvent] = []
+        self.target_events: list[TargetQuantityTargetEvent] = []
+        self.order_events: list[TargetQuantityOrderEvent] = []
 
     def configure_pre_open_reconciliation(
         self,
@@ -547,7 +538,7 @@ class TargetWeightStrategy(Strategy):
         existing_bar_type_keys = set(self._bar_types)
         refreshed_bar_types = {str(key): value for key, value in bar_types.items()}
         if unsubscribe_removed_bars:
-            removable = existing_bar_type_keys.difference(refreshed_bar_types).difference(self._target_weights)
+            removable = existing_bar_type_keys.difference(refreshed_bar_types).difference(self._target_quantities)
             for key in sorted(removable):
                 if self._current_quantity(InstrumentId.from_str(key)) > 0:
                     continue
@@ -605,51 +596,72 @@ class TargetWeightStrategy(Strategy):
             except Exception as exc:
                 self.log.warning(f"Bar unsubscribe failed for {bar_type}: {exc}")
 
-    def update_target_weights(
+    def update_target_quantities(
         self,
-        weights: dict[str | InstrumentId, float],
+        quantities: dict[str | InstrumentId, int | Decimal],
         target_date: date,
         reason: str,
+        total_asset: Decimal | float | None = None,
         version: str | None = None,
     ) -> None:
-        normalized: dict[str, float] = {}
-        for instrument_id, weight in weights.items():
+        """
+        Accept the day's per-instrument target share counts (固定目标股数).
+
+        Quantity is the sole sizing input: each convergence cycle drives current_qty
+        toward target_qty per instrument. ``0`` is a valid target (liquidate / hold
+        none) and is retained. ``total_asset`` pins the sizing denominator used for
+        cash reporting only; the quantities are explicit, so no per-instrument
+        re-sizing from live equity occurs. Called from the bar/timer path and from the
+        snapshot recorder (once per day, after the target is generated or loaded from
+        MySQL on restart).
+        """
+        normalized: dict[str, Decimal] = {}
+        for instrument_id, quantity in quantities.items():
             instrument_id_text = str(instrument_id)
-            weight_value = float(weight)
-            if weight_value <= 0:
+            try:
+                value = Decimal(str(quantity))
+            except Exception:
                 continue
-            normalized[instrument_id_text] = weight_value
+            if value < 0:
+                continue
+            normalized[instrument_id_text] = value
         version_value = version or target_version(target_date, normalized, reason)
         self._refresh_order_book_depth_subscriptions(normalized)
-        if version_value == self._target_version and normalized == self._target_weights:
+        frozen_value: Decimal | None = None
+        if total_asset is not None:
+            try:
+                candidate = Decimal(str(total_asset))
+            except Exception:
+                candidate = None
+            if candidate is not None and candidate > 0:
+                frozen_value = candidate
+        if (
+            version_value == self._target_version
+            and normalized == self._target_quantities
+            and frozen_value == self._target_total_asset
+        ):
             return
-        self._target_weights = dict(sorted(normalized.items()))
+        self._target_quantities = dict(sorted(normalized.items()))
         self._target_date = target_date
         self._target_reason = reason
         self._target_version = version_value
         self._frozen_instruments = {}
         self._deferred_buys = {}
         self._insufficient_funds = set()
-        # A plain weight update supersedes any previously frozen share counts;
-        # apply_frozen_targets re-populates them after delegating here.
-        self._frozen_target_qty = {}
-        self._frozen_portfolio_value = None
+        self._target_total_asset = frozen_value
         self._achieved_versions.discard(version_value)
-        total_weight = sum(self._target_weights.values())
-        if total_weight > 1.0:
-            self.log.warning(f"target weights sum to {total_weight:.6f}; buys may be cash-constrained")
-        detail = self._target_weights_log_detail(self._target_weights)
+        detail = self._target_quantities_log_detail(self._target_quantities)
         self.log.info(
-            f"accepted target weights version={version_value} date={target_date} "
-            f"count={len(self._target_weights)} total_weight={total_weight:.6f} reason={reason} "
-            f"detail={detail}",
+            f"accepted target quantities version={version_value} date={target_date} "
+            f"count={len(self._target_quantities)} total_asset={self._target_total_asset} "
+            f"reason={reason} detail={detail}",
             color=LogColor.BLUE,
         )
         if self._convergence_suspended or not self._within_trading_window():
             return
         self._converge_to_target(current_date=target_date, trigger="target_update")
 
-    def _refresh_order_book_depth_subscriptions(self, weights: dict[str, float]) -> None:
+    def _refresh_order_book_depth_subscriptions(self, quantities: dict[str, Decimal]) -> None:
         subscribed_ids = set(self._subscribed_order_book_depth_instruments)
         for instrument_id_text in sorted(subscribed_ids):
             try:
@@ -658,7 +670,7 @@ class TargetWeightStrategy(Strategy):
                 self.log.warning(
                     f"Order-book depth unsubscribe failed for {instrument_id_text}: {exc}",
                 )
-        desired_ids = set(weights).union(self._held_instrument_ids())
+        desired_ids = set(quantities).union(self._held_instrument_ids())
         refreshed_ids: set[str] = set()
         for instrument_id_text in sorted(desired_ids):
             instrument_id = InstrumentId.from_str(instrument_id_text)
@@ -683,76 +695,13 @@ class TargetWeightStrategy(Strategy):
             )
             self._sleep(10.0)
 
-    def apply_frozen_targets(
-        self,
-        target_date: date,
-        weights: dict[str | InstrumentId, float],
-        target_qty: dict[str | InstrumentId, int | Decimal],
-        total_asset: Decimal | float | None,
-        reason: str,
-        version: str | None = None,
-    ) -> None:
-        """
-        Accept a set of target weights together with pre-committed share counts
-        (固定目标股数) and a frozen total-asset value.
-
-        The weights drive the same convergence/freeze/record machinery as
-        update_target_weights; the frozen quantities and total asset make sizing
-        deterministic for the day: _target_quantity returns the committed share count
-        and _portfolio_value returns the frozen total asset, so the day's execution no
-        longer depends on the live (fluctuating) portfolio equity. Called from the
-        snapshot recorder once per day after the target is generated or loaded from
-        MySQL on restart.
-        """
-        # Delegating clears _frozen_target_qty/_frozen_portfolio_value (a plain weight
-        # update supersedes stale freezes), but it must not converge until the frozen
-        # quantities below are installed. On a mid-session restart, an intermediate
-        # live-weight convergence can submit a buy using drifting account value, then
-        # the frozen target immediately makes the same symbol look overweight.
-        was_suspended = self._convergence_suspended
-        self._convergence_suspended = True
-        try:
-            self.update_target_weights(
-                weights=weights,
-                target_date=target_date,
-                reason=reason,
-                version=version,
-            )
-        finally:
-            self._convergence_suspended = was_suspended
-        frozen: dict[str, Decimal] = {}
-        for instrument_id, quantity in target_qty.items():
-            try:
-                value = Decimal(str(quantity))
-            except Exception:
-                continue
-            if value < 0:
-                continue
-            frozen[str(instrument_id)] = value
-        self._frozen_target_qty = frozen
-        if total_asset is not None:
-            try:
-                frozen_value = Decimal(str(total_asset))
-            except Exception:
-                frozen_value = None
-            if frozen_value is not None and frozen_value > 0:
-                self._frozen_portfolio_value = frozen_value
-        self.log.info(
-            f"applied frozen targets version={self._target_version} date={target_date} "
-            f"count={len(frozen)} frozen_total_asset={self._frozen_portfolio_value}",
-            color=LogColor.BLUE,
-        )
-        if self._convergence_suspended or not self._within_trading_window():
-            return
-        self._converge_to_target(current_date=target_date, trigger="frozen_targets")
-
     @staticmethod
-    def _target_weights_log_detail(weights: dict[str, float]) -> str:
-        if not weights:
+    def _target_quantities_log_detail(quantities: dict[str, Decimal]) -> str:
+        if not quantities:
             return "[]"
         return "[" + ", ".join(
-            f"{instrument_id}={float(weight):.6f}"
-            for instrument_id, weight in sorted(weights.items())
+            f"{instrument_id}={int(quantity)}"
+            for instrument_id, quantity in sorted(quantities.items())
         ) + "]"
 
     def on_bar(self, bar: Bar) -> None:
@@ -931,17 +880,17 @@ class TargetWeightStrategy(Strategy):
         client_order_id = str(event.client_order_id)
         instrument_id_text = str(getattr(event, "instrument_id", ""))
         reason = str(getattr(event, "reason", "") or "")
-        target_weight = self._order_target_weights.get(
+        target_qty = self._order_target_qty.get(
             client_order_id,
-            self._target_weights.get(instrument_id_text, 0.0),
+            self._target_quantities.get(instrument_id_text, Decimal("0")),
         )
         self._forget_submitted_order(client_order_id)
         self._rejected_order_ids.add(client_order_id)
         if _is_insufficient_funds(reason):
             if instrument_id_text:
                 self._insufficient_funds.add(instrument_id_text)
-                if target_weight > 0:
-                    self._deferred_buys[instrument_id_text] = target_weight
+                if target_qty > 0:
+                    self._deferred_buys[instrument_id_text] = target_qty
             self.log.warning(
                 f"Order {client_order_id} {instrument_id_text} rejected for insufficient funds; "
                 f"will retry after cash changes. reason={reason}",
@@ -995,22 +944,22 @@ class TargetWeightStrategy(Strategy):
         self._log_account_sizing_snapshot(trigger)
         self._reconcile_unfilled_orders(current_date)
         open_order_instruments = self._open_order_instruments()
-        desired = self._desired_weights()
+        desired = self._desired_quantities()
         self._refresh_symbol_freezes(desired)
-        sell_targets: dict[str, float] = {}
-        buy_targets: dict[str, float] = {}
+        sell_targets: dict[str, Decimal] = {}
+        buy_targets: dict[str, Decimal] = {}
         # Per-instrument classification tally for the convergence summary log below.
         # Every desired instrument lands in exactly one action/skip bucket so we can
-        # explain each cycle, including the common silent-stall cause: a held target
-        # with no today-open price, which makes sizing skip it.
+        # explain each cycle. A buy with no today-open price still acts (a market or
+        # fallback-priced order), but is flagged in the missing_price bucket for audit.
         skip_open_order: list[str] = []
         skip_frozen: list[str] = []
         skip_sellable_exhausted: list[str] = []
-        skip_missing_open: list[str] = []
+        skip_missing_price: list[str] = []
         skip_missing_instrument: list[str] = []
         skip_on_target: list[str] = []
-        buy_missing_open: list[str] = []
-        for instrument_id_text, target_weight in desired.items():
+        buy_missing_price: list[str] = []
+        for instrument_id_text, target_qty in desired.items():
             if instrument_id_text in open_order_instruments:
                 skip_open_order.append(instrument_id_text)
                 continue
@@ -1019,22 +968,20 @@ class TargetWeightStrategy(Strategy):
                 continue
             side, reason = self._target_side(
                 instrument_id_text,
-                target_weight,
+                target_qty,
                 return_reason=True,
             )
             if side == "sell":
                 if self._sellable_exhausted.get(instrument_id_text) == current_date:
                     skip_sellable_exhausted.append(instrument_id_text)
                     continue
-                sell_targets[instrument_id_text] = target_weight
+                sell_targets[instrument_id_text] = target_qty
             elif side == "buy":
-                if reason == "missing_open":
-                    buy_missing_open.append(instrument_id_text)
-                buy_targets[instrument_id_text] = target_weight
+                if reason == "missing_price":
+                    buy_missing_price.append(instrument_id_text)
+                buy_targets[instrument_id_text] = target_qty
             else:
-                if reason == "missing_open":
-                    skip_missing_open.append(instrument_id_text)
-                elif reason == "missing_instrument":
+                if reason == "missing_instrument":
                     skip_missing_instrument.append(instrument_id_text)
                 else:
                     skip_on_target.append(instrument_id_text)
@@ -1047,15 +994,15 @@ class TargetWeightStrategy(Strategy):
             skip_open_order=skip_open_order,
             skip_frozen=skip_frozen,
             skip_sellable_exhausted=skip_sellable_exhausted,
-            skip_missing_open=skip_missing_open,
+            skip_missing_price=skip_missing_price,
             skip_missing_instrument=skip_missing_instrument,
             skip_on_target=skip_on_target,
-            buy_missing_open=buy_missing_open,
+            buy_missing_price=buy_missing_price,
         )
 
-        for instrument_id_text, target_weight in sorted(sell_targets.items()):
-            self._record_target(current_date, instrument_id_text, target_weight, self._target_reason)
-            self._submit_target_weight(current_date, instrument_id_text, target_weight, self._target_reason)
+        for instrument_id_text, target_qty in sorted(sell_targets.items()):
+            self._record_target(current_date, instrument_id_text, target_qty, self._target_reason)
+            self._submit_target_quantity(current_date, instrument_id_text, target_qty, self._target_reason)
         if buy_targets:
             self._submit_buys_within_cash(current_date, buy_targets, self._target_reason)
 
@@ -1063,16 +1010,16 @@ class TargetWeightStrategy(Strategy):
             self._achieved_versions.add(self._target_version)
             self.log.info(
                 f"target achieved version={self._target_version} trigger={trigger} "
-                f"count={len(self._target_weights)}",
+                f"count={len(self._target_quantities)}",
                 color=LogColor.GREEN,
             )
 
-    def _desired_weights(self) -> dict[str, float]:
-        desired = dict(self._target_weights)
+    def _desired_quantities(self) -> dict[str, Decimal]:
+        desired = dict(self._target_quantities)
         if not bool(self.config.exit_non_targets):
             return desired
         for instrument_id in self._held_instrument_ids():
-            desired.setdefault(instrument_id, 0.0)
+            desired.setdefault(instrument_id, Decimal("0"))
         return desired
 
     def _held_instrument_ids(self) -> set[str]:
@@ -1100,20 +1047,20 @@ class TargetWeightStrategy(Strategy):
         *,
         trigger: str,
         desired_count: int,
-        sell_targets: dict[str, float],
-        buy_targets: dict[str, float],
+        sell_targets: dict[str, Decimal],
+        buy_targets: dict[str, Decimal],
         skip_open_order: list[str],
         skip_frozen: list[str],
         skip_sellable_exhausted: list[str],
-        skip_missing_open: list[str],
+        skip_missing_price: list[str],
         skip_missing_instrument: list[str],
         skip_on_target: list[str],
-        buy_missing_open: list[str],
+        buy_missing_price: list[str],
     ) -> None:
         estimated_buy_cost = Decimal("0")
         unknown_buy_cost = 0
-        for instrument_id_text, target_weight in buy_targets.items():
-            cost = self._estimated_buy_cost(instrument_id_text, target_weight)
+        for instrument_id_text, target_qty in buy_targets.items():
+            cost = self._estimated_buy_cost(instrument_id_text, target_qty)
             if cost is None:
                 unknown_buy_cost += 1
                 continue
@@ -1133,14 +1080,14 @@ class TargetWeightStrategy(Strategy):
                 available_buy_cash = max(Decimal("0"), available_buy_cash - reserved_buy_cash)
             cash_gap = max(Decimal("0"), estimated_buy_cost - available_buy_cash)
 
-        missing_open_instruments = sorted(set(skip_missing_open).union(buy_missing_open))
+        missing_price_instruments = sorted(set(skip_missing_price).union(buy_missing_price))
         self.log.info(
             "Target convergence summary "
             f"trigger={trigger} version={self._target_version} desired={desired_count} "
             f"sell_targets={len(sell_targets)} buy_targets={len(buy_targets)} "
             f"open_order={len(skip_open_order)} frozen={len(skip_frozen)} "
             f"sellable_exhausted={len(skip_sellable_exhausted)} "
-            f"missing_open={len(missing_open_instruments)} "
+            f"missing_price={len(missing_price_instruments)} "
             f"missing_instrument={len(skip_missing_instrument)} "
             f"on_target={len(skip_on_target)} "
             f"deferred_buys={len(self._deferred_buys)} "
@@ -1148,7 +1095,7 @@ class TargetWeightStrategy(Strategy):
             f"estimated_buy_cost={estimated_buy_cost} unknown_buy_cost={unknown_buy_cost} "
             f"free_cash={free_cash} reserved_buy_cash={reserved_buy_cash} "
             f"available_buy_cash={available_buy_cash} cash_gap={cash_gap} "
-            f"missing_open_instruments={self._instrument_list_sample(missing_open_instruments)} "
+            f"missing_price_instruments={self._instrument_list_sample(missing_price_instruments)} "
             f"open_order_instruments={self._instrument_list_sample(skip_open_order)} "
             f"frozen_instruments={self._instrument_list_sample(skip_frozen)} "
             f"sellable_exhausted_instruments={self._instrument_list_sample(skip_sellable_exhausted)}",
@@ -1170,7 +1117,7 @@ class TargetWeightStrategy(Strategy):
     def _target_side(
         self,
         instrument_id_text: str,
-        target_weight: float,
+        target_qty: Decimal,
         *,
         return_reason: Literal[False] = False,
     ) -> str | None:
@@ -1180,7 +1127,7 @@ class TargetWeightStrategy(Strategy):
     def _target_side(
         self,
         instrument_id_text: str,
-        target_weight: float,
+        target_qty: Decimal,
         *,
         return_reason: Literal[True],
     ) -> tuple[str | None, str]:
@@ -1189,7 +1136,7 @@ class TargetWeightStrategy(Strategy):
     def _target_side(
         self,
         instrument_id_text: str,
-        target_weight: float,
+        target_qty: Decimal,
         *,
         return_reason: bool = False,
     ) -> str | None | tuple[str | None, str]:
@@ -1200,36 +1147,32 @@ class TargetWeightStrategy(Strategy):
 
         instrument_id = InstrumentId.from_str(instrument_id_text)
         current_qty = self._current_quantity(instrument_id)
-        if target_weight <= 0:
+        target_qty = Decimal(str(target_qty))
+        if target_qty <= 0:
             if current_qty > 0:
                 return result("sell", "exit")
             return result(None, "on_target")
         instrument = self.cache.instrument(instrument_id)
-        open_price = self._today_open.get(instrument_id_text)
         if instrument is None:
             return result("buy" if current_qty <= 0 else None, "missing_instrument")
-        if open_price is None or open_price <= 0:
-            return result("buy" if current_qty <= 0 else None, "missing_open")
-        current_weight = self._current_weight(instrument_id_text)
-        if current_weight is not None:
-            tolerance = max(0.0, float(self.config.weight_tolerance_percent))
-            if abs(current_weight - float(target_weight)) <= tolerance:
-                return result(None, "on_target")
-        target_qty = self._target_quantity(instrument, open_price, target_weight)
+        # Quantity is explicit, so the side is a pure share-count delta; a missing open
+        # price only affects limit pricing (handled downstream), not the decision.
+        open_price = self._today_open.get(instrument_id_text)
+        missing_price = open_price is None or open_price <= 0
         delta_qty = target_qty - current_qty
         if delta_qty > 0:
-            return result("buy", "underweight")
+            return result("buy", "missing_price" if missing_price else "underweight")
         if delta_qty < 0:
             return result("sell", "overweight")
         return result(None, "on_target")
 
-    def _refresh_symbol_freezes(self, desired: dict[str, float]) -> None:
+    def _refresh_symbol_freezes(self, desired: dict[str, Decimal]) -> None:
         if str(self.config.limit_stop_mode) != "freeze_symbol":
             return
-        for instrument_id_text, target_weight in desired.items():
+        for instrument_id_text, target_qty in desired.items():
             if instrument_id_text in self._frozen_instruments:
                 continue
-            side = self._target_side(instrument_id_text, target_weight)
+            side = self._target_side(instrument_id_text, target_qty)
             if side is None:
                 continue
             limit_reason = self._price_limit_reason(instrument_id_text, side)
@@ -1258,24 +1201,14 @@ class TargetWeightStrategy(Strategy):
             return False
         if self._deferred_buys or self._insufficient_funds:
             return False
-        desired = self._desired_weights()
-        tolerance = max(0.0, float(self.config.weight_tolerance_percent))
-        for instrument_id_text, target_weight in desired.items():
+        desired = self._desired_quantities()
+        for instrument_id_text, target_qty in desired.items():
             if instrument_id_text in self._frozen_instruments:
                 continue
-            current_weight = self._current_weight(instrument_id_text)
-            if current_weight is None:
-                if self._current_quantity(InstrumentId.from_str(instrument_id_text)) <= 0 and target_weight <= tolerance:
-                    continue
+            current_qty = self._current_quantity(InstrumentId.from_str(instrument_id_text))
+            if current_qty != Decimal(str(target_qty)):
                 return False
-            if abs(current_weight - target_weight) > tolerance:
-                return False
-        target_cash = max(float(self.config.target_cash_buffer_percent), 1.0 - sum(self._target_weights.values()))
-        free_cash = self._free_cash()
-        if free_cash is None:
-            return False
-        cash_weight = float(free_cash / max(self._portfolio_value(), Decimal("1")))
-        return cash_weight <= target_cash + max(0.0, float(self.config.cash_tolerance_percent))
+        return True
 
     def _reconcile_unfilled_orders(self, trading_date: date) -> None:
         timeout_secs = float(self.config.unfilled_timeout_secs)
@@ -1328,7 +1261,7 @@ class TargetWeightStrategy(Strategy):
                 instrument_id=instrument_id_text,
                 side="buy" if order.side == OrderSide.BUY else "sell",
                 quantity=0,
-                target_weight=self._target_weights.get(instrument_id_text, 0.0),
+                target_qty=self._target_quantities.get(instrument_id_text, Decimal("0")),
                 status="canceled",
                 reason="unfilled_timeout",
                 order_id=client_order_id,
@@ -1337,21 +1270,21 @@ class TargetWeightStrategy(Strategy):
     def _submit_buys_within_cash(
         self,
         trading_date: date,
-        buy_candidates: dict[str, float],
+        buy_candidates: dict[str, Decimal],
         reason: str,
     ) -> None:
         if not buy_candidates:
             return
         free_cash = self._free_cash()
         if free_cash is None:
-            for instrument_id, target_weight in buy_candidates.items():
-                self._deferred_buys[instrument_id] = target_weight
+            for instrument_id, target_qty in buy_candidates.items():
+                self._deferred_buys[instrument_id] = target_qty
                 self._record_order(
                     trading_date,
                     instrument_id,
                     "buy",
                     0,
-                    target_weight,
+                    target_qty,
                     "deferred",
                     "missing_free_cash",
                 )
@@ -1363,14 +1296,14 @@ class TargetWeightStrategy(Strategy):
         if reserved_buy_cash > 0:
             free_cash = max(Decimal("0"), free_cash - reserved_buy_cash)
         for instrument_id in sorted(buy_candidates, key=lambda i: buy_candidates[i], reverse=True):
-            target_weight = buy_candidates[instrument_id]
+            target_qty = buy_candidates[instrument_id]
             if instrument_id in self._insufficient_funds:
-                self._deferred_buys[instrument_id] = target_weight
+                self._deferred_buys[instrument_id] = target_qty
                 continue
-            intent = self._target_order_intent(instrument_id, target_weight)
+            intent = self._target_order_intent(instrument_id, target_qty)
             if intent is None:
-                self._record_target(trading_date, instrument_id, target_weight, reason)
-                self._submit_target_weight(trading_date, instrument_id, target_weight, reason)
+                self._record_target(trading_date, instrument_id, target_qty, reason)
+                self._submit_target_quantity(trading_date, instrument_id, target_qty, reason)
                 continue
             if intent.side != OrderSide.BUY:
                 continue
@@ -1381,51 +1314,43 @@ class TargetWeightStrategy(Strategy):
             for quantity in slices:
                 est_cost = self._estimated_order_cost(quantity, intent.price)
                 if est_cost > free_cash:
-                    self._deferred_buys[instrument_id] = target_weight
+                    self._deferred_buys[instrument_id] = target_qty
                     self._record_order(
                         trading_date,
                         instrument_id,
                         "buy",
                         0,
-                        target_weight,
+                        target_qty,
                         "deferred",
                         "insufficient_cash",
                     )
                     break
                 if not submitted_any:
-                    self._record_target(trading_date, instrument_id, target_weight, reason)
+                    self._record_target(trading_date, instrument_id, target_qty, reason)
                 self._submit_order_quantity(
                     trading_date=trading_date,
                     intent=intent,
                     quantity=quantity,
-                    target_weight=target_weight,
+                    target_qty=target_qty,
                     reason=reason,
                 )
                 submitted_any = True
                 free_cash -= est_cost
             if not submitted_any and instrument_id not in self._deferred_buys:
-                self._deferred_buys[instrument_id] = target_weight
+                self._deferred_buys[instrument_id] = target_qty
 
-    def _target_order_intent(self, instrument_id_text: str, target_weight: float) -> TargetOrderIntent | None:
+    def _target_order_intent(self, instrument_id_text: str, target_qty: Decimal) -> TargetOrderIntent | None:
         instrument_id = InstrumentId.from_str(instrument_id_text)
         instrument = self.cache.instrument(instrument_id)
         if instrument is None:
             return None
         current_qty = self._current_quantity(instrument_id)
-        if target_weight <= 0:
+        target_qty = Decimal(str(target_qty))
+        if target_qty <= 0:
             if current_qty <= 0:
                 return None
             price = self._limit_price(instrument, instrument_id, OrderSide.SELL, abs(current_qty))
             return TargetOrderIntent(instrument_id, instrument, OrderSide.SELL, abs(current_qty), price)
-        open_price = self._today_open.get(instrument_id_text)
-        if open_price is None or open_price <= 0:
-            return None
-        current_weight = self._current_weight(instrument_id_text)
-        if current_weight is not None:
-            tolerance = max(0.0, float(self.config.weight_tolerance_percent))
-            if abs(current_weight - float(target_weight)) <= tolerance:
-                return None
-        target_qty = self._target_quantity(instrument, open_price, target_weight)
         delta_qty = target_qty - current_qty
         if delta_qty == 0:
             return None
@@ -1448,50 +1373,45 @@ class TargetWeightStrategy(Strategy):
     def _estimated_order_cost(quantity: Decimal, price: Any) -> Decimal:
         return Decimal(str(quantity)) * Decimal(str(price))
 
-    def _estimated_buy_cost(self, instrument_id_text: str, target_weight: float) -> Decimal | None:
+    def _estimated_buy_cost(self, instrument_id_text: str, target_qty: Decimal) -> Decimal | None:
         instrument_id = InstrumentId.from_str(instrument_id_text)
         instrument = self.cache.instrument(instrument_id)
         open_price = self._today_open.get(instrument_id_text)
         if instrument is None or open_price is None or open_price <= 0:
             return None
         current_qty = self._current_quantity(instrument_id)
-        target_qty = self._target_quantity(instrument, open_price, target_weight)
-        delta_qty = target_qty - current_qty
+        delta_qty = Decimal(str(target_qty)) - current_qty
         if delta_qty <= 0:
             return Decimal("0")
         return Decimal(str(delta_qty)) * Decimal(str(open_price))
 
-    def _submit_target_weight(
+    def _submit_target_quantity(
         self,
         trading_date: date,
         instrument_id_text: str,
-        target_weight: float,
+        target_qty: Decimal,
         reason: str,
     ) -> bool:
         instrument_id = InstrumentId.from_str(instrument_id_text)
         instrument = self.cache.instrument(instrument_id)
         if instrument is None:
-            self._record_order(trading_date, instrument_id_text, "buy", 0, target_weight, "rejected", "missing_instrument")
+            self._record_order(trading_date, instrument_id_text, "buy", 0, target_qty, "rejected", "missing_instrument")
             return False
         current_qty = self._current_quantity(instrument_id)
-        if target_weight <= 0:
+        if Decimal(str(target_qty)) <= 0:
             if current_qty <= 0:
                 return True
             return self._submit_full_exit(trading_date, instrument_id, instrument, current_qty, reason)
-        intent = self._target_order_intent(instrument_id_text, target_weight)
+        intent = self._target_order_intent(instrument_id_text, target_qty)
         if intent is None:
-            open_price = self._today_open.get(instrument_id_text)
-            if open_price is None or open_price <= 0:
-                self._record_order(trading_date, instrument_id_text, "buy", 0, target_weight, "rejected", "missing_price")
-                return False
-            self._record_order(trading_date, instrument_id_text, "buy", 0, target_weight, "skipped", "already_target")
+            self._record_order(trading_date, instrument_id_text, "buy", 0, target_qty, "skipped", "already_target")
             return True
         for quantity in self._order_slices(intent):
             self._submit_order_quantity(
                 trading_date=trading_date,
                 intent=intent,
                 quantity=quantity,
-                target_weight=target_weight,
+                target_qty=target_qty,
                 reason=reason,
             )
         return True
@@ -1508,7 +1428,7 @@ class TargetWeightStrategy(Strategy):
             trading_date=trading_date,
             instrument_id=instrument_id,
             requested_qty=abs(current_qty),
-            target_weight=0.0,
+            target_qty=Decimal("0"),
             reason=reason,
         )
         if qty_abs is None or qty_abs <= 0:
@@ -1520,7 +1440,7 @@ class TargetWeightStrategy(Strategy):
                 order_side=OrderSide.SELL,
                 quantity=instrument.make_qty(qty_abs),
             )
-            self._track_submitted_order(order, 0.0)
+            self._track_submitted_order(order, Decimal("0"))
             try:
                 self.submit_order(order)
             except Exception:
@@ -1531,7 +1451,7 @@ class TargetWeightStrategy(Strategy):
                 str(instrument_id),
                 "sell",
                 int(qty_abs),
-                0.0,
+                Decimal("0"),
                 "submitted",
                 reason,
                 str(order.client_order_id),
@@ -1543,7 +1463,7 @@ class TargetWeightStrategy(Strategy):
                 trading_date=trading_date,
                 intent=intent,
                 quantity=quantity,
-                target_weight=0.0,
+                target_qty=Decimal("0"),
                 reason=reason,
             )
         return True
@@ -1553,7 +1473,7 @@ class TargetWeightStrategy(Strategy):
         trading_date: date,
         intent: TargetOrderIntent,
         quantity: Decimal,
-        target_weight: float,
+        target_qty: Decimal,
         reason: str,
     ) -> bool:
         if intent.side == OrderSide.SELL:
@@ -1561,7 +1481,7 @@ class TargetWeightStrategy(Strategy):
                 trading_date=trading_date,
                 instrument_id=intent.instrument_id,
                 requested_qty=quantity,
-                target_weight=target_weight,
+                target_qty=target_qty,
                 reason=reason,
             )
             if clamped_quantity is None or clamped_quantity <= 0:
@@ -1580,7 +1500,7 @@ class TargetWeightStrategy(Strategy):
                 order_side=intent.side,
                 quantity=intent.instrument.make_qty(quantity),
             )
-        self._track_submitted_order(order, target_weight)
+        self._track_submitted_order(order, target_qty)
         try:
             self.submit_order(order)
         except Exception:
@@ -1592,7 +1512,7 @@ class TargetWeightStrategy(Strategy):
             str(intent.instrument_id),
             side_text,
             int(quantity),
-            target_weight,
+            target_qty,
             "submitted",
             reason,
             str(order.client_order_id),
@@ -1604,7 +1524,7 @@ class TargetWeightStrategy(Strategy):
         trading_date: date,
         instrument_id: InstrumentId,
         requested_qty: Decimal,
-        target_weight: float,
+        target_qty: Decimal,
         reason: str,
     ) -> Decimal | None:
         instrument_id_text = str(instrument_id)
@@ -1621,7 +1541,7 @@ class TargetWeightStrategy(Strategy):
                 instrument_id_text,
                 "sell",
                 0,
-                target_weight,
+                target_qty,
                 "deferred",
                 "sellable_snapshot_unstable",
             )
@@ -1660,7 +1580,7 @@ class TargetWeightStrategy(Strategy):
                 instrument_id_text,
                 "sell",
                 0,
-                target_weight,
+                target_qty,
                 "deferred",
                 "sellable_exhausted" if broker_authoritative else "sellable_pending_broker_data",
             )
@@ -1823,15 +1743,15 @@ class TargetWeightStrategy(Strategy):
         except Exception:
             return Decimal(str(quantity))
 
-    def _track_submitted_order(self, order: Any, target_weight: float) -> None:
+    def _track_submitted_order(self, order: Any, target_qty: Decimal) -> None:
         client_order_id = str(order.client_order_id)
         self._order_submit_ts[client_order_id] = self.clock.timestamp_ns()
-        self._order_target_weights[client_order_id] = float(target_weight)
+        self._order_target_qty[client_order_id] = Decimal(str(target_qty))
         self._order_target_versions[client_order_id] = self._target_version
 
     def _forget_submitted_order(self, client_order_id: str) -> None:
         self._order_submit_ts.pop(client_order_id, None)
-        self._order_target_weights.pop(client_order_id, None)
+        self._order_target_qty.pop(client_order_id, None)
         self._order_target_versions.pop(client_order_id, None)
 
     def _active_orders(
@@ -1993,93 +1913,9 @@ class TargetWeightStrategy(Strategy):
         except Exception:
             return False
 
-    def compute_target_quantities(
-        self,
-        weights: dict[str | InstrumentId, float],
-        total_asset: Decimal | float,
-        open_prices: dict[str, float] | None = None,
-    ) -> dict[str, Decimal]:
-        """
-        Compute per-instrument target share counts (固定目标股数) from weights and a
-        fixed total-asset value, applying the same lot-size / STAR-market rounding as
-        live sizing. Open prices default to the currently known today-open per
-        instrument (self._today_open); callers may pass an explicit map (e.g. the
-        pre-open full-tick snapshot). Instruments without an instrument in cache or a
-        positive open price are skipped.
-
-        This is the pure sizing step the snapshot recorder uses before-trading to
-        commit the day's quantities; it does not mutate any strategy state.
-        """
-        total_value = Decimal(str(total_asset))
-        prices = open_prices or self._today_open
-        result: dict[str, Decimal] = {}
-        for instrument_id, weight in weights.items():
-            instrument_id_text = str(instrument_id)
-            weight_value = float(weight)
-            if weight_value <= 0:
-                continue
-            try:
-                instrument = self.cache.instrument(InstrumentId.from_str(instrument_id_text))
-            except Exception:
-                instrument = None
-            if instrument is None:
-                continue
-            open_price = prices.get(instrument_id_text)
-            if open_price is None or open_price <= 0:
-                continue
-            qty = self._quantity_from_value(instrument, float(open_price), weight_value, total_value)
-            if qty > 0:
-                result[instrument_id_text] = qty
-        return result
-
-    def _quantity_from_value(
-        self,
-        instrument: Any,
-        open_price: float,
-        target_weight: float,
-        total_value: Decimal,
-    ) -> Decimal:
-        """
-        Round a weight×value/open_price target to lot / STAR-market rules. Single
-        source of truth for both live sizing (_target_quantity) and pre-committed
-        frozen sizing (compute_target_quantities).
-        """
-        if target_weight <= 0 or open_price <= 0:
-            return Decimal("0")
-        raw_qty = total_value * Decimal(str(target_weight)) / Decimal(str(open_price))
-        if self._is_star_market(instrument):
-            min_qty = Decimal(str(self.config.star_min_buy_qty))
-            if raw_qty < min_qty:
-                return Decimal("0")
-            return Decimal(int(raw_qty))
-        lot_size = Decimal(str(instrument.lot_size))
-        if lot_size <= 0:
-            lot_size = Decimal("1")
-        return (raw_qty // lot_size) * lot_size
-
-    def _target_quantity(self, instrument: Any, open_price: float, target_weight: float) -> Decimal:
-        if target_weight <= 0:
-            return Decimal("0")
-        # A frozen share count (固定目标股数), when set for this instrument, is the
-        # authoritative target for the day: it was already rounded to lot / STAR-market
-        # rules when committed, so return it verbatim and skip live-value re-sizing.
-        frozen_qty = self._frozen_target_qty.get(str(instrument.id))
-        if frozen_qty is not None:
-            return frozen_qty
-        return self._quantity_from_value(
-            instrument,
-            float(open_price),
-            target_weight,
-            self._portfolio_value(),
-        )
-
-    @staticmethod
-    def _is_star_market(instrument: Any) -> bool:
-        try:
-            symbol = str(getattr(instrument, "raw_symbol", "") or instrument.id)
-        except Exception:
-            return False
-        return symbol.lstrip().startswith("688")
+    def _target_quantity(self, instrument_id_text: str) -> Decimal:
+        """The committed target share count for an instrument (0 when none set)."""
+        return self._target_quantities.get(instrument_id_text, Decimal("0"))
 
     def investable_total_asset(self) -> Decimal:
         """
@@ -2095,10 +1931,11 @@ class TargetWeightStrategy(Strategy):
 
     def _portfolio_value(self) -> Decimal:
         # A frozen total asset (set alongside 固定目标股数) pins the day's sizing
-        # denominator so weight/cash checks stay consistent with the committed target
-        # instead of drifting with live equity.
-        if self._frozen_portfolio_value is not None and self._frozen_portfolio_value > 0:
-            return self._frozen_portfolio_value
+        # denominator so cash reporting stays consistent with the committed target
+        # instead of drifting with live equity. Per-instrument sizing is explicit
+        # (share counts), so this value is used only for cash/reporting.
+        if self._target_total_asset is not None and self._target_total_asset > 0:
+            return self._target_total_asset
         broker_total_asset = self._broker_account_decimal("total_asset")
         if broker_total_asset is not None and broker_total_asset > 0:
             return broker_total_asset
@@ -2375,20 +2212,20 @@ class TargetWeightStrategy(Strategy):
         self,
         trading_date: date,
         instrument_id: str,
-        target_weight: float,
+        target_qty: Decimal,
         reason: str,
     ) -> None:
-        current_weight = self._current_weight(instrument_id)
-        delta_weight = None if current_weight is None else float(target_weight) - current_weight
+        target_qty = Decimal(str(target_qty))
+        current_qty = self._current_quantity(InstrumentId.from_str(instrument_id))
         self.target_events.append(
-            TargetWeightTargetEvent(
+            TargetQuantityTargetEvent(
                 target_id=f"{self._target_version}-{instrument_id}-{len(self.target_events)}",
                 target_date=self._target_date or trading_date,
                 execute_date=trading_date,
                 instrument_id=instrument_id,
-                target_weight=float(target_weight),
-                current_weight=current_weight,
-                delta_weight=delta_weight,
+                target_qty=target_qty,
+                current_qty=current_qty,
+                delta_qty=target_qty - current_qty,
                 reason=reason,
                 extra={"target_version": self._target_version},
             ),
@@ -2400,19 +2237,19 @@ class TargetWeightStrategy(Strategy):
         instrument_id: str,
         side: str,
         quantity: int,
-        target_weight: float,
+        target_qty: Decimal,
         status: str,
         reason: str | None,
         order_id: str | None = None,
     ) -> None:
         self.order_events.append(
-            TargetWeightOrderEvent(
+            TargetQuantityOrderEvent(
                 order_id=order_id or f"internal-{trading_date.isoformat()}-{instrument_id}-{len(self.order_events)}",
                 trading_date=trading_date,
                 instrument_id=instrument_id,
                 side=side,
                 quantity=int(quantity),
-                target_weight=float(target_weight),
+                target_qty=Decimal(str(target_qty)),
                 status=status,
                 reason=reason,
                 extra={"target_version": self._target_version},
@@ -2466,6 +2303,6 @@ def bar_date(bar: Bar, timezone_name: str) -> date:
     return pd.Timestamp(bar.ts_event, unit="ns", tz="UTC").tz_convert(timezone_name).date()
 
 
-def target_version(target_date: date, weights: dict[str, float], reason: str) -> str:
-    total = sum(weights.values())
-    return f"{target_date.isoformat()}-{reason}-{len(weights)}-{total:.8f}"
+def target_version(target_date: date, quantities: dict[str, Decimal], reason: str) -> str:
+    total = sum((Decimal(str(qty)) for qty in quantities.values()), Decimal("0"))
+    return f"{target_date.isoformat()}-{reason}-{len(quantities)}-{int(total)}"

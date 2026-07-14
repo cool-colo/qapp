@@ -50,7 +50,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
                 f"risk-manager optimize failed status={status} failure_reason={failure_reason}",
             )
         target_qty = self._target_quantities(response, request.candidates)
-        weights = self._target_weights(response, request.candidates, target_qty, request)
+        weights = self._audit_weights(response, request.candidates)
         return ModelTargetPlan(
             trading_date=request.trading_date,
             signal_date=request.signal_date,
@@ -167,20 +167,17 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             quantities[instrument_id] = qty
         return dict(sorted(quantities.items()))
 
-    def _target_weights(
+    def _audit_weights(
         self,
         response: dict[str, Any],
         candidates: list[ModelTargetCandidate],
-        target_qty: dict[str, int],
-        request: ModelTargetPlanningRequest,
     ) -> dict[str, float]:
         """
-        Resolve target weights driving the convergence loop's per-instrument side.
+        Map the service-provided ``target_weight`` per row to instrument ids.
 
-        Prefer the service ``target_weight``; when a row only carries a share count,
-        synthesize a weight from ``qty × open_price / investable_asset`` so the
-        instrument is still visited. A committed quantity of 0 maps to weight 0 (a
-        retained liquidation target, not a buy).
+        Weights are recorded to MySQL for audit only — execution is driven entirely by
+        ``target_qty``. Rows the service sized by quantity only (no positive weight)
+        simply have no weight entry; no synthetic weight is fabricated.
         """
         stock_to_instrument = self._stock_to_instrument(candidates)
         weights: dict[str, float] = {}
@@ -193,26 +190,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             weight = self._coerce_float(row.get("target_weight", row.get("weight")))
             if weight is not None and weight > 0:
                 weights[instrument_id] = weight
-        # Fill instruments the service sized by quantity only (no positive weight).
-        basis = request.investable_asset if request.investable_asset is not None else request.total_asset
-        for instrument_id, qty in target_qty.items():
-            if instrument_id in weights:
-                continue
-            if qty <= 0:
-                weights.setdefault(instrument_id, 0.0)
-                continue
-            weights[instrument_id] = self._synthetic_weight(qty, request.open_prices.get(instrument_id), basis)
         return dict(sorted(weights.items()))
-
-    @staticmethod
-    def _synthetic_weight(qty: int, open_price: float | None, basis: float | None) -> float:
-        if open_price and basis and float(basis) > 0:
-            weight = float(qty) * float(open_price) / float(basis)
-            if weight > 0:
-                return weight
-        # Nominal positive placeholder so a quantity-only target still converges even
-        # when price/asset context is unavailable; frozen share count governs sizing.
-        return 1e-6
 
     @staticmethod
     def _stock_to_instrument(candidates: list[ModelTargetCandidate]) -> dict[str, str]:

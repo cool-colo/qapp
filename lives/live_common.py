@@ -165,7 +165,7 @@ def parse_args() -> argparse.Namespace:
         default=float(env("MODEL_MAX_POSITION_PERCENT", "0.03")),
     )
     parser.add_argument("--holding-days", type=int, default=int(env("MODEL_HOLDING_DAYS", "10")))
-    parser.add_argument("--stop-loss", type=float, default=float(env("MODEL_STOP_LOSS", "0.05")))
+    parser.add_argument("--stop-loss", type=float, default=float(env("MODEL_STOP_LOSS", "0.1")))
     parser.add_argument(
         "--trailing-take-profit",
         type=float,
@@ -193,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cash-buffer-percent",
         type=float,
-        default=float(env("MODEL_CASH_BUFFER_PERCENT", "0.01")),
+        default=float(env("MODEL_CASH_BUFFER_PERCENT", "0.00")),
         help="Fraction of free cash held back when sizing/gating buys (commission + slippage margin).",
     )
     parser.add_argument(
@@ -235,18 +235,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(env("RISK_MANAGER_TIMEOUT_SECS", "10")),
         help="Timeout for risk-manager optimize requests.",
-    )
-    parser.add_argument(
-        "--weight-tolerance-percent",
-        type=float,
-        default=float(env("MODEL_WEIGHT_TOLERANCE_PERCENT", "0.003")),
-        help="Practical achievement tolerance for per-instrument target weights.",
-    )
-    parser.add_argument(
-        "--cash-tolerance-percent",
-        type=float,
-        default=float(env("MODEL_CASH_TOLERANCE_PERCENT", "0.01")),
-        help="Practical achievement tolerance for residual free-cash weight.",
     )
     parser.add_argument(
         "--stop-time",

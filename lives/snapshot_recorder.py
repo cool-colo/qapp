@@ -10,8 +10,8 @@ via :class:`LiveSnapshotWriter`.
 Design boundaries:
 
 - The strategy stays DB-free. This actor owns all MySQL access and only reaches the
-  strategy through the public ``compute_daily_target_plan`` / ``apply_frozen_targets``
-  / ``compute_target_quantities`` methods.
+  strategy through the public ``compute_daily_target_plan`` / ``update_target_quantities``
+  methods.
 - QMT-reported fields (from ``account.last_event.info`` and position reports) are the
   authoritative values and land in the unprefixed columns; Nautilus-derived values
   land in ``nt_`` columns for comparison. Both raw payloads are kept as JSON.
@@ -359,9 +359,9 @@ class SnapshotRecorder(Actor):
         investable_asset = self._plan_investable_asset(plan, total_asset)
         open_prices = dict(plan.open_prices) if plan.open_prices else self._current_open_prices()
         price_sources = dict(plan.price_sources)
-        # Prefer the risk-manager's committed share counts (固定目标股数, 0 kept). Only
-        # fall back to local sizing when the planner returned none (e.g. equal-weight).
-        target_qty = self._plan_target_quantities(plan, total_asset, open_prices)
+        # The risk-manager planner commits explicit share counts (固定目标股数, 0 kept).
+        # These drive execution; weights are persisted for audit only.
+        target_qty = self._plan_target_quantities(plan)
         version = self._strategy.plan_version(plan)
         plan_signal_date = plan.signal_date or signal_date
         position_id = self._position_snapshot_anchor(trading_date)
@@ -403,7 +403,7 @@ class SnapshotRecorder(Actor):
                 self._writer.write_target_portfolios(records)
             except Exception as exc:
                 self.log.warning(f"target portfolio write failed: {exc}")
-        self._apply_frozen(trading_date, plan.weights, target_qty, investable_asset, plan.reason, version)
+        self._apply_target(trading_date, target_qty, investable_asset, plan.reason, version)
         self.log.info(
             f"generated & persisted daily target: date={trading_date} signal_date={plan_signal_date} "
             f"weights={len(plan.weights)} frozen_qty={len(target_qty)} "
@@ -411,25 +411,12 @@ class SnapshotRecorder(Actor):
             color=LogColor.GREEN,
         )
 
-    def _plan_target_quantities(
-        self,
-        plan: Any,
-        total_asset: Any,
-        open_prices: dict[str, float],
-    ) -> dict[str, Any]:
+    def _plan_target_quantities(self, plan: Any) -> dict[str, Any]:
         plan_qty = getattr(plan, "target_qty", None)
         if isinstance(plan_qty, dict) and plan_qty:
             # Keep every entry, including committed 0 (liquidate) targets.
             return {str(instrument_id): qty for instrument_id, qty in plan_qty.items()}
-        try:
-            return self._strategy.compute_target_quantities(
-                weights=plan.weights,
-                total_asset=total_asset,
-                open_prices=open_prices,
-            )
-        except Exception as exc:
-            self.log.warning(f"frozen target quantity computation failed: {exc}")
-            return {}
+        return {}
 
     def _plan_total_asset(self, plan: Any) -> Decimal:
         value = getattr(plan, "total_asset", None)
@@ -467,22 +454,15 @@ class SnapshotRecorder(Actor):
         return max(prev) if prev else None
 
     def _apply_loaded_target(self, trading_date: date, rows: list[dict[str, Any]]) -> None:
-        weights: dict[str, float] = {}
         target_qty: dict[str, int] = {}
         frozen_asset: Decimal | None = None  # sizing basis (prefer investable_asset)
         version: str | None = None
         reason = "loaded_target"
         for row in rows:
             instrument_id_text = str(row.get("instrument_id"))
-            weight = row.get("target_weight")
             qty = row.get("target_qty")
-            if weight is not None:
-                weights[instrument_id_text] = float(weight)
             if qty is not None:
                 target_qty[instrument_id_text] = int(qty)
-                # A committed quantity (including 0) still needs a weight entry so the
-                # convergence loop visits the instrument; default 0 for qty-only rows.
-                weights.setdefault(instrument_id_text, 0.0)
             if frozen_asset is None:
                 frozen_asset = self._decimal_or_none(
                     row.get("investable_asset") or row.get("total_asset"),
@@ -491,35 +471,33 @@ class SnapshotRecorder(Actor):
                 version = str(row.get("target_version"))
             if row.get("reason"):
                 reason = str(row.get("reason"))
-        if not weights:
+        if not target_qty:
             return
-        self._apply_frozen(trading_date, weights, target_qty, frozen_asset, reason, version)
+        self._apply_target(trading_date, target_qty, frozen_asset, reason, version)
         self.log.info(
-            f"loaded persisted daily target: date={trading_date} weights={len(weights)} "
+            f"loaded persisted daily target: date={trading_date} "
             f"frozen_qty={len(target_qty)} frozen_asset={frozen_asset} version={version}",
             color=LogColor.GREEN,
         )
 
-    def _apply_frozen(
+    def _apply_target(
         self,
         trading_date: date,
-        weights: dict[str, float],
         target_qty: dict[str, Any],
         total_asset: Any,
         reason: str,
         version: str | None,
     ) -> None:
         try:
-            self._strategy.apply_frozen_targets(
+            self._strategy.update_target_quantities(
+                quantities=target_qty,
                 target_date=trading_date,
-                weights=weights,
-                target_qty=target_qty,
-                total_asset=total_asset,
                 reason=reason,
+                total_asset=total_asset,
                 version=version,
             )
         except Exception as exc:
-            self.log.warning(f"apply_frozen_targets failed: {exc}")
+            self.log.warning(f"update_target_quantities failed: {exc}")
 
     def _load_target(self, trading_date: date, signal_date: date | None) -> list[dict[str, Any]]:
         try:
@@ -592,7 +570,7 @@ class SnapshotRecorder(Actor):
             filled_qty=self._int_or_none(getattr(order, "filled_qty", None)) or 0 if order else 0,
             avg_fill_price=self._decimal_or_none(getattr(order, "avg_px", None)) if order else None,
             status=self._order_status_text(order, event),
-            target_weight=self._order_target_weight(client_order_id),
+            target_weight=self._order_target_qty(client_order_id),
             target_version=self._order_target_version(client_order_id),
             open_price=self._order_open_price(instrument_id_text),
             book_snapshot=self._order_book_snapshot(instrument_id, instrument_id_text),
@@ -885,11 +863,11 @@ class SnapshotRecorder(Actor):
             return SnapshotRecorder._jsonable(position)
         return {"can_use_volume": SnapshotRecorder._to_str(fallback_can_use)}
 
-    def _order_target_weight(self, client_order_id: str) -> Decimal | None:
-        weights = getattr(self._strategy, "_order_target_weights", {})
-        if isinstance(weights, dict) and client_order_id in weights:
+    def _order_target_qty(self, client_order_id: str) -> Decimal | None:
+        quantities = getattr(self._strategy, "_order_target_qty", {})
+        if isinstance(quantities, dict) and client_order_id in quantities:
             try:
-                return Decimal(str(weights[client_order_id]))
+                return Decimal(str(quantities[client_order_id]))
             except Exception:
                 return None
         return None
