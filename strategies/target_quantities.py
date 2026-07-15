@@ -7,12 +7,11 @@ import threading
 import time
 from concurrent.futures import Future as ConcurrentFuture
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import date
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
-from typing import Literal
-from typing import overload
 
 import pandas as pd
 
@@ -68,12 +67,75 @@ class TargetQuantityOrderEvent:
 
 
 @dataclass(frozen=True)
+class IntentContext:
+    instrument_id: str
+    target_qty: Decimal
+    current_qty: Decimal
+    delta_qty: Decimal
+    price_context: PriceContext | None
+    pricer_class: str | None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def record(self, **details: Any) -> None:
+        for key, value in details.items():
+            if value is not None:
+                self.details[key] = value
+
+    def snapshot(self) -> dict[str, Any]:
+        result = {
+            "instrument_id": self.instrument_id,
+            "target_qty": self.target_qty,
+            "current_qty": self.current_qty,
+            "delta_qty": self.delta_qty,
+            "pricer_class": self.pricer_class,
+            "price_context": self._price_context_snapshot(),
+        }
+        result.update(self.details)
+        return result
+
+    def log_text(self) -> str:
+        return self._format_value(self.snapshot())
+
+    def _price_context_snapshot(self) -> dict[str, Any] | None:
+        ctx = self.price_context
+        if ctx is None:
+            return None
+        return {
+            "instrument_id": str(ctx.instrument_id),
+            "side": ctx.side.name,
+            "open_price": ctx.open_price,
+            "last_close": ctx.last_close,
+            "tick": ctx.tick,
+            "quantity": ctx.quantity,
+            "cancel_count": ctx.cancel_count,
+            "best_bid": ctx.best_bid,
+            "best_ask": ctx.best_ask,
+            "bids": ctx.bids,
+            "asks": ctx.asks,
+        }
+
+    @classmethod
+    def _format_value(cls, value: Any) -> str:
+        if isinstance(value, dict):
+            return "{" + ", ".join(
+                f"{key}={cls._format_value(item)}"
+                for key, item in sorted(value.items())
+            ) + "}"
+        if isinstance(value, list):
+            return "[" + ", ".join(cls._format_value(item) for item in value) + "]"
+        if isinstance(value, tuple):
+            return "(" + ", ".join(cls._format_value(item) for item in value) + ")"
+        return str(value)
+
+
+@dataclass(frozen=True)
 class TargetOrderIntent:
     instrument_id: InstrumentId
     instrument: Any
     side: OrderSide
     quantity: Decimal
     price: Any
+    context: IntentContext
 
 
 @dataclass(frozen=True)
@@ -167,9 +229,8 @@ class TargetQuantityStrategy(Strategy):
         self._converge_lock = threading.Lock()
         self._rejected_order_ids: set[str] = set()
         self._insufficient_funds: set[str] = set()
-        self._order_submit_ts: dict[str, int] = {}
-        self._order_target_qty: dict[str, Decimal] = {}
         self._order_target_versions: dict[str, str] = {}
+        self._order_intent_contexts: dict[str, IntentContext] = {}
         self._order_splitter = NotionalOrderSplitter(config.order_slice_notional)
         self._buy_pricer = OpenOffsetBuyPriceStrategy(
             offset_bps=float(config.buy_offset_bps),
@@ -615,12 +676,12 @@ class TargetQuantityStrategy(Strategy):
                 continue
             normalized[instrument_id_text] = value
         version_value = version or target_version(target_date, normalized, reason)
-        self._refresh_order_book_depth_subscriptions(normalized)
         if (
             version_value == self._target_version
             and normalized == self._target_quantities
         ):
             return
+        self._refresh_order_book_depth_subscriptions(normalized)
         self._target_quantities = dict(sorted(normalized.items()))
         self._target_date = target_date
         self._target_reason = reason
@@ -635,22 +696,28 @@ class TargetQuantityStrategy(Strategy):
             f"count={len(self._target_quantities)} reason={reason} detail={detail}",
             color=LogColor.BLUE,
         )
-        if self._convergence_suspended or not self._within_trading_window():
+        if self._convergence_suspended:
             return
         self._converge_to_target(current_date=target_date, trigger="target_update")
 
     def _refresh_order_book_depth_subscriptions(self, quantities: dict[str, Decimal]) -> None:
         subscribed_ids = set(self._subscribed_order_book_depth_instruments)
-        for instrument_id_text in sorted(subscribed_ids):
+        desired_ids = set(quantities).union(self._held_instrument_ids())
+        removable_ids = subscribed_ids.difference(desired_ids)
+        addable_ids = desired_ids.difference(subscribed_ids)
+        removed_ids: set[str] = set()
+        for instrument_id_text in sorted(removable_ids):
             try:
                 self.unsubscribe_order_book_depth(InstrumentId.from_str(instrument_id_text))
             except Exception as exc:
                 self.log.warning(
                     f"Order-book depth unsubscribe failed for {instrument_id_text}: {exc}",
                 )
-        desired_ids = set(quantities).union(self._held_instrument_ids())
-        refreshed_ids: set[str] = set()
-        for instrument_id_text in sorted(desired_ids):
+                continue
+            subscribed_ids.discard(instrument_id_text)
+            removed_ids.add(instrument_id_text)
+        added_ids: set[str] = set()
+        for instrument_id_text in sorted(addable_ids):
             instrument_id = InstrumentId.from_str(instrument_id_text)
             try:
                 self.subscribe_order_book_depth(
@@ -663,12 +730,14 @@ class TargetQuantityStrategy(Strategy):
                     f"Order-book depth subscribe failed for {instrument_id_text}: {exc}",
                 )
                 continue
-            refreshed_ids.add(instrument_id_text)
-        self._subscribed_order_book_depth_instruments = refreshed_ids
-        if refreshed_ids:
+            subscribed_ids.add(instrument_id_text)
+            added_ids.add(instrument_id_text)
+        self._subscribed_order_book_depth_instruments = subscribed_ids
+        if added_ids:
             self.log.info(
-                "Refreshed order-book depth subscriptions: "
-                f"count={len(refreshed_ids)} instruments={sorted(refreshed_ids)}",
+                "Updated order-book depth subscriptions: "
+                f"subscribed={sorted(added_ids)} unsubscribed={sorted(removed_ids)} "
+                f"active_count={len(subscribed_ids)}",
                 color=LogColor.BLUE,
             )
             self._sleep(10.0)
@@ -696,12 +765,10 @@ class TargetQuantityStrategy(Strategy):
         self._ensure_pricing_date(trading_date)
         if instrument_id not in self._authoritative_open:
             self._set_authoritative_open(instrument_id, trading_date, float(bar.open))
-        within_window = self._within_trading_window(int(bar.ts_event))
+        within_window = self._within_trading_window()
         self._convergence_suspended = not within_window
         self.on_target_bar(bar)
         self._convergence_suspended = False
-        if not within_window:
-            return
         self._converge_to_target(current_date=trading_date, trigger="bar")
 
     def on_target_bar(self, bar: Bar) -> None:
@@ -820,8 +887,7 @@ class TargetQuantityStrategy(Strategy):
     def on_order_canceled(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
         self._forget_submitted_order(client_order_id)
-        if self._within_trading_window():
-            self._converge_to_target(current_date=self._clock_date(), trigger="cancel")
+        self._converge_to_target(current_date=self._clock_date(), trigger="cancel")
 
     def on_order_denied(self, event: Any) -> None:
         self._handle_order_not_accepted(event)
@@ -833,17 +899,15 @@ class TargetQuantityStrategy(Strategy):
         client_order_id = str(event.client_order_id)
         instrument_id_text = str(getattr(event, "instrument_id", ""))
         reason = str(getattr(event, "reason", "") or "")
-        target_qty = self._order_target_qty.get(
-            client_order_id,
-            self._target_quantities.get(instrument_id_text, Decimal("0")),
-        )
         self._forget_submitted_order(client_order_id)
         self._rejected_order_ids.add(client_order_id)
         if _is_insufficient_funds(reason):
+            order = self.cache.order(event.client_order_id)
+            order_qty = self._decimal_quantity(order.quantity)
             if instrument_id_text:
                 self._insufficient_funds.add(instrument_id_text)
-                if target_qty > 0:
-                    self._deferred_buys[instrument_id_text] = target_qty
+                if order_qty > 0:
+                    self._deferred_buys[instrument_id_text] = order_qty
             self.log.warning(
                 f"Order {client_order_id} {instrument_id_text} rejected for insufficient funds; "
                 f"will retry after cash changes. reason={reason}",
@@ -861,14 +925,14 @@ class TargetQuantityStrategy(Strategy):
             self._deferred_buys.pop(instrument_id_text, None)
 
     def _on_converge_timer(self, _event: Any) -> None:
-        if not self._within_trading_window():
-            return
         try:
             self._converge_to_target(current_date=self._clock_date(), trigger="timer")
         except Exception as exc:
             self.log.warning(f"target convergence failed: {exc}")
 
     def _converge_to_target(self, current_date: date, trigger: str) -> None:
+        if not self._within_trading_window():
+            return
         acquired = self._converge_lock.acquire(blocking=False)
         if not acquired:
             return
@@ -898,19 +962,17 @@ class TargetQuantityStrategy(Strategy):
         self._reconcile_unfilled_orders(current_date)
         open_order_instruments = self._open_order_instruments()
         desired = self._desired_quantities()
-        self._refresh_symbol_freezes(desired)
-        sell_targets: dict[str, Decimal] = {}
-        buy_targets: dict[str, Decimal] = {}
+        sell_intents: dict[str, TargetOrderIntent] = {}
+        buy_intents: dict[str, TargetOrderIntent] = {}
         # Per-instrument classification tally for the convergence summary log below.
         # Every desired instrument lands in exactly one action/skip bucket so we can
-        # explain each cycle. Missing today-open prices are flagged for audit.
+        # explain each cycle. Missing mandatory order inputs are logged as errors by
+        # _target_order_intent and counted as intent_error here.
         skip_open_order: list[str] = []
         skip_frozen: list[str] = []
         skip_sellable_exhausted: list[str] = []
-        skip_missing_price: list[str] = []
-        skip_missing_instrument: list[str] = []
         skip_on_target: list[str] = []
-        buy_missing_price: list[str] = []
+        skip_intent_error: list[str] = []
         for instrument_id_text, target_qty in desired.items():
             if instrument_id_text in open_order_instruments:
                 skip_open_order.append(instrument_id_text)
@@ -918,45 +980,72 @@ class TargetQuantityStrategy(Strategy):
             if instrument_id_text in self._frozen_instruments:
                 skip_frozen.append(instrument_id_text)
                 continue
-            side, reason = self._target_side(
-                instrument_id_text,
-                target_qty,
-                return_reason=True,
+            intent = self._target_order_intent(instrument_id_text, target_qty)
+            if intent is None:
+                current_qty = self._current_quantity(InstrumentId.from_str(instrument_id_text))
+                if current_qty == Decimal(str(target_qty)):
+                    skip_on_target.append(instrument_id_text)
+                else:
+                    skip_intent_error.append(instrument_id_text)
+                continue
+            intent.context.record(
+                convergence_trigger=trigger,
+                target_version=self._target_version,
+                trading_date=current_date,
             )
-            if side == "sell":
+            limit_reason = self._price_limit_reason(instrument_id_text, intent.side)
+            if limit_reason is not None and str(self.config.limit_stop_mode) == "freeze_symbol":
+                intent.context.record(limit_reason=limit_reason, action="freeze_symbol")
+                self._frozen_instruments[instrument_id_text] = limit_reason
+                self._deferred_buys.pop(instrument_id_text, None)
+                self._insufficient_funds.discard(instrument_id_text)
+                skip_frozen.append(instrument_id_text)
+                self.log.warning(
+                    f"Freezing {instrument_id_text} for target version={self._target_version}: "
+                    f"{limit_reason} intent_context={intent.context.log_text()}",
+                )
+                continue
+            if intent.side == OrderSide.SELL:
                 if self._sellable_exhausted.get(instrument_id_text) == current_date:
+                    intent.context.record(action="skip", skip_reason="sellable_exhausted")
                     skip_sellable_exhausted.append(instrument_id_text)
                     continue
-                sell_targets[instrument_id_text] = target_qty
-            elif side == "buy":
-                if reason == "missing_price":
-                    buy_missing_price.append(instrument_id_text)
-                buy_targets[instrument_id_text] = target_qty
+                intent.context.record(action="sell_target")
+                sell_intents[instrument_id_text] = intent
+            elif intent.side == OrderSide.BUY:
+                intent.context.record(action="buy_target")
+                buy_intents[instrument_id_text] = intent
             else:
-                if reason == "missing_instrument":
-                    skip_missing_instrument.append(instrument_id_text)
-                else:
-                    skip_on_target.append(instrument_id_text)
+                intent.context.record(action="skip", skip_reason="unsupported_side")
+                skip_intent_error.append(instrument_id_text)
 
         self._log_convergence_summary(
             trigger=trigger,
             desired_count=len(desired),
-            sell_targets=sell_targets,
-            buy_targets=buy_targets,
+            sell_intents=sell_intents,
+            buy_intents=buy_intents,
             skip_open_order=skip_open_order,
             skip_frozen=skip_frozen,
             skip_sellable_exhausted=skip_sellable_exhausted,
-            skip_missing_price=skip_missing_price,
-            skip_missing_instrument=skip_missing_instrument,
             skip_on_target=skip_on_target,
-            buy_missing_price=buy_missing_price,
+            skip_intent_error=skip_intent_error,
         )
 
-        for instrument_id_text, target_qty in sorted(sell_targets.items()):
-            self._record_target(current_date, instrument_id_text, target_qty, self._target_reason)
-            self._submit_target_quantity(current_date, instrument_id_text, target_qty, self._target_reason)
-        if buy_targets:
-            self._submit_buys_within_cash(current_date, buy_targets, self._target_reason)
+        for instrument_id_text, intent in sorted(sell_intents.items()):
+            self._record_target(
+                current_date,
+                instrument_id_text,
+                intent.context.target_qty,
+                self._target_reason,
+                intent.context,
+            )
+            self._submit_target_quantity(
+                current_date,
+                intent,
+                self._target_reason,
+            )
+        if buy_intents:
+            self._submit_buys_within_cash(current_date, buy_intents, self._target_reason)
 
         if self._target_achieved():
             self._achieved_versions.add(self._target_version)
@@ -999,20 +1088,18 @@ class TargetQuantityStrategy(Strategy):
         *,
         trigger: str,
         desired_count: int,
-        sell_targets: dict[str, Decimal],
-        buy_targets: dict[str, Decimal],
+        sell_intents: dict[str, TargetOrderIntent],
+        buy_intents: dict[str, TargetOrderIntent],
         skip_open_order: list[str],
         skip_frozen: list[str],
         skip_sellable_exhausted: list[str],
-        skip_missing_price: list[str],
-        skip_missing_instrument: list[str],
         skip_on_target: list[str],
-        buy_missing_price: list[str],
+        skip_intent_error: list[str],
     ) -> None:
         estimated_buy_cost = Decimal("0")
         unknown_buy_cost = 0
-        for instrument_id_text, target_qty in buy_targets.items():
-            cost = self._estimated_buy_cost(instrument_id_text, target_qty)
+        for instrument_id_text, intent in buy_intents.items():
+            cost = self._estimated_buy_cost(instrument_id_text, intent.context.target_qty)
             if cost is None:
                 unknown_buy_cost += 1
                 continue
@@ -1032,22 +1119,20 @@ class TargetQuantityStrategy(Strategy):
                 available_buy_cash = max(Decimal("0"), available_buy_cash - reserved_buy_cash)
             cash_gap = max(Decimal("0"), estimated_buy_cost - available_buy_cash)
 
-        missing_price_instruments = sorted(set(skip_missing_price).union(buy_missing_price))
         self.log.info(
             "Target convergence summary "
             f"trigger={trigger} version={self._target_version} desired={desired_count} "
-            f"sell_targets={len(sell_targets)} buy_targets={len(buy_targets)} "
+            f"sell_targets={len(sell_intents)} buy_targets={len(buy_intents)} "
             f"open_order={len(skip_open_order)} frozen={len(skip_frozen)} "
             f"sellable_exhausted={len(skip_sellable_exhausted)} "
-            f"missing_price={len(missing_price_instruments)} "
-            f"missing_instrument={len(skip_missing_instrument)} "
+            f"intent_error={len(skip_intent_error)} "
             f"on_target={len(skip_on_target)} "
             f"deferred_buys={len(self._deferred_buys)} "
             f"insufficient_funds={len(self._insufficient_funds)} "
             f"estimated_buy_cost={estimated_buy_cost} unknown_buy_cost={unknown_buy_cost} "
             f"free_cash={free_cash} reserved_buy_cash={reserved_buy_cash} "
             f"available_buy_cash={available_buy_cash} cash_gap={cash_gap} "
-            f"missing_price_instruments={self._instrument_list_sample(missing_price_instruments)} "
+            f"intent_error_instruments={self._instrument_list_sample(skip_intent_error)} "
             f"open_order_instruments={self._instrument_list_sample(skip_open_order)} "
             f"frozen_instruments={self._instrument_list_sample(skip_frozen)} "
             f"sellable_exhausted_instruments={self._instrument_list_sample(skip_sellable_exhausted)}",
@@ -1065,86 +1150,14 @@ class TargetQuantityStrategy(Strategy):
             shown = f"{shown}, ...(+{remaining})"
         return f"[{shown}]"
 
-    @overload
-    def _target_side(
-        self,
-        instrument_id_text: str,
-        target_qty: Decimal,
-        *,
-        return_reason: Literal[False] = False,
-    ) -> str | None:
-        ...
-
-    @overload
-    def _target_side(
-        self,
-        instrument_id_text: str,
-        target_qty: Decimal,
-        *,
-        return_reason: Literal[True],
-    ) -> tuple[str | None, str]:
-        ...
-
-    def _target_side(
-        self,
-        instrument_id_text: str,
-        target_qty: Decimal,
-        *,
-        return_reason: bool = False,
-    ) -> str | None | tuple[str | None, str]:
-        def result(side: str | None, reason: str) -> str | None | tuple[str | None, str]:
-            if return_reason:
-                return side, reason
-            return side
-
-        instrument_id = InstrumentId.from_str(instrument_id_text)
-        current_qty = self._current_quantity(instrument_id)
-        target_qty = Decimal(str(target_qty))
-        if target_qty <= 0:
-            if current_qty > 0:
-                return result("sell", "exit")
-            return result(None, "on_target")
-        instrument = self.cache.instrument(instrument_id)
-        if instrument is None:
-            return result("buy" if current_qty <= 0 else None, "missing_instrument")
-        # Quantity is explicit, so the side is a pure share-count delta; a missing open
-        # price only affects limit pricing (handled downstream), not the decision.
-        open_price = self._today_open.get(instrument_id_text)
-        missing_price = open_price is None or open_price <= 0
-        delta_qty = target_qty - current_qty
-        if delta_qty > 0:
-            return result("buy", "missing_price" if missing_price else "underweight")
-        if delta_qty < 0:
-            return result("sell", "overweight")
-        return result(None, "on_target")
-
-    def _refresh_symbol_freezes(self, desired: dict[str, Decimal]) -> None:
-        if str(self.config.limit_stop_mode) != "freeze_symbol":
-            return
-        for instrument_id_text, target_qty in desired.items():
-            if instrument_id_text in self._frozen_instruments:
-                continue
-            side = self._target_side(instrument_id_text, target_qty)
-            if side is None:
-                continue
-            limit_reason = self._price_limit_reason(instrument_id_text, side)
-            if limit_reason is None:
-                continue
-            self._frozen_instruments[instrument_id_text] = limit_reason
-            self._deferred_buys.pop(instrument_id_text, None)
-            self._insufficient_funds.discard(instrument_id_text)
-            self.log.warning(
-                f"Freezing {instrument_id_text} for target version={self._target_version}: {limit_reason}",
-            )
-
-    def _price_limit_reason(self, instrument_id_text: str, side: str) -> str | None:
+    def _price_limit_reason(self, instrument_id_text: str, side: OrderSide) -> str | None:
         price = self._last_close.get(instrument_id_text)
         if price is None or price <= 0:
             return None
         up_limit, down_limit = self._price_limits(instrument_id_text)
-        if side == "buy" and up_limit is not None and price >= up_limit:
+        if side == OrderSide.BUY and up_limit is not None and price >= up_limit:
             return "up_limit"
-        if side == "sell" and down_limit is not None and price <= down_limit:
+        if side == OrderSide.SELL and down_limit is not None and price <= down_limit:
             return "down_limit"
         return None
 
@@ -1182,9 +1195,7 @@ class TargetQuantityStrategy(Strategy):
                     continue
             except Exception:
                 pass
-            submit_ts = self._order_submit_ts.get(client_order_id)
-            if submit_ts is None:
-                submit_ts = int(getattr(order, "ts_last", now) or now)
+            submit_ts = int(order.ts_last)
             if now - submit_ts < timeout_ns:
                 continue
             if self._at_price_limit(order):
@@ -1199,6 +1210,16 @@ class TargetQuantityStrategy(Strategy):
             except Exception as exc:
                 self.log.warning(f"cancel_order failed for {client_order_id}: {exc}")
                 continue
+            intent_context = self._order_intent_contexts.get(client_order_id)
+            if intent_context is None:
+                intent_context = self._intent_context_from_order(
+                    order=order,
+                    target_qty=self._target_quantities.get(instrument_id_text, Decimal("0")),
+                )
+            intent_context.record(
+                cancel_reason="unfilled_timeout",
+                canceled_order_id=client_order_id,
+            )
             self._forget_submitted_order(client_order_id)
             if order.side == OrderSide.BUY:
                 self._cancel_count_buy[instrument_id_text] = (
@@ -1217,19 +1238,25 @@ class TargetQuantityStrategy(Strategy):
                 status="canceled",
                 reason="unfilled_timeout",
                 order_id=client_order_id,
+                intent_context=intent_context,
             )
 
     def _submit_buys_within_cash(
         self,
         trading_date: date,
-        buy_candidates: dict[str, Decimal],
+        buy_intents: dict[str, TargetOrderIntent],
         reason: str,
     ) -> None:
-        if not buy_candidates:
+        if not buy_intents:
             return
         free_cash = self._free_cash()
         if free_cash is None:
-            for instrument_id, target_qty in buy_candidates.items():
+            for instrument_id, intent in buy_intents.items():
+                target_qty = intent.context.target_qty
+                intent.context.record(
+                    cash_gate="missing_free_cash",
+                    trading_date=trading_date,
+                )
                 self._deferred_buys[instrument_id] = target_qty
                 self._record_order(
                     trading_date,
@@ -1239,34 +1266,64 @@ class TargetQuantityStrategy(Strategy):
                     target_qty,
                     "deferred",
                     "missing_free_cash",
+                    intent_context=intent.context,
                 )
             return
+        original_free_cash = free_cash
         buffer_pct = max(0.0, float(self.config.cash_buffer_percent))
         if buffer_pct > 0:
             free_cash = free_cash * Decimal(str(1.0 - min(buffer_pct, 1.0)))
         reserved_buy_cash = self._open_buy_order_notional()
         if reserved_buy_cash > 0:
             free_cash = max(Decimal("0"), free_cash - reserved_buy_cash)
-        for instrument_id in sorted(buy_candidates, key=lambda i: buy_candidates[i], reverse=True):
-            target_qty = buy_candidates[instrument_id]
+        ordered_candidates = sorted(
+            buy_intents,
+            key=lambda i: buy_intents[i].context.target_qty,
+            reverse=True,
+        )
+        for candidate_index, instrument_id in enumerate(ordered_candidates):
+            intent = buy_intents[instrument_id]
+            target_qty = intent.context.target_qty
+            intent.context.record(
+                cash_gate="evaluating",
+                cash_gate_index=candidate_index,
+                free_cash_initial=original_free_cash,
+                cash_buffer_percent=buffer_pct,
+                reserved_buy_cash=reserved_buy_cash,
+                available_cash_before_candidate=free_cash,
+                trading_date=trading_date,
+            )
             if instrument_id in self._insufficient_funds:
+                intent.context.record(
+                    cash_gate="deferred",
+                    defer_reason="insufficient_funds_backoff",
+                )
                 self._deferred_buys[instrument_id] = target_qty
-                continue
-            intent = self._target_order_intent(instrument_id, target_qty)
-            if intent is None:
-                self._record_target(trading_date, instrument_id, target_qty, reason)
-                self._submit_target_quantity(trading_date, instrument_id, target_qty, reason)
                 continue
             if intent.side != OrderSide.BUY:
                 continue
             slices = self._order_slices(intent)
+            intent.context.record(slice_count=len(slices))
             if not slices:
+                intent.context.record(cash_gate="skipped", skip_reason="no_order_slices")
                 continue
             submitted_any = False
-            for quantity in slices:
+            for slice_index, quantity in enumerate(slices):
                 est_cost = self._estimated_order_cost(quantity, intent.price)
+                intent.context.record(
+                    slice_index=slice_index,
+                    slice_quantity=quantity,
+                    slice_estimated_cost=est_cost,
+                    available_cash_before_slice=free_cash,
+                )
                 if est_cost > free_cash:
                     self._deferred_buys[instrument_id] = target_qty
+                    intent.context.record(
+                        cash_gate="deferred",
+                        defer_reason="insufficient_cash",
+                        available_cash_at_defer=free_cash,
+                        deferred_slice_index=slice_index,
+                    )
                     self._record_order(
                         trading_date,
                         instrument_id,
@@ -1275,51 +1332,117 @@ class TargetQuantityStrategy(Strategy):
                         target_qty,
                         "deferred",
                         "insufficient_cash",
+                        intent_context=intent.context,
                     )
                     break
                 if not submitted_any:
-                    self._record_target(trading_date, instrument_id, target_qty, reason)
+                    self._record_target(trading_date, instrument_id, target_qty, reason, intent.context)
                 self._submit_order_quantity(
                     trading_date=trading_date,
                     intent=intent,
                     quantity=quantity,
-                    target_qty=target_qty,
                     reason=reason,
+                    slice_index=slice_index,
+                    slice_count=len(slices),
                 )
                 submitted_any = True
                 free_cash -= est_cost
+                intent.context.record(
+                    cash_gate="submitted",
+                    available_cash_after_slice=free_cash,
+                )
             if not submitted_any and instrument_id not in self._deferred_buys:
                 self._deferred_buys[instrument_id] = target_qty
+                intent.context.record(cash_gate="deferred", defer_reason="no_slice_submitted")
 
     def _target_order_intent(self, instrument_id_text: str, target_qty: Decimal) -> TargetOrderIntent | None:
         instrument_id = InstrumentId.from_str(instrument_id_text)
-        instrument = self.cache.instrument(instrument_id)
-        if instrument is None:
-            return None
         current_qty = self._current_quantity(instrument_id)
         target_qty = Decimal(str(target_qty))
+        delta_qty = target_qty - current_qty
         if target_qty <= 0:
             if current_qty <= 0:
                 return None
-            price = self._limit_price(instrument, instrument_id, OrderSide.SELL, abs(current_qty))
-            return TargetOrderIntent(instrument_id, instrument, OrderSide.SELL, abs(current_qty), price)
-        delta_qty = target_qty - current_qty
-        if delta_qty == 0:
+            quantity = abs(current_qty)
+            side = OrderSide.SELL
+        else:
+            if delta_qty == 0:
+                return None
+            side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
+            quantity = abs(delta_qty)
+
+        instrument = self.cache.instrument(instrument_id)
+        if instrument is None:
+            self.log.error(
+                f"Cannot create target order intent for {instrument_id_text}: missing instrument",
+            )
             return None
-        side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
-        price = self._limit_price(instrument, instrument_id, side, abs(delta_qty))
+
+        price_context = self._build_price_context(instrument, instrument_id, side, quantity)
+        pricer = self._pricer_for_side(side)
+        raw_price = pricer.compute(price_context)
+        price = None if raw_price is None or raw_price <= 0 else instrument.make_price(raw_price)
+        context = IntentContext(
+            instrument_id=instrument_id_text,
+            target_qty=target_qty,
+            current_qty=current_qty,
+            delta_qty=delta_qty,
+            price_context=price_context,
+            pricer_class=pricer.__class__.__name__,
+        )
+        context.record(
+            side=side.name,
+            intent_quantity=quantity,
+            limit_price=price,
+            target_version=self._target_version,
+        )
         if price is None:
+            self.log.error(
+                f"Cannot create target order intent for {instrument_id_text}: missing limit price "
+                f"side={side.name} quantity={quantity} target_qty={target_qty} current_qty={current_qty} "
+                f"intent_context={context.log_text()}",
+            )
             return None
-        return TargetOrderIntent(instrument_id, instrument, side, abs(delta_qty), price)
+        return TargetOrderIntent(instrument_id, instrument, side, quantity, price, context)
 
     def _order_slices(self, intent: TargetOrderIntent) -> list[Decimal]:
-        if intent.price is None:
-            return [intent.quantity]
         return self._order_splitter.split(
             instrument=intent.instrument,
             quantity=Decimal(str(intent.quantity)),
             price=Decimal(str(intent.price)),
         )
+
+    def _intent_context_from_order(self, order: Any, target_qty: Decimal) -> IntentContext:
+        instrument_id = getattr(order, "instrument_id")
+        instrument_id_text = str(instrument_id)
+        current_qty = self._current_quantity(instrument_id)
+        target_qty = Decimal(str(target_qty))
+        side = getattr(order, "side", OrderSide.NO_ORDER_SIDE)
+        raw_quantity = getattr(order, "quantity", Decimal("0"))
+        quantity = self._decimal_quantity(raw_quantity)
+        instrument = self.cache.instrument(instrument_id)
+        price_context = None
+        pricer_class = None
+        if instrument is not None and side in {OrderSide.BUY, OrderSide.SELL}:
+            price_context = self._build_price_context(instrument, instrument_id, side, quantity)
+            pricer_class = self._pricer_for_side(side).__class__.__name__
+        context = IntentContext(
+            instrument_id=instrument_id_text,
+            target_qty=target_qty,
+            current_qty=current_qty,
+            delta_qty=target_qty - current_qty,
+            price_context=price_context,
+            pricer_class=pricer_class,
+        )
+        context.record(
+            side=getattr(side, "name", str(side)),
+            intent_quantity=quantity,
+            limit_price=getattr(order, "price", None),
+            target_version=self._target_version,
+            context_source="order_record",
+            order_id=str(getattr(order, "client_order_id", "")),
+        )
+        return context
 
     @staticmethod
     def _estimated_order_cost(quantity: Decimal, price: Any) -> Decimal:
@@ -1340,96 +1463,38 @@ class TargetQuantityStrategy(Strategy):
     def _submit_target_quantity(
         self,
         trading_date: date,
-        instrument_id_text: str,
-        target_qty: Decimal,
+        intent: TargetOrderIntent,
         reason: str,
     ) -> bool:
-        instrument_id = InstrumentId.from_str(instrument_id_text)
-        instrument = self.cache.instrument(instrument_id)
-        if instrument is None:
-            self._record_order(trading_date, instrument_id_text, "buy", 0, target_qty, "rejected", "missing_instrument")
-            return False
-        current_qty = self._current_quantity(instrument_id)
-        if Decimal(str(target_qty)) <= 0:
-            if current_qty <= 0:
-                return True
-            return self._submit_full_exit(trading_date, instrument_id, instrument, current_qty, reason)
-        intent = self._target_order_intent(instrument_id_text, target_qty)
-        if intent is None:
-            target_qty_decimal = Decimal(str(target_qty))
-            delta_qty = target_qty_decimal - current_qty
-            missing_open = self._today_open.get(instrument_id_text)
-            missing_price = delta_qty != 0 and (missing_open is None or missing_open <= 0)
-            side = "buy" if delta_qty >= 0 else "sell"
+        instrument_id_text = str(intent.instrument_id)
+        target_qty = intent.context.target_qty
+        if self.cache.instrument(intent.instrument_id) is None:
+            self.log.error(f"Cannot submit target quantity for {instrument_id_text}: missing instrument")
             self._record_order(
                 trading_date,
                 instrument_id_text,
-                side,
+                "buy",
                 0,
                 target_qty,
-                "skipped",
-                "missing_price" if missing_price else "already_target",
+                "rejected",
+                "missing_instrument",
+                intent_context=intent.context,
             )
-            return not missing_price
-        for quantity in self._order_slices(intent):
-            self._submit_order_quantity(
-                trading_date=trading_date,
-                intent=intent,
-                quantity=quantity,
-                target_qty=target_qty,
-                reason=reason,
-            )
-        return True
-
-    def _submit_full_exit(
-        self,
-        trading_date: date,
-        instrument_id: InstrumentId,
-        instrument: Any,
-        current_qty: Decimal,
-        reason: str,
-    ) -> bool:
-        qty_abs = self._clamp_sell_quantity(
-            trading_date=trading_date,
-            instrument_id=instrument_id,
-            requested_qty=abs(current_qty),
-            target_qty=Decimal("0"),
-            reason=reason,
-        )
-        if qty_abs is None or qty_abs <= 0:
             return False
-        price = self._limit_price(instrument, instrument_id, OrderSide.SELL, qty_abs)
-        if price is None:
-            order = self.order_factory.market(
-                instrument_id=instrument_id,
-                order_side=OrderSide.SELL,
-                quantity=instrument.make_qty(qty_abs),
-            )
-            self._track_submitted_order(order, Decimal("0"))
-            try:
-                self.submit_order(order)
-            except Exception:
-                self._forget_submitted_order(str(order.client_order_id))
-                raise
-            self._record_order(
-                trading_date,
-                str(instrument_id),
-                "sell",
-                int(qty_abs),
-                Decimal("0"),
-                "submitted",
-                reason,
-                str(order.client_order_id),
-            )
-            return True
-        intent = TargetOrderIntent(instrument_id, instrument, OrderSide.SELL, qty_abs, price)
-        for quantity in self._order_slices(intent):
+        slices = self._order_slices(intent)
+        intent.context.record(
+            submit_path="target_quantity",
+            trading_date=trading_date,
+            slice_count=len(slices),
+        )
+        for slice_index, quantity in enumerate(slices):
             self._submit_order_quantity(
                 trading_date=trading_date,
                 intent=intent,
                 quantity=quantity,
-                target_qty=Decimal("0"),
                 reason=reason,
+                slice_index=slice_index,
+                slice_count=len(slices),
             )
         return True
 
@@ -1438,34 +1503,47 @@ class TargetQuantityStrategy(Strategy):
         trading_date: date,
         intent: TargetOrderIntent,
         quantity: Decimal,
-        target_qty: Decimal,
         reason: str,
+        slice_index: int | None = None,
+        slice_count: int | None = None,
     ) -> bool:
+        target_qty = intent.context.target_qty
+        intent.context.record(
+            submit_path="order_quantity",
+            trading_date=trading_date,
+            requested_quantity=quantity,
+            slice_index=slice_index,
+            slice_count=slice_count,
+        )
         if intent.side == OrderSide.SELL:
             clamped_quantity = self._clamp_sell_quantity(
                 trading_date=trading_date,
                 instrument_id=intent.instrument_id,
                 requested_qty=quantity,
-                target_qty=target_qty,
                 reason=reason,
+                intent_context=intent.context,
             )
+            intent.context.record(clamped_quantity=clamped_quantity)
             if clamped_quantity is None or clamped_quantity <= 0:
                 return False
             quantity = clamped_quantity
-        if intent.price is not None:
-            order = self.order_factory.limit(
-                instrument_id=intent.instrument_id,
-                order_side=intent.side,
-                quantity=intent.instrument.make_qty(quantity),
-                price=intent.price,
-            )
         else:
-            order = self.order_factory.market(
-                instrument_id=intent.instrument_id,
-                order_side=intent.side,
-                quantity=intent.instrument.make_qty(quantity),
+            intent.context.record(clamped_quantity=quantity)
+        if intent.price is None:
+            self.log.error(
+                f"Cannot submit order for {intent.instrument_id}: missing limit price "
+                f"side={intent.side.name} quantity={quantity} intent_context={intent.context.log_text()}",
             )
-        self._track_submitted_order(order, target_qty)
+            return False
+        intent.context.record(submitted_quantity=quantity, limit_price=intent.price)
+        order = self.order_factory.limit(
+            instrument_id=intent.instrument_id,
+            order_side=intent.side,
+            quantity=intent.instrument.make_qty(quantity),
+            price=intent.price,
+        )
+        intent.context.record(order_id=str(order.client_order_id))
+        self._track_submitted_order(order, intent.context)
         try:
             self.submit_order(order)
         except Exception:
@@ -1480,6 +1558,7 @@ class TargetQuantityStrategy(Strategy):
             target_qty,
             "submitted",
             reason,
+            intent.context,
             str(order.client_order_id),
         )
         return True
@@ -1489,10 +1568,11 @@ class TargetQuantityStrategy(Strategy):
         trading_date: date,
         instrument_id: InstrumentId,
         requested_qty: Decimal,
-        target_qty: Decimal,
         reason: str,
+        intent_context: IntentContext,
     ) -> Decimal | None:
         instrument_id_text = str(instrument_id)
+        target_qty = intent_context.target_qty
         if requested_qty <= 0:
             return Decimal("0")
 
@@ -1501,6 +1581,12 @@ class TargetQuantityStrategy(Strategy):
         open_sell_qty = self._open_sell_quantity(instrument_id)
         fills_after = self._today_fill_snapshot(instrument_id, trading_date)
         if fills_before != fills_after:
+            intent_context.record(
+                sell_clamp_status="deferred",
+                sell_clamp_reason="sellable_snapshot_unstable",
+                fills_before=fills_before,
+                fills_after=fills_after,
+            )
             self._record_order(
                 trading_date,
                 instrument_id_text,
@@ -1509,10 +1595,12 @@ class TargetQuantityStrategy(Strategy):
                 target_qty,
                 "deferred",
                 "sellable_snapshot_unstable",
+                intent_context=intent_context,
             )
             self.log.warning(
                 f"Deferring SELL for {instrument_id_text}: Nautilus fill snapshot changed while "
-                f"calculating sellable quantity; before={fills_before}, after={fills_after}",
+                f"calculating sellable quantity; before={fills_before}, after={fills_after} "
+                f"intent_context={intent_context.log_text()}",
             )
             return None
 
@@ -1537,9 +1625,27 @@ class TargetQuantityStrategy(Strategy):
         # skip a genuinely-sellable position for the day if the first attempt races the reconcile.
         broker_authoritative = venue_can_use is not None
         sellable_qty = max(Decimal("0"), sellable_base - open_sell_qty)
+        intent_context.record(
+            sellable_source=sellable_source,
+            broker_authoritative=broker_authoritative,
+            sellable_base=sellable_base,
+            sellable_qty=sellable_qty,
+            venue_can_use=venue_can_use,
+            open_sell_qty=open_sell_qty,
+            today_buy_qty=fills_after.buy_qty,
+        )
         if sellable_qty <= 0:
             if broker_authoritative:
                 self._sellable_exhausted[instrument_id_text] = trading_date
+            intent_context.record(
+                sell_clamp_status="deferred",
+                sell_clamp_reason=(
+                    "sellable_exhausted"
+                    if broker_authoritative
+                    else "sellable_pending_broker_data"
+                ),
+                clamped_quantity=Decimal("0"),
+            )
             self._record_order(
                 trading_date,
                 instrument_id_text,
@@ -1548,16 +1654,22 @@ class TargetQuantityStrategy(Strategy):
                 target_qty,
                 "deferred",
                 "sellable_exhausted" if broker_authoritative else "sellable_pending_broker_data",
+                intent_context=intent_context,
             )
             self.log.warning(
                 f"Skipping SELL for {instrument_id_text}: sellable exhausted "
                 f"(source={sellable_source}, latched={broker_authoritative}, net_qty={current_qty}, "
                 f"today_buy_qty={fills_after.buy_qty}, venue_can_use={venue_can_use}, "
-                f"open_sell_qty={open_sell_qty}, requested_qty={requested_qty})",
+                f"open_sell_qty={open_sell_qty}, requested_qty={requested_qty}) "
+                f"intent_context={intent_context.log_text()}",
             )
             return Decimal("0")
 
         clamped_qty = min(Decimal(str(requested_qty)), sellable_qty)
+        intent_context.record(
+            sell_clamp_status="clamped" if clamped_qty < requested_qty else "unchanged",
+            clamped_quantity=clamped_qty,
+        )
         if clamped_qty < requested_qty:
             if broker_authoritative:
                 self._sellable_exhausted[instrument_id_text] = trading_date
@@ -1565,7 +1677,8 @@ class TargetQuantityStrategy(Strategy):
                 f"Clamping SELL for {instrument_id_text}: requested_qty={requested_qty}, "
                 f"sellable_qty={sellable_qty}, source={sellable_source}, "
                 f"today_buy_qty={fills_after.buy_qty}, venue_can_use={venue_can_use}, "
-                f"open_sell_qty={open_sell_qty}",
+                f"open_sell_qty={open_sell_qty} "
+                f"intent_context={intent_context.log_text()}",
             )
         return clamped_qty
 
@@ -1708,16 +1821,14 @@ class TargetQuantityStrategy(Strategy):
         except Exception:
             return Decimal(str(quantity))
 
-    def _track_submitted_order(self, order: Any, target_qty: Decimal) -> None:
+    def _track_submitted_order(self, order: Any, intent_context: IntentContext) -> None:
         client_order_id = str(order.client_order_id)
-        self._order_submit_ts[client_order_id] = self.clock.timestamp_ns()
-        self._order_target_qty[client_order_id] = Decimal(str(target_qty))
         self._order_target_versions[client_order_id] = self._target_version
+        self._order_intent_contexts[client_order_id] = intent_context
 
     def _forget_submitted_order(self, client_order_id: str) -> None:
-        self._order_submit_ts.pop(client_order_id, None)
-        self._order_target_qty.pop(client_order_id, None)
         self._order_target_versions.pop(client_order_id, None)
+        self._order_intent_contexts.pop(client_order_id, None)
 
     def _active_orders(
         self,
@@ -1753,6 +1864,9 @@ class TargetQuantityStrategy(Strategy):
             pass
         return True
 
+    def _pricer_for_side(self, side: OrderSide) -> Any:
+        return self._buy_pricer if side == OrderSide.BUY else self._sell_pricer
+
     def _limit_price(
         self,
         instrument: Any,
@@ -1761,7 +1875,7 @@ class TargetQuantityStrategy(Strategy):
         quantity: Decimal | None = None,
     ) -> Any | None:
         ctx = self._build_price_context(instrument, instrument_id, side, quantity)
-        pricer = self._buy_pricer if side == OrderSide.BUY else self._sell_pricer
+        pricer = self._pricer_for_side(side)
         raw = pricer.compute(ctx)
         if raw is None or raw <= 0:
             return None
@@ -2086,8 +2200,7 @@ class TargetQuantityStrategy(Strategy):
         return (_read(self._UP_LIMIT_KEYS), _read(self._DOWN_LIMIT_KEYS))
 
     def _at_price_limit(self, order: Any) -> bool:
-        side = "buy" if order.side == OrderSide.BUY else "sell"
-        return self._price_limit_reason(str(order.instrument_id), side) is not None
+        return self._price_limit_reason(str(order.instrument_id), order.side) is not None
 
     def _note_quote_tick(self, tick: QuoteTick) -> None:
         """Record the latest live quote exchange timestamp for the trading gate."""
@@ -2196,9 +2309,17 @@ class TargetQuantityStrategy(Strategy):
         instrument_id: str,
         target_qty: Decimal,
         reason: str,
+        intent_context: IntentContext,
     ) -> None:
         target_qty = Decimal(str(target_qty))
         current_qty = self._current_quantity(InstrumentId.from_str(instrument_id))
+        extra: dict[str, Any] = {"target_version": self._target_version}
+        intent_context.record(
+            record_type="target",
+            record_reason=reason,
+            record_trading_date=trading_date,
+        )
+        extra["intent_context"] = intent_context.snapshot()
         self.target_events.append(
             TargetQuantityTargetEvent(
                 target_id=f"{self._target_version}-{instrument_id}-{len(self.target_events)}",
@@ -2209,8 +2330,14 @@ class TargetQuantityStrategy(Strategy):
                 current_qty=current_qty,
                 delta_qty=target_qty - current_qty,
                 reason=reason,
-                extra={"target_version": self._target_version},
+                extra=extra,
             ),
+        )
+        self.log.info(
+            f"Recorded target instrument_id={instrument_id} target_qty={target_qty} "
+            f"current_qty={current_qty} reason={reason} "
+            f"intent_context={intent_context.log_text()}",
+            color=LogColor.BLUE,
         )
 
     def _record_order(
@@ -2222,8 +2349,19 @@ class TargetQuantityStrategy(Strategy):
         target_qty: Decimal,
         status: str,
         reason: str | None,
+        intent_context: IntentContext,
         order_id: str | None = None,
     ) -> None:
+        extra: dict[str, Any] = {"target_version": self._target_version}
+        intent_context.record(
+            record_type="order",
+            record_status=status,
+            record_reason=reason,
+            record_order_id=order_id,
+            record_trading_date=trading_date,
+            record_quantity=quantity,
+        )
+        extra["intent_context"] = intent_context.snapshot()
         self.order_events.append(
             TargetQuantityOrderEvent(
                 order_id=order_id or f"internal-{trading_date.isoformat()}-{instrument_id}-{len(self.order_events)}",
@@ -2234,8 +2372,14 @@ class TargetQuantityStrategy(Strategy):
                 target_qty=Decimal(str(target_qty)),
                 status=status,
                 reason=reason,
-                extra={"target_version": self._target_version},
+                extra=extra,
             ),
+        )
+        self.log.info(
+            f"Recorded order instrument_id={instrument_id} side={side} quantity={quantity} "
+            f"target_qty={target_qty} status={status} reason={reason} order_id={order_id} "
+            f"intent_context={intent_context.log_text()}",
+            color=LogColor.BLUE,
         )
 
 
