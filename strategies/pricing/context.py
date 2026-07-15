@@ -33,9 +33,7 @@ class PriceContext:
     asks: list[tuple[float, float]] = field(default_factory=list)
 
     def base_price(self) -> float | None:
-        """Reference price for the base offset: today's open, else last close."""
+        """Reference price for the base offset: today's open only."""
         if self.open_price is not None and self.open_price > 0:
             return self.open_price
-        if self.last_close is not None and self.last_close > 0:
-            return self.last_close
         return None

@@ -154,14 +154,12 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
     def _on_converge_timer(self, _event: Any) -> None:
         if bool(self.config.process_targets_on_timer) and self._within_trading_window():
             trading_date = self._clock_date()
-            self._seed_open_prices_from_last_close(trading_date)
             self._process_trading_day_once(trading_date, "timer")
         super()._on_converge_timer(_event)
 
     def _process_trading_day_once(self, trading_date: date, trigger: str) -> bool:
         if trading_date in self._processed_dates:
             return False
-        self._seed_open_prices_from_last_close(trading_date)
         self._process_trading_day(trading_date)
         self._processed_dates.add(trading_date)
         self.log.info(

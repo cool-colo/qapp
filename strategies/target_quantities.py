@@ -91,6 +91,7 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     initial_cash: Decimal = Decimal("1000000")
     timezone_name: str = "Asia/Shanghai"
     trading_windows: str = "09:29-11:30,13:00-14:55"
+    exchange_trading_windows: str = "09:30-11:30,13:00-14:55"
     stop_time: str | None = "14:55"
     initial_last_closes: dict[str, float] | None = None
     unfilled_timeout_secs: float = 60.0
@@ -113,7 +114,6 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     subscribe_trade_ticks: bool = True
     quote_tick_window_probe_instrument_ids: tuple[InstrumentId, ...] = ()
     subscribe_order_book_depth: bool = False
-    seed_open_from_last_close: bool = False
     full_tick_refresh_secs: float = 60.0
     full_tick_prefetch_time: str | None = "09:27"
 
@@ -187,9 +187,7 @@ class TargetQuantityStrategy(Strategy):
         # Today's open price per instrument (first bar of the trading date wins).
         self._today_open: dict[str, float] = {}
         # Instruments whose _today_open came from an authoritative source (real
-        # bar open or QMT full-tick). Fallback sources (depth mid, seeded last
-        # close) must not overwrite these, and an authoritative open overwrites a
-        # previously-set fallback value.
+        # bar open or QMT full-tick).
         self._authoritative_open: set[str] = set()
         self._depth_books: dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]] = {}
         self._subscribed_order_book_depth_instruments: set[str] = set()
@@ -198,13 +196,11 @@ class TargetQuantityStrategy(Strategy):
         self._cancel_count_buy: dict[str, int] = {}
         self._cancel_count_sell: dict[str, int] = {}
         self._pricing_date: date | None = None
-        # Trading-day (in config timezone) on which we have received at least one
-        # quote tick while the clock was inside a scheduled trading window. Time
-        # in the window is necessary but not sufficient to trade/converge when
-        # quote subscriptions/probes are configured: live quotes confirm the
-        # market is actually open and streaming. A single subscribed/probe
-        # instrument's tick is enough to unlock the whole window.
-        self._quote_tick_window_date: date | None = None
+        # Latest quote tick event timestamp. The order gate requires both the
+        # local clock and the exchange event timestamp to be inside their
+        # configured windows, preventing stale/pre-open quotes from unlocking
+        # trading purely because local time has advanced.
+        self._last_quote_tick_ts_event: int = 0
         self._quote_tick_window_probe_ids = {
             str(instrument_id)
             for instrument_id in config.quote_tick_window_probe_instrument_ids
@@ -308,7 +304,7 @@ class TargetQuantityStrategy(Strategy):
         if self._full_tick_prefetch_time is not None:
             self._schedule_full_tick_prefetch()
         # Prime the snapshot immediately on start (e.g. mid-session restart) so the
-        # first convergence prices against real opens rather than seeded closes.
+        # first convergence prices against real opens.
         self._run_full_tick_fetch(trigger="start")
 
     def _schedule_full_tick_prefetch(self) -> None:
@@ -404,7 +400,7 @@ class TargetQuantityStrategy(Strategy):
         trading_date: date,
         open_price: float,
     ) -> bool:
-        """Set today's open from an authoritative source, overwriting fallbacks."""
+        """Set today's open from an authoritative source."""
         if open_price <= 0:
             return False
         self._ensure_pricing_date(trading_date)
@@ -714,11 +710,11 @@ class TargetQuantityStrategy(Strategy):
         )
         # The first real bar of the day carries the true daily open; later intraday
         # bars must not clobber it. Full-tick fetches (below) remain authoritative
-        # and may still refine it. Fallback (seeded/depth) values are overwritten.
+        # and may still refine it.
         self._ensure_pricing_date(trading_date)
         if instrument_id not in self._authoritative_open:
             self._set_authoritative_open(instrument_id, trading_date, float(bar.open))
-        within_window = self._within_trading_window()
+        within_window = self._within_trading_window(int(bar.ts_event))
         self._convergence_suspended = not within_window
         self.on_target_bar(bar)
         self._convergence_suspended = False
@@ -738,11 +734,10 @@ class TargetQuantityStrategy(Strategy):
         self._depth_books = {}
         self._cancel_count_buy = {}
         self._cancel_count_sell = {}
-        # New trading day: require a fresh live quote before the window unlocks.
-        # Keep a flag already set for this same date (a tick may have arrived
-        # before the first bar of the day triggered this reset).
-        if self._quote_tick_window_date != trading_date:
-            self._quote_tick_window_date = None
+        # New trading day: stale quote timestamps must not satisfy the exchange
+        # window gate.
+        if self._event_trading_date(self._last_quote_tick_ts_event) != trading_date:
+            self._last_quote_tick_ts_event = 0
 
     def _update_price_state(
         self,
@@ -753,30 +748,6 @@ class TargetQuantityStrategy(Strategy):
         self._ensure_pricing_date(trading_date)
         if last_price is not None and last_price > 0:
             self._last_close[instrument_id] = float(last_price)
-
-    def _seed_open_prices_from_last_close(self, trading_date: date) -> None:
-        if not bool(self.config.seed_open_from_last_close):
-            return
-        self._ensure_pricing_date(trading_date)
-        seeded = 0
-        for instrument_id, close_price in self._last_close.items():
-            try:
-                price = float(close_price)
-            except (TypeError, ValueError):
-                continue
-            if price <= 0:
-                continue
-            if (
-                instrument_id not in self._today_open
-                and instrument_id not in self._authoritative_open
-            ):
-                self._today_open[instrument_id] = price
-                seeded += 1
-        if seeded:
-            self.log.info(
-                f"Seeded timer pricing opens from last closes: date={trading_date} count={seeded}",
-                color=LogColor.BLUE,
-            )
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         self._note_quote_tick(tick)
@@ -810,8 +781,8 @@ class TargetQuantityStrategy(Strategy):
         # The depth book is captured for aggressive walk-book pricing only. Its
         # mid/best price is NOT a dependable reference for today's open or last
         # price (pre-open auction levels are provisional, snapshots are sparse), so
-        # it must never feed _today_open / _last_close. Those come from the QMT
-        # full-tick snapshot and seeded ClickHouse closes instead.
+        # it must never feed _today_open / _last_close. Today's open comes from
+        # real bars or the QMT full-tick snapshot.
         self._ensure_pricing_date(trading_date)
         self._depth_books[str(depth.instrument_id)] = (bids, asks)
         if not self._should_log_sample(self.config.order_book_depth_log_sample_rate):
@@ -950,8 +921,7 @@ class TargetQuantityStrategy(Strategy):
         buy_targets: dict[str, Decimal] = {}
         # Per-instrument classification tally for the convergence summary log below.
         # Every desired instrument lands in exactly one action/skip bucket so we can
-        # explain each cycle. A buy with no today-open price still acts (a market or
-        # fallback-priced order), but is flagged in the missing_price bucket for audit.
+        # explain each cycle. Missing today-open prices are flagged for audit.
         skip_open_order: list[str] = []
         skip_frozen: list[str] = []
         skip_sellable_exhausted: list[str] = []
@@ -1404,8 +1374,21 @@ class TargetQuantityStrategy(Strategy):
             return self._submit_full_exit(trading_date, instrument_id, instrument, current_qty, reason)
         intent = self._target_order_intent(instrument_id_text, target_qty)
         if intent is None:
-            self._record_order(trading_date, instrument_id_text, "buy", 0, target_qty, "skipped", "already_target")
-            return True
+            target_qty_decimal = Decimal(str(target_qty))
+            delta_qty = target_qty_decimal - current_qty
+            missing_open = self._today_open.get(instrument_id_text)
+            missing_price = delta_qty != 0 and (missing_open is None or missing_open <= 0)
+            side = "buy" if delta_qty >= 0 else "sell"
+            self._record_order(
+                trading_date,
+                instrument_id_text,
+                side,
+                0,
+                target_qty,
+                "skipped",
+                "missing_price" if missing_price else "already_target",
+            )
+            return not missing_price
         for quantity in self._order_slices(intent):
             self._submit_order_quantity(
                 trading_date=trading_date,
@@ -2131,20 +2114,11 @@ class TargetQuantityStrategy(Strategy):
         return self._price_limit_reason(str(order.instrument_id), side) is not None
 
     def _note_quote_tick(self, tick: QuoteTick) -> None:
-        """Record that a live quote tick arrived while inside a trading window.
-
-        A single tick from any subscribed/probe instrument is enough to unlock
-        the window for the whole trading day. The flag is reset daily by
-        ``_ensure_pricing_date``.
-        """
-        if self._quote_tick_window_date == self._clock_date():
-            return
-        if not self._within_trading_time():
-            return
-        self._quote_tick_window_date = self._clock_date()
-
-    def _quote_tick_window_gate_enabled(self) -> bool:
-        return bool(self.config.subscribe_quote_ticks) or bool(self._quote_tick_window_probe_ids)
+        """Record the latest live quote exchange timestamp for the trading gate."""
+        ts_event = int(tick.ts_event)
+        if ts_event <= 0:
+            raise ValueError(f"Quote tick ts_event must be positive, got {ts_event}")
+        self._last_quote_tick_ts_event = ts_event
 
     def _within_pre_open_quote_log_window(self) -> bool:
         try:
@@ -2155,17 +2129,9 @@ class TargetQuantityStrategy(Strategy):
             return False
         return start <= now < end
 
-    def _within_trading_time(self) -> bool:
-        """True when the clock is inside a scheduled trading session (time only).
-
-        This is the necessary-but-not-sufficient half of ``_within_trading_window``:
-        it ignores whether live quotes have arrived.
-        """
-        try:
-            now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
-        except Exception:
-            return True
-        for session in str(self.config.trading_windows).split(","):
+    @staticmethod
+    def _time_window_index(current: Any, windows: str) -> int | None:
+        for index, session in enumerate(str(windows).split(",")):
             session = session.strip()
             if not session or "-" not in session:
                 continue
@@ -2175,21 +2141,61 @@ class TargetQuantityStrategy(Strategy):
                 close_t = pd.Timestamp(close_str.strip()).time()
             except Exception:
                 continue
-            if open_t <= now <= close_t:
-                return True
-        return False
+            if open_t <= current <= close_t:
+                return index
+        return None
 
-    def _within_trading_window(self) -> bool:
-        # Time in the scheduled window is necessary but not sufficient: we also
-        # require at least one live quote tick received during a window today,
-        # confirming the market is actually open and streaming. If neither full
-        # quote subscriptions nor quote probes are configured, fall back to the
-        # time-only check.
-        if not self._within_trading_time():
+    @staticmethod
+    def _time_in_windows(current: Any, windows: str) -> bool:
+        return TargetQuantityStrategy._time_window_index(current, windows) is not None
+
+    def _local_trading_window_index(self) -> int | None:
+        try:
+            now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
+        except Exception:
+            return 0
+        return self._time_window_index(now, self.config.trading_windows)
+
+    def _within_trading_time(self) -> bool:
+        """True when the clock is inside a scheduled trading session (time only).
+
+        This is the necessary-but-not-sufficient half of ``_within_trading_window``:
+        it ignores exchange event time.
+        """
+        return self._local_trading_window_index() is not None
+
+    def _within_exchange_trading_time(
+        self,
+        ts_event: int | None = None,
+        session_index: int | None = None,
+    ) -> bool:
+        event_ts = int(ts_event or 0) or self._last_quote_tick_ts_event
+        if event_ts <= 0:
             return False
-        if not self._quote_tick_window_gate_enabled():
-            return True
-        return self._quote_tick_window_date == self._clock_date()
+        try:
+            event_time = pd.Timestamp(event_ts, unit="ns", tz="UTC").tz_convert(
+                self.config.timezone_name,
+            )
+        except Exception:
+            return False
+        if event_time.date() != self._clock_date():
+            return False
+        event_window_index = self._time_window_index(
+            event_time.time(),
+            self.config.exchange_trading_windows,
+        )
+        if event_window_index is None:
+            return False
+        return session_index is None or event_window_index == session_index
+
+    def _within_trading_window(self, ts_event: int | None = None) -> bool:
+        # Both local clock time and exchange event time must be inside their
+        # configured windows. Live timer/cancel paths use the latest quote tick
+        # ts_event; data-driven paths can pass the current event timestamp.
+        local_window_index = self._local_trading_window_index()
+        if local_window_index is None:
+            return False
+        return self._within_exchange_trading_time(ts_event, session_index=local_window_index)
 
     def _stop_time_reached(self) -> bool:
         stop_time = self.config.stop_time

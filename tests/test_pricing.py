@@ -80,10 +80,10 @@ class SellPriceStrategyTest(unittest.TestCase):
         # 20 - max(20*5bps=0.01, 0.01)=0.01 -> 19.99
         self.assertAlmostEqual(price, 19.99)
 
-    def test_falls_back_to_last_close_when_open_missing(self) -> None:
+    def test_returns_none_when_open_missing(self) -> None:
         pricer = OpenOffsetSellPriceStrategy(offset_bps=5.0, cancel_threshold=1)
         price = pricer.compute(sell_ctx(open_price=None, last_close=10.0, cancel_count=0))
-        self.assertAlmostEqual(price, 9.99)
+        self.assertIsNone(price)
 
     def test_walks_bid_ladder_when_cancelled(self) -> None:
         pricer = OpenOffsetSellPriceStrategy(offset_bps=5.0, cancel_threshold=1)

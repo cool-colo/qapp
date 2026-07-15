@@ -315,10 +315,13 @@ class TestableTargetQuantityStrategy:
     _at_price_limit = TargetQuantityStrategy._at_price_limit
     _target_side = TargetQuantityStrategy._target_side
     _stop_time_reached = TargetQuantityStrategy._stop_time_reached
+    _time_window_index = staticmethod(TargetQuantityStrategy._time_window_index)
+    _time_in_windows = staticmethod(TargetQuantityStrategy._time_in_windows)
+    _local_trading_window_index = TargetQuantityStrategy._local_trading_window_index
     _within_trading_window = TargetQuantityStrategy._within_trading_window
     _within_trading_time = TargetQuantityStrategy._within_trading_time
+    _within_exchange_trading_time = TargetQuantityStrategy._within_exchange_trading_time
     _within_pre_open_quote_log_window = TargetQuantityStrategy._within_pre_open_quote_log_window
-    _quote_tick_window_gate_enabled = TargetQuantityStrategy._quote_tick_window_gate_enabled
     _note_quote_tick = TargetQuantityStrategy._note_quote_tick
     on_quote_tick = TargetQuantityStrategy.on_quote_tick
     _subscribe_quote_tick_window_probes = TargetQuantityStrategy._subscribe_quote_tick_window_probes
@@ -337,7 +340,6 @@ class TestableTargetQuantityStrategy:
     _log_pre_open_reconcile_result = TargetQuantityStrategy._log_pre_open_reconcile_result
     _ensure_pricing_date = TargetQuantityStrategy._ensure_pricing_date
     _update_price_state = TargetQuantityStrategy._update_price_state
-    _seed_open_prices_from_last_close = TargetQuantityStrategy._seed_open_prices_from_last_close
     _set_authoritative_open = TargetQuantityStrategy._set_authoritative_open
     _apply_full_tick = TargetQuantityStrategy._apply_full_tick
     _full_tick_open = staticmethod(TargetQuantityStrategy._full_tick_open)
@@ -473,12 +475,9 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._pricing_date = None
         strategy._quote_tick_window_probe_ids = set()
         strategy._subscribed_quote_tick_probe_instruments = set()
-        # Mark the trading window as already unlocked by a live quote tick (the runtime
-        # state during a trading session). The window gate now requires a tick when
-        # subscribe_quote_ticks is on; these tests exercise convergence, not the gate.
-        strategy._quote_tick_window_date = pd.Timestamp(
-            strategy.clock.utc_now(),
-        ).tz_convert(strategy.config.timezone_name).date()
+        # Seed a current in-window exchange event timestamp; these tests exercise
+        # convergence behavior, not the trading-window gate.
+        strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 10:00:00")
         strategy._convergence_suspended = False
         strategy._converge_lock = threading.Lock()
         strategy._pre_open_reconcile = lambda timeout_secs: True
@@ -600,24 +599,6 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(strategy.subscribed_trade_ticks, [])
         self.assertEqual(strategy.subscribed_order_book_depths, [])
 
-    def test_seed_open_prices_from_last_close_resets_new_day_counts(self) -> None:
-        strategy = self.make_strategy(prices={INST_A: 10.0, INST_B: 20.0})
-        strategy.config = TargetQuantityStrategyConfig(
-            instrument_ids=[INST_A, INST_B],
-            bar_types={},
-            seed_open_from_last_close=True,
-        )
-        strategy._pricing_date = date(2026, 7, 1)
-        strategy._today_open = {str(INST_A): 9.0}
-        strategy._cancel_count_buy = {str(INST_A): 2}
-        strategy._cancel_count_sell = {str(INST_A): 1}
-
-        strategy._seed_open_prices_from_last_close(date(2026, 7, 2))
-
-        self.assertEqual(strategy._today_open, {str(INST_A): 10.0, str(INST_B): 20.0})
-        self.assertEqual(strategy._cancel_count_buy, {})
-        self.assertEqual(strategy._cancel_count_sell, {})
-
     def test_trade_tick_logging_uses_sample_rate_like_quote_ticks(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
@@ -652,9 +633,10 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             subscribe_quote_ticks=False,
             quote_tick_window_probe_instrument_ids=(INST_A,),
             trading_windows="09:29-11:30,13:00-14:55",
+            exchange_trading_windows="09:30-11:30,13:00-14:55",
         )
         strategy._quote_tick_window_probe_ids = {str(INST_A)}
-        strategy._quote_tick_window_date = None
+        strategy._last_quote_tick_ts_event = 0
         strategy.clock.now = pd.Timestamp("2026-07-02 01:25:00", tz="UTC")
         tick = type(
             "Tick",
@@ -665,18 +647,19 @@ class TargetQuantityStrategyTest(unittest.TestCase):
                 "bid_size": Decimal("100"),
                 "ask_price": Decimal("10.01"),
                 "ask_size": Decimal("100"),
-                "ts_event": 1,
-                "ts_init": 2,
+                "ts_event": china_ts_ns("2026-07-02 09:25:00"),
+                "ts_init": china_ts_ns("2026-07-02 09:25:01"),
             },
         )()
 
         strategy.on_quote_tick(tick)
 
-        self.assertIsNone(strategy._quote_tick_window_date)
+        self.assertEqual(strategy._last_quote_tick_ts_event, china_ts_ns("2026-07-02 09:25:00"))
+        self.assertFalse(strategy._within_trading_window())
         self.assertEqual(len(strategy.log.infos), 1)
         self.assertIn("forced pre-open diagnostics", strategy.log.infos[0][0][0])
 
-    def test_quote_tick_0929_unlocks_window(self) -> None:
+    def test_quote_tick_0929_does_not_unlock_exchange_window(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
             instrument_ids=[INST_A],
@@ -684,9 +667,10 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             subscribe_quote_ticks=False,
             quote_tick_window_probe_instrument_ids=(INST_A,),
             trading_windows="09:29-11:30,13:00-14:55",
+            exchange_trading_windows="09:30-11:30,13:00-14:55",
         )
         strategy._quote_tick_window_probe_ids = {str(INST_A)}
-        strategy._quote_tick_window_date = None
+        strategy._last_quote_tick_ts_event = 0
         strategy.clock.now = pd.Timestamp("2026-07-02 01:29:00", tz="UTC")
         tick = type(
             "Tick",
@@ -697,15 +681,64 @@ class TargetQuantityStrategyTest(unittest.TestCase):
                 "bid_size": Decimal("100"),
                 "ask_price": Decimal("10.01"),
                 "ask_size": Decimal("100"),
-                "ts_event": 1,
-                "ts_init": 2,
+                "ts_event": china_ts_ns("2026-07-02 09:29:00"),
+                "ts_init": china_ts_ns("2026-07-02 09:29:01"),
             },
         )()
 
         strategy.on_quote_tick(tick)
 
-        self.assertEqual(strategy._quote_tick_window_date, date(2026, 7, 2))
+        self.assertEqual(strategy._last_quote_tick_ts_event, china_ts_ns("2026-07-02 09:29:00"))
+        self.assertTrue(strategy._within_trading_time())
+        self.assertFalse(strategy._within_exchange_trading_time())
+        self.assertFalse(strategy._within_trading_window())
+
+    def test_quote_tick_0930_unlocks_exchange_window(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            subscribe_quote_ticks=False,
+            quote_tick_window_probe_instrument_ids=(INST_A,),
+            trading_windows="09:29-11:30,13:00-14:55",
+            exchange_trading_windows="09:30-11:30,13:00-14:55",
+        )
+        strategy._quote_tick_window_probe_ids = {str(INST_A)}
+        strategy._last_quote_tick_ts_event = 0
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:30:00", tz="UTC")
+        tick = type(
+            "Tick",
+            (),
+            {
+                "instrument_id": INST_A,
+                "bid_price": Decimal("10.00"),
+                "bid_size": Decimal("100"),
+                "ask_price": Decimal("10.01"),
+                "ask_size": Decimal("100"),
+                "ts_event": china_ts_ns("2026-07-02 09:30:00"),
+                "ts_init": china_ts_ns("2026-07-02 09:30:01"),
+            },
+        )()
+
+        strategy.on_quote_tick(tick)
+
+        self.assertEqual(strategy._last_quote_tick_ts_event, china_ts_ns("2026-07-02 09:30:00"))
         self.assertTrue(strategy._within_trading_window())
+
+    def test_morning_quote_tick_does_not_unlock_afternoon_window(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            trading_windows="09:29-11:30,13:00-14:55",
+            exchange_trading_windows="09:30-11:30,13:00-14:55",
+        )
+        strategy.clock.now = pd.Timestamp("2026-07-02 05:00:00", tz="UTC")
+        strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 11:30:00")
+
+        self.assertTrue(strategy._within_trading_time())
+        self.assertTrue(strategy._within_exchange_trading_time())
+        self.assertFalse(strategy._within_trading_window())
 
     def test_desired_quantities_exit_non_targets_by_default(self) -> None:
         strategy = self.make_strategy(positions={INST_A: Decimal("100"), INST_C: Decimal("200")})
@@ -809,8 +842,8 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertIn("missing_price=1", summary_logs[0])
         self.assertIn(f"missing_price_instruments=[{INST_A}]", summary_logs[0])
         self.assertIn("sell_targets=0 buy_targets=1", summary_logs[0])
-        self.assertEqual(len(strategy.submitted_orders), 1)
-        self.assertEqual(strategy.submitted_orders[0].side, OrderSide.BUY)
+        self.assertEqual(strategy.submitted_orders, [])
+        self.assertEqual(strategy.order_events[-1].reason, "missing_price")
 
     def test_convergence_summary_logs_cash_gap_for_buy_candidates(self) -> None:
         strategy = self.make_strategy(
@@ -1458,12 +1491,12 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(bids, [(9.99, 1000.0)])
         self.assertEqual(asks, [(10.01, 1200.0)])
 
-    def test_full_tick_open_overrides_seeded_last_close(self) -> None:
-        # Regression for the 42.14-vs-53.09 bug: a stale seeded last-close (or
-        # depth mid) must be overwritten by the authoritative full-tick open.
+    def test_full_tick_open_overrides_existing_non_authoritative_open(self) -> None:
+        # Regression for the 42.14-vs-53.09 bug: a stale non-authoritative value
+        # must be overwritten by the authoritative full-tick open.
         strategy = self.make_strategy()
         strategy._pricing_date = date(2026, 7, 2)
-        strategy._today_open = {str(INST_A): 42.14}  # stale seed / depth value
+        strategy._today_open = {str(INST_A): 42.14}
         strategy._authoritative_open = set()
         strategy.clock.now = pd.Timestamp("2026-07-02 01:27:00", tz="UTC")
 
@@ -1505,22 +1538,6 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             any("no running event loop" in args[0] for args, _kwargs in strategy.log.warnings),
         )
 
-    def test_seed_does_not_override_authoritative_open(self) -> None:
-        strategy = self.make_strategy()
-        strategy.config = TargetQuantityStrategyConfig(
-            instrument_ids=[INST_A],
-            bar_types={},
-            seed_open_from_last_close=True,
-        )
-        strategy._pricing_date = date(2026, 7, 2)
-        strategy._today_open = {str(INST_A): 53.09}
-        strategy._authoritative_open = {str(INST_A)}
-        strategy._last_close = {str(INST_A): 42.14}
-
-        strategy._seed_open_prices_from_last_close(date(2026, 7, 2))
-
-        self.assertEqual(strategy._today_open[str(INST_A)], 53.09)
-
     def test_full_tick_open_extraction(self) -> None:
         self.assertEqual(TargetQuantityStrategy._full_tick_open({"open": 53.09}), 53.09)
         self.assertEqual(TargetQuantityStrategy._full_tick_open(53.09), 53.09)
@@ -1530,7 +1547,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
     def test_buy_price_uses_gap_up_open_not_stale_seed(self) -> None:
         # End-to-end: after a full-tick refresh, a gap-up open drives the buy
-        # limit price (open + offset), not the stale seeded last close.
+        # limit price (open + offset), not a stale previously-cached value.
         strategy = self.make_strategy(open_prices={INST_A: 42.14})
         strategy._pricing_date = date(2026, 7, 2)
         strategy._authoritative_open = set()

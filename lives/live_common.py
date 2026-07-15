@@ -370,6 +370,15 @@ def parse_args() -> argparse.Namespace:
             "Default '09:29-11:30,13:00-14:55'."
         ),
     )
+    parser.add_argument(
+        "--exchange-trading-windows",
+        default=env("QMT_EXCHANGE_TRADING_WINDOWS", "09:30-11:30,13:00-14:55"),
+        help=(
+            "Live-only: comma-separated HH:MM-HH:MM sessions checked against market "
+            "data ts_event. Orders submit only when both --trading-windows and this "
+            "window match. Default '09:30-11:30,13:00-14:55'."
+        ),
+    )
     parser.add_argument("--price-precision", type=int, default=int(env("QMT_PRICE_PRECISION", "2")))
     parser.add_argument(
         "--initial-cash",
