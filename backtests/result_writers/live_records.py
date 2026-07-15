@@ -127,7 +127,7 @@ class LiveOrderRecord:
     quantity: int | None = None
     filled_qty: int = 0
     avg_fill_price: Decimal | None = None
-    target_weight: Decimal | None = None
+    target_qty: int | None = None
     target_version: str | None = None
     open_price: Decimal | None = None
     book_snapshot: JsonMapping | None = None

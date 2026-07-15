@@ -161,10 +161,6 @@ class TargetQuantityStrategy(Strategy):
         self._target_date: date | None = None
         self._target_reason = "target_quantity"
         self._target_version = ""
-        # Frozen total asset carried alongside the quantities. Pins the sizing
-        # denominator used only for cash reporting and the account snapshot log; the
-        # per-instrument quantities are explicit, so this never re-derives share counts.
-        self._target_total_asset: Decimal | None = None
         self._achieved_versions: set[str] = set()
         self._frozen_instruments: dict[str, str] = {}
         self._deferred_buys: dict[str, Decimal] = {}
@@ -597,7 +593,6 @@ class TargetQuantityStrategy(Strategy):
         quantities: dict[str | InstrumentId, int | Decimal],
         target_date: date,
         reason: str,
-        total_asset: Decimal | float | None = None,
         version: str | None = None,
     ) -> None:
         """
@@ -605,11 +600,9 @@ class TargetQuantityStrategy(Strategy):
 
         Quantity is the sole sizing input: each convergence cycle drives current_qty
         toward target_qty per instrument. ``0`` is a valid target (liquidate / hold
-        none) and is retained. ``total_asset`` pins the sizing denominator used for
-        cash reporting only; the quantities are explicit, so no per-instrument
-        re-sizing from live equity occurs. Called from the bar/timer path and from the
-        snapshot recorder (once per day, after the target is generated or loaded from
-        MySQL on restart).
+        none) and is retained. Called from the bar/timer path and from the snapshot
+        recorder (once per day, after the target is generated or loaded from MySQL on
+        restart).
         """
         normalized: dict[str, Decimal] = {}
         for instrument_id, quantity in quantities.items():
@@ -623,18 +616,9 @@ class TargetQuantityStrategy(Strategy):
             normalized[instrument_id_text] = value
         version_value = version or target_version(target_date, normalized, reason)
         self._refresh_order_book_depth_subscriptions(normalized)
-        frozen_value: Decimal | None = None
-        if total_asset is not None:
-            try:
-                candidate = Decimal(str(total_asset))
-            except Exception:
-                candidate = None
-            if candidate is not None and candidate > 0:
-                frozen_value = candidate
         if (
             version_value == self._target_version
             and normalized == self._target_quantities
-            and frozen_value == self._target_total_asset
         ):
             return
         self._target_quantities = dict(sorted(normalized.items()))
@@ -644,13 +628,11 @@ class TargetQuantityStrategy(Strategy):
         self._frozen_instruments = {}
         self._deferred_buys = {}
         self._insufficient_funds = set()
-        self._target_total_asset = frozen_value
         self._achieved_versions.discard(version_value)
         detail = self._target_quantities_log_detail(self._target_quantities)
         self.log.info(
             f"accepted target quantities version={version_value} date={target_date} "
-            f"count={len(self._target_quantities)} total_asset={self._target_total_asset} "
-            f"reason={reason} detail={detail}",
+            f"count={len(self._target_quantities)} reason={reason} detail={detail}",
             color=LogColor.BLUE,
         )
         if self._convergence_suspended or not self._within_trading_window():
@@ -1913,12 +1895,6 @@ class TargetQuantityStrategy(Strategy):
         return investable if investable > 0 else Decimal("0")
 
     def _portfolio_value(self) -> Decimal:
-        # A frozen total asset (set alongside 固定目标股数) pins the day's sizing
-        # denominator so cash reporting stays consistent with the committed target
-        # instead of drifting with live equity. Per-instrument sizing is explicit
-        # (share counts), so this value is used only for cash/reporting.
-        if self._target_total_asset is not None and self._target_total_asset > 0:
-            return self._target_total_asset
         broker_total_asset = self._broker_account_decimal("total_asset")
         if broker_total_asset is not None and broker_total_asset > 0:
             return broker_total_asset

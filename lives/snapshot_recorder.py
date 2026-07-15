@@ -403,7 +403,7 @@ class SnapshotRecorder(Actor):
                 self._writer.write_target_portfolios(records)
             except Exception as exc:
                 self.log.warning(f"target portfolio write failed: {exc}")
-        self._apply_target(trading_date, target_qty, investable_asset, plan.reason, version)
+        self._apply_target(trading_date, target_qty, plan.reason, version)
         self.log.info(
             f"generated & persisted daily target: date={trading_date} signal_date={plan_signal_date} "
             f"weights={len(plan.weights)} frozen_qty={len(target_qty)} "
@@ -455,7 +455,6 @@ class SnapshotRecorder(Actor):
 
     def _apply_loaded_target(self, trading_date: date, rows: list[dict[str, Any]]) -> None:
         target_qty: dict[str, int] = {}
-        frozen_asset: Decimal | None = None  # sizing basis (prefer investable_asset)
         version: str | None = None
         reason = "loaded_target"
         for row in rows:
@@ -463,20 +462,16 @@ class SnapshotRecorder(Actor):
             qty = row.get("target_qty")
             if qty is not None:
                 target_qty[instrument_id_text] = int(qty)
-            if frozen_asset is None:
-                frozen_asset = self._decimal_or_none(
-                    row.get("investable_asset") or row.get("total_asset"),
-                )
             if version is None and row.get("target_version"):
                 version = str(row.get("target_version"))
             if row.get("reason"):
                 reason = str(row.get("reason"))
         if not target_qty:
             return
-        self._apply_target(trading_date, target_qty, frozen_asset, reason, version)
+        self._apply_target(trading_date, target_qty, reason, version)
         self.log.info(
             f"loaded persisted daily target: date={trading_date} "
-            f"frozen_qty={len(target_qty)} frozen_asset={frozen_asset} version={version}",
+            f"frozen_qty={len(target_qty)} version={version}",
             color=LogColor.GREEN,
         )
 
@@ -484,7 +479,6 @@ class SnapshotRecorder(Actor):
         self,
         trading_date: date,
         target_qty: dict[str, Any],
-        total_asset: Any,
         reason: str,
         version: str | None,
     ) -> None:
@@ -493,7 +487,6 @@ class SnapshotRecorder(Actor):
                 quantities=target_qty,
                 target_date=trading_date,
                 reason=reason,
-                total_asset=total_asset,
                 version=version,
             )
         except Exception as exc:
@@ -570,7 +563,7 @@ class SnapshotRecorder(Actor):
             filled_qty=self._int_or_none(getattr(order, "filled_qty", None)) or 0 if order else 0,
             avg_fill_price=self._decimal_or_none(getattr(order, "avg_px", None)) if order else None,
             status=self._order_status_text(order, event),
-            target_weight=self._order_target_qty(client_order_id),
+            target_qty=self._order_target_qty(client_order_id),
             target_version=self._order_target_version(client_order_id),
             open_price=self._order_open_price(instrument_id_text),
             book_snapshot=self._order_book_snapshot(instrument_id, instrument_id_text),
@@ -863,13 +856,10 @@ class SnapshotRecorder(Actor):
             return SnapshotRecorder._jsonable(position)
         return {"can_use_volume": SnapshotRecorder._to_str(fallback_can_use)}
 
-    def _order_target_qty(self, client_order_id: str) -> Decimal | None:
+    def _order_target_qty(self, client_order_id: str) -> int | None:
         quantities = getattr(self._strategy, "_order_target_qty", {})
         if isinstance(quantities, dict) and client_order_id in quantities:
-            try:
-                return Decimal(str(quantities[client_order_id]))
-            except Exception:
-                return None
+            return self._int_or_none(quantities[client_order_id])
         return None
 
     def _order_target_version(self, client_order_id: str) -> str | None:

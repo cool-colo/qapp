@@ -503,13 +503,34 @@ class TargetLiveConfigTest(unittest.TestCase):
             ],
         )
 
-    def test_writer_ensure_order_columns_adds_open_price_and_book_snapshot(self) -> None:
+    def test_writer_ensure_order_columns_adds_target_qty_open_price_and_book_snapshot(self) -> None:
         writer = object.__new__(LiveSnapshotWriter)
         writer._query = MagicMock(
             return_value=[
                 ("id",),
                 ("trade_date",),
                 ("client_order_id",),
+            ],
+        )
+        writer._execute = MagicMock()
+
+        writer._ensure_order_columns()
+
+        self.assertEqual(
+            writer._execute.call_args_list,
+            [
+                call(
+                    "ALTER TABLE `live_order` ADD COLUMN `target_qty` BIGINT NULL",
+                    (),
+                ),
+                call(
+                    "ALTER TABLE `live_order` ADD COLUMN `open_price` DECIMAL(20,4) NULL",
+                    (),
+                ),
+                call(
+                    "ALTER TABLE `live_order` ADD COLUMN `book_snapshot` JSON NULL",
+                    (),
+                ),
             ],
         )
 
@@ -539,6 +560,19 @@ class TargetLiveConfigTest(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_writer_ensure_order_columns_renames_target_weight_to_target_qty(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._query = MagicMock(
+            return_value=[
+                ("id",),
+                ("trade_date",),
+                ("client_order_id",),
+                ("target_weight",),
+                ("open_price",),
+                ("book_snapshot",),
+            ],
+        )
         writer._execute = MagicMock()
 
         writer._ensure_order_columns()
@@ -547,11 +581,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             writer._execute.call_args_list,
             [
                 call(
-                    "ALTER TABLE `live_order` ADD COLUMN `open_price` DECIMAL(20,4) NULL",
-                    (),
-                ),
-                call(
-                    "ALTER TABLE `live_order` ADD COLUMN `book_snapshot` JSON NULL",
+                    "ALTER TABLE `live_order` CHANGE COLUMN `target_weight` `target_qty` BIGINT NULL",
                     (),
                 ),
             ],
@@ -667,13 +697,14 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder._strategy = SimpleNamespace(
             _stock_by_instrument={},
             _order_target_weights={},
+            _order_target_qty={"O-1": Decimal("20000")},
             _order_target_versions={},
         )
         recorder.cache = SimpleNamespace(order=MagicMock(return_value=None))
         recorder._now_naive = MagicMock(return_value=datetime(2026, 7, 9, 13, 21, 43))
         recorder._event_date = MagicMock(return_value=date(2026, 7, 9))
         recorder._stock_code = lambda instrument_id: SnapshotRecorder._stock_code(recorder, instrument_id)
-        recorder._order_target_weight = lambda client_order_id: SnapshotRecorder._order_target_weight(
+        recorder._order_target_qty = lambda client_order_id: SnapshotRecorder._order_target_qty(
             recorder,
             client_order_id,
         )
@@ -730,6 +761,7 @@ class TargetLiveConfigTest(unittest.TestCase):
 
         record = writer.upsert_order.call_args.args[0]
         self.assertEqual(record.client_order_id, "O-1")
+        self.assertEqual(record.target_qty, 20000)
         self.assertEqual(len(record.reason), SnapshotRecorder._LIVE_ORDER_REASON_MAX_LEN)
         self.assertTrue(record.reason.endswith("..."))
         self.assertEqual(record.open_price, Decimal("19.87"))

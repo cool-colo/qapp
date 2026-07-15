@@ -171,13 +171,12 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
     def _process_trading_day(self, trading_date: date) -> None:
         plan = self.compute_daily_target_plan(trading_date)
         # The risk-manager planner commits explicit share counts (固定目标股数); the
-        # executor trades toward those quantities against the frozen total asset. Weights
-        # on the plan are audit-only and are not consulted for execution.
+        # executor trades toward those quantities. Weights on the plan are audit-only
+        # and are not consulted for execution.
         self.update_target_quantities(
             quantities=plan.target_qty,
             target_date=trading_date,
             reason=plan.reason,
-            total_asset=plan.investable_asset,
             version=self._plan_version(plan),
         )
 

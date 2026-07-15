@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS `live_order` (
   `filled_qty`    BIGINT       NULL DEFAULT 0,
   `avg_fill_price` DECIMAL(20,4) NULL,
   `status`        VARCHAR(24)  NOT NULL,
-  `target_weight` DECIMAL(12,8) NULL,
+  `target_qty`    BIGINT       NULL,
   `target_version` VARCHAR(128) NULL,
   `open_price`    DECIMAL(20,4) NULL,
   `book_snapshot` JSON         NULL,
@@ -328,6 +328,7 @@ class LiveSnapshotWriter:
         Failures only warn implicitly via the caller's best-effort behavior.
         """
         additions = {
+            "target_qty": "BIGINT NULL",
             "open_price": "DECIMAL(20,4) NULL",
             "book_snapshot": "JSON NULL",
         }
@@ -338,6 +339,17 @@ class LiveSnapshotWriter:
             }
         except Exception:
             return
+        if "target_weight" in existing and "target_qty" not in existing:
+            try:
+                self._execute(
+                    "ALTER TABLE `live_order` CHANGE COLUMN `target_weight` `target_qty` BIGINT NULL",
+                    (),
+                )
+                existing.remove("target_weight")
+                existing.add("target_qty")
+            except Exception:
+                # Fall back to the additive path below when rename/type-change is not allowed.
+                pass
         for column, ddl in additions.items():
             if column in existing:
                 continue
@@ -757,7 +769,7 @@ class LiveSnapshotWriter:
             "filled_qty": record.filled_qty,
             "avg_fill_price": record.avg_fill_price,
             "status": record.status,
-            "target_weight": record.target_weight,
+            "target_qty": record.target_qty,
             "target_version": record.target_version,
             "open_price": record.open_price,
             "book_snapshot": _json_dumps(record.book_snapshot),

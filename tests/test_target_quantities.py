@@ -437,7 +437,6 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._target_date = None
         strategy._target_reason = "target_quantity"
         strategy._target_version = ""
-        strategy._target_total_asset = None
         strategy._achieved_versions = set()
         strategy._frozen_instruments = {}
         strategy._deferred_buys = {}
@@ -865,7 +864,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertIn("available_buy_cash=1000.0", summary_logs[0])
         self.assertIn("cash_gap=499000.0", summary_logs[0])
 
-    def test_update_target_quantities_accepts_loaded_frozen_total_asset(self) -> None:
+    def test_update_target_quantities_accepts_loaded_target_quantities(self) -> None:
         strategy = self.make_strategy(
             positions={INST_A: Decimal("1000")},
             free_cash="1000000",
@@ -876,13 +875,11 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy.update_target_quantities(
             quantities={INST_A: Decimal("1000")},
             target_date=date(2026, 7, 2),
-            reason="restart_frozen",
-            total_asset=Decimal("500000"),
-            version="frozen-v1",
+            reason="restart_loaded",
+            version="loaded-v1",
         )
 
         self.assertEqual(strategy._target_quantities, {str(INST_A): Decimal("1000")})
-        self.assertEqual(strategy._target_total_asset, Decimal("500000"))
         self.assertEqual(strategy.submitted_orders, [])
 
     def test_limit_up_freezes_only_affected_buy_symbol(self) -> None:
