@@ -957,6 +957,7 @@ class LiveSnapshotWriter:
         """
         try:
             self._query("SELECT 1", ())
+            _LOGGER.info("LiveSnapshotWriter keepalive ping succeeded")
             return True
         except Exception as exc:
             _LOGGER.warning("LiveSnapshotWriter keepalive ping failed: %r", exc)

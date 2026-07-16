@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -18,6 +20,7 @@ from urllib.parse import urlunsplit
 import pandas as pd
 
 
+_LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 NAUTILUS_TRADER_PATH = Path(
     os.environ.get("NAUTILUS_TRADER_PATH", "/data/flc/code/quant/nautilus_trader"),
@@ -145,17 +148,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stock-codes", default=",".join(env_list("MODEL_STOCK_CODES", "000001.SZ,000002.SZ")))
     parser.add_argument("--all-stocks", action="store_true", default=env_bool("MODEL_ALL_STOCKS", False))
     parser.add_argument("--excluded-stock-codes", default=",".join(env_list("MODEL_EXCLUDED_STOCK_CODES", "")))
-    parser.add_argument(
-        "--filter-bj",
-        action="store_true",
-        default=env_bool("MODEL_ENABLE_FILTER_BJ_STOCK_CODES", False),
-    )
-    parser.add_argument("--index-code", default=env("MODEL_INDEX_CODE", ""))
-    parser.add_argument(
-        "--index-weight-lookback-days",
-        type=int,
-        default=int(env("MODEL_INDEX_WEIGHT_LOOKBACK_DAYS", "370")),
-    )
     parser.add_argument("--min-score", type=float, default=parse_optional_float(env("MODEL_MIN_SCORE")))
     parser.add_argument("--top-frac", type=float, default=float(env("MODEL_TOP_FRAC", "0.10")))
     parser.add_argument("--max-positions", type=int, default=int(env("MODEL_MAX_POSITIONS", "30")))
@@ -176,7 +168,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(env("MODEL_TRAILING_TAKE_PROFIT_START", "0.0")),
     )
-    parser.add_argument("--min-avg-amount", type=float, default=float(env("MODEL_MIN_AVG_AMOUNT", "0.0")))
     parser.add_argument("--min-listed-days", type=int, default=int(env("MODEL_MIN_LISTED_DAYS", "120")))
     parser.add_argument(
         "--unfilled-timeout-secs",
@@ -244,7 +235,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--full-tick-refresh-secs",
         type=float,
-        default=float(env("MODEL_FULL_TICK_REFRESH_SECS", "60") or 60),
+        default=float(env("MODEL_FULL_TICK_REFRESH_SECS", "1") or 1),
         help=(
             "Interval in seconds for refreshing the authoritative full-tick snapshot "
             "(today's open, etc.) from the QMT proxy during the trading window. 0 disables."
@@ -539,13 +530,9 @@ def build_prediction_request(
         stock_codes=env_list_from_value(args.stock_codes),
         all_stocks=args.all_stocks,
         excluded_stock_codes=set(env_list_from_value(args.excluded_stock_codes)),
-        enable_filter_bj_stock_codes=args.filter_bj,
-        index_code=args.index_code.strip().upper(),
-        index_weight_lookback_days=args.index_weight_lookback_days,
         min_score=args.min_score,
         top_frac=args.top_frac,
         max_positions=args.max_positions,
-        min_avg_amount=args.min_avg_amount,
         signal_warmup_days=args.signal_warmup_days,
     )
 
@@ -582,7 +569,6 @@ def signal_config(bundle: PredictionDataBundle, loaded_stock_codes: set[str]) ->
                     "stock_code": signal.stock_code,
                     "score": signal.score,
                     "rank": signal.rank,
-                    "avg_amount_20": signal.avg_amount_20,
                 },
             )
         if rows:
@@ -675,9 +661,11 @@ GROUP BY source_code
         ``open`` to anchor pricing.
         """
         if not stock_codes:
+            _LOGGER.error("full-tick snapshot requested with empty stock_codes")
             return {}
         base_url = str(getattr(self.args, "base_url_http", "") or "").rstrip("/")
         if not base_url:
+            _LOGGER.error("full-tick snapshot requires base_url_http")
             return {}
         api_key = getattr(self.args, "api_key", None)
         symbol_to_stock = {qmt_symbol(code): code for code in stock_codes}
@@ -688,10 +676,13 @@ GROUP BY source_code
                 symbol = str(item.get("symbol", "")).strip().upper()
                 stock_code = symbol_to_stock.get(symbol)
                 if not stock_code:
+                    _LOGGER.warning("full-tick snapshot returned unrequested symbol: %s", symbol)
                     continue
                 tick = self._coerce_tick_fields(item.get("tick"))
                 if tick:
                     by_stock[stock_code] = tick
+                else:
+                    _LOGGER.error("full-tick snapshot returned unusable tick for %s: %s", stock_code, item.get("tick"))
         return {
             str(build_bar_type(stock_code).instrument_id): tick
             for stock_code, tick in by_stock.items()
@@ -811,19 +802,31 @@ GROUP BY source_code
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         timeout = float(getattr(self.args, "clickhouse_timeout_secs", 10.0) or 10.0)
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, ValueError, TimeoutError) as exc:
-            raise RuntimeError(f"QMT full-tick request failed: {exc}") from exc
-        if isinstance(payload, dict) and not payload.get("success", True):
-            raise RuntimeError(str(payload.get("message") or payload))
-        data = payload.get("data", payload) if isinstance(payload, dict) else payload
-        if isinstance(data, dict):
-            return list(data.get("items", []))
-        return list(data or [])
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                if isinstance(payload, dict) and not payload.get("success", True):
+                    raise RuntimeError(str(payload.get("message") or payload))
+                data = payload.get("data", payload) if isinstance(payload, dict) else payload
+                if isinstance(data, dict):
+                    return list(data.get("items", []))
+                return list(data or [])
+            except (urllib.error.URLError, ValueError, TimeoutError, RuntimeError) as exc:
+                if attempt >= max_attempts:
+                    raise RuntimeError(f"QMT full-tick request failed after {max_attempts} attempts: {exc}") from exc
+                _LOGGER.warning(
+                    "QMT full-tick request failed (attempt %d/%d), retrying in 1s: %s",
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                time.sleep(1)
+
+        raise RuntimeError(f"QMT full-tick request failed after {max_attempts} attempts")
 
 
 def normalized_stock_codes(values: set[str] | list[str]) -> set[str]:

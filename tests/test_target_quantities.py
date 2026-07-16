@@ -346,7 +346,7 @@ class TestableTargetQuantityStrategy:
     _schedule_on_loop = TargetQuantityStrategy._schedule_on_loop
     _on_pre_open_reconcile_done = TargetQuantityStrategy._on_pre_open_reconcile_done
     _log_pre_open_reconcile_result = TargetQuantityStrategy._log_pre_open_reconcile_result
-    _ensure_pricing_date = TargetQuantityStrategy._ensure_pricing_date
+    _roll_trading_day = TargetQuantityStrategy._roll_trading_day
     _update_price_state = TargetQuantityStrategy._update_price_state
     _set_authoritative_open = TargetQuantityStrategy._set_authoritative_open
     _apply_full_tick = TargetQuantityStrategy._apply_full_tick
@@ -478,7 +478,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._sleep = lambda seconds: strategy._sleep_calls.append(seconds)
         strategy._cancel_count_buy = {}
         strategy._cancel_count_sell = {}
-        strategy._pricing_date = None
+        strategy._trading_day = None
         strategy._quote_tick_window_probe_ids = set()
         strategy._subscribed_quote_tick_probe_instruments = set()
         # Seed a current in-window exchange event timestamp; these tests exercise
@@ -1440,7 +1440,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         # Regression for the 42.14-vs-53.09 bug: a stale non-authoritative value
         # must be overwritten by the authoritative full-tick open.
         strategy = self.make_strategy()
-        strategy._pricing_date = date(2026, 7, 2)
+        strategy._trading_day = date(2026, 7, 2)
         strategy._today_open = {str(INST_A): 42.14}
         strategy._authoritative_open = set()
         strategy.clock.now = pd.Timestamp("2026-07-02 01:27:00", tz="UTC")
@@ -1494,7 +1494,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         # End-to-end: after a full-tick refresh, a gap-up open drives the buy
         # limit price (open + offset), not a stale previously-cached value.
         strategy = self.make_strategy(open_prices={INST_A: 42.14})
-        strategy._pricing_date = date(2026, 7, 2)
+        strategy._trading_day = date(2026, 7, 2)
         strategy._authoritative_open = set()
         strategy._apply_full_tick({str(INST_A): {"open": 53.09}}, "prefetch")
 

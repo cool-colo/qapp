@@ -67,7 +67,7 @@ class SnapshotRecorderConfig(ActorConfig, frozen=True):
     # Keep the MySQL connection warm between trading sessions so the server doesn't
     # close the idle socket and make the next order-event burst each hit a
     # connection-lost error. 4 min is well under a typical wait_timeout.
-    keepalive_secs: int = 240
+    keepalive_secs: int = 20
 
 
 class SnapshotRecorder(Actor):
@@ -156,8 +156,6 @@ class SnapshotRecorder(Actor):
 
     def _schedule_keepalive(self) -> None:
         interval = int(self.config.keepalive_secs)
-        if interval <= 0:
-            return
         self.clock.set_timer(
             name=self._KEEPALIVE_TIMER,
             interval=timedelta(seconds=interval),

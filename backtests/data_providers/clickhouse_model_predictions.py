@@ -43,18 +43,6 @@ class ClickHouseModelPredictionDataProvider(ModelPredictionDataProvider):
         query_start = trading_dates[0].date()
 
         stock_codes = self._requested_stock_codes(request)
-        index_weights = pd.DataFrame()
-        if request.index_code:
-            index_weights = self._index_weights(
-                index_code=request.index_code,
-                start_date=(
-                    pd.Timestamp(query_start) - pd.Timedelta(days=int(request.index_weight_lookback_days))
-                ).date(),
-                end_date=query_end,
-            )
-            if index_weights.empty:
-                raise RuntimeError(f"No index weights found for {request.index_code}")
-            stock_codes = sorted(index_weights["stock_code"].dropna().unique().tolist())
 
         predictions = self._predictions(
             table=request.predictions_table,
@@ -74,22 +62,6 @@ class ClickHouseModelPredictionDataProvider(ModelPredictionDataProvider):
         if predictions.empty:
             raise RuntimeError("No predictions left after excluded stock code filtering")
 
-        if request.enable_filter_bj_stock_codes:
-            predictions = predictions.loc[~predictions["stock_code"].str.endswith(".BJ")].copy()
-        if predictions.empty:
-            raise RuntimeError("No predictions left after BJ stock code filtering")
-
-        if request.index_code:
-            predictions = filter_by_index_universe(predictions, index_weights)
-        if predictions.empty:
-            raise RuntimeError("No predictions left after index universe filtering")
-
-        predictions = self._add_liquidity_filter(
-            predictions=predictions,
-            start_date=query_start,
-            end_date=query_end,
-            min_avg_amount=request.min_avg_amount,
-        )
         selected = select_daily_signals(
             predictions,
             min_score=request.min_score,
@@ -180,68 +152,6 @@ WHERE {" AND ".join(where)}
 ORDER BY date, score DESC
 """
         return ensure_json_each_row(sql)
-
-    def _index_weights(self, index_code: str, start_date: date, end_date: date) -> pd.DataFrame:
-        sql = f"""
-SELECT trade_date AS date, index_code, con_code AS stock_code, weight
-FROM dwd_index_weight
-WHERE index_code = {quote_literal(index_code.upper())}
-  AND trade_date >= {quote_literal(str(start_date))}
-  AND trade_date <= {quote_literal(str(end_date))}
-ORDER BY date, stock_code
-"""
-        rows = self._fetch(ensure_json_each_row(sql))
-        frame = pd.DataFrame(rows)
-        if frame.empty:
-            return pd.DataFrame(columns=["date", "index_code", "stock_code", "weight"])
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
-        frame["stock_code"] = frame["stock_code"].map(normalize_stock_code)
-        frame["weight"] = pd.to_numeric(frame["weight"], errors="coerce")
-        return frame.dropna(subset=["date", "stock_code"]).reset_index(drop=True)
-
-    def _add_liquidity_filter(
-        self,
-        predictions: pd.DataFrame,
-        start_date: date,
-        end_date: date,
-        min_avg_amount: float,
-    ) -> pd.DataFrame:
-        if min_avg_amount <= 0 or predictions.empty:
-            result = predictions.copy()
-            result["avg_amount_20"] = np.nan
-            return result
-
-        stock_codes = sorted(predictions["stock_code"].dropna().unique().tolist())
-        values = ", ".join(quote_literal(code) for code in stock_codes)
-        sql = f"""
-SELECT trade_date AS date, source_code AS stock_code, close, vol AS volume, amount
-FROM dws_stock_factor_wide
-WHERE source_code IN ({values})
-  AND trade_date >= {quote_literal(str(start_date))}
-  AND trade_date <= {quote_literal(str(end_date))}
-ORDER BY source_code, trade_date
-"""
-        rows = self._fetch(ensure_json_each_row(sql))
-        bars = pd.DataFrame(rows)
-        if bars.empty:
-            raise RuntimeError("No bars returned for MODEL_MIN_AVG_AMOUNT liquidity filter")
-        bars["date"] = pd.to_datetime(bars["date"], errors="coerce").dt.normalize()
-        bars["stock_code"] = bars["stock_code"].map(normalize_stock_code)
-        bars["close"] = pd.to_numeric(bars["close"], errors="coerce")
-        bars["volume"] = pd.to_numeric(bars["volume"], errors="coerce")
-        bars["amount"] = pd.to_numeric(bars["amount"], errors="coerce")
-        bars["amount"] = bars["amount"].fillna(bars["close"] * bars["volume"])
-        bars["avg_amount_20"] = (
-            bars.sort_values(["stock_code", "date"])
-            .groupby("stock_code")["amount"]
-            .transform(lambda values: values.rolling(20, min_periods=20).mean())
-        )
-        merged = predictions.merge(
-            bars[["date", "stock_code", "avg_amount_20"]],
-            on=["date", "stock_code"],
-            how="left",
-        )
-        return merged.loc[merged["avg_amount_20"] >= float(min_avg_amount)].copy()
 
     def _instrument_metadata(
         self,
@@ -356,27 +266,6 @@ def normalize_prediction_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return result.loc[:, columns].reset_index(drop=True)
 
 
-def filter_by_index_universe(samples: pd.DataFrame, index_weights: pd.DataFrame) -> pd.DataFrame:
-    if samples.empty or index_weights.empty:
-        return samples.iloc[0:0].copy()
-    frame = samples.copy()
-    frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
-    frame["stock_code"] = frame["stock_code"].map(normalize_stock_code)
-    weights = index_weights[["date", "stock_code"]].copy()
-    weights["date"] = pd.to_datetime(weights["date"]).dt.normalize()
-    weights["stock_code"] = weights["stock_code"].map(normalize_stock_code)
-    weights = weights.dropna(subset=["date", "stock_code"]).drop_duplicates(["date", "stock_code"])
-    weight_dates = pd.DatetimeIndex(weights["date"].drop_duplicates().sort_values())
-    positions = weight_dates.searchsorted(frame["date"].to_numpy(dtype="datetime64[ns]"), side="right") - 1
-    effective_dates = np.full(len(frame), np.datetime64("NaT"), dtype="datetime64[ns]")
-    valid = positions >= 0
-    effective_dates[valid] = weight_dates.to_numpy()[positions[valid]]
-    frame["__index_weight_date"] = pd.to_datetime(effective_dates)
-    constituents = weights.rename(columns={"date": "__index_weight_date"})
-    filtered = frame.merge(constituents, on=["__index_weight_date", "stock_code"], how="inner")
-    return filtered.drop(columns=["__index_weight_date"]).reset_index(drop=True)
-
-
 def select_daily_signals(
     samples: pd.DataFrame,
     min_score: float | None,
@@ -408,14 +297,12 @@ def build_signal_map(selected: pd.DataFrame) -> dict[date, list[PredictionSignal
         signal_date = pd.Timestamp(value).date()
         signals = []
         for row in part.sort_values("rank").itertuples():
-            avg_amount = getattr(row, "avg_amount_20", None)
             signals.append(
                 PredictionSignal(
                     signal_date=signal_date,
                     stock_code=str(row.stock_code),
                     score=float(row.score),
                     rank=int(row.rank),
-                    avg_amount_20=None if pd.isna(avg_amount) else float(avg_amount),
                 ),
             )
         signals_by_date[signal_date] = signals

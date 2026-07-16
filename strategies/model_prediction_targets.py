@@ -383,7 +383,6 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 rank=entry_rank,
                 side="buy",
                 selected=True,
-                extra={"avg_amount_20": signal.get("avg_amount_20")},
             )
 
     def _trim_active_positions(self) -> None:

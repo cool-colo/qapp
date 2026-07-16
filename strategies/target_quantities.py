@@ -176,7 +176,7 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     subscribe_trade_ticks: bool = True
     quote_tick_window_probe_instrument_ids: tuple[InstrumentId, ...] = ()
     subscribe_order_book_depth: bool = False
-    full_tick_refresh_secs: float = 60.0
+    full_tick_refresh_secs: float = 1.0
     full_tick_prefetch_time: str | None = "09:27"
 
 
@@ -246,13 +246,17 @@ class TargetQuantityStrategy(Strategy):
         # Instruments whose _today_open came from an authoritative source (real
         # bar open or QMT full-tick).
         self._authoritative_open: set[str] = set()
+        # True once the first depth-driven convergence of the current trading day
+        # has fired (reset per day in _roll_trading_day). Lets the earliest
+        # order-book depth callback submit orders as early as possible.
+        self._depth_converged_today = False
         self._depth_books: dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]] = {}
         self._subscribed_order_book_depth_instruments: set[str] = set()
         self._sleep = time.sleep
         # Side-specific cancel counts per instrument; reset daily and on fill.
         self._cancel_count_buy: dict[str, int] = {}
         self._cancel_count_sell: dict[str, int] = {}
-        self._pricing_date: date | None = None
+        self._trading_day: date | None = None
         # Latest quote tick event timestamp. The order gate requires both the
         # local clock and the exchange event timestamp to be inside their
         # configured windows, preventing stale/pre-open quotes from unlocking
@@ -348,18 +352,15 @@ class TargetQuantityStrategy(Strategy):
         self._start_full_tick_refresh()
 
     def _start_full_tick_refresh(self) -> None:
-        if self._full_tick_source is None:
-            return
+
         refresh_secs = float(self.config.full_tick_refresh_secs)
-        if refresh_secs > 0:
-            self.clock.set_timer(
-                name=self._FULL_TICK_REFRESH_TIMER,
-                interval=timedelta(seconds=refresh_secs),
-                callback=self._on_full_tick_refresh_timer,
-                fire_immediately=False,
-            )
-        if self._full_tick_prefetch_time is not None:
-            self._schedule_full_tick_prefetch()
+        self.clock.set_timer(
+            name=self._FULL_TICK_REFRESH_TIMER,
+            interval=timedelta(seconds=refresh_secs),
+            callback=self._on_full_tick_refresh_timer,
+            fire_immediately=False,
+        )
+        self._schedule_full_tick_prefetch()
         # Prime the snapshot immediately on start (e.g. mid-session restart) so the
         # first convergence prices against real opens.
         self._run_full_tick_fetch(trigger="start")
@@ -389,8 +390,7 @@ class TargetQuantityStrategy(Strategy):
         self._run_full_tick_fetch(trigger="refresh")
 
     def _run_full_tick_fetch(self, trigger: str) -> None:
-        if self._full_tick_source is None:
-            return
+
         if self._full_tick_task is not None and not self._full_tick_task.done():
             return
         try:
@@ -425,12 +425,14 @@ class TargetQuantityStrategy(Strategy):
         signature change.
         """
         if not isinstance(snapshot, dict) or not snapshot:
+            self.log.warning(f"full-tick snapshot is invalid! ({trigger})")
             return
         trading_date = self._clock_date()
         updated = 0
         for instrument_id, fields in snapshot.items():
             open_price = self._full_tick_open(fields)
             if open_price is None:
+                self.log.warning(f"full-tick snapshot contains invalid open price for {instrument_id} ({trigger})")
                 continue
             if self._set_authoritative_open(str(instrument_id), trading_date, open_price):
                 updated += 1
@@ -460,7 +462,7 @@ class TargetQuantityStrategy(Strategy):
         """Set today's open from an authoritative source."""
         if open_price <= 0:
             return False
-        self._ensure_pricing_date(trading_date)
+        self._roll_trading_day(trading_date)
         previous = self._today_open.get(instrument_id)
         self._today_open[instrument_id] = float(open_price)
         self._authoritative_open.add(instrument_id)
@@ -762,7 +764,7 @@ class TargetQuantityStrategy(Strategy):
         # The first real bar of the day carries the true daily open; later intraday
         # bars must not clobber it. Full-tick fetches (below) remain authoritative
         # and may still refine it.
-        self._ensure_pricing_date(trading_date)
+        self._roll_trading_day(trading_date)
         if instrument_id not in self._authoritative_open:
             self._set_authoritative_open(instrument_id, trading_date, float(bar.open))
         within_window = self._within_trading_window()
@@ -774,13 +776,22 @@ class TargetQuantityStrategy(Strategy):
     def on_target_bar(self, bar: Bar) -> None:
         """Hook for subclasses to update targets before convergence."""
 
-    def _ensure_pricing_date(self, trading_date: date) -> None:
-        if trading_date == self._pricing_date:
+    def _roll_trading_day(self, trading_date: date) -> None:
+        """Roll intraday state to ``trading_date``.
+
+        Idempotent within a day: when the trading date is unchanged this is a
+        no-op. On a day boundary it resets all per-day intraday state (today's
+        opens, depth books, the first-depth convergence flag, cancel counts) and
+        drops stale quote timestamps so they cannot satisfy the exchange window
+        gate.
+        """
+        if trading_date == self._trading_day:
             return
-        self._pricing_date = trading_date
+        self._trading_day = trading_date
         self._today_open = {}
         self._authoritative_open = set()
         self._depth_books = {}
+        self._depth_converged_today = False
         self._cancel_count_buy = {}
         self._cancel_count_sell = {}
         # New trading day: stale quote timestamps must not satisfy the exchange
@@ -794,7 +805,7 @@ class TargetQuantityStrategy(Strategy):
         trading_date: date,
         last_price: float | None = None,
     ) -> None:
-        self._ensure_pricing_date(trading_date)
+        self._roll_trading_day(trading_date)
         if last_price is not None and last_price > 0:
             self._last_close[instrument_id] = float(last_price)
 
@@ -832,8 +843,16 @@ class TargetQuantityStrategy(Strategy):
         # price (pre-open auction levels are provisional, snapshots are sparse), so
         # it must never feed _today_open / _last_close. Today's open comes from
         # real bars or the QMT full-tick snapshot.
-        self._ensure_pricing_date(trading_date)
+        self._roll_trading_day(trading_date)
         self._depth_books[str(depth.instrument_id)] = (bids, asks)
+        # On the first depth callback of each trading day, converge immediately so
+        # orders are submitted as early as possible (priced against real depth)
+        # rather than waiting for the next bar/timer. Gated on the trading window.
+        if not self._depth_converged_today and self._within_trading_window(
+            int(getattr(depth, "ts_event", 0) or 0),
+        ):
+            self._depth_converged_today = True
+            self._converge_to_target(current_date=trading_date, trigger="order_book_depth")
         if not self._should_log_sample(self.config.order_book_depth_log_sample_rate):
             return
         self.log.info(

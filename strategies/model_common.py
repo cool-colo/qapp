@@ -32,7 +32,6 @@ def normalize_signals(raw: dict[str, list[dict[str, Any]]]) -> dict[date, list[d
                     "stock_code": str(signal["stock_code"]),
                     "score": float(signal["score"]),
                     "rank": int(signal.get("rank", len(normalized) + 1)),
-                    "avg_amount_20": signal.get("avg_amount_20"),
                 },
             )
         result[signal_date] = normalized

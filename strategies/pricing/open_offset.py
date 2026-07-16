@@ -68,7 +68,7 @@ class OpenOffsetBuyPriceStrategy(BuyPriceStrategy):
     def __init__(
         self,
         offset_bps: float = 5.0,
-        max_price_bps: float = 10.0,
+        max_price_bps: float = 100.0,
         cancel_threshold: int = 2,
     ) -> None:
         self.offset_bps = float(offset_bps)

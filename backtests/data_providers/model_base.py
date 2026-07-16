@@ -17,13 +17,9 @@ class ModelPredictionDataRequest:
     stock_codes: list[str] | None = None
     all_stocks: bool = False
     excluded_stock_codes: set[str] | None = None
-    enable_filter_bj_stock_codes: bool = False
-    index_code: str = ""
-    index_weight_lookback_days: int = 370
     min_score: float | None = None
     top_frac: float = 0.10
     max_positions: int = 30
-    min_avg_amount: float = 0.0
     signal_warmup_days: int = 7
 
 
@@ -33,7 +29,6 @@ class PredictionSignal:
     stock_code: str
     score: float
     rank: int
-    avg_amount_20: float | None = None
 
 
 @dataclass(frozen=True)
@@ -58,7 +53,6 @@ class PredictionDataBundle:
                         "stock_code": signal.stock_code,
                         "score": signal.score,
                         "rank": signal.rank,
-                        "avg_amount_20": signal.avg_amount_20,
                     },
                 )
         return pd.DataFrame(rows)

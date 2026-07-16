@@ -71,7 +71,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         with patch.dict(os.environ, {"QMT_ACCOUNT_ID": "TEST"}, clear=False):
             with patch.object(sys, "argv", ["test"]):
                 args = parse_args()
-        self.assertEqual(args.full_tick_refresh_secs, 60.0)
+        self.assertEqual(args.full_tick_refresh_secs, 1.0)
         self.assertEqual(args.full_tick_prefetch_time, "09:27")
 
     def test_full_tick_prefetch_can_be_disabled(self) -> None:
@@ -96,7 +96,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             st_by_date={},
             suspended_by_date={},
         )
-        self.assertEqual(config.full_tick_refresh_secs, 60.0)
+        self.assertEqual(config.full_tick_refresh_secs, 1.0)
         self.assertEqual(config.full_tick_prefetch_time, "09:27")
 
     def test_daily_log_file_name_defaults_to_model_preds_with_exchange_date(self) -> None:
@@ -185,7 +185,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder.config = SnapshotRecorderConfig(
             account_id="ACC",
             trader_id="TRADER",
-            keepalive_secs=240,
+            keepalive_secs=20,
         )
         recorder.clock = MagicMock()
         recorder.log = MagicMock()
@@ -201,19 +201,6 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(kwargs["callback"], recorder._on_keepalive)
         self.assertFalse(kwargs["fire_immediately"])
 
-    def test_snapshot_recorder_keepalive_disabled_when_non_positive(self) -> None:
-        recorder = SimpleNamespace()
-        recorder.config = SnapshotRecorderConfig(
-            account_id="ACC",
-            trader_id="TRADER",
-            keepalive_secs=0,
-        )
-        recorder.clock = MagicMock()
-        recorder.log = MagicMock()
-
-        SnapshotRecorder._schedule_keepalive(recorder)
-
-        recorder.clock.set_timer.assert_not_called()
 
     def test_snapshot_recorder_keepalive_pings_writer(self) -> None:
         recorder = SimpleNamespace()

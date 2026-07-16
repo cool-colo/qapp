@@ -39,7 +39,7 @@
 
 ### 2. `lives/snapshot_recorder.py`
 
-- `SnapshotRecorderConfig` 新增 `keepalive_secs: int = 240`(4 分钟)。
+- `SnapshotRecorderConfig` 新增 `keepalive_secs: int = 20`(20 秒)。
 - `on_start()` 用 `self.clock.set_timer(name="SNAPSHOT-DB-KEEPALIVE",
   interval=timedelta(seconds=keepalive_secs), callback=self._on_keepalive,
   fire_immediately=False)` 注册。

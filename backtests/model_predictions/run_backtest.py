@@ -91,17 +91,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stock-codes", default=",".join(env_list("MODEL_STOCK_CODES", "000001.SZ,000002.SZ")))
     parser.add_argument("--all-stocks", action="store_true", default=env_bool("MODEL_ALL_STOCKS", False))
     parser.add_argument("--excluded-stock-codes", default=",".join(env_list("MODEL_EXCLUDED_STOCK_CODES", "")))
-    parser.add_argument(
-        "--filter-bj",
-        action="store_true",
-        default=env_bool("MODEL_ENABLE_FILTER_BJ_STOCK_CODES", False),
-    )
-    parser.add_argument("--index-code", default=env("MODEL_INDEX_CODE", ""))
-    parser.add_argument(
-        "--index-weight-lookback-days",
-        type=int,
-        default=int(env("MODEL_INDEX_WEIGHT_LOOKBACK_DAYS", "370")),
-    )
     parser.add_argument("--min-score", type=float, default=parse_optional_float(env("MODEL_MIN_SCORE")))
     parser.add_argument("--top-frac", type=float, default=float(env("MODEL_TOP_FRAC", "0.10")))
     parser.add_argument("--max-positions", type=int, default=int(env("MODEL_MAX_POSITIONS", "30")))
@@ -128,7 +117,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(env("MODEL_TRAILING_TAKE_PROFIT_START", "0.0")),
     )
-    parser.add_argument("--min-avg-amount", type=float, default=float(env("MODEL_MIN_AVG_AMOUNT", "0.0")))
     parser.add_argument("--min-listed-days", type=int, default=int(env("MODEL_MIN_LISTED_DAYS", "120")))
     parser.add_argument("--signal-warmup-days", type=int, default=int(env("MODEL_SIGNAL_WARMUP_DAYS", "7")))
     parser.add_argument("--max-universe", type=int, default=int(env("MODEL_MAX_UNIVERSE", "0")))
@@ -173,13 +161,9 @@ def build_prediction_request(args: argparse.Namespace) -> ModelPredictionDataReq
         stock_codes=env_list_from_value(args.stock_codes),
         all_stocks=args.all_stocks,
         excluded_stock_codes=set(env_list_from_value(args.excluded_stock_codes)),
-        enable_filter_bj_stock_codes=args.filter_bj,
-        index_code=args.index_code.strip().upper(),
-        index_weight_lookback_days=args.index_weight_lookback_days,
         min_score=args.min_score,
         top_frac=args.top_frac,
         max_positions=args.max_positions,
-        min_avg_amount=args.min_avg_amount,
         signal_warmup_days=args.signal_warmup_days,
     )
 
@@ -338,7 +322,6 @@ def signals_config(bundle: PredictionDataBundle, loaded_stock_codes: set[str]) -
                     "stock_code": signal.stock_code,
                     "score": signal.score,
                     "rank": signal.rank,
-                    "avg_amount_20": signal.avg_amount_20,
                 },
             )
         if rows:
@@ -377,7 +360,7 @@ def create_experiment_record(args: argparse.Namespace, experiment_id_value: str,
         engine_name="nautilus_trader",
         status="running",
         benchmark=benchmark_config.display_name if benchmark_config.enabled else None,
-        universe_id=args.index_code.strip().upper() or None,
+        universe_id=None,
         cost_config={},
         slippage_config={},
         risk_config={"risk_engine_bypass": True},
@@ -418,9 +401,6 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.stock_codes": args.stock_codes,
         "strategy.all_stocks": args.all_stocks,
         "strategy.excluded_stock_codes": args.excluded_stock_codes,
-        "strategy.filter_bj": args.filter_bj,
-        "strategy.index_code": args.index_code.strip().upper(),
-        "strategy.index_weight_lookback_days": args.index_weight_lookback_days,
         "strategy.min_score": args.min_score,
         "strategy.top_frac": args.top_frac,
         "strategy.max_positions": args.max_positions,
@@ -429,7 +409,6 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.stop_loss": args.stop_loss,
         "strategy.trailing_take_profit": args.trailing_take_profit,
         "strategy.trailing_take_profit_start": args.trailing_take_profit_start,
-        "strategy.min_avg_amount": args.min_avg_amount,
         "strategy.min_listed_days": args.min_listed_days,
         "base.start_date": args.start,
         "base.end_date": args.end,
