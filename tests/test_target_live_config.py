@@ -29,7 +29,9 @@ from lives.live_qmt_target_model_predictions import _resolve_daily_log_file_name
 from lives.snapshot_recorder import SnapshotRecorder
 from lives.snapshot_recorder import SnapshotRecorderConfig
 from lives.live_qmt_target_model_predictions import normalize_refresh_time
+from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig
+from strategies.target_quantities import TargetQuantityStrategy
 
 
 class TargetLiveConfigTest(unittest.TestCase):
@@ -47,6 +49,84 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(config.max_position_percent, 0.03)
         self.assertFalse(config.process_targets_on_timer)
 
+    def test_process_trading_day_prefers_live_target_portfolio(self) -> None:
+        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        signal_date = date(2026, 7, 7)
+        trading_date = date(2026, 7, 8)
+        loader = MagicMock(
+            return_value=[
+                {
+                    "instrument_id": "000001.SZ.QMT",
+                    "target_qty": 1000,
+                    "target_version": "ver-1",
+                    "reason": "risk_manager_optimize",
+                },
+                {
+                    "instrument_id": "000002.SZ.QMT",
+                    "target_qty": 0,
+                    "target_version": "ver-1",
+                    "reason": "risk_manager_optimize",
+                },
+            ],
+        )
+        strategy._live_target_portfolio_loader = loader
+        strategy._resolve_signal_date = MagicMock(return_value=signal_date)
+        strategy.compute_daily_target_plan = MagicMock()
+        strategy.update_target_quantities = MagicMock()
+
+        strategy._process_trading_day(trading_date)
+
+        loader.assert_called_once_with(trading_date, signal_date)
+        strategy.compute_daily_target_plan.assert_not_called()
+        strategy.update_target_quantities.assert_called_once_with(
+            quantities={"000001.SZ.QMT": 1000, "000002.SZ.QMT": 0},
+            target_date=trading_date,
+            reason="risk_manager_optimize",
+            version="ver-1",
+        )
+
+    def test_process_trading_day_computes_when_live_target_portfolio_missing(self) -> None:
+        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        trading_date = date(2026, 7, 8)
+        plan = SimpleNamespace(target_qty={"000001.SZ.QMT": 1000}, reason="computed")
+        strategy._live_target_portfolio_loader = MagicMock(return_value=[])
+        strategy._resolve_signal_date = MagicMock(return_value=date(2026, 7, 7))
+        strategy.compute_daily_target_plan = MagicMock(return_value=plan)
+        strategy._plan_version = MagicMock(return_value="computed-ver")
+        strategy.update_target_quantities = MagicMock()
+
+        strategy._process_trading_day(trading_date)
+
+        strategy.compute_daily_target_plan.assert_called_once_with(trading_date)
+        strategy.update_target_quantities.assert_called_once_with(
+            quantities={"000001.SZ.QMT": 1000},
+            target_date=trading_date,
+            reason="computed",
+            version="computed-ver",
+        )
+
+    def test_process_trading_day_fails_when_live_target_rows_have_no_quantities(self) -> None:
+        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        strategy._live_target_portfolio_loader = MagicMock(
+            return_value=[
+                {
+                    "instrument_id": "000001.SZ.QMT",
+                    "target_qty": None,
+                    "target_version": "ver-1",
+                    "reason": "risk_manager_optimize",
+                },
+            ],
+        )
+        strategy._resolve_signal_date = MagicMock(return_value=date(2026, 7, 7))
+        strategy.compute_daily_target_plan = MagicMock()
+        strategy.update_target_quantities = MagicMock()
+
+        with self.assertRaisesRegex(RuntimeError, "target_qty"):
+            strategy._process_trading_day(date(2026, 7, 8))
+
+        strategy.compute_daily_target_plan.assert_not_called()
+        strategy.update_target_quantities.assert_not_called()
+
     def test_normalize_refresh_time_accepts_hh_mm_and_hh_mm_ss(self) -> None:
         self.assertEqual(normalize_refresh_time("9:00"), "09:00")
         self.assertEqual(normalize_refresh_time("09:00:30"), "09:00")
@@ -57,15 +137,15 @@ class TargetLiveConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_refresh_time("25:00")
 
-    def test_pre_open_reconcile_time_defaults_to_0915(self) -> None:
+    def test_parse_args_does_not_expose_pre_open_reconcile_time(self) -> None:
         with patch.dict(
             os.environ,
-            {"QMT_ACCOUNT_ID": "TEST", "MODEL_LIVE_PRE_OPEN_RECONCILE_TIME": "09:15"},
+            {"QMT_ACCOUNT_ID": "TEST"},
             clear=False,
         ):
             with patch.object(sys, "argv", ["test"]):
                 args = parse_args()
-        self.assertEqual(args.pre_open_reconcile_time, "09:15")
+        self.assertFalse(hasattr(args, "pre_open_reconcile_time"))
 
     def test_full_tick_args_default(self) -> None:
         with patch.dict(os.environ, {"QMT_ACCOUNT_ID": "TEST"}, clear=False):
@@ -99,21 +179,46 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(config.full_tick_refresh_secs, 1.0)
         self.assertEqual(config.full_tick_prefetch_time, "09:27")
 
-    def test_daily_log_file_name_defaults_to_model_preds_with_exchange_date(self) -> None:
-        fake_now = SimpleNamespace(strftime=lambda fmt: "2026-07-08")
-        with patch("lives.live_qmt_target_model_predictions.pd.Timestamp.now", return_value=fake_now):
-            self.assertEqual(
-                _resolve_daily_log_file_name(None, "Asia/Shanghai"),
-                "model_preds-2026-07-08",
-            )
+    def test_model_targets_timer_uses_dedicated_callback(self) -> None:
+        class TargetTimerStub:
+            _PROCESS_TARGETS_TIMER = TargetModelPredictionsStrategy._PROCESS_TARGETS_TIMER
+            _start_process_targets_timer = TargetModelPredictionsStrategy._start_process_targets_timer
+            _on_process_targets_timer = TargetModelPredictionsStrategy._on_process_targets_timer
 
-    def test_daily_log_file_name_appends_date_to_configured_base(self) -> None:
-        fake_now = SimpleNamespace(strftime=lambda fmt: "2026-07-08")
-        with patch("lives.live_qmt_target_model_predictions.pd.Timestamp.now", return_value=fake_now):
-            self.assertEqual(
-                _resolve_daily_log_file_name("model_preds", "Asia/Shanghai"),
-                "model_preds-2026-07-08",
-            )
+        config = TargetModelPredictionsStrategyConfig(
+            instrument_ids=[],
+            bar_types={},
+            instrument_stock_codes={},
+            signals_by_date={},
+            trading_dates=[],
+            listed_dates={},
+            st_by_date={},
+            suspended_by_date={},
+            process_targets_on_timer=True,
+            process_targets_interval_secs=7.0,
+        )
+        strategy = TargetTimerStub()
+        strategy.config = config
+        strategy.clock = MagicMock()
+
+        strategy._start_process_targets_timer()
+
+        strategy.clock.set_timer.assert_called_once()
+        kwargs = strategy.clock.set_timer.call_args.kwargs
+        self.assertEqual(kwargs["name"], TargetModelPredictionsStrategy._PROCESS_TARGETS_TIMER)
+        self.assertEqual(kwargs["interval"], timedelta(seconds=7))
+        self.assertEqual(kwargs["callback"], strategy._on_process_targets_timer)
+        self.assertFalse(kwargs["fire_immediately"])
+        self.assertIs(
+            TargetModelPredictionsStrategy._on_converge_timer,
+            TargetQuantityStrategy._on_converge_timer,
+        )
+
+    def test_daily_log_file_name_defaults_to_nautilus_daily_rotation(self) -> None:
+        self.assertIsNone(_resolve_daily_log_file_name(None, "Asia/Shanghai"))
+
+    def test_daily_log_file_name_base_uses_nautilus_daily_rotation(self) -> None:
+        self.assertIsNone(_resolve_daily_log_file_name("model_preds", "Asia/Shanghai"))
 
     def test_daily_log_file_name_preserves_existing_date(self) -> None:
         fake_now = SimpleNamespace(strftime=lambda fmt: "2026-07-08")
@@ -169,7 +274,8 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder._run_after_trading.assert_not_called()
 
     def test_snapshot_recorder_post_close_start_uses_continuous_then_after(self) -> None:
-        recorder = self._make_snapshot_recorder_stub("2026-07-08 15:41:00")
+        # Start after the configured after_time (default 23:00, once QMT has settled).
+        recorder = self._make_snapshot_recorder_stub("2026-07-08 23:01:00")
 
         SnapshotRecorder._catch_up_on_start(recorder)
 
@@ -180,36 +286,43 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
         recorder._run_after_trading.assert_called_once_with(date(2026, 7, 8), allow_fallback=True)
 
-    def test_snapshot_recorder_schedules_keepalive_timer(self) -> None:
-        recorder = SimpleNamespace()
-        recorder.config = SnapshotRecorderConfig(
-            account_id="ACC",
-            trader_id="TRADER",
-            keepalive_secs=20,
+    def test_warn_if_asset_inconsistent_warns_on_large_gap(self) -> None:
+        recorder = SimpleNamespace(log=MagicMock())
+        # total_asset overshoots components by ~2% (unsettled T+1 proceeds): warn.
+        SnapshotRecorder._warn_if_asset_inconsistent(
+            recorder,
+            AFTER_TRADING,
+            Decimal("10013512.18"),
+            Decimal("9128140.00"),
+            Decimal("584777.63"),
+            Decimal("104984.00"),
         )
-        recorder.clock = MagicMock()
-        recorder.log = MagicMock()
-        recorder._KEEPALIVE_TIMER = SnapshotRecorder._KEEPALIVE_TIMER
-        recorder._on_keepalive = object()
+        recorder.log.warning.assert_called_once()
 
-        SnapshotRecorder._schedule_keepalive(recorder)
+    def test_warn_if_asset_inconsistent_silent_when_reconciled(self) -> None:
+        recorder = SimpleNamespace(log=MagicMock())
+        # total_asset == market_value + cash + frozen_cash: no warning.
+        SnapshotRecorder._warn_if_asset_inconsistent(
+            recorder,
+            AFTER_TRADING,
+            Decimal("9935864.32"),
+            Decimal("9158457.00"),
+            Decimal("672401.27"),
+            Decimal("105006.05"),
+        )
+        recorder.log.warning.assert_not_called()
 
-        recorder.clock.set_timer.assert_called_once()
-        kwargs = recorder.clock.set_timer.call_args.kwargs
-        self.assertEqual(kwargs["name"], SnapshotRecorder._KEEPALIVE_TIMER)
-        self.assertEqual(kwargs["interval"], timedelta(seconds=240))
-        self.assertEqual(kwargs["callback"], recorder._on_keepalive)
-        self.assertFalse(kwargs["fire_immediately"])
-
-
-    def test_snapshot_recorder_keepalive_pings_writer(self) -> None:
-        recorder = SimpleNamespace()
-        recorder._writer = MagicMock()
-        recorder.log = MagicMock()
-
-        SnapshotRecorder._on_keepalive(recorder, None)
-
-        recorder._writer.ping.assert_called_once_with()
+    def test_warn_if_asset_inconsistent_silent_on_missing_component(self) -> None:
+        recorder = SimpleNamespace(log=MagicMock())
+        SnapshotRecorder._warn_if_asset_inconsistent(
+            recorder,
+            AFTER_TRADING,
+            Decimal("10000000"),
+            None,
+            Decimal("500000"),
+            Decimal("100000"),
+        )
+        recorder.log.warning.assert_not_called()
 
     def test_writer_asset_snapshot_id_falls_back_to_continuous(self) -> None:
         writer = object.__new__(LiveSnapshotWriter)
@@ -281,35 +394,35 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(rows[0]["snapshot_type"], CONTINUOUS_TRADING)
         self.assertEqual(writer._query.call_count, 2)
 
-    def test_writer_execute_retries_once_after_connection_lost(self) -> None:
+    def test_writer_execute_commits_through_pooled_connection(self) -> None:
+        # The writer now checks out a connection from the pool (here a single-connection
+        # engine shim), runs on its cursor, commits, and returns it to the pool. Verify
+        # the SQL/paramstyle path is unchanged and commit fires.
         cursor = MagicMock()
-        # First cursor.execute raises the classic dropped-connection error, second succeeds.
-        cursor.execute.side_effect = [Exception(0, ""), None]
         connection = MagicMock()
         connection.cursor.return_value = cursor
-        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=False)
+        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=True)
 
         writer._execute("INSERT INTO t VALUES (%s)", (1,))
 
-        self.assertEqual(cursor.execute.call_count, 2)
-        connection.ping.assert_called_once_with(reconnect=True)
+        cursor.execute.assert_called_once_with("INSERT INTO t VALUES (%s)", (1,))
+        connection.commit.assert_called_once_with()
 
-    def test_writer_execute_does_not_retry_on_non_connection_error(self) -> None:
+    def test_writer_execute_rolls_back_and_raises_on_error(self) -> None:
         cursor = MagicMock()
         cursor.execute.side_effect = Exception(1062, "Duplicate entry")
         connection = MagicMock()
         connection.cursor.return_value = cursor
-        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=False)
+        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=True)
 
         with self.assertRaises(Exception):
             writer._execute("INSERT INTO t VALUES (%s)", (1,))
 
-        self.assertEqual(cursor.execute.call_count, 1)
-        connection.ping.assert_not_called()
+        connection.rollback.assert_called_once_with()
+        connection.commit.assert_not_called()
 
-    def test_writer_query_retries_once_after_connection_lost(self) -> None:
+    def test_writer_query_reads_through_pooled_connection(self) -> None:
         cursor = MagicMock()
-        cursor.execute.side_effect = [Exception(2013, "Lost connection"), None]
         cursor.fetchall.return_value = [(7,)]
         connection = MagicMock()
         connection.cursor.return_value = cursor
@@ -318,103 +431,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         rows = writer._query("SELECT 1", ())
 
         self.assertEqual(rows, [(7,)])
-        self.assertEqual(cursor.execute.call_count, 2)
-        connection.ping.assert_called_once_with(reconnect=True)
-
-    def test_writer_execute_logs_reconnect_failure_details(self) -> None:
-        cursor = MagicMock()
-        cursor.execute.side_effect = Exception(0, "")
-        connection = MagicMock()
-        connection.cursor.return_value = cursor
-        connection.ping.side_effect = Exception(2006, "server has gone away")
-        connection.connect.side_effect = Exception(2003, "can't connect")
-        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=False)
-
-        with patch("backtests.result_writers.live_writer._LOGGER") as logger:
-            with self.assertRaises(Exception):
-                writer._execute("INSERT INTO t VALUES (%s)", (1,))
-
-        logger.warning.assert_any_call(
-            "LiveSnapshotWriter ping(reconnect=True) failed: %r",
-            connection.ping.side_effect,
-        )
-        logger.warning.assert_any_call(
-            "LiveSnapshotWriter connect() failed during reconnect: %r",
-            connection.connect.side_effect,
-        )
-        logger.warning.assert_any_call(
-            "LiveSnapshotWriter failed to reconnect after connection-lost error: %r",
-            cursor.execute.side_effect,
-        )
-
-    def test_writer_execute_logs_retry_failure_after_reconnect(self) -> None:
-        first_exc = Exception(0, "")
-        retry_exc = Exception(1064, "bad sql")
-        cursor = MagicMock()
-        cursor.execute.side_effect = [first_exc, retry_exc]
-        connection = MagicMock()
-        connection.cursor.return_value = cursor
-        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=False)
-
-        with patch("backtests.result_writers.live_writer._LOGGER") as logger:
-            with self.assertRaises(Exception):
-                writer._execute("INSERT INTO t VALUES (%s)", (1,))
-
-        logger.warning.assert_any_call(
-            "LiveSnapshotWriter retry after reconnect failed; original=%r retry=%r",
-            first_exc,
-            retry_exc,
-        )
-        connection.ping.assert_called_once_with(reconnect=True)
-
-    def test_writer_reconnect_rebuilds_from_connect_kwargs(self) -> None:
-        # With connect kwargs on hand, a dropped socket must be rebuilt from scratch
-        # (a fresh connection), not poked via ping()/connect() on the dead object.
-        dead_cursor = MagicMock()
-        dead_cursor.execute.side_effect = Exception(2013, "Lost connection")
-        dead_connection = MagicMock()
-        dead_connection.cursor.return_value = dead_cursor
-
-        fresh_cursor = MagicMock()
-        fresh_cursor.execute.return_value = None
-        fresh_connection = MagicMock()
-        fresh_connection.cursor.return_value = fresh_cursor
-
-        writer = LiveSnapshotWriter.for_testing(connection=dead_connection, commit=False)
-        writer._connect_kwargs = {"host": "127.0.0.1"}
-
-        with patch.object(
-            LiveSnapshotWriter,
-            "_create_connection",
-            return_value=fresh_connection,
-        ) as create:
-            writer._execute("INSERT INTO t VALUES (%s)", (1,))
-
-        create.assert_called_once_with({"host": "127.0.0.1"})
-        self.assertIs(writer._connection, fresh_connection)
-        # The dead connection is never pinged/reconnected when a rebuild is possible.
-        dead_connection.ping.assert_not_called()
-        dead_connection.connect.assert_not_called()
-        fresh_cursor.execute.assert_called_once()
-
-    def test_writer_ping_runs_select_and_returns_true(self) -> None:
-        cursor = MagicMock()
-        cursor.fetchall.return_value = [(1,)]
-        connection = MagicMock()
-        connection.cursor.return_value = cursor
-        writer = LiveSnapshotWriter.for_testing(connection=connection)
-
-        self.assertTrue(writer.ping())
         cursor.execute.assert_called_once_with("SELECT 1", ())
-
-    def test_writer_ping_swallows_failure_and_returns_false(self) -> None:
-        cursor = MagicMock()
-        cursor.execute.side_effect = Exception(1064, "bad sql")
-        connection = MagicMock()
-        connection.cursor.return_value = cursor
-        writer = LiveSnapshotWriter.for_testing(connection=connection)
-
-        self.assertFalse(writer.ping())
 
     def test_writer_write_target_portfolios_keys_by_snapshot_type(self) -> None:
         writer = object.__new__(LiveSnapshotWriter)

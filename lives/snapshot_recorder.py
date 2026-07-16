@@ -28,7 +28,6 @@ import inspect
 import asyncio
 from datetime import date
 from datetime import datetime
-from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -58,15 +57,20 @@ class SnapshotRecorderConfig(ActorConfig, frozen=True):
     trader_id: str
     timezone_name: str = "Asia/Shanghai"
     before_time: str = "09:27"
-    after_time: str = "15:40"
+    # QMT does not finish end-of-day settlement at market close: at 15:40 the frozen
+    # cash is still locked and same-day sells are unsettled (T+1 在途), so total_asset
+    # does not reconcile against market_value+cash+frozen and none of the figures match
+    # what the QMT UI shows after settlement. Take the after-trading snapshot late in
+    # the evening, once the terminal has settled, so the persisted numbers agree with QMT.
+    after_time: str = "23:00"
     trading_windows: str = "09:30-11:30,13:00-14:55"
     # The before-trading catch-up window: a start within this HH:MM range (inclusive)
     # still runs the before-trading phase even if before_time already passed.
     before_catchup_start: str = "09:26"
     before_catchup_end: str = "09:29"
-    # Keep the MySQL connection warm between trading sessions so the server doesn't
-    # close the idle socket and make the next order-event burst each hit a
-    # connection-lost error. 4 min is well under a typical wait_timeout.
+    # Deprecated / unused: connection health is now owned by the LiveSnapshotWriter
+    # connection pool (SQLAlchemy QueuePool + pool_pre_ping). Retained so existing
+    # deployments that still pass this config value do not fail to construct.
     keepalive_secs: int = 20
 
 
@@ -91,6 +95,7 @@ class SnapshotRecorder(Actor):
         self._strategy = strategy_ref
         self._fetch_full_tick = fetch_full_tick
         self._fetch_positions = fetch_positions
+        self._writer.set_logger(self.log)
         self._before_time = self._parse_hh_mm(config.before_time)
         self._after_time = self._parse_hh_mm(config.after_time)
         # Guards so each phase applies the frozen target to the strategy at most once
@@ -101,7 +106,6 @@ class SnapshotRecorder(Actor):
 
     def on_start(self) -> None:
         self._subscribe_order_events()
-        self._schedule_keepalive()
         if self._before_time is not None:
             self._schedule_daily(self._BEFORE_ALERT, self._before_time, self._on_before_timer)
         if self._after_time is not None:
@@ -154,24 +158,13 @@ class SnapshotRecorder(Actor):
         self._schedule_daily(self._AFTER_ALERT, self._after_time, self._on_after_timer)
         self._run_after_trading(self._now().date(), allow_fallback=False)
 
-    def _schedule_keepalive(self) -> None:
-        interval = int(self.config.keepalive_secs)
-        self.clock.set_timer(
-            name=self._KEEPALIVE_TIMER,
-            interval=timedelta(seconds=interval),
-            callback=self._on_keepalive,
-            fire_immediately=False,
-        )
-        self.log.info(
-            f"snapshot DB keepalive scheduled every {interval}s",
-            color=LogColor.BLUE,
-        )
-
-    def _on_keepalive(self, _event: Any) -> None:
-        try:
-            self._writer.ping()
-        except Exception as exc:
-            self.log.warning(f"snapshot DB keepalive failed: {exc}")
+    def _schedule_keepalive(self) -> None:  # retained as a no-op for backward compat
+        # Removed: the MySQL connection pool (LiveSnapshotWriter, SQLAlchemy QueuePool
+        # with pool_pre_ping) now owns connection health. Each DB op checks out its own
+        # connection and pre-ping discards any the server closed while idle, so there is
+        # no shared socket to keep warm and no keepalive timer on the Rust LiveClock
+        # timer thread. Kept as a no-op so any external caller does not break.
+        return
 
     # ---- phase runners -------------------------------------------------------
 
@@ -209,6 +202,13 @@ class SnapshotRecorder(Actor):
         account = self._first_account()
         info = self._account_info(account)
         nt_free, nt_total, nt_locked = self._nt_balances(account)
+        total_asset = self._info_decimal(info, "total_asset")
+        market_value = self._info_decimal(info, "market_value")
+        cash = self._info_decimal(info, "cash")
+        frozen_cash = self._info_decimal(info, "frozen_cash")
+        self._warn_if_asset_inconsistent(
+            snapshot_type, total_asset, market_value, cash, frozen_cash,
+        )
         record = LiveAssetSnapshotRecord(
             trade_date=trading_date,
             write_time=self._now_naive(),
@@ -216,11 +216,14 @@ class SnapshotRecorder(Actor):
             account_id=self.config.account_id,
             trader_id=self.config.trader_id,
             source=source,
-            total_asset=self._info_decimal(info, "total_asset"),
-            market_value=self._info_decimal(info, "market_value"),
-            cash=self._info_decimal(info, "cash"),
+            total_asset=total_asset,
+            market_value=market_value,
+            cash=cash,
+            # xtquant's XtAsset has no separate "available" field — cash IS 可用
+            # (m_dCash). Keep the legacy fallback key for forward-compat, but this
+            # column effectively mirrors `cash`.
             available_cash=self._info_decimal(info, "available_cash", "cash"),
-            frozen_cash=self._info_decimal(info, "frozen_cash"),
+            frozen_cash=frozen_cash,
             nt_equity=self._nt_equity(),
             nt_market_value=self._nt_net_exposure(),
             nt_balance_total=nt_total,
@@ -242,6 +245,41 @@ class SnapshotRecorder(Actor):
         except Exception as exc:
             self.log.warning(f"asset snapshot write failed ({snapshot_type}): {exc}")
             return None
+
+    # Warn past this relative gap between total_asset and its components. A healthy
+    # settled account closes to well under 1%; a larger gap means QMT has not finished
+    # settling (frozen cash still locked, same-day sells 在途/未交收) and the snapshot
+    # will not reconcile against the QMT UI.
+    _ASSET_RECONCILE_TOLERANCE = Decimal("0.01")
+
+    def _warn_if_asset_inconsistent(
+        self,
+        snapshot_type: str,
+        total_asset: Decimal | None,
+        market_value: Decimal | None,
+        cash: Decimal | None,
+        frozen_cash: Decimal | None,
+    ) -> None:
+        # total_asset should equal market_value + cash + frozen_cash for a settled
+        # cash account. When it doesn't, the QMT payload is mid-settlement; surface it
+        # so a stale/unsettled snapshot isn't mistaken for a reconciled one.
+        if total_asset is None or total_asset <= 0:
+            return
+        components = Decimal("0")
+        for value in (market_value, cash, frozen_cash):
+            if value is None:
+                # A missing component makes the check meaningless — skip silently.
+                return
+            components += value
+        gap = total_asset - components
+        if abs(gap) <= total_asset * SnapshotRecorder._ASSET_RECONCILE_TOLERANCE:
+            return
+        self.log.warning(
+            f"asset snapshot does not reconcile ({snapshot_type}): "
+            f"total_asset={total_asset} != market_value+cash+frozen_cash={components} "
+            f"(gap={gap}); QMT likely still settling — figures may not match the QMT UI",
+            color=LogColor.YELLOW,
+        )
 
     # ---- position snapshot ---------------------------------------------------
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import Any
 from uuid import uuid4
 from urllib.error import HTTPError
@@ -13,6 +15,9 @@ from strategies.model_target_planners.base import ModelTargetPlan
 from strategies.model_target_planners.base import ModelTargetPlanner
 from strategies.model_target_planners.base import ModelTargetPlanningRequest
 from strategies.model_target_planners.base import normalize_stock_code
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class RiskManagerModelTargetPlanner(ModelTargetPlanner):
@@ -110,30 +115,64 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
     def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         endpoint = f"{self.base_url}/v1/portfolio/optimize"
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = Request(
-            endpoint,
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self.timeout_secs) as response:
-                body = response.read().decode("utf-8")
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"risk-manager optimize HTTP {exc.code}: {body[:500]}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"risk-manager optimize request failed: {exc}") from exc
-        try:
-            loaded = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("risk-manager optimize returned invalid JSON") from exc
-        if not isinstance(loaded, dict):
-            raise RuntimeError("risk-manager optimize returned a non-object JSON payload")
-        return loaded
+        max_retries = 5
+        max_attempts = max_retries + 1
+        for attempt in range(1, max_attempts + 1):
+            cause: BaseException | None = None
+            request = Request(
+                endpoint,
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=self.timeout_secs) as response:
+                    body = response.read().decode("utf-8")
+                loaded = json.loads(body)
+                if not isinstance(loaded, dict):
+                    raise RuntimeError("risk-manager optimize returned a non-object JSON payload")
+                return loaded
+            except HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                error = RuntimeError(f"risk-manager optimize HTTP {exc.code}: {body[:500]}")
+                cause = exc
+            except URLError as exc:
+                error = RuntimeError(f"risk-manager optimize request failed: {exc}")
+                cause = exc
+            except json.JSONDecodeError as exc:
+                error = RuntimeError("risk-manager optimize returned invalid JSON")
+                cause = exc
+            except RuntimeError as exc:
+                error = exc
+
+            if attempt >= max_attempts:
+                _LOGGER.error(
+                    "risk-manager optimize request failed after %d attempts (%d retries): %s",
+                    max_attempts,
+                    max_retries,
+                    error,
+                )
+                if cause is not None:
+                    raise error from cause
+                raise error
+
+            retry_number = attempt
+            retry_delay_secs = retry_number
+            _LOGGER.warning(
+                "risk-manager optimize request failed (attempt %d/%d), retry %d/%d in %ds: %s",
+                attempt,
+                max_attempts,
+                retry_number,
+                max_retries,
+                retry_delay_secs,
+                error,
+            )
+            time.sleep(retry_delay_secs)
+
+        raise RuntimeError(f"risk-manager optimize request failed after {max_attempts} attempts")
 
     def _target_quantities(
         self,

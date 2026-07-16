@@ -255,6 +255,8 @@ class TestableTargetQuantityStrategy:
     _UP_LIMIT_KEYS = TargetQuantityStrategy._UP_LIMIT_KEYS
     _DOWN_LIMIT_KEYS = TargetQuantityStrategy._DOWN_LIMIT_KEYS
     _PRE_OPEN_RECONCILE_ALERT = TargetQuantityStrategy._PRE_OPEN_RECONCILE_ALERT
+    _FULL_TICK_REFRESH_TIMER = TargetQuantityStrategy._FULL_TICK_REFRESH_TIMER
+    _FULL_TICK_PREFETCH_ALERT = TargetQuantityStrategy._FULL_TICK_PREFETCH_ALERT
     _TERMINAL_ORDER_STATUSES = TargetQuantityStrategy._TERMINAL_ORDER_STATUSES
     on_start = TargetQuantityStrategy.on_start
     refresh_target_instruments = TargetQuantityStrategy.refresh_target_instruments
@@ -470,7 +472,9 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         }
         strategy._authoritative_open = set()
         strategy._full_tick_source = None
-        strategy._full_tick_prefetch_time = None
+        strategy._full_tick_prefetch_time = TargetQuantityStrategy._parse_hh_mm(
+            strategy.config.full_tick_prefetch_time,
+        )
         strategy._full_tick_task = None
         strategy._depth_books = {}
         strategy._subscribed_order_book_depth_instruments = set()
@@ -550,7 +554,13 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(strategy.subscribed_quote_ticks, [])
         self.assertEqual(strategy.subscribed_trade_ticks, [])
         self.assertEqual(strategy.subscribed_order_book_depths, [])
-        self.assertEqual(len(strategy.clock.timers), 1)
+        self.assertEqual(
+            {timer["name"] for timer in strategy.clock.timers},
+            {
+                "TARGET-WEIGHT-CONVERGE",
+                TargetQuantityStrategy._FULL_TICK_REFRESH_TIMER,
+            },
+        )
 
     def test_on_start_subscribes_quote_tick_window_probes_when_quote_ticks_disabled(self) -> None:
         strategy = self.make_strategy()

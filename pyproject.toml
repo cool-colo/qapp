@@ -19,16 +19,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# MySQL result persistence (backtests run with --write-results). Imported lazily
-# in backtests/result_writers/mysql.py, so only needed when persisting results.
-mysql = ["pymysql"]
+# MySQL result persistence (backtests run with --write-results, and the live daily-
+# snapshot writer). Imported lazily in the result writers. pymysql is the driver;
+# sqlalchemy provides the thread-safe connection pool the live writer checks out per
+# operation (so a LiveClock timer thread and the node loop never share a socket).
+mysql = ["pymysql", "sqlalchemy"]
 
 # Prometheus metrics endpoint for the live node (lives/monitoring.py). Imported
 # optionally — the exporter no-ops with a warning if this is absent.
 monitoring = ["prometheus_client"]
 
 # Everything optional at once, for a full deployment environment.
-all = ["pymysql", "prometheus_client"]
+all = ["pymysql", "sqlalchemy", "prometheus_client"]
 
 [tool.setuptools.packages.find]
 # Scripts run as modules from the repo root

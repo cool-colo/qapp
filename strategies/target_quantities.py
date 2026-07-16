@@ -682,6 +682,11 @@ class TargetQuantityStrategy(Strategy):
             version_value == self._target_version
             and normalized == self._target_quantities
         ):
+            self.log.info(
+                f"target quantities unchanged for version={version_value} date={target_date} "
+                f"count={len(normalized)} reason={reason}",
+                color=LogColor.BLUE,
+            )
             return
         self._refresh_order_book_depth_subscriptions(normalized)
         self._target_quantities = dict(sorted(normalized.items()))
@@ -962,8 +967,13 @@ class TargetQuantityStrategy(Strategy):
 
     def _converge_to_target_locked(self, current_date: date, trigger: str) -> None:
         if not self._target_version:
+            self.log.warning("target convergence skipped: no target version set")
             return
         if self._target_version in self._achieved_versions:
+            self.log.info(
+                f"target convergence skipped: already achieved version={self._target_version}",
+                color=LogColor.GREEN,
+            )
             return
         self._sellable_exhausted = {
             instrument_id: exhausted_date

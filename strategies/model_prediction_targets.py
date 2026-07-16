@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import date
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
+from typing import Callable
 
 import pandas as pd
 
@@ -51,6 +53,7 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     risk_manager_mode: str = "simulation"
     risk_manager_timeout_secs: float = 10.0
     process_targets_on_timer: bool = False
+    process_targets_interval_secs: float = 10.0
 
 
 class TargetModelPredictionsStrategy(TargetQuantityStrategy):
@@ -61,6 +64,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
     inherited executor decides how to reach them through Nautilus account, cache, and
     order APIs.
     """
+
+    _PROCESS_TARGETS_TIMER = "TARGET-MODEL-PROCESS-TARGETS"
 
     def __init__(self, config: TargetModelPredictionsStrategyConfig) -> None:
         super().__init__(config)
@@ -92,7 +97,21 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             pd.Timestamp(config.trading_dates[0]).date() if config.trading_dates else None,
         )
         self._target_planner = build_model_target_planner(config)
+        self._live_target_portfolio_loader: Callable[[date, date | None], list[dict[str, Any]]] | None = None
         self.signal_events: list[ModelPredictionSignalEvent] = []
+
+    def configure_live_target_portfolio_loader(
+        self,
+        loader: Callable[[date, date | None], list[dict[str, Any]]] | None,
+    ) -> None:
+        """
+        Inject a loader for persisted daily live targets.
+
+        The strategy remains storage-agnostic: live wiring owns MySQL access and
+        provides rows from ``live_target_portfolio``. Backtests leave this unset and
+        use the computed plan path.
+        """
+        self._live_target_portfolio_loader = loader
 
     def refresh_reference_data(
         self,
@@ -151,11 +170,24 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         trading_date = bar_date(bar, self.config.timezone_name)
         self._process_trading_day_once(trading_date, "bar")
 
-    def _on_converge_timer(self, _event: Any) -> None:
-        if bool(self.config.process_targets_on_timer) and self._within_trading_window():
+    def on_start(self) -> None:
+        super().on_start()
+        self._start_process_targets_timer()
+
+    def _start_process_targets_timer(self) -> None:
+        interval_secs = float(self.config.process_targets_interval_secs)
+        if bool(self.config.process_targets_on_timer) and interval_secs > 0:
+            self.clock.set_timer(
+                name=self._PROCESS_TARGETS_TIMER,
+                interval=timedelta(seconds=interval_secs),
+                callback=self._on_process_targets_timer,
+                fire_immediately=False,
+            )
+
+    def _on_process_targets_timer(self, _event: Any) -> None:
+        if self._within_trading_window():
             trading_date = self._clock_date()
             self._process_trading_day_once(trading_date, "timer")
-        super()._on_converge_timer(_event)
 
     def _process_trading_day_once(self, trading_date: date, trigger: str) -> bool:
         if trading_date in self._processed_dates:
@@ -169,6 +201,16 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         return True
 
     def _process_trading_day(self, trading_date: date) -> None:
+        loaded_target = self._live_target_portfolio_target(trading_date)
+        if loaded_target is not None:
+            quantities, reason, version = loaded_target
+            self.update_target_quantities(
+                quantities=quantities,
+                target_date=trading_date,
+                reason=reason,
+                version=version,
+            )
+            return
         plan = self.compute_daily_target_plan(trading_date)
         # The risk-manager planner commits explicit share counts (固定目标股数); the
         # executor trades toward those quantities. Weights on the plan are audit-only
@@ -179,6 +221,68 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             reason=plan.reason,
             version=self._plan_version(plan),
         )
+
+    def _live_target_portfolio_target(
+        self,
+        trading_date: date,
+    ) -> tuple[dict[str, int], str, str | None] | None:
+        loader = self._live_target_portfolio_loader
+        if loader is None:
+            self._log_live_target_portfolio_info(
+                f"live target portfolio loader is not configured: date={trading_date}",
+            )
+            return None
+        signal_date = self._resolve_signal_date(trading_date)
+        rows = loader(trading_date, signal_date)
+        if not rows:
+            self._log_live_target_portfolio_info(
+                f"live target portfolio not found: date={trading_date} signal_date={signal_date}",
+            )
+            return None
+        quantities, reason, version = self._target_quantities_from_live_target_rows(rows)
+        self._log_live_target_portfolio_info(
+            f"loaded live target portfolio: date={trading_date} signal_date={signal_date} "
+            f"frozen_qty={len(quantities)} version={version}",
+            color=LogColor.GREEN,
+        )
+        return quantities, reason, version
+
+    def _log_live_target_portfolio_info(
+        self,
+        message: str,
+        color: LogColor = LogColor.BLUE,
+    ) -> None:
+        if self.log is None:
+            return
+        self.log.info(message, color=color)
+
+    @staticmethod
+    def _target_quantities_from_live_target_rows(
+        rows: list[dict[str, Any]],
+    ) -> tuple[dict[str, int], str, str | None]:
+        quantities: dict[str, int] = {}
+        reason = "loaded_target"
+        version: str | None = None
+        for row in rows:
+            instrument_id = str(row["instrument_id"] or "").strip()
+            if not instrument_id:
+                raise RuntimeError("live_target_portfolio row has empty instrument_id")
+            qty = row.get("target_qty")
+            if qty is None:
+                continue
+            quantity = int(qty)
+            if quantity < 0:
+                raise RuntimeError(
+                    f"live_target_portfolio row has negative target_qty: instrument_id={instrument_id}",
+                )
+            quantities[instrument_id] = quantity
+            if version is None and row.get("target_version"):
+                version = str(row["target_version"])
+            if row.get("reason"):
+                reason = str(row["reason"])
+        if not quantities:
+            raise RuntimeError("live_target_portfolio rows contain no target_qty values")
+        return quantities, reason, version
 
     def compute_daily_target_plan(self, trading_date: date) -> ModelTargetPlan:
         """

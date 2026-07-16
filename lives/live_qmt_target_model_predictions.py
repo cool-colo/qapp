@@ -30,8 +30,8 @@ from nautilus_trader.common.enums import LogColor
 
 
 QMT_CLIENT = legacy.QMT_CLIENT
-_MISSING = object()
 _DATE_TOKEN_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
+_PRE_OPEN_RECONCILE_TIME_SHANGHAI = "09:15"
 
 
 class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
@@ -150,29 +150,16 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
 
 def parse_args():
     original_argv = sys.argv[:]
-    cleaned_argv, pre_open_reconcile_time = _extract_pre_open_reconcile_time_arg(original_argv)
     try:
-        sys.argv = cleaned_argv
+        sys.argv = original_argv
         args = legacy.parse_args()
     finally:
         sys.argv = original_argv
-    # `--pre-open-reconcile-time` is target-specific and is not defined by the shared
-    # `live_common.parse_args()`, so strip it before delegating and then apply the
-    # target-model env/default here.
-    if pre_open_reconcile_time is _MISSING:
-        pre_open_reconcile_time = os.environ.get(
-            "MODEL_LIVE_PRE_OPEN_RECONCILE_TIME",
-            os.environ.get("MODEL_PRE_OPEN_RECONCILE_TIME", "09:15"),
-        )
-    args.pre_open_reconcile_time = pre_open_reconcile_time
     args.log_file_name = _resolve_daily_log_file_name(args.log_file_name, args.exchange_timezone)
     try:
         args.refresh_time = normalize_refresh_time(args.refresh_time)
-        args.pre_open_reconcile_time = normalize_refresh_time(args.pre_open_reconcile_time)
     except ValueError as exc:
         raise SystemExit(f"invalid configured HH:MM time: {exc}") from exc
-    if args.pre_open_reconcile_time is None:
-        raise SystemExit("pre-open reconcile time is required")
     _apply_snapshot_args(args)
     return args
 
@@ -182,8 +169,8 @@ def _apply_snapshot_args(args: Any) -> None:
     Attach daily-snapshot / MySQL settings to args from the environment.
 
     These are target-model-specific and not defined by the shared
-    ``live_common.parse_args()``, so — like ``--pre-open-reconcile-time`` — they are
-    resolved here rather than added to the shared parser.
+    ``live_common.parse_args()``, so they are resolved here rather than added to
+    the shared parser.
     """
     env = os.environ.get
     args.snapshot_before_time = env("MODEL_SNAPSHOT_BEFORE_TIME", "09:27")
@@ -195,36 +182,14 @@ def _apply_snapshot_args(args: Any) -> None:
     args.mysql_database = env("MYSQL_DATABASE", "")
 
 
-def _resolve_daily_log_file_name(log_file_name: str | None, timezone_name: str) -> str:
+def _resolve_daily_log_file_name(log_file_name: str | None, timezone_name: str) -> str | None:
     base_name = (log_file_name or "model_preds").strip() or "model_preds"
     if "{date}" in base_name:
         date_text = pd.Timestamp.now(tz=timezone_name).strftime("%Y-%m-%d")
         return base_name.replace("{date}", date_text)
     if _DATE_TOKEN_RE.search(base_name):
         return base_name
-    date_text = pd.Timestamp.now(tz=timezone_name).strftime("%Y-%m-%d")
-    return f"{base_name}-{date_text}"
-
-
-def _extract_pre_open_reconcile_time_arg(argv: list[str]) -> tuple[list[str], str | object]:
-    cleaned = [argv[0]]
-    value: str | object = _MISSING
-    index = 1
-    while index < len(argv):
-        arg = argv[index]
-        if arg == "--pre-open-reconcile-time":
-            if index + 1 >= len(argv):
-                raise SystemExit("--pre-open-reconcile-time requires a value")
-            value = argv[index + 1]
-            index += 2
-            continue
-        if arg.startswith("--pre-open-reconcile-time="):
-            value = arg.split("=", 1)[1]
-            index += 1
-            continue
-        cleaned.append(arg)
-        index += 1
-    return cleaned, value
+    return None
 
 
 def normalize_refresh_time(value: str | None) -> str | None:
@@ -281,11 +246,13 @@ def _add_snapshot_recorder(
 ) -> None:
     """Build the MySQL-backed daily-snapshot recorder actor and add it to the node."""
     from backtests.result_writers.live_writer import LiveSnapshotWriter
+    from backtests.result_writers.live_records import BEFORE_TRADING
     from lives.snapshot_recorder import SnapshotRecorder
     from lives.snapshot_recorder import SnapshotRecorderConfig
 
     try:
         writer = LiveSnapshotWriter.from_pymysql_kwargs(
+            logger=node.get_logger(),
             host=args.mysql_host,
             port=int(args.mysql_port),
             user=args.mysql_user,
@@ -301,6 +268,18 @@ def _add_snapshot_recorder(
             is_warning=True,
         )
         raise
+
+    def _load_live_target_portfolio(trading_date: Any, signal_date: Any) -> list[dict[str, Any]]:
+        return writer.load_target_portfolios(
+            str(args.account_id),
+            str(args.trader_id),
+            trading_date,
+            signal_date,
+            preferred_snapshot_type=BEFORE_TRADING,
+            fallback_to_continuous=True,
+        )
+
+    strategy.configure_live_target_portfolio_loader(_load_live_target_portfolio)
     recorder = SnapshotRecorder(
         config=SnapshotRecorderConfig(
             account_id=str(args.account_id),
@@ -461,6 +440,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             full_tick_refresh_secs=args.full_tick_refresh_secs,
             full_tick_prefetch_time=args.full_tick_prefetch_time,
             process_targets_on_timer=True,
+            process_targets_interval_secs=args.resubmit_interval_secs,
         ),
         refresh_context=lambda active_stock_codes: loader.load(
             extra_stock_codes=extra_stock_codes.union(active_stock_codes),
@@ -475,7 +455,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
     # installed as well.
     strategy.configure_pre_open_reconciliation(
         reconcile=node.kernel.exec_engine.reconcile_execution_state,
-        reconcile_time=args.pre_open_reconcile_time,
+        reconcile_time=_PRE_OPEN_RECONCILE_TIME_SHANGHAI,
         timeout_secs=config_node.timeout_reconciliation,
         loop=node.kernel.exec_engine._loop,
     )

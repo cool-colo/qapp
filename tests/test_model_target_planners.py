@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from datetime import date
+from urllib.error import URLError
 from unittest.mock import patch
 
 from strategies.model_target_planners import EqualWeightModelTargetPlanner
@@ -207,6 +208,63 @@ class ModelTargetPlannerTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "no_risk_data"):
                 planner.plan(request)
+
+    def test_risk_manager_post_json_retries_transient_failures(self) -> None:
+        planner = RiskManagerModelTargetPlanner(
+            base_url="http://risk-manager.local",
+            risk_model_id="cn_a_mean_variance",
+            mode="simulation",
+        )
+        responses = [
+            URLError("temporary failure 1"),
+            URLError("temporary failure 2"),
+            FakeResponse({"success": True, "target_weights": []}),
+        ]
+
+        def fake_urlopen(_http_request, timeout):
+            del timeout
+            result = responses.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        with (
+            patch("strategies.model_target_planners.risk_manager.urlopen", side_effect=fake_urlopen) as urlopen_mock,
+            patch("strategies.model_target_planners.risk_manager.time.sleep") as sleep_mock,
+            self.assertLogs("strategies.model_target_planners.risk_manager", level="WARNING") as logs,
+        ):
+            payload = planner._post_json({"request_id": "retry-test"})
+
+        self.assertEqual(payload, {"success": True, "target_weights": []})
+        self.assertEqual(urlopen_mock.call_count, 3)
+        sleep_mock.assert_any_call(1)
+        sleep_mock.assert_any_call(2)
+        self.assertEqual(sleep_mock.call_count, 2)
+        self.assertEqual(len(logs.records), 2)
+        self.assertEqual([record.levelname for record in logs.records], ["WARNING", "WARNING"])
+
+    def test_risk_manager_post_json_logs_error_after_retry_exhaustion(self) -> None:
+        planner = RiskManagerModelTargetPlanner(
+            base_url="http://risk-manager.local",
+            risk_model_id="cn_a_mean_variance",
+            mode="simulation",
+        )
+
+        with (
+            patch(
+                "strategies.model_target_planners.risk_manager.urlopen",
+                side_effect=URLError("risk manager unavailable"),
+            ) as urlopen_mock,
+            patch("strategies.model_target_planners.risk_manager.time.sleep") as sleep_mock,
+            self.assertLogs("strategies.model_target_planners.risk_manager", level="ERROR") as logs,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "risk-manager optimize request failed"):
+                planner._post_json({"request_id": "retry-exhausted"})
+
+        self.assertEqual(urlopen_mock.call_count, 6)
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [1, 2, 3, 4, 5])
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(logs.records[0].levelname, "ERROR")
 
 
 if __name__ == "__main__":

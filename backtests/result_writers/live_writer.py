@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from datetime import date
 from datetime import datetime
 from decimal import Decimal
@@ -20,9 +19,6 @@ from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveTradeRecord
 
 
-_LOGGER = logging.getLogger(__name__)
-
-
 def _json_default(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
@@ -39,6 +35,44 @@ def _json_dumps(value: Mapping[str, Any] | None) -> str | None:
 
 def _timestamp(value: datetime | None) -> datetime:
     return value or datetime.now()
+
+
+class _SingleConnectionEngine:
+    """
+    Minimal engine shim wrapping one already-open DB-API connection.
+
+    Used only by ``LiveSnapshotWriter.for_testing`` so tests can inject a mock
+    connection while the runtime code still goes through the real
+    ``raw_connection()`` -> cursor -> close path. ``raw_connection`` hands back the
+    same underlying connection every time; ``close()`` on it is intercepted so
+    returning a connection to this "pool" does not close the mock, matching how a
+    real pool recycles connections.
+    """
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def raw_connection(self):
+        return _NonClosingConnection(self._connection)
+
+    def dispose(self) -> None:
+        close = getattr(self._connection, "close", None)
+        if close is not None:
+            close()
+
+
+class _NonClosingConnection:
+    """Proxy that forwards everything to the wrapped connection but no-ops ``close``."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def close(self) -> None:  # returning to the "pool" must not close the mock
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
 
 
 # DDL kept alongside the writer so a fresh deployment can bootstrap the schema.
@@ -211,50 +245,108 @@ class LiveSnapshotWriter:
 
     def __init__(
         self,
-        connection=None,
+        engine=None,
         connect_kwargs: Mapping[str, Any] | None = None,
         commit: bool = True,
         create_tables: bool = True,
+        logger: Any | None = None,
     ) -> None:
-        # Keep the connect kwargs so a dropped socket can be rebuilt from scratch.
-        # Empty dict means "no way to rebuild" (an externally supplied connection);
-        # _reconnect then falls back to ping()/connect() on the existing object.
+        self._logger = logger
+        # Keep the connect kwargs for reference/debugging. The engine below builds
+        # each pooled connection from them via pymysql; the pool (not this class)
+        # owns connection lifecycle and health.
         self._connect_kwargs = dict(connect_kwargs or {})
-        self._connection = connection or self._create_connection(self._connect_kwargs)
+        # A SQLAlchemy engine wrapping a thread-safe QueuePool over pymysql. Every DB
+        # op checks out its own connection and returns it, so concurrent callers on
+        # different threads (e.g. a LiveClock timer thread vs. the node event loop)
+        # never share a socket. This is what fixes the "Packet sequence number wrong"
+        # protocol corruption that a single shared pymysql connection suffered under
+        # concurrent access.
+        self._engine = engine or self._create_engine(self._connect_kwargs)
         self._commit = commit
         if create_tables:
             self.create_tables()
 
     @classmethod
-    def from_pymysql_kwargs(cls, **connect_kwargs: Any) -> "LiveSnapshotWriter":
-        return cls(connect_kwargs=connect_kwargs)
+    def from_pymysql_kwargs(
+        cls,
+        *,
+        logger: Any,
+        **connect_kwargs: Any,
+    ) -> "LiveSnapshotWriter":
+        return cls(connect_kwargs=connect_kwargs, logger=logger)
 
     @classmethod
-    def for_testing(cls, connection: Any, commit: bool = False) -> "LiveSnapshotWriter":
+    def for_testing(
+        cls,
+        connection: Any,
+        commit: bool = False,
+        logger: Any | None = None,
+    ) -> "LiveSnapshotWriter":
         """
         Build a writer around an already-constructed (mock) connection without touching
-        a live DB. Sets every field ``__init__`` would, so runtime code can rely on
-        ``self._connect_kwargs`` existing rather than guarding for it.
+        a live DB. The connection is wrapped in a minimal single-connection engine shim
+        so the runtime code path (``raw_connection()`` -> cursor -> close) is exercised
+        exactly as it is against a real pool.
         """
         writer = cls.__new__(cls)
+        writer._logger = logger
         writer._connect_kwargs = {}
-        writer._connection = connection
+        writer._engine = _SingleConnectionEngine(connection)
         writer._commit = commit
         return writer
 
+    def set_logger(self, logger: Any) -> None:
+        """Attach a runtime logger, typically the Nautilus node/actor logger."""
+        self._logger = logger
+
+    def _log_info(self, message: str, *args: Any) -> None:
+        self._logger.info(message % args if args else message)
+
+    def _log_warning(self, message: str, *args: Any) -> None:
+        self._logger.warning(message % args if args else message)
+
     @staticmethod
-    def _create_connection(connect_kwargs: Mapping[str, Any]):
+    def _create_engine(connect_kwargs: Mapping[str, Any]):
         try:
-            import pymysql
+            import pymysql  # noqa: F401  (validates the driver is importable)
         except ImportError as exc:
             raise ImportError("pymysql is required to write live snapshots to MySQL") from exc
-        return pymysql.connect(**dict(connect_kwargs))
+        try:
+            from sqlalchemy import create_engine
+            from sqlalchemy.pool import QueuePool
+        except ImportError as exc:
+            raise ImportError(
+                "sqlalchemy is required to write live snapshots to MySQL"
+            ) from exc
+
+        kwargs = dict(connect_kwargs)
+
+        def _creator():
+            import pymysql
+
+            return pymysql.connect(**kwargs)
+
+        # `mysql+pymysql://` only supplies the dialect (so pool_pre_ping can issue a
+        # dialect-appropriate liveness check); the actual connection comes from
+        # `_creator`, reusing the exact pymysql kwargs the caller passed. pool_pre_ping
+        # transparently discards a connection the server closed while idle and opens a
+        # fresh one on checkout, replacing the old hand-rolled reconnect logic.
+        return create_engine(
+            "mysql+pymysql://",
+            creator=_creator,
+            poolclass=QueuePool,
+            pool_size=5,
+            max_overflow=5,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
 
     def close(self) -> None:
-        close = getattr(self._connection, "close", None)
-        if close is not None:
-            close()
-        self._connection = None
+        dispose = getattr(self._engine, "dispose", None)
+        if dispose is not None:
+            dispose()
+        self._engine = None
 
     def create_tables(self) -> None:
         for statement in CREATE_TABLES_SQL:
@@ -830,161 +922,56 @@ class LiveSnapshotWriter:
         self._executemany(sql, params)
 
     def _query(self, sql: str, params: Sequence[Any]) -> list[tuple[Any, ...]]:
-        def run():
-            cursor = self._connection.cursor()
+        connection = self._engine.raw_connection()
+        try:
+            cursor = connection.cursor()
             try:
                 cursor.execute(sql, params)
                 return list(cursor.fetchall())
             finally:
                 self._close_cursor(cursor)
-
-        return self._with_reconnect(run)
+        finally:
+            connection.close()  # returns the connection to the pool
 
     def _execute(self, sql: str, params: Sequence[Any]) -> None:
-        def run():
-            cursor = self._connection.cursor()
+        connection = self._engine.raw_connection()
+        try:
+            cursor = connection.cursor()
             try:
                 cursor.execute(sql, params)
-                self._commit_if_needed()
+                self._commit_if_needed(connection)
             except Exception:
-                self._rollback_if_needed()
+                self._rollback_if_needed(connection)
                 raise
             finally:
                 self._close_cursor(cursor)
-
-        self._with_reconnect(run)
+        finally:
+            connection.close()
 
     def _executemany(self, sql: str, params: Iterable[Sequence[Any]]) -> None:
         materialized = list(params)
-
-        def run():
-            cursor = self._connection.cursor()
+        connection = self._engine.raw_connection()
+        try:
+            cursor = connection.cursor()
             try:
                 cursor.executemany(sql, materialized)
-                self._commit_if_needed()
+                self._commit_if_needed(connection)
             except Exception:
-                self._rollback_if_needed()
+                self._rollback_if_needed(connection)
                 raise
             finally:
                 self._close_cursor(cursor)
+        finally:
+            connection.close()
 
-        self._with_reconnect(run)
-
-    def _with_reconnect(self, run):
-        """
-        Run a DB operation, transparently recovering from a dropped connection.
-
-        A long-running live process leaves the MySQL connection idle between events;
-        the server (or an intervening proxy) eventually closes it, after which PyMySQL
-        raises a connection-level error — commonly ``(0, '')`` — on the next cursor
-        use. On such an error, re-establish the socket and retry once. Non-connection
-        errors (bad SQL, constraint violations) are not retried. Avoids a ping
-        round-trip on every healthy write (order events fire in bursts).
-        """
-        try:
-            return run()
-        except Exception as exc:
-            if not self._is_connection_lost(exc):
-                raise
-            if not self._reconnect():
-                _LOGGER.warning(
-                    "LiveSnapshotWriter failed to reconnect after connection-lost error: %r",
-                    exc,
-                )
-                raise
-            try:
-                return run()
-            except Exception as retry_exc:
-                _LOGGER.warning(
-                    "LiveSnapshotWriter retry after reconnect failed; original=%r retry=%r",
-                    exc,
-                    retry_exc,
-                )
-                raise
-
-    def _reconnect(self) -> bool:
-        # When we hold the connect kwargs, the only reliable recovery is to discard the
-        # dropped socket and build a brand-new connection — poking ping()/connect() on a
-        # half-dead PyMySQL object fails with "'NoneType' object has no attribute
-        # 'settimeout'" once its internal socket is None.
-        if self._connect_kwargs:
-            try:
-                self._connection = self._create_connection(self._connect_kwargs)
-                return True
-            except Exception as exc:
-                _LOGGER.warning(
-                    "LiveSnapshotWriter rebuild connection failed during reconnect: %r",
-                    exc,
-                )
-                return False
-        # No kwargs to rebuild from (externally injected connection). Fall back to the
-        # documented PyMySQL recovery path: ping(reconnect=True), then connect().
-        ping = getattr(self._connection, "ping", None)
-        if ping is not None:
-            try:
-                ping(reconnect=True)
-                return True
-            except TypeError:
-                pass
-            except Exception as exc:
-                _LOGGER.warning(
-                    "LiveSnapshotWriter ping(reconnect=True) failed: %r",
-                    exc,
-                )
-        connect = getattr(self._connection, "connect", None)
-        if connect is None:
-            _LOGGER.warning(
-                "LiveSnapshotWriter connection object has no connect() after reconnect failure",
-            )
-            return False
-        try:
-            connect()
-            return True
-        except Exception as exc:
-            _LOGGER.warning(
-                "LiveSnapshotWriter connect() failed during reconnect: %r",
-                exc,
-            )
-            return False
-
-    def ping(self) -> bool:
-        """
-        Keep the connection warm. A long-idle socket gets closed by the server between
-        trading sessions; a periodic ping re-establishes it before the next burst of
-        order events, so the burst doesn't each individually eat a connection-lost
-        error. Runs through ``_with_reconnect`` so a dropped socket is rebuilt here
-        rather than on the first live write. Never raises.
-        """
-        try:
-            self._query("SELECT 1", ())
-            _LOGGER.info("LiveSnapshotWriter keepalive ping succeeded")
-            return True
-        except Exception as exc:
-            _LOGGER.warning("LiveSnapshotWriter keepalive ping failed: %r", exc)
-            return False
-
-    @staticmethod
-    def _is_connection_lost(exc: Exception) -> bool:
-        # PyMySQL surfaces a lost connection as OperationalError/InterfaceError whose
-        # first arg is an errno. 0 (with an empty message) and the classic
-        # 2006/2013 (server gone away / lost connection during query) all mean the
-        # socket must be re-established.
-        args = getattr(exc, "args", ())
-        code = args[0] if args else None
-        if code in (0, 2006, 2013, 2055):
-            return True
-        # Fall back to class-name matching so we don't hard-depend on pymysql types.
-        name = type(exc).__name__
-        return name in ("InterfaceError", "OperationalError") and code in (None, 0)
-
-    def _commit_if_needed(self) -> None:
+    def _commit_if_needed(self, connection: Any) -> None:
         if self._commit:
-            self._connection.commit()
+            connection.commit()
 
-    def _rollback_if_needed(self) -> None:
+    def _rollback_if_needed(self, connection: Any) -> None:
         if not self._commit:
             return
-        rollback = getattr(self._connection, "rollback", None)
+        rollback = getattr(connection, "rollback", None)
         if rollback is not None:
             rollback()
 
