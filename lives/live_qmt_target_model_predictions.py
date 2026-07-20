@@ -24,6 +24,8 @@ from lives import live_common as legacy
 from lives.live_reconciliation import LiveExecutionReconciliation
 from lives.monitoring import PrometheusExporter
 from lives.monitoring import PrometheusExporterConfig
+from lives.status_server import LiveStatusServer
+from lives.status_server import StatusServerConfig
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig
 from nautilus_trader.common.enums import LogColor
@@ -243,6 +245,9 @@ def _add_snapshot_recorder(
     strategy: Any,
     fetch_full_tick: Any,
     fetch_positions: Any | None = None,
+    fetch_orders: Any | None = None,
+    fetch_trades: Any | None = None,
+    fetch_open_prices: Any | None = None,
 ) -> None:
     """Build the MySQL-backed daily-snapshot recorder actor and add it to the node."""
     from backtests.result_writers.live_writer import LiveSnapshotWriter
@@ -293,6 +298,9 @@ def _add_snapshot_recorder(
         strategy_ref=strategy,
         fetch_full_tick=fetch_full_tick,
         fetch_positions=fetch_positions,
+        fetch_orders=fetch_orders,
+        fetch_trades=fetch_trades,
+        fetch_open_prices=fetch_open_prices,
     )
     node.trader.add_actor(recorder)
     _emit_snapshot_status(
@@ -475,9 +483,36 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
     def _fetch_positions() -> dict[str, dict[str, Any]]:
         return loader.broker_position_snapshot()
 
+    def _fetch_orders() -> list[dict[str, Any]]:
+        # Authoritative QMT order list for the account; the recorder reconstructs
+        # live_order from this after close (infrastructure plumbing, not strategy).
+        return loader.broker_order_snapshot()
+
+    def _fetch_trades() -> list[dict[str, Any]]:
+        return loader.broker_trade_snapshot()
+
+    def _fetch_open_prices(stock_codes: list[str]) -> dict[str, dict[str, float]]:
+        # Synchronous full-tick fetch for an explicit stock-code list (the stocks in the
+        # day's orders), keyed by instrument id. Used by the after-close order backfill to
+        # anchor open_price authoritatively, without relying on the universe-wide async
+        # _today_open. Returns whatever the proxy has; the whole tick dict per instrument.
+        codes = [code for code in dict.fromkeys(stock_codes) if code]
+        if not codes:
+            return {}
+        return loader.full_tick_snapshot(codes)
+
     strategy.configure_full_tick_source(fetch_full_tick=_fetch_full_tick)
     node.trader.add_strategy(strategy)
-    _add_snapshot_recorder(args, node, strategy, _fetch_full_tick, _fetch_positions)
+    _add_snapshot_recorder(
+        args,
+        node,
+        strategy,
+        _fetch_full_tick,
+        _fetch_positions,
+        _fetch_orders,
+        _fetch_trades,
+        _fetch_open_prices,
+    )
     if args.metrics_port and int(args.metrics_port) > 0:
         exporter = PrometheusExporter(
             config=PrometheusExporterConfig(
@@ -492,20 +527,40 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
     node.add_data_client_factory(QMT_CLIENT, QMTLiveDataClientFactory)
     node.add_exec_client_factory(QMT_CLIENT, QMTLiveExecClientFactory)
     node.build()
-    return node
+
+    status_server: LiveStatusServer | None = None
+    if args.status_port and int(args.status_port) > 0:
+        status_server = LiveStatusServer(
+            node=node,
+            strategy_ref=strategy,
+            config=StatusServerConfig(
+                port=int(args.status_port),
+                addr=args.status_addr,
+            ),
+        )
+        status_server.start()
+        node.get_logger().info(
+            f"Live status server on http://{args.status_addr}:{args.status_port}/health",
+            color=LogColor.GREEN,
+        )
+    return node, status_server
 
 
 def main() -> None:
     args = parse_args()
     connection = legacy.build_connection(args)
     loader = legacy.LivePredictionDataLoader(args, connection)
-    node = build_node(args, loader)
+    node, status_server = build_node(args, loader)
     if args.build_only:
+        if status_server is not None:
+            status_server.stop()
         node.dispose()
         return
     try:
         node.run()
     finally:
+        if status_server is not None:
+            status_server.stop()
         node.dispose()
 
 

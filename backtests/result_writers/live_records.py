@@ -122,6 +122,10 @@ class LiveOrderRecord:
     venue_order_id: str | None = None
     stock_code: str | None = None
     side: str | None = None
+    # `source` marks whether the row came from the live Nautilus msgbus event stream
+    # (``live``) or was reconstructed from the QMT broker order list after close
+    # (``fallback`` — see SnapshotRecorder after-trading backfill).
+    source: str = SOURCE_LIVE
     order_type: str | None = None
     limit_price: Decimal | None = None
     quantity: int | None = None
@@ -150,6 +154,8 @@ class LiveTradeRecord:
     venue_order_id: str | None = None
     stock_code: str | None = None
     side: str | None = None
+    # See LiveOrderRecord.source. QMT-reconstructed trade rows are stamped ``fallback``.
+    source: str = SOURCE_LIVE
     price: Decimal | None = None
     quantity: int | None = None
     amount: Decimal | None = None

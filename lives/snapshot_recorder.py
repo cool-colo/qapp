@@ -57,12 +57,14 @@ class SnapshotRecorderConfig(ActorConfig, frozen=True):
     trader_id: str
     timezone_name: str = "Asia/Shanghai"
     before_time: str = "09:27"
-    # QMT does not finish end-of-day settlement at market close: at 15:40 the frozen
-    # cash is still locked and same-day sells are unsettled (T+1 在途), so total_asset
-    # does not reconcile against market_value+cash+frozen and none of the figures match
-    # what the QMT UI shows after settlement. Take the after-trading snapshot late in
-    # the evening, once the terminal has settled, so the persisted numbers agree with QMT.
-    after_time: str = "23:00"
+    # After-trading snapshot fires shortly after market close (15:00). Note QMT may not
+    # have finished end-of-day settlement yet at 15:05: frozen cash can still be locked
+    # and same-day sells unsettled (T+1 在途), so total_asset may not reconcile against
+    # market_value+cash+frozen and the figures may not match the settled QMT UI. The
+    # reconciliation check below downgrades to a warning rather than blocking the write.
+    # If the process starts after this time and the after-trading snapshot is missing,
+    # `_catch_up_on_start` backfills one.
+    after_time: str = "15:05"
     trading_windows: str = "09:30-11:30,13:00-14:55"
     # The before-trading catch-up window: a start within this HH:MM range (inclusive)
     # still runs the before-trading phase even if before_time already passed.
@@ -89,12 +91,18 @@ class SnapshotRecorder(Actor):
         strategy_ref: Any,
         fetch_full_tick: Any | None = None,
         fetch_positions: Any | None = None,
+        fetch_orders: Any | None = None,
+        fetch_trades: Any | None = None,
+        fetch_open_prices: Any | None = None,
     ) -> None:
         super().__init__(config)
         self._writer = writer
         self._strategy = strategy_ref
         self._fetch_full_tick = fetch_full_tick
         self._fetch_positions = fetch_positions
+        self._fetch_orders = fetch_orders
+        self._fetch_trades = fetch_trades
+        self._fetch_open_prices = fetch_open_prices
         self._writer.set_logger(self.log)
         self._before_time = self._parse_hh_mm(config.before_time)
         self._after_time = self._parse_hh_mm(config.after_time)
@@ -133,9 +141,12 @@ class SnapshotRecorder(Actor):
         except Exception as exc:
             self.log.warning(f"snapshot on-start full-tick fetch failed: {exc}")
         if after_t is not None and current >= after_t:
-            # Post-close start: do not backfill before-trading after the window has
-            # been missed; keep a continuous snapshot as the fallback baseline, then
-            # record the after-trading snapshot.
+            # Post-close start (at/after after_time): do not backfill before-trading
+            # after its window has been missed; keep a continuous snapshot as the
+            # fallback baseline, then backfill the after-trading snapshot. Both writes
+            # are guarded by has_asset_snapshot, so a snapshot already recorded today
+            # (e.g. by the timer before a restart) is not duplicated — only a missing
+            # after-trading snapshot gets written.
             self._run_continuous_trading(today, allow_fallback=True)
             self._run_after_trading(today, allow_fallback=True)
             return
@@ -186,6 +197,12 @@ class SnapshotRecorder(Actor):
         source = SOURCE_FALLBACK if allow_fallback else SOURCE_LIVE
         self._record_asset(trading_date, AFTER_TRADING, source)
         self._record_positions(trading_date, AFTER_TRADING, source)
+        # Reconstruct today's order/trade rows from the QMT broker lists. The live
+        # msgbus path may have missed or mis-recorded them; QMT is authoritative after
+        # close, so these upserts (idempotent on client_order_id / trade_id) overwrite
+        # whatever the live path left behind.
+        self._backfill_orders(trading_date)
+        self._backfill_trades(trading_date)
 
     # ---- asset snapshot ------------------------------------------------------
 
@@ -722,6 +739,263 @@ class SnapshotRecorder(Actor):
             )
         except Exception as exc:
             self.log.warning(f"position snapshot async write failed ({snapshot_type}): {exc}")
+
+    # ---- order / trade backfill (QMT authoritative, after close) -------------
+
+    def _backfill_orders(self, trading_date: date) -> None:
+        if self._fetch_orders is None:
+            return
+        self._resolve_list_fetch(
+            self._fetch_orders,
+            lambda rows: self._write_backfilled_orders(trading_date, rows),
+            "order",
+        )
+
+    def _backfill_trades(self, trading_date: date) -> None:
+        if self._fetch_trades is None:
+            return
+        self._resolve_list_fetch(
+            self._fetch_trades,
+            lambda rows: self._write_backfilled_trades(trading_date, rows),
+            "trade",
+        )
+
+    def _resolve_list_fetch(self, fetch: Any, sink: Any, label: str) -> None:
+        """
+        Call ``fetch`` (which may return a list or an awaitable), then hand the resulting
+        list of broker dicts to ``sink``. Mirrors _run_position_fetch's async handling so
+        the fetch works whether or not a running event loop is present.
+        """
+        try:
+            result = fetch()
+        except Exception as exc:
+            self.log.warning(f"snapshot broker-{label} fetch failed: {exc}")
+            return
+        if inspect.isawaitable(result):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    result = asyncio.run(self._await(result))
+                except Exception as exc:
+                    self.log.warning(f"snapshot broker-{label} fetch failed: {exc}")
+                    return
+            else:
+                task = asyncio.ensure_future(result, loop=loop)
+                task.add_done_callback(
+                    lambda done: self._on_list_fetch_done(done, sink, label),
+                )
+                return
+        self._invoke_sink(result, sink, label)
+
+    def _on_list_fetch_done(self, task: asyncio.Future[Any], sink: Any, label: str) -> None:
+        try:
+            result = task.result()
+        except Exception as exc:
+            self.log.warning(f"snapshot broker-{label} fetch failed: {exc}")
+            return
+        self._invoke_sink(result, sink, label)
+
+    def _invoke_sink(self, result: Any, sink: Any, label: str) -> None:
+        rows = result if isinstance(result, list) else []
+        try:
+            sink(rows)
+        except Exception as exc:
+            self.log.warning(f"snapshot broker-{label} backfill write failed: {exc}")
+
+    def _write_backfilled_orders(self, trading_date: date, rows: list[Any]) -> None:
+        # Resolve open prices synchronously for exactly the stocks in these orders, once
+        # the full order list is known (authoritative full-tick open per instrument, no
+        # universe coverage gap, no reliance on the async _today_open).
+        open_prices = self._backfill_open_prices(rows)
+        count = 0
+        for row in rows:
+            record = self._order_record_from_broker(trading_date, row, open_prices)
+            if record is None:
+                continue
+            try:
+                self._writer.upsert_order(record)
+                count += 1
+            except Exception as exc:
+                self.log.warning(f"backfilled order upsert failed: {exc}")
+        if count:
+            self.log.info(
+                f"backfilled {count} order(s) from QMT for {trading_date}",
+                color=LogColor.GREEN,
+            )
+
+    def _write_backfilled_trades(self, trading_date: date, rows: list[Any]) -> None:
+        count = 0
+        for row in rows:
+            record = self._trade_record_from_broker(trading_date, row)
+            if record is None:
+                continue
+            try:
+                self._writer.upsert_trade(record)
+                count += 1
+            except Exception as exc:
+                self.log.warning(f"backfilled trade upsert failed: {exc}")
+        if count:
+            self.log.info(
+                f"backfilled {count} trade(s) from QMT for {trading_date}",
+                color=LogColor.GREEN,
+            )
+
+    def _order_record_from_broker(
+        self,
+        trading_date: date,
+        row: Any,
+        open_prices: dict[str, Decimal],
+    ) -> LiveOrderRecord | None:
+        if not isinstance(row, dict):
+            return None
+        client_order_id = self._maybe_str(row.get("client_order_id"))
+        if not client_order_id:
+            # No client_order_id means the row cannot key onto the live_order unique key
+            # (account, trader, client_order_id); skip rather than collide.
+            return None
+        instrument_id_text = str(row.get("instrument_id") or "")
+        stock_code = self._maybe_str(row.get("stock_code")) or self._stock_code(instrument_id_text)
+        status = self._maybe_str(row.get("lifecycle_status"))
+        return LiveOrderRecord(
+            trade_date=trading_date,
+            write_time=self._now_naive(),
+            account_id=self.config.account_id,
+            trader_id=self.config.trader_id,
+            client_order_id=client_order_id,
+            venue_order_id=self._maybe_str(row.get("order_id")) or self._maybe_str(row.get("order_sysid")),
+            instrument_id=instrument_id_text,
+            stock_code=stock_code,
+            source=SOURCE_FALLBACK,
+            side=self._qmt_side(row.get("order_type")),
+            order_type=self._qmt_order_type(row.get("price_type")),
+            limit_price=self._decimal_or_none(row.get("price")),
+            quantity=self._int_or_none(row.get("order_volume")),
+            filled_qty=self._int_or_none(row.get("traded_volume")) or 0,
+            avg_fill_price=self._decimal_or_none(row.get("traded_price")),
+            status=(status.lower() if status else "unknown"),
+            # QMT reports no open, so open_price is resolved synchronously from full-tick
+            # for the stocks in these orders (see _backfill_open_prices). target_qty /
+            # target_version / book_snapshot stay null — strategy-only, unknown to QMT.
+            open_price=open_prices.get(instrument_id_text),
+            reason=self._bounded_order_reason(row.get("status_msg")),
+            qmt_raw=self._jsonable(row),
+            created_at=self._now_naive(),
+            updated_at=self._now_naive(),
+        )
+
+    def _backfill_open_prices(self, rows: list[Any]) -> dict[str, Decimal]:
+        """
+        Fetch today's open price per instrument for exactly the stocks appearing in the
+        backfilled orders, synchronously, from the QMT full-tick source.
+
+        QMT's order dicts carry no open, so we resolve it from full-tick keyed by
+        instrument id. The day's open is fixed at 09:30 and constant all session, so a
+        post-close (or restart) fetch still returns today's real open. This is done after
+        the full order list is known so we request only the stocks we need, and it does
+        not depend on the strategy's async _today_open (which is empty right after a
+        restart and would miss stocks rotated out of the universe).
+        """
+        if self._fetch_open_prices is None:
+            return {}
+        stock_codes: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            stock_code = self._maybe_str(row.get("stock_code"))
+            if not stock_code:
+                stock_code = self._stock_code(str(row.get("instrument_id") or ""))
+            if stock_code:
+                stock_codes.append(stock_code)
+        if not stock_codes:
+            return {}
+        try:
+            ticks = self._fetch_open_prices(sorted(set(stock_codes)))
+        except Exception as exc:
+            self.log.warning(f"backfill open-price fetch failed: {exc}")
+            return {}
+        resolved: dict[str, Decimal] = {}
+        if isinstance(ticks, dict):
+            for instrument_id_text, tick in ticks.items():
+                open_value = tick.get("open") if isinstance(tick, dict) else tick
+                open_price = self._decimal_or_none(open_value)
+                if open_price is not None and open_price > 0:
+                    resolved[str(instrument_id_text)] = open_price
+        return resolved
+
+    def _trade_record_from_broker(self, trading_date: date, row: Any) -> LiveTradeRecord | None:
+        if not isinstance(row, dict):
+            return None
+        trade_id = self._maybe_str(row.get("traded_id"))
+        if not trade_id:
+            return None
+        instrument_id_text = str(row.get("instrument_id") or "")
+        stock_code = self._maybe_str(row.get("stock_code")) or self._stock_code(instrument_id_text)
+        return LiveTradeRecord(
+            trade_date=trading_date,
+            write_time=self._now_naive(),
+            account_id=self.config.account_id,
+            trader_id=self.config.trader_id,
+            trade_id=trade_id,
+            client_order_id=self._maybe_str(row.get("client_order_id")) or "",
+            venue_order_id=self._maybe_str(row.get("order_id")) or self._maybe_str(row.get("order_sysid")),
+            instrument_id=instrument_id_text,
+            stock_code=stock_code,
+            source=SOURCE_FALLBACK,
+            side=self._qmt_side(row.get("order_type")),
+            price=self._decimal_or_none(row.get("traded_price")),
+            quantity=self._int_or_none(row.get("traded_volume")),
+            amount=self._decimal_or_none(row.get("traded_amount")),
+            commission=self._decimal_or_none(row.get("commission")),
+            trade_time=self._epoch_ms_to_naive(row.get("traded_time_ms")),
+            qmt_raw=self._jsonable(row),
+            created_at=self._now_naive(),
+        )
+
+    @staticmethod
+    def _qmt_side(order_type: Any) -> str | None:
+        # xtquant STOCK_BUY=23, STOCK_SELL=24 (see xtconstant).
+        try:
+            code = int(order_type)
+        except (TypeError, ValueError):
+            return None
+        if code == 23:
+            return "buy"
+        if code == 24:
+            return "sell"
+        return None
+
+    @staticmethod
+    def _qmt_order_type(price_type: Any) -> str | None:
+        # QMT reports the price type in `price_type` (xtquant): FIX_PRICE=11 is a limit
+        # order, LATEST_PRICE=5 and the various MARKET_* codes are market orders. Render
+        # it into the same LIMIT/MARKET vocabulary the live-msgbus path stores (Nautilus
+        # OrderType), so the `order_type` column is consistent across both sources. The
+        # strategy submits limit orders, so this is normally LIMIT.
+        try:
+            code = int(price_type)
+        except (TypeError, ValueError):
+            return None
+        if code == 11:
+            return "LIMIT"
+        return "MARKET"
+
+    def _epoch_ms_to_naive(self, value: Any) -> datetime | None:
+        try:
+            ms = int(value)
+        except (TypeError, ValueError):
+            return None
+        if ms <= 0:
+            return None
+        try:
+            return (
+                pd.Timestamp(ms, unit="ms", tz="UTC")
+                .tz_convert(self.config.timezone_name)
+                .tz_localize(None)
+                .to_pydatetime()
+            )
+        except Exception:
+            return None
 
     def _apply_full_tick(self, snapshot: Any) -> None:
         if not isinstance(snapshot, dict) or not snapshot:

@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS `live_order` (
   `instrument_id` VARCHAR(32)  NOT NULL,
   `stock_code`    VARCHAR(16)  NULL,
   `side`          VARCHAR(8)   NULL,
+  `source`        VARCHAR(16)  NOT NULL DEFAULT 'live',
   `order_type`    VARCHAR(16)  NULL,
   `limit_price`   DECIMAL(20,4) NULL,
   `quantity`      BIGINT       NULL,
@@ -216,6 +217,7 @@ CREATE TABLE IF NOT EXISTS `live_trade` (
   `instrument_id` VARCHAR(32)  NOT NULL,
   `stock_code`    VARCHAR(16)  NULL,
   `side`          VARCHAR(8)   NULL,
+  `source`        VARCHAR(16)  NOT NULL DEFAULT 'live',
   `price`         DECIMAL(20,4) NULL,
   `quantity`      BIGINT       NULL,
   `amount`        DECIMAL(20,4) NULL,
@@ -354,6 +356,7 @@ class LiveSnapshotWriter:
         self._ensure_target_columns()
         self._ensure_position_columns()
         self._ensure_order_columns()
+        self._ensure_trade_columns()
         self._ensure_target_indexes()
 
     def _ensure_target_columns(self) -> None:
@@ -423,6 +426,9 @@ class LiveSnapshotWriter:
             "target_qty": "BIGINT NULL",
             "open_price": "DECIMAL(20,4) NULL",
             "book_snapshot": "JSON NULL",
+            # Distinguishes QMT after-close backfilled rows (``fallback``) from live
+            # msgbus rows (``live``).
+            "source": "VARCHAR(16) NOT NULL DEFAULT 'live'",
         }
         try:
             existing = {
@@ -448,6 +454,34 @@ class LiveSnapshotWriter:
             try:
                 self._execute(
                     f"ALTER TABLE `live_order` ADD COLUMN `{column}` {ddl}",
+                    (),
+                )
+            except Exception:
+                # Concurrent add or insufficient privilege — leave as-is.
+                pass
+
+    def _ensure_trade_columns(self) -> None:
+        """
+        Add trade columns introduced after the initial live_trade deployment.
+        Best-effort only.
+        """
+        additions = {
+            # See _ensure_order_columns: marks QMT-reconstructed rows.
+            "source": "VARCHAR(16) NOT NULL DEFAULT 'live'",
+        }
+        try:
+            existing = {
+                str(row[0])
+                for row in self._query("SHOW COLUMNS FROM `live_trade`", ())
+            }
+        except Exception:
+            return
+        for column, ddl in additions.items():
+            if column in existing:
+                continue
+            try:
+                self._execute(
+                    f"ALTER TABLE `live_trade` ADD COLUMN `{column}` {ddl}",
                     (),
                 )
             except Exception:
@@ -855,6 +889,7 @@ class LiveSnapshotWriter:
             "instrument_id": record.instrument_id,
             "stock_code": record.stock_code,
             "side": record.side,
+            "source": record.source,
             "order_type": record.order_type,
             "limit_price": record.limit_price,
             "quantity": record.quantity,
@@ -885,6 +920,7 @@ class LiveSnapshotWriter:
             "instrument_id": record.instrument_id,
             "stock_code": record.stock_code,
             "side": record.side,
+            "source": record.source,
             "price": record.price,
             "quantity": record.quantity,
             "amount": record.amount,

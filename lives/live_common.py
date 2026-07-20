@@ -307,6 +307,17 @@ def parse_args() -> argparse.Namespace:
         help="Prometheus label value identifying this node/account.",
     )
     parser.add_argument(
+        "--status-port",
+        type=int,
+        default=int(env("MODEL_STATUS_PORT", "9200")),
+        help="In-process health status HTTP port (lives.status_server). Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--status-addr",
+        default=env("MODEL_STATUS_ADDR", "0.0.0.0"),
+        help="Bind address for the health status HTTP server.",
+    )
+    parser.add_argument(
         "--excluded-name-prefixes",
         default=",".join(env_list("MODEL_EXCLUDED_NAME_PREFIXES", "*ST,ST,退市")),
         help="Never buy stocks whose instrument name starts with any of these prefixes.",
@@ -697,7 +708,64 @@ GROUP BY source_code
         """
         return self._normalize_broker_positions(await self._fetch_broker_positions())
 
+    async def broker_order_snapshot(self) -> list[dict[str, Any]]:
+        """
+        Broker-reported order list for the account (proxy ``_convert_order`` dicts),
+        each enriched with a normalized ``stock_code`` and Nautilus ``instrument_id``.
+
+        Persistence plumbing only: used by the after-close SnapshotRecorder backfill to
+        reconstruct ``live_order`` from QMT's authoritative order list when the live
+        msgbus path missed or mis-recorded the day's orders.
+        """
+        rows = await self._with_broker_session(
+            lambda client, session_id: client.get_orders(session_id),
+        )
+        return self._enrich_broker_rows(rows)
+
+    async def broker_trade_snapshot(self) -> list[dict[str, Any]]:
+        """
+        Broker-reported trade list for the account (proxy ``_convert_trade`` dicts),
+        each enriched with a normalized ``stock_code`` and Nautilus ``instrument_id``.
+
+        Persistence plumbing only: the after-close backfill counterpart for
+        ``live_trade`` (see :meth:`broker_order_snapshot`).
+        """
+        rows = await self._with_broker_session(
+            lambda client, session_id: client.get_trades(session_id),
+        )
+        return self._enrich_broker_rows(rows)
+
+    @classmethod
+    def _enrich_broker_rows(cls, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """
+        Attach a normalized ``stock_code`` and derived ``instrument_id`` to each broker
+        order/trade dict so the recorder stays QMT-symbol-agnostic. Rows without a
+        resolvable stock code are passed through unchanged.
+        """
+        enriched: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            stock_code = cls._position_stock_code(row)
+            item = dict(row)
+            if stock_code:
+                item["stock_code"] = stock_code
+                item["instrument_id"] = str(build_bar_type(stock_code).instrument_id)
+            enriched.append(item)
+        return enriched
+
     async def _fetch_broker_positions(self) -> list[dict[str, Any]]:
+        return await self._with_broker_session(
+            lambda client, session_id: client.get_positions(session_id),
+        )
+
+    async def _with_broker_session(self, action: Any) -> list[dict[str, Any]]:
+        """
+        Open a short-lived QMT trading session, run ``action(client, session_id)``
+        (an awaitable), and always close the session/client. Returns ``[]`` when the
+        base URL or account id is not configured. Shared by the position/order/trade
+        broker snapshots so the session dance lives in one place.
+        """
         base_url = str(getattr(self.args, "base_url_http", "") or "").rstrip("/")
         account_id = str(getattr(self.args, "account_id", "") or "").strip()
         if not base_url or not account_id:
@@ -717,7 +785,7 @@ GROUP BY source_code
                 str(getattr(self.args, "account_type", "STOCK") or "STOCK"),
             )
             session_id = str(session["session_id"])
-            return list(await client.get_positions(session_id))
+            return list(await action(client, session_id))
         finally:
             if session_id is not None:
                 await client.close_session(session_id)

@@ -459,13 +459,21 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     extra={"reason": skip_reason},
                 )
                 continue
+            state = self._active_positions.get(instrument_id)
+            if state is None and available_slots <= 0:
+                continue
+            if state is None and self._today_open_price(instrument_id) is None:
+                self._log_missing_new_entry_open_price(
+                    trading_date=trading_date,
+                    signal_date=signal["date"],
+                    instrument_id=instrument_id,
+                    stock_code=stock_code,
+                )
+                continue
             close_price = self._last_close.get(instrument_id)
             if close_price is None or close_price <= 0:
                 continue
-            state = self._active_positions.get(instrument_id)
             if state is None:
-                if available_slots <= 0:
-                    continue
                 self._active_positions[instrument_id] = {
                     "entry_date": trading_date,
                     "entry_price": close_price,
@@ -488,6 +496,28 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 side="buy",
                 selected=True,
             )
+
+    def _today_open_price(self, instrument_id_text: str) -> float | None:
+        open_price = self._today_open.get(instrument_id_text)
+        if open_price is None or open_price <= 0:
+            return None
+        return float(open_price)
+
+    def _log_missing_new_entry_open_price(
+        self,
+        trading_date: date,
+        signal_date: date,
+        instrument_id: str,
+        stock_code: str,
+    ) -> None:
+        if self.log is None:
+            return
+        self.log.warning(
+            f"skipping new model target entry: missing open price "
+            f"date={trading_date} signal_date={signal_date} "
+            f"instrument_id={instrument_id} stock_code={stock_code}",
+            color=LogColor.YELLOW,
+        )
 
     def _trim_active_positions(self) -> None:
         max_positions = int(self.config.max_positions)
