@@ -367,6 +367,13 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             reconciliation_lookback_mins=1440,
             reconciliation_instrument_ids=reconciliation_ids,
             filter_unclaimed_external_orders=not args.load_all_instruments,
+            # QMT 的下单确认链路较慢（Submit→Accepted 观测到 ~6s）。默认的
+            # inflight_check_threshold_ms=5000 会在订单正常确认途中就把它判为
+            # 延迟单，主动向 venue 发 QueryOrder 核对状态；此时 QMT 那边可能已
+            # 全量成交，查询返回的 filled_qty 会被合成为一笔 inferred fill，随后
+            # poll 循环的真实 fill 又到达，同一笔成交被计两次 → overfill 拒绝。
+            # 调大阈值到 20s，覆盖 QMT 慢确认，避免这一竞态。
+            inflight_check_threshold_ms=20_000,
         ),
         data_clients={
             QMT_CLIENT: QMTDataClientConfig(
