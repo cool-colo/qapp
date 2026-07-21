@@ -11,6 +11,36 @@ from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 
 
 class ModelPredictionTargetsTest(unittest.TestCase):
+    def _make_exit_strategy_stub(
+        self,
+        *,
+        active_positions: dict[str, dict],
+        today_open: dict[str, float],
+        last_close: dict[str, float],
+    ):
+        class ExitStrategyStub:
+            _prepare_model_exits = TargetModelPredictionsStrategy._prepare_model_exits
+            _exit_price_with_source = TargetModelPredictionsStrategy._exit_price_with_source
+            _today_open_price = TargetModelPredictionsStrategy._today_open_price
+            _log_missing_exit_open_price = TargetModelPredictionsStrategy._log_missing_exit_open_price
+            _update_trailing_state = TargetModelPredictionsStrategy._update_trailing_state
+            _record_signal = TargetModelPredictionsStrategy._record_signal
+
+        strategy = ExitStrategyStub()
+        strategy.config = SimpleNamespace(
+            stop_loss=0.05,
+            trailing_take_profit=0.0,
+            trailing_take_profit_start=0.0,
+        )
+        strategy.log = MagicMock()
+        strategy._active_positions = active_positions
+        strategy._today_open = today_open
+        strategy._last_close = last_close
+        strategy._stock_by_instrument = {"000001.SZ.QMT": "000001.SZ"}
+        strategy._current_quantity = MagicMock(return_value=100)
+        strategy.signal_events = []
+        return strategy
+
     def _make_target_plan_strategy_stub(
         self,
         *,
@@ -95,6 +125,67 @@ class ModelPredictionTargetsTest(unittest.TestCase):
         self.assertEqual(strategy._active_positions[instrument_id]["last_signal_date"], date(2026, 7, 7))
         strategy.log.warning.assert_not_called()
         strategy._target_plan.assert_called_once_with(date(2026, 7, 8), date(2026, 7, 7))
+
+    def test_prepare_model_exits_uses_open_price_for_stop(self) -> None:
+        instrument_id = "000001.SZ.QMT"
+        strategy = self._make_exit_strategy_stub(
+            active_positions={
+                instrument_id: {
+                    "entry_date": date(2026, 7, 1),
+                    "entry_price": 10.0,
+                    "high_price": 10.0,
+                    "last_signal_date": date(2026, 7, 1),
+                    "score": 0.2,
+                },
+            },
+            today_open={instrument_id: 9.4},
+            last_close={instrument_id: 10.0},
+        )
+
+        strategy._prepare_model_exits(
+            trading_date=date(2026, 7, 8),
+            signal_date=date(2026, 7, 7),
+            target_ids={instrument_id},
+            is_rebalance=False,
+        )
+
+        self.assertEqual(strategy._active_positions, {})
+        self.assertEqual(strategy.signal_events[0].signal_name, "stop_triggered")
+        self.assertEqual(strategy.signal_events[0].extra["open_price"], 9.4)
+        self.assertEqual(strategy.signal_events[0].extra["price_source"], "open")
+        strategy.log.warning.assert_not_called()
+
+    def test_prepare_model_exits_falls_back_to_last_close_with_warning(self) -> None:
+        instrument_id = "000001.SZ.QMT"
+        strategy = self._make_exit_strategy_stub(
+            active_positions={
+                instrument_id: {
+                    "entry_date": date(2026, 7, 1),
+                    "entry_price": 10.0,
+                    "high_price": 10.0,
+                    "last_signal_date": date(2026, 7, 1),
+                    "score": 0.2,
+                },
+            },
+            today_open={},
+            last_close={instrument_id: 9.4},
+        )
+
+        strategy._prepare_model_exits(
+            trading_date=date(2026, 7, 8),
+            signal_date=date(2026, 7, 7),
+            target_ids={instrument_id},
+            is_rebalance=False,
+        )
+
+        self.assertEqual(strategy._active_positions, {})
+        self.assertEqual(strategy.signal_events[0].signal_name, "stop_triggered")
+        self.assertEqual(strategy.signal_events[0].extra["open_price"], 9.4)
+        self.assertEqual(strategy.signal_events[0].extra["price_source"], "prev_close")
+        strategy.log.warning.assert_called_once()
+        warning = strategy.log.warning.call_args.args[0]
+        self.assertIn("missing open price", warning)
+        self.assertIn(instrument_id, warning)
 
 
 if __name__ == "__main__":

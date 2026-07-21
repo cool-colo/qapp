@@ -397,13 +397,20 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             if current_qty <= 0:
                 self._active_positions.pop(instrument_id, None)
                 continue
-            close_price = self._last_close.get(instrument_id)
-            cost_price = float(state.get("entry_price") or close_price or 0.0)
-            trailing = self._update_trailing_state(state, close_price, cost_price)
+            exit_price, price_source = self._exit_price_with_source(instrument_id)
+            if price_source == "prev_close":
+                self._log_missing_exit_open_price(
+                    trading_date=trading_date,
+                    instrument_id=instrument_id,
+                    stock_code=self._stock_by_instrument.get(instrument_id, ""),
+                    fallback_price=exit_price,
+                )
+            cost_price = float(state.get("entry_price") or exit_price or 0.0)
+            trailing = self._update_trailing_state(state, exit_price, cost_price)
             stop_triggered = (
-                close_price is not None
+                exit_price is not None
                 and cost_price > 0
-                and close_price <= cost_price * (1.0 - self.config.stop_loss)
+                and exit_price <= cost_price * (1.0 - self.config.stop_loss)
             )
             trailing_triggered = bool(trailing["triggered"])
             rebalance_exit = is_rebalance and instrument_id not in target_ids
@@ -426,12 +433,38 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 rank=exit_rank,
                 side="sell",
                 extra={
-                    "close_price": close_price,
+                    "open_price": exit_price,
+                    "price_source": price_source,
                     "entry_price": cost_price,
                     "high_price": trailing["high_price"],
                     "trailing_stop_price": trailing["stop_price"],
                 },
             )
+
+    def _exit_price_with_source(self, instrument_id_text: str) -> tuple[float | None, str | None]:
+        open_price = self._today_open_price(instrument_id_text)
+        if open_price is not None:
+            return open_price, "open"
+        close_price = self._last_close.get(instrument_id_text)
+        if close_price is not None and close_price > 0:
+            return float(close_price), "prev_close"
+        return None, None
+
+    def _log_missing_exit_open_price(
+        self,
+        trading_date: date,
+        instrument_id: str,
+        stock_code: str,
+        fallback_price: float | None,
+    ) -> None:
+        if self.log is None:
+            return
+        self.log.warning(
+            f"model target exit using previous close: missing open price "
+            f"date={trading_date} instrument_id={instrument_id} "
+            f"stock_code={stock_code} fallback_price={fallback_price}",
+            color=LogColor.YELLOW,
+        )
 
     def _prepare_model_entries(self, trading_date: date, signals: list[dict[str, Any]]) -> None:
         if not signals:
