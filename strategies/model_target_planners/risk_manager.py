@@ -114,12 +114,9 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         # ``expected_return`` is the model's pred_return_live for this candidate. Omit
         # when unknown so the service applies its own default rather than a fabricated
         # constant.
-        if candidate.expected_return is not None:
-            payload["expected_return"] = float(candidate.expected_return)
-        # Open price lets the service compute target_quantity; omit when unknown so the
-        # service simply skips the share-count for that candidate.
-        if candidate.open_price is not None and float(candidate.open_price) > 0:
-            payload["price"] = float(candidate.open_price)
+        #payload["expected_return"] = float(candidate.expected_return)
+        payload["expected_return"] = 0.01 + 0.1 * candidate.score
+        payload["price"] = float(candidate.open_price)
         return payload
 
     def _request_id(self, request: ModelTargetPlanningRequest) -> str:
