@@ -35,3 +35,5 @@ Thumbs.db
 .gitignore
 logs
 start_qapp.sh
+.envs
+

@@ -27,15 +27,10 @@ Example crontab (every 5 minutes during trading hours)::
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
-import hmac
 import json
 import logging
 import os
 import sys
-import time
-import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,6 +44,8 @@ if NAUTILUS_TRADER_PATH.exists() and str(NAUTILUS_TRADER_PATH) not in sys.path:
     sys.path.insert(0, str(NAUTILUS_TRADER_PATH))
 
 import requests
+
+from monitoring.dingtalk_alert import DingTalkAlerter
 
 logger = logging.getLogger("check_live_status")
 
@@ -245,9 +242,8 @@ def evaluate(live: FetchResult, proxy: FetchResult, rules: dict[str, bool]) -> l
 # --------------------------------------------------------------------------- #
 
 
-# DingTalk custom-robot webhook base (send endpoint). Everything except the
-# per-robot access_token + signing secret is hardcoded here.
-DINGTALK_WEBHOOK_URL = "https://oapi.dingtalk.com/robot/send"
+# DingTalk @-targets for status alerts. The webhook URL + signing live in
+# monitoring.dingtalk_alert.
 DINGTALK_AT_USER_IDS: list[str] = []
 DINGTALK_AT_MOBILES: list[str] = []
 DINGTALK_IS_AT_ALL = False
@@ -263,19 +259,6 @@ def _format_alert_message(alerts: list[Alert]) -> str:
     return "\n".join(lines)
 
 
-def _dingtalk_signed_url(access_token: str, secret: str) -> str:
-    """Build the signed webhook URL (加签 security mode)."""
-    timestamp = str(round(time.time() * 1000))
-    string_to_sign = f"{timestamp}\n{secret}"
-    hmac_code = hmac.new(
-        secret.encode("utf-8"),
-        string_to_sign.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).digest()
-    sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
-    return f"{DINGTALK_WEBHOOK_URL}?access_token={access_token}&timestamp={timestamp}&sign={sign}"
-
-
 def send_dingtalk(
     alerts: list[Alert],
     access_token: str | None,
@@ -284,31 +267,17 @@ def send_dingtalk(
 ) -> None:
     """POST the alert summary to the DingTalk custom-robot webhook (加签 mode).
 
-    ``access_token`` and ``secret`` are the only per-robot inputs; the webhook
-    URL and @-targets are hardcoded above. When either credential is missing the
-    delivery is skipped (logged), so the checker still runs without a webhook.
+    Delegates signing + delivery to ``monitoring.dingtalk_alert``. When either
+    credential is missing the delivery is skipped (logged), so the checker still
+    runs without a webhook.
     """
-    if not access_token or not secret:
-        logger.info("DingTalk credentials missing — skipping webhook delivery")
-        return None
-
-    url = _dingtalk_signed_url(access_token, secret)
-    body = {
-        "msgtype": "text",
-        "text": {"content": _format_alert_message(alerts)},
-        "at": {
-            "isAtAll": DINGTALK_IS_AT_ALL,
-            "atUserIds": DINGTALK_AT_USER_IDS,
-            "atMobiles": DINGTALK_AT_MOBILES,
-        },
-    }
-    headers = {"Content-Type": "application/json"}
-    try:
-        resp = requests.post(url, json=body, headers=headers, timeout=timeout)
-        logger.info("DingTalk webhook response: %s", resp.text)
-    except requests.RequestException as exc:
-        logger.error("DingTalk webhook delivery failed: %r", exc)
-    return None
+    alerter = DingTalkAlerter(access_token=access_token, secret=secret, timeout=timeout)
+    alerter.send_text(
+        _format_alert_message(alerts),
+        at_all=DINGTALK_IS_AT_ALL,
+        at_mobiles=DINGTALK_AT_MOBILES,
+        at_user_ids=DINGTALK_AT_USER_IDS,
+    )
 
 
 def print_status_report(live: FetchResult, proxy: FetchResult) -> None:
