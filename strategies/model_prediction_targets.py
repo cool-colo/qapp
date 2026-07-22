@@ -568,6 +568,11 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         )
         total_asset = float(self._portfolio_value())
         investable_asset = float(self.investable_total_asset())
+        holdings_value = sum(
+            holding.quantity * holding.price for holding in current_holdings
+        )
+        if investable_asset < holdings_value:
+            investable_asset = float(holdings_value)
         return ModelTargetPlanningRequest(
             trading_date=trading_date,
             signal_date=signal_date,

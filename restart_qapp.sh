@@ -11,7 +11,7 @@ SESSION=qapp
 WORKDIR=/data/flc/code/quant/qapp
 
 tmux send-keys -t "$SESSION" C-c
-sleep 30
+sleep 15
 tmux send-keys -t "$SESSION" "cd $WORKDIR && ./start_qapp.sh" Enter
 
 echo "========== $(date '+%F %T') Restart end =========="
