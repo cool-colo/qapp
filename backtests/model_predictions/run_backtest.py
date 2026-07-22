@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--excluded-stock-codes", default=",".join(env_list("MODEL_EXCLUDED_STOCK_CODES", "")))
     parser.add_argument("--min-score", type=float, default=parse_optional_float(env("MODEL_MIN_SCORE")))
     parser.add_argument("--top-frac", type=float, default=float(env("MODEL_TOP_FRAC", "0.10")))
-    parser.add_argument("--max-positions", type=int, default=int(env("MODEL_MAX_POSITIONS", "30")))
+    parser.add_argument("--max-positions", type=int, default=int(env("MODEL_MAX_POSITIONS", "50")))
     parser.add_argument(
         "--price-offset-ticks",
         type=int,
@@ -322,6 +322,7 @@ def signals_config(bundle: PredictionDataBundle, loaded_stock_codes: set[str]) -
                     "stock_code": signal.stock_code,
                     "score": signal.score,
                     "rank": signal.rank,
+                    "pred_return_live": signal.pred_return_live,
                 },
             )
         if rows:

@@ -150,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--excluded-stock-codes", default=",".join(env_list("MODEL_EXCLUDED_STOCK_CODES", "")))
     parser.add_argument("--min-score", type=float, default=parse_optional_float(env("MODEL_MIN_SCORE")))
     parser.add_argument("--top-frac", type=float, default=float(env("MODEL_TOP_FRAC", "0.10")))
-    parser.add_argument("--max-positions", type=int, default=int(env("MODEL_MAX_POSITIONS", "30")))
+    parser.add_argument("--max-positions", type=int, default=int(env("MODEL_MAX_POSITIONS", "50")))
     parser.add_argument(
         "--max-position-percent",
         type=float,
@@ -212,7 +212,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--risk-manager-risk-model-id",
-        default=env("RISK_MANAGER_RISK_MODEL_ID", "cn_a_mean_variance"),
+        default=env("RISK_MANAGER_RISK_MODEL_ID", "cn_a_basic_constraints_integer_lots"),
         help="risk-manager risk_model_id for portfolio optimization.",
     )
     parser.add_argument(
@@ -580,6 +580,7 @@ def signal_config(bundle: PredictionDataBundle, loaded_stock_codes: set[str]) ->
                     "stock_code": signal.stock_code,
                     "score": signal.score,
                     "rank": signal.rank,
+                    "pred_return_live": signal.pred_return_live,
                 },
             )
         if rows:

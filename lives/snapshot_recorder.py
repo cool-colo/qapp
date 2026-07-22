@@ -412,6 +412,8 @@ class SnapshotRecorder(Actor):
         investable_asset = self._plan_investable_asset(plan, total_asset)
         open_prices = dict(plan.open_prices) if plan.open_prices else self._current_open_prices()
         price_sources = dict(plan.price_sources)
+        expected_returns = dict(plan.expected_returns)
+        holding_meta = dict(plan.holding_meta)
         # The risk-manager planner commits explicit share counts (固定目标股数, 0 kept).
         # These drive execution; weights are persisted for audit only.
         target_qty = self._plan_target_quantities(plan)
@@ -425,6 +427,13 @@ class SnapshotRecorder(Actor):
         for instrument_id_text in instrument_ids:
             weight = plan.weights.get(instrument_id_text)
             qty = target_qty.get(instrument_id_text)
+            expected_return = expected_returns.get(instrument_id_text)
+            # Rows whose instrument is a current holding carry its recency
+            # (recent_buy_date / recent_holding_days) in ``extra``.
+            extra: dict[str, Any] = {"target_version": version}
+            meta = holding_meta.get(instrument_id_text)
+            if meta:
+                extra.update(meta)
             records.append(
                 LiveTargetRecord(
                     trade_date=trading_date,
@@ -446,8 +455,9 @@ class SnapshotRecorder(Actor):
                     price_source=price_sources.get(instrument_id_text),
                     target_qty=self._int_or_none(qty),
                     score=self._instrument_score(instrument_id_text),
+                    expected_return=self._decimal_or_none(expected_return),
                     reason=plan.reason,
-                    extra={"target_version": version},
+                    extra=extra,
                     created_at=self._now_naive(),
                 ),
             )

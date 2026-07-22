@@ -10,6 +10,7 @@ from urllib.error import URLError
 from urllib.request import Request
 from urllib.request import urlopen
 
+from strategies.model_target_planners.base import CurrentHolding
 from strategies.model_target_planners.base import ModelTargetCandidate
 from strategies.model_target_planners.base import ModelTargetPlan
 from strategies.model_target_planners.base import ModelTargetPlanner
@@ -42,10 +43,9 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             raise ValueError("risk_manager_mode must be one of: backtest, simulation, live")
 
     def plan(self, request: ModelTargetPlanningRequest) -> ModelTargetPlan:
-        if not request.active_instrument_ids:
+        # Nothing to optimize when there are neither signal candidates nor holdings.
+        if not request.candidates and not request.current_holdings:
             return ModelTargetPlan(request.trading_date, request.signal_date, {}, self.reason)
-        if not request.candidates:
-            raise RuntimeError("risk-manager optimize requires active positions mapped to stock codes")
         request_id = self._request_id(request)
         response = self._post_json(self._payload(request, request_id))
         if not bool(response.get("success")):
@@ -54,8 +54,11 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             raise RuntimeError(
                 f"risk-manager optimize failed status={status} failure_reason={failure_reason}",
             )
-        target_qty = self._target_quantities(response, request.candidates)
-        weights = self._audit_weights(response, request.candidates)
+        # Response rows may reference either a signal candidate (buy/hold) or a current
+        # holding being liquidated (target_qty == 0), so map both back to instrument ids.
+        stock_to_instrument = self._stock_to_instrument(request)
+        target_qty = self._target_quantities(response, stock_to_instrument)
+        weights = self._audit_weights(response, stock_to_instrument)
         return ModelTargetPlan(
             trading_date=request.trading_date,
             signal_date=request.signal_date,
@@ -67,11 +70,8 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
 
     def _payload(self, request: ModelTargetPlanningRequest, request_id: str) -> dict[str, Any]:
         asof_date = request.signal_date or request.trading_date
-        current_weights = [
-            {"stock_code": stock_code, "current_weight": weight}
-            for stock_code, weight in sorted(request.current_weights.items())
-        ]
-        previous_position_total = sum(max(0.0, weight) for weight in request.current_weights.values())
+        holdings = sorted(request.current_holdings, key=lambda holding: holding.stock_code)
+        current_weights = [self._holding_payload(holding) for holding in holdings]
         payload: dict[str, Any] = {
             "request_id": request_id,
             "mode": self.mode,
@@ -81,7 +81,6 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             "candidates": [self._candidate_payload(candidate) for candidate in request.candidates],
             "current_weights": current_weights,
             "benchmark_weights": [],
-            "previous_position_total": previous_position_total,
         }
         # Pre-market investable total (net of trading buffer) so the service sizes share
         # counts server-side from candidate open prices.
@@ -91,13 +90,32 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         return payload
 
     @staticmethod
+    def _holding_payload(holding: CurrentHolding) -> dict[str, Any]:
+        # ``recent_target_date`` is the internal field name; the wire contract uses
+        # ``recent_buy_date`` (the value is the last positive-target date).
+        payload: dict[str, Any] = {
+            "stock_code": holding.stock_code,
+            "quantity": int(holding.quantity),
+            "price": float(holding.price),
+            "recent_buy_date": (
+                None if holding.recent_target_date is None else holding.recent_target_date.isoformat()
+            ),
+            "recent_holding_days": int(holding.recent_holding_days),
+        }
+        return payload
+
+    @staticmethod
     def _candidate_payload(candidate: ModelTargetCandidate) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "stock_code": candidate.stock_code,
             "score": candidate.score,
             "is_tradable": True,
-            "expected_return": 0.02,
         }
+        # ``expected_return`` is the model's pred_return_live for this candidate. Omit
+        # when unknown so the service applies its own default rather than a fabricated
+        # constant.
+        if candidate.expected_return is not None:
+            payload["expected_return"] = float(candidate.expected_return)
         # Open price lets the service compute target_quantity; omit when unknown so the
         # service simply skips the share-count for that candidate.
         if candidate.open_price is not None and float(candidate.open_price) > 0:
@@ -176,7 +194,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
     def _target_quantities(
         self,
         response: dict[str, Any],
-        candidates: list[ModelTargetCandidate],
+        stock_to_instrument: dict[str, str],
     ) -> dict[str, int]:
         """
         Map the service-provided ``target_quantity`` per row to instrument ids.
@@ -184,7 +202,6 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         ``target_quantity == 0`` is a valid target (liquidate / hold none) and is kept;
         only a missing or non-numeric value is skipped.
         """
-        stock_to_instrument = self._stock_to_instrument(candidates)
         rows = self._target_rows(response)
         quantities: dict[str, int] = {}
         for row in rows:
@@ -208,7 +225,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
     def _audit_weights(
         self,
         response: dict[str, Any],
-        candidates: list[ModelTargetCandidate],
+        stock_to_instrument: dict[str, str],
     ) -> dict[str, float]:
         """
         Map the service-provided ``target_weight`` per row to instrument ids.
@@ -217,7 +234,6 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         ``target_qty``. Rows the service sized by quantity only (no positive weight)
         simply have no weight entry; no synthetic weight is fabricated.
         """
-        stock_to_instrument = self._stock_to_instrument(candidates)
         weights: dict[str, float] = {}
         for row in self._target_rows(response):
             if not isinstance(row, dict):
@@ -231,11 +247,13 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         return dict(sorted(weights.items()))
 
     @staticmethod
-    def _stock_to_instrument(candidates: list[ModelTargetCandidate]) -> dict[str, str]:
-        return {
-            normalize_stock_code(candidate.stock_code): candidate.instrument_id
-            for candidate in candidates
-        }
+    def _stock_to_instrument(request: ModelTargetPlanningRequest) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        for candidate in request.candidates:
+            mapping[normalize_stock_code(candidate.stock_code)] = candidate.instrument_id
+        for holding in request.current_holdings:
+            mapping.setdefault(normalize_stock_code(holding.stock_code), holding.instrument_id)
+        return mapping
 
     @staticmethod
     def _target_rows(response: dict[str, Any]) -> list[Any]:

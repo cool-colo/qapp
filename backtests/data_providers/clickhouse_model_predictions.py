@@ -146,7 +146,7 @@ ORDER BY date
             values = ", ".join(quote_literal(to_prediction_table_stock_code(code)) for code in stock_codes)
             where.insert(0, f"stock_code IN ({values})")
         sql = f"""
-SELECT stock_code, pred_date AS date, score
+SELECT stock_code, pred_date AS date, score, pred_return_live
 FROM {quote_identifier(table)}
 WHERE {" AND ".join(where)}
 ORDER BY date, score DESC
@@ -249,16 +249,23 @@ def to_prediction_table_stock_code(value: object) -> str:
 
 
 def normalize_prediction_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    columns = ["date", "stock_code", "score"]
+    # ``score`` is required (rows without it are dropped); ``pred_return_live`` is the
+    # optional expected-return signal, carried through as NaN when missing rather than
+    # dropping the row.
+    required = ["date", "stock_code", "score"]
+    columns = ["date", "stock_code", "score", "pred_return_live"]
     if frame.empty:
         return pd.DataFrame(columns=columns)
     result = frame.copy()
-    missing = sorted(set(columns).difference(result.columns))
+    missing = sorted(set(required).difference(result.columns))
     if missing:
         raise ValueError(f"model_predictions query result is missing columns: {missing}")
+    if "pred_return_live" not in result.columns:
+        result["pred_return_live"] = np.nan
     result["date"] = pd.to_datetime(result["date"], errors="coerce").dt.normalize()
     result["stock_code"] = result["stock_code"].map(normalize_stock_code)
     result["score"] = pd.to_numeric(result["score"], errors="coerce")
+    result["pred_return_live"] = pd.to_numeric(result["pred_return_live"], errors="coerce")
     result = result.dropna(subset=["date", "stock_code", "score"]).copy()
     result = result.loc[np.isfinite(result["score"].astype(float))].copy()
     result = result.sort_values(["date", "stock_code", "score"], ascending=[True, True, False])
@@ -297,12 +304,18 @@ def build_signal_map(selected: pd.DataFrame) -> dict[date, list[PredictionSignal
         signal_date = pd.Timestamp(value).date()
         signals = []
         for row in part.sort_values("rank").itertuples():
+            pred_return_live = getattr(row, "pred_return_live", None)
             signals.append(
                 PredictionSignal(
                     signal_date=signal_date,
                     stock_code=str(row.stock_code),
                     score=float(row.score),
                     rank=int(row.rank),
+                    pred_return_live=(
+                        None
+                        if pred_return_live is None or pd.isna(pred_return_live)
+                        else float(pred_return_live)
+                    ),
                 ),
             )
         signals_by_date[signal_date] = signals

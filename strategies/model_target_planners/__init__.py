@@ -1,3 +1,4 @@
+from strategies.model_target_planners.base import CurrentHolding
 from strategies.model_target_planners.base import ModelTargetCandidate
 from strategies.model_target_planners.base import ModelTargetPlan
 from strategies.model_target_planners.base import ModelTargetPlanner
@@ -7,6 +8,7 @@ from strategies.model_target_planners.factory import build_model_target_planner
 from strategies.model_target_planners.risk_manager import RiskManagerModelTargetPlanner
 
 __all__ = [
+    "CurrentHolding",
     "ModelTargetCandidate",
     "ModelTargetPlan",
     "ModelTargetPlanner",

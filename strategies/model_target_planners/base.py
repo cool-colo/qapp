@@ -24,6 +24,11 @@ class ModelTargetPlan:
     price_sources: dict[str, str] = field(default_factory=dict)  # instrument_id -> open|prev_close
     total_asset: float | None = None  # raw total asset
     investable_asset: float | None = None  # total asset net of trading buffer
+    # instrument_id -> pred_return_live used for that candidate (audit; persisted).
+    expected_returns: dict[str, float] = field(default_factory=dict)
+    # instrument_id -> {"recent_buy_date", "recent_holding_days"} for instruments that
+    # are current holdings, so persisted target rows carry the recency in ``extra``.
+    holding_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,25 @@ class ModelTargetCandidate:
     stock_code: str
     score: float
     open_price: float | None = None  # pre-market open (falls back to prev close upstream)
+    expected_return: float | None = None  # daily_model_predictions.pred_return_live
+
+
+@dataclass(frozen=True)
+class CurrentHolding:
+    """
+    A currently-held position sent to the risk manager as ``current_weights``.
+
+    ``recent_target_date`` is the internal name for the most recent date this stock
+    carried a positive target (last ``target_qty > 0`` in live, or the entry date in
+    backtests). It is serialized on the wire as ``recent_buy_date``.
+    """
+
+    instrument_id: str
+    stock_code: str
+    quantity: int
+    price: float  # current price, defaults to today's open
+    recent_target_date: date | None = None
+    recent_holding_days: int = 0
 
 
 @dataclass(frozen=False)
@@ -40,7 +64,7 @@ class ModelTargetPlanningRequest:
     signal_date: date | None
     active_instrument_ids: list[str]
     candidates: list[ModelTargetCandidate]
-    current_weights: dict[str, float]
+    current_holdings: list[CurrentHolding]
     target_cash_buffer_percent: float
     max_position_percent: float
     total_asset: float | None = None  # raw total asset

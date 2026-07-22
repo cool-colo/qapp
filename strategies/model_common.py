@@ -26,12 +26,16 @@ def normalize_signals(raw: dict[str, list[dict[str, Any]]]) -> dict[date, list[d
         signal_date = pd.Timestamp(key).date()
         normalized = []
         for signal in signals:
+            pred_return_live = signal.get("pred_return_live")
             normalized.append(
                 {
                     "date": pd.Timestamp(signal["date"]).date(),
                     "stock_code": str(signal["stock_code"]),
                     "score": float(signal["score"]),
                     "rank": int(signal.get("rank", len(normalized) + 1)),
+                    "pred_return_live": (
+                        None if pred_return_live is None else float(pred_return_live)
+                    ),
                 },
             )
         result[signal_date] = normalized

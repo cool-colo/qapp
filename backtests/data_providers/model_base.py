@@ -19,7 +19,7 @@ class ModelPredictionDataRequest:
     excluded_stock_codes: set[str] | None = None
     min_score: float | None = None
     top_frac: float = 0.10
-    max_positions: int = 30
+    max_positions: int = 50
     signal_warmup_days: int = 7
 
 
@@ -29,6 +29,7 @@ class PredictionSignal:
     stock_code: str
     score: float
     rank: int
+    pred_return_live: float | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class PredictionDataBundle:
                         "stock_code": signal.stock_code,
                         "score": signal.score,
                         "rank": signal.rank,
+                        "pred_return_live": signal.pred_return_live,
                     },
                 )
         return pd.DataFrame(rows)

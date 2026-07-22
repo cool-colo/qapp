@@ -104,6 +104,7 @@ class LiveTargetRecord:
     price_source: str | None = None
     target_qty: int | None = None
     score: Decimal | None = None
+    expected_return: Decimal | None = None
     reason: str | None = None
     extra: JsonMapping | None = None
     created_at: datetime | None = None

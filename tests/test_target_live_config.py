@@ -375,6 +375,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                     "open",           # price_source
                     1000,             # target_qty
                     1.2,              # score
+                    0.03,             # expected_return
                     "loaded_target",  # reason
                     CONTINUOUS_TRADING,  # snapshot_type
                 )],

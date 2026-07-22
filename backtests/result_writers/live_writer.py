@@ -164,6 +164,7 @@ CREATE TABLE IF NOT EXISTS `live_target_portfolio` (
   `price_source`  VARCHAR(16)  NULL,
   `target_qty`    BIGINT       NULL,
   `score`         DECIMAL(20,8) NULL,
+  `expected_return` DECIMAL(20,8) NULL,
   `reason`        VARCHAR(64)  NULL,
   `extra`         JSON         NULL,
   `created_at`    DATETIME     NOT NULL,
@@ -369,6 +370,7 @@ class LiveSnapshotWriter:
             "position_snapshot_id": "BIGINT NULL",
             "investable_asset": "DECIMAL(20,4) NULL",
             "price_source": "VARCHAR(16) NULL",
+            "expected_return": "DECIMAL(20,8) NULL",
         }
         try:
             existing = {
@@ -697,6 +699,7 @@ class LiveSnapshotWriter:
             "price_source",
             "target_qty",
             "score",
+            "expected_return",
             "reason",
             "snapshot_type",
         ]
@@ -715,6 +718,60 @@ class LiveSnapshotWriter:
             if rows:
                 return [dict(zip(columns, row)) for row in rows]
         return []
+
+    def load_recent_target_dates(
+        self,
+        account_id: str,
+        trader_id: str,
+        trade_date: date,
+        cutoff_trade_date: date,
+        stock_codes: Sequence[str],
+    ) -> dict[str, date]:
+        """
+        Resolve, per stock, the most recent ``trade_date`` that carried a positive
+        target (``target_qty > 0``) within the window ``[cutoff_trade_date, trade_date)``
+        — i.e. excluding today. ``before_trading`` rows win over other snapshot types on
+        the same date. Returns ``{stock_code: recent_target_date}``; stocks with no
+        qualifying row are absent.
+
+        Used to populate the risk-manager request's ``recent_buy_date`` /
+        ``recent_holding_days`` for currently-held positions.
+        """
+        codes = [str(code) for code in stock_codes if code]
+        if not codes:
+            return {}
+        placeholders = ", ".join(["%s"] * len(codes))
+        # Per (stock_code), take the latest trade_date; within a tie on date, prefer
+        # before_trading (snapshot_type ordering weight 0) over other snapshot types (1).
+        sql = (
+            "SELECT `stock_code`, MAX(`trade_date`) AS recent_target_date "
+            "FROM `live_target_portfolio` "
+            "WHERE `account_id`=%s AND `trader_id`=%s "
+            "AND `trade_date` >= %s AND `trade_date` < %s "
+            "AND `target_qty` IS NOT NULL AND `target_qty` > 0 "
+            f"AND `stock_code` IN ({placeholders}) "
+            "GROUP BY `stock_code`"
+        )
+        params: tuple[Any, ...] = (
+            account_id,
+            trader_id,
+            cutoff_trade_date,
+            trade_date,
+            *codes,
+        )
+        rows = self._query(sql, params)
+        result: dict[str, date] = {}
+        for row in rows:
+            stock_code = str(row[0])
+            recent = row[1]
+            if recent is None:
+                continue
+            if isinstance(recent, datetime):
+                recent = recent.date()
+            elif not isinstance(recent, date):
+                recent = datetime.strptime(str(recent), "%Y-%m-%d").date()
+            result[stock_code] = recent
+        return result
 
     def latest_asset_snapshot_value(
         self,
@@ -871,6 +928,7 @@ class LiveSnapshotWriter:
             "price_source": record.price_source,
             "target_qty": record.target_qty,
             "score": record.score,
+            "expected_return": record.expected_return,
             "reason": record.reason,
             "extra": _json_dumps(record.extra),
             "created_at": _timestamp(record.created_at),

@@ -113,7 +113,7 @@ def build_engine(
             target_weight_planner=os.environ.get("MODEL_TARGET_WEIGHT_PLANNER", "risk_manager"),
             target_weight_planner_error_policy=os.environ.get("MODEL_TARGET_WEIGHT_PLANNER_ERROR_POLICY", "raise"),
             risk_manager_base_url=os.environ.get("RISK_MANAGER_BASE_URL", "http://127.0.0.1:8000"),
-            risk_manager_risk_model_id=os.environ.get("RISK_MANAGER_RISK_MODEL_ID", "cn_a_mean_variance"),
+            risk_manager_risk_model_id=os.environ.get("RISK_MANAGER_RISK_MODEL_ID", "cn_a_basic_constraints_integer_lots"),
             risk_manager_mode=os.environ.get("RISK_MANAGER_MODE", "backtest"),
             risk_manager_timeout_secs=float(os.environ.get("RISK_MANAGER_TIMEOUT_SECS", "10")),
             order_slice_notional=env_decimal("MODEL_ORDER_SLICE_NOTIONAL", "300000"),

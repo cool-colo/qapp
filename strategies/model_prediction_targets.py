@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 from datetime import date
 from datetime import timedelta
-from decimal import Decimal
 from typing import Any
 from typing import Callable
 
@@ -15,11 +14,10 @@ from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import InstrumentId
 
 from strategies.model_common import ModelPredictionSignalEvent
-from strategies.model_common import first_trading_date_on_or_after
-from strategies.model_common import is_rebalance_day
 from strategies.model_common import normalize_initial_active_positions
 from strategies.model_common import normalize_signals
 from strategies.model_common import previous_trading_date
+from strategies.model_target_planners import CurrentHolding
 from strategies.model_target_planners import ModelTargetCandidate
 from strategies.model_target_planners import ModelTargetPlan
 from strategies.model_target_planners import ModelTargetPlanningRequest
@@ -37,7 +35,7 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     listed_dates: dict[str, str]
     st_by_date: dict[str, list[str]]
     suspended_by_date: dict[str, list[str]]
-    max_positions: int = 30
+    max_positions: int = 50
     max_position_percent: float = 0.03
     holding_days: int = 10
     stop_loss: float = 0.05
@@ -92,12 +90,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         }
         self._active_positions = normalize_initial_active_positions(config.initial_active_positions)
         self._processed_dates: set[date] = set()
-        self._rebalance_start_date = first_trading_date_on_or_after(
-            self._trading_dates,
-            pd.Timestamp(config.trading_dates[0]).date() if config.trading_dates else None,
-        )
         self._target_planner = build_model_target_planner(config)
         self._live_target_portfolio_loader: Callable[[date, date | None], list[dict[str, Any]]] | None = None
+        self._recent_target_loader: Callable[[date, date, list[str]], dict[str, date]] | None = None
         self.signal_events: list[ModelPredictionSignalEvent] = []
 
     def configure_live_target_portfolio_loader(
@@ -112,6 +107,21 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         use the computed plan path.
         """
         self._live_target_portfolio_loader = loader
+
+    def configure_recent_target_loader(
+        self,
+        loader: Callable[[date, date, list[str]], dict[str, date]] | None,
+    ) -> None:
+        """
+        Inject a loader for the most-recent positive-target date per held stock.
+
+        Signature: ``loader(trading_date, cutoff_trade_date, stock_codes) ->
+        {stock_code: recent_target_date}``. Live wiring queries ``live_target_portfolio``
+        for the last ``target_qty > 0`` date (before_trading preferred) within the
+        window ``[cutoff_trade_date, trading_date)``. Backtests leave this unset and
+        fall back to each position's entry date.
+        """
+        self._recent_target_loader = loader
 
     def refresh_reference_data(
         self,
@@ -286,38 +296,29 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
 
     def compute_daily_target_plan(self, trading_date: date) -> ModelTargetPlan:
         """
-        Run the daily selection pipeline (seed positions → exits → entries → trim →
-        target planner) and return the resulting plan **without submitting orders or
-        accepting the target**.
+        Build the risk-manager request for the day and return the resulting plan
+        **without submitting orders or accepting the target**.
+
+        Two independent inputs are built and filtered separately (no merge):
+
+        * **candidates** — the signal stocks, minus entry-ineligible ones (name
+          prefixes, ST, suspension, minimum listed days, missing sizing price).
+        * **current_holdings** — the held positions, minus the untradable ones and the
+          ones a local hard-exit rule (stop-loss / trailing take-profit) fires on, so
+          the optimizer no longer sees them as current state and unwinds them.
 
         The bar/timer path (_process_trading_day) uses this and then applies the plan
         via update_target_quantities. The snapshot recorder uses it before-trading to
-        derive the day's frozen share counts, persist them, and then feed them back via
-        update_target_quantities. Both paths therefore run the same selection logic.
+        derive the day's frozen share counts. Both paths therefore run the same logic.
         """
         self._seed_active_positions_from_portfolio(trading_date)
         signal_date = self._resolve_signal_date(trading_date)
         today_signals = self._signals_by_date.get(signal_date, []) if signal_date else []
-        target_ids = {
-            str(self._instrument_by_stock[signal["stock_code"]])
-            for signal in today_signals
-            if signal["stock_code"] in self._instrument_by_stock
-        }
-        rebalance_today = is_rebalance_day(
-            trading_dates=self._trading_dates,
-            rebalance_start_date=self._rebalance_start_date,
-            current_date=trading_date,
-            holding_days=self.config.holding_days,
-        )
         self.log.info(
             f"model target day {trading_date}: signal_date={signal_date} "
-            f"signals={len(today_signals)} mapped_targets={len(target_ids)} "
-            f"rebalance={rebalance_today} active={len(self._active_positions)}",
+            f"signals={len(today_signals)} active={len(self._active_positions)}",
             color=LogColor.BLUE,
         )
-        self._prepare_model_exits(trading_date, signal_date, target_ids, rebalance_today)
-        self._prepare_model_entries(trading_date, today_signals)
-        self._trim_active_positions()
         return self._target_plan(trading_date, signal_date)
 
     def plan_version(self, plan: ModelTargetPlan) -> str:
@@ -384,62 +385,80 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             "score": float(latest_signal.get("score", 0.0)),
         }
 
-    def _prepare_model_exits(
+    def _holding_exclusion(
         self,
         trading_date: date,
         signal_date: date | None,
-        target_ids: set[str],
-        is_rebalance: bool,
-    ) -> None:
-        exit_rank = 0
-        for instrument_id, state in list(self._active_positions.items()):
-            current_qty = self._current_quantity(InstrumentId.from_str(instrument_id))
-            if current_qty <= 0:
-                self._active_positions.pop(instrument_id, None)
-                continue
-            exit_price, price_source = self._exit_price_with_source(instrument_id)
-            if price_source == "prev_close":
-                self._log_missing_exit_open_price(
-                    trading_date=trading_date,
-                    instrument_id=instrument_id,
-                    stock_code=self._stock_by_instrument.get(instrument_id, ""),
-                    fallback_price=exit_price,
-                )
-            cost_price = float(state.get("entry_price") or exit_price or 0.0)
-            trailing = self._update_trailing_state(state, exit_price, cost_price)
-            stop_triggered = (
-                exit_price is not None
-                and cost_price > 0
-                and exit_price <= cost_price * (1.0 - self.config.stop_loss)
-            )
-            trailing_triggered = bool(trailing["triggered"])
-            rebalance_exit = is_rebalance and instrument_id not in target_ids
-            if not (stop_triggered or trailing_triggered or rebalance_exit):
-                continue
-            self._active_positions.pop(instrument_id, None)
-            exit_rank += 1
-            if stop_triggered:
-                signal_name = "stop_triggered"
-            elif trailing_triggered:
-                signal_name = "trailing_take_profit_triggered"
-            else:
-                signal_name = "rebalance_exit"
-            self._record_signal(
-                signal_date=signal_date or trading_date,
+        instrument_id: str,
+        exit_rank: int,
+    ) -> str | None:
+        """
+        Decide whether a currently-held position must be **excluded** from the
+        risk-manager ``current_holdings`` so the optimizer unwinds it.
+
+        Two exclusion families, both unchanged in intent from the old exit logic:
+
+        * **untradable** — the stock is suspended or ST today (can't be traded, so it
+          is not offered as current state).
+        * **local hard-exit** — stop-loss or trailing-take-profit fires against the
+          entry/high-water state tracked in ``_active_positions``.
+
+        Updates the position's trailing state as a side effect (the daily high-water
+        mark must advance even on days the position is kept) and records a sell
+        ``signal_event`` when it excludes. Returns the exclusion reason, or ``None`` to
+        keep the holding.
+        """
+        state = self._active_positions.get(instrument_id, {})
+        exit_price, price_source = self._exit_price_with_source(instrument_id)
+        if price_source == "prev_close":
+            self._log_missing_exit_open_price(
+                trading_date=trading_date,
                 instrument_id=instrument_id,
                 stock_code=self._stock_by_instrument.get(instrument_id, ""),
-                signal_name=signal_name,
-                score=state.get("score"),
-                rank=exit_rank,
-                side="sell",
-                extra={
-                    "open_price": exit_price,
-                    "price_source": price_source,
-                    "entry_price": cost_price,
-                    "high_price": trailing["high_price"],
-                    "trailing_stop_price": trailing["stop_price"],
-                },
+                fallback_price=exit_price,
             )
+        cost_price = float(state.get("entry_price") or exit_price or 0.0)
+        trailing = self._update_trailing_state(state, exit_price, cost_price)
+        stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
+        untradable = self._untradable_reason(stock_code, trading_date)
+        stop_triggered = (
+            exit_price is not None
+            and cost_price > 0
+            and exit_price <= cost_price * (1.0 - self.config.stop_loss)
+        )
+        trailing_triggered = bool(trailing["triggered"])
+        if untradable:
+            signal_name = untradable
+        elif stop_triggered:
+            signal_name = "stop_triggered"
+        elif trailing_triggered:
+            signal_name = "trailing_take_profit_triggered"
+        else:
+            return None
+        self._record_signal(
+            signal_date=signal_date or trading_date,
+            instrument_id=instrument_id,
+            stock_code=self._stock_by_instrument.get(instrument_id, ""),
+            signal_name=signal_name,
+            score=state.get("score"),
+            rank=exit_rank,
+            side="sell",
+            extra={
+                "open_price": exit_price,
+                "price_source": price_source,
+                "entry_price": cost_price,
+                "high_price": trailing["high_price"],
+                "trailing_stop_price": trailing["stop_price"],
+            },
+        )
+        return signal_name
+
+    def _untradable_reason(self, stock_code: str, trading_date: date) -> str | None:
+        if stock_code in self._suspended_by_date.get(trading_date, set()):
+            return "suspended"
+        if stock_code in self._st_by_date.get(trading_date, set()):
+            return "st"
+        return None
 
     def _exit_price_with_source(self, instrument_id_text: str) -> tuple[float | None, str | None]:
         open_price = self._today_open_price(instrument_id_text)
@@ -466,70 +485,6 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             color=LogColor.YELLOW,
         )
 
-    def _prepare_model_entries(self, trading_date: date, signals: list[dict[str, Any]]) -> None:
-        if not signals:
-            return
-        active_ids = set(self._active_positions)
-        available_slots = max(0, int(self.config.max_positions) - len(active_ids))
-        entry_rank = 0
-        for signal in signals:
-            stock_code = signal["stock_code"]
-            instrument = self._instrument_by_stock.get(stock_code)
-            if instrument is None:
-                continue
-            instrument_id = str(instrument)
-            skip_reason = self._entry_skip_reason(stock_code, trading_date)
-            if skip_reason:
-                self._record_signal(
-                    signal_date=signal["date"],
-                    instrument_id=instrument_id,
-                    stock_code=stock_code,
-                    signal_name="entry_filtered",
-                    score=signal.get("score"),
-                    rank=signal.get("rank"),
-                    side="buy",
-                    selected=False,
-                    extra={"reason": skip_reason},
-                )
-                continue
-            state = self._active_positions.get(instrument_id)
-            if state is None and available_slots <= 0:
-                continue
-            if state is None and self._today_open_price(instrument_id) is None:
-                self._log_missing_new_entry_open_price(
-                    trading_date=trading_date,
-                    signal_date=signal["date"],
-                    instrument_id=instrument_id,
-                    stock_code=stock_code,
-                )
-                continue
-            close_price = self._last_close.get(instrument_id)
-            if close_price is None or close_price <= 0:
-                continue
-            if state is None:
-                self._active_positions[instrument_id] = {
-                    "entry_date": trading_date,
-                    "entry_price": close_price,
-                    "high_price": close_price,
-                    "last_signal_date": signal["date"],
-                    "score": float(signal["score"]),
-                }
-                available_slots -= 1
-            else:
-                state["last_signal_date"] = signal["date"]
-                state["score"] = float(signal["score"])
-            entry_rank += 1
-            self._record_signal(
-                signal_date=signal["date"],
-                instrument_id=instrument_id,
-                stock_code=stock_code,
-                signal_name="model_prediction_score",
-                score=signal.get("score"),
-                rank=entry_rank,
-                side="buy",
-                selected=True,
-            )
-
     def _today_open_price(self, instrument_id_text: str) -> float | None:
         open_price = self._today_open.get(instrument_id_text)
         if open_price is None or open_price <= 0:
@@ -546,30 +501,11 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         if self.log is None:
             return
         self.log.warning(
-            f"skipping new model target entry: missing open price "
+            f"skipping model prediction candidate: missing open price "
             f"date={trading_date} signal_date={signal_date} "
             f"instrument_id={instrument_id} stock_code={stock_code}",
             color=LogColor.YELLOW,
         )
-
-    def _trim_active_positions(self) -> None:
-        max_positions = int(self.config.max_positions)
-        if max_positions <= 0 or len(self._active_positions) <= max_positions:
-            return
-        rows = []
-        for instrument_id, state in self._active_positions.items():
-            rows.append(
-                {
-                    "instrument_id": instrument_id,
-                    "score": float(state.get("score", 0.0)),
-                    "last_signal_date": pd.Timestamp(state.get("last_signal_date", pd.Timestamp.min)),
-                },
-            )
-        ranked = sorted(rows, key=lambda item: (item["score"], item["last_signal_date"]), reverse=True)
-        keep_ids = {item["instrument_id"] for item in ranked[:max_positions]}
-        for instrument_id in list(self._active_positions):
-            if instrument_id not in keep_ids:
-                self._active_positions.pop(instrument_id, None)
 
     def _target_plan(self, trading_date: date, signal_date: date | None) -> ModelTargetPlan:
         request = self._target_planning_request(trading_date, signal_date)
@@ -592,12 +528,30 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             for _price, source in (self._open_price_with_source(instrument_id),)
             if source is not None
         }
+        expected_returns = {
+            candidate.instrument_id: float(candidate.expected_return)
+            for candidate in request.candidates
+            if candidate.expected_return is not None
+        }
+        holding_meta = {
+            holding.instrument_id: {
+                "recent_buy_date": (
+                    None
+                    if holding.recent_target_date is None
+                    else holding.recent_target_date.isoformat()
+                ),
+                "recent_holding_days": int(holding.recent_holding_days),
+            }
+            for holding in request.current_holdings
+        }
         return dataclasses.replace(
             plan,
             open_prices=dict(request.open_prices),
             price_sources=price_sources,
             total_asset=request.total_asset,
             investable_asset=request.investable_asset,
+            expected_returns=expected_returns,
+            holding_meta=holding_meta,
         )
 
     def _target_planning_request(
@@ -605,29 +559,13 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         trading_date: date,
         signal_date: date | None,
     ) -> ModelTargetPlanningRequest:
-        active_ids = sorted(self._active_positions)
         open_prices: dict[str, float] = {}
-        candidates = []
-        for instrument_id in active_ids:
-            stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
-            if not stock_code:
-                continue
-            state = self._active_positions.get(instrument_id, {})
-            try:
-                score = float(state.get("score", 0.0))
-            except (TypeError, ValueError):
-                score = 0.0
-            price, _source = self._open_price_with_source(instrument_id)
-            if price is not None:
-                open_prices[instrument_id] = price
-            candidates.append(
-                ModelTargetCandidate(
-                    instrument_id=instrument_id,
-                    stock_code=stock_code,
-                    score=score,
-                    open_price=price,
-                ),
-            )
+        candidates = self._build_candidates(trading_date, signal_date, open_prices)
+        current_holdings = self._build_current_holdings(trading_date, signal_date, open_prices)
+        active_ids = sorted(
+            {candidate.instrument_id for candidate in candidates}
+            | {holding.instrument_id for holding in current_holdings},
+        )
         total_asset = float(self._portfolio_value())
         investable_asset = float(self.investable_total_asset())
         return ModelTargetPlanningRequest(
@@ -635,13 +573,214 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             signal_date=signal_date,
             active_instrument_ids=active_ids,
             candidates=candidates,
-            current_weights=self._current_weights_by_stock(),
+            current_holdings=current_holdings,
             target_cash_buffer_percent=float(self.config.target_cash_buffer_percent),
             max_position_percent=float(self.config.max_position_percent),
             total_asset=total_asset,
             investable_asset=investable_asset,
             open_prices=open_prices,
         )
+
+    def _build_candidates(
+        self,
+        trading_date: date,
+        signal_date: date | None,
+        open_prices: dict[str, float],
+    ) -> list[ModelTargetCandidate]:
+        """
+        Build the candidate list from the resolved signal date's signals only (not
+        current holdings). Entry-ineligible signals (name prefixes, ST, suspension,
+        minimum listed days, missing sizing price) are filtered out and recorded as
+        ``entry_filtered`` signal events; the survivors carry their score, sizing open
+        price, and ``expected_return`` (the model's ``pred_return_live``).
+        """
+        signals = self._signals_by_date.get(signal_date, []) if signal_date else []
+        candidates: list[ModelTargetCandidate] = []
+        seen: set[str] = set()
+        entry_rank = 0
+        for signal in signals:
+            stock_code = signal["stock_code"]
+            instrument = self._instrument_by_stock.get(stock_code)
+            if instrument is None:
+                continue
+            instrument_id = str(instrument)
+            if instrument_id in seen:
+                continue
+            seen.add(instrument_id)
+            skip_reason = self._entry_skip_reason(stock_code, trading_date)
+            if skip_reason is None and self._today_open_price(instrument_id) is None:
+                self._log_missing_new_entry_open_price(
+                    trading_date=trading_date,
+                    signal_date=signal["date"],
+                    instrument_id=instrument_id,
+                    stock_code=stock_code,
+                )
+                skip_reason = "missing_open_price"
+            if skip_reason:
+                self._record_signal(
+                    signal_date=signal["date"],
+                    instrument_id=instrument_id,
+                    stock_code=stock_code,
+                    signal_name="entry_filtered",
+                    score=signal["score"],
+                    rank=signal.get("rank"),
+                    side="buy",
+                    selected=False,
+                    extra={"reason": skip_reason},
+                )
+                continue
+            price, _source = self._open_price_with_source(instrument_id)
+            if price is not None:
+                open_prices[instrument_id] = price
+            entry_rank += 1
+            candidates.append(
+                ModelTargetCandidate(
+                    instrument_id=instrument_id,
+                    stock_code=normalize_stock_code(stock_code),
+                    score=float(signal["score"]),
+                    open_price=price,
+                    expected_return=float(signal["pred_return_live"]),
+                ),
+            )
+            self._record_signal(
+                signal_date=signal["date"],
+                instrument_id=instrument_id,
+                stock_code=stock_code,
+                signal_name="model_prediction_score",
+                score=signal["score"],
+                rank=entry_rank,
+                side="buy",
+                selected=True,
+            )
+        return candidates
+
+    def _build_current_holdings(
+        self,
+        trading_date: date,
+        signal_date: date | None,
+        open_prices: dict[str, float],
+    ) -> list[CurrentHolding]:
+        """
+        Build the current-holdings list (the planner's ``current_weights``) from the
+        currently-held positions only — no merge with signals.
+
+        Untradable holdings (ST / suspended) and holdings a local hard-exit rule
+        (stop-loss / trailing-take-profit) fires on are excluded via
+        ``_holding_exclusion`` so the optimizer unwinds them. Each surviving holding
+        carries its share count, sizing price, and recency (``recent_target_date`` /
+        holding days).
+        """
+        held_ids = sorted(self._held_instrument_ids())
+        recent_target_dates = self._recent_target_dates(trading_date, held_ids)
+        holdings: list[CurrentHolding] = []
+        exit_rank = 0
+        for instrument_id in held_ids:
+            stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
+            if not stock_code:
+                continue
+            quantity = int(self._current_quantity(InstrumentId.from_str(instrument_id)))
+            if quantity <= 0:
+                continue
+            exit_rank += 1
+            exclusion = self._holding_exclusion(trading_date, signal_date, instrument_id, exit_rank)
+            if exclusion is not None:
+                continue
+            price, _source = self._open_price_with_source(instrument_id)
+            if price is None:
+                continue
+            open_prices.setdefault(instrument_id, price)
+            recent_target_date = recent_target_dates.get(instrument_id)
+            recent_holding_days = self._recent_holding_days(trading_date, recent_target_date)
+            holdings.append(
+                CurrentHolding(
+                    instrument_id=instrument_id,
+                    stock_code=stock_code,
+                    quantity=quantity,
+                    price=price,
+                    recent_target_date=recent_target_date,
+                    recent_holding_days=recent_holding_days,
+                ),
+            )
+        return holdings
+
+    def _recent_target_dates(
+        self,
+        trading_date: date,
+        held_ids: list[str],
+    ) -> dict[str, date]:
+        """
+        Resolve each held instrument's most-recent positive-target date (internal name
+        ``recent_target_date``), keyed by instrument id.
+
+        Live: query ``live_target_portfolio`` (the last ``target_qty > 0`` date within
+        the trailing 30-trading-day window, excluding today) via the injected loader.
+        Backtest: fall back to the position's entry date from ``_active_positions``.
+        """
+        result: dict[str, date] = {}
+        loader = self._recent_target_loader
+        if loader is not None:
+            cutoff = self._recent_target_cutoff_date(trading_date)
+            stock_codes = [
+                normalize_stock_code(self._stock_by_instrument.get(instrument_id))
+                for instrument_id in held_ids
+            ]
+            stock_codes = [code for code in stock_codes if code]
+            try:
+                raw = loader(trading_date, cutoff, stock_codes)
+            except Exception as exc:
+                if self.log is not None:
+                    self.log.warning(f"recent target loader failed: {exc}", color=LogColor.YELLOW)
+                raw = {}
+            by_stock = {normalize_stock_code(code): value for code, value in (raw or {}).items()}
+            for instrument_id in held_ids:
+                stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
+                value = by_stock.get(stock_code)
+                if value is not None:
+                    result[instrument_id] = pd.Timestamp(value).date()
+            return result
+        # Backtest fallback: the position's entry date.
+        for instrument_id in held_ids:
+            state = self._active_positions.get(instrument_id)
+            if not isinstance(state, dict):
+                continue
+            entry_date = state.get("entry_date")
+            if entry_date is not None:
+                result[instrument_id] = pd.Timestamp(entry_date).date()
+        return result
+
+    def _recent_target_cutoff_date(self, trading_date: date, window: int = 30) -> date:
+        """The 30th-prior trading day (inclusive lower bound of the recency window)."""
+        prior_dates = [value for value in self._trading_dates if value < trading_date]
+        if not prior_dates:
+            return trading_date
+        prior_dates.sort()
+        if len(prior_dates) <= window:
+            return prior_dates[0]
+        return prior_dates[-window]
+
+    def _recent_holding_days(self, trading_date: date, recent_target_date: date | None) -> int:
+        """
+        Count trading days from ``recent_target_date`` to ``trading_date`` inclusive
+        (today == recent_target_date → 1; 3 trading days back → 3). Returns 0 when the
+        recent target date is unknown.
+        """
+        if recent_target_date is None:
+            return 0
+        trading_dates = sorted(self._trading_dates)
+        try:
+            today_index = trading_dates.index(trading_date)
+        except ValueError:
+            # Today may not be in the loaded calendar (e.g. edge dates): fall back to a
+            # calendar-day span so we never report a negative / zero span.
+            return max(1, (trading_date - recent_target_date).days + 1)
+        recent_index = None
+        for index, value in enumerate(trading_dates):
+            if value >= recent_target_date:
+                recent_index = index
+                break
+        if recent_index is None:
+            return 1
+        return max(1, today_index - recent_index + 1)
 
     def _open_price_with_source(self, instrument_id_text: str) -> tuple[float | None, str | None]:
         """
@@ -660,34 +799,6 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         if close_price is not None and close_price > 0:
             return float(close_price), "prev_close"
         return None, None
-
-    def _current_weights_by_stock(self) -> dict[str, float]:
-        instrument_ids = set(self._active_positions)
-        instrument_ids.update(self._held_instrument_ids())
-        weights: dict[str, float] = {}
-        for instrument_id in sorted(instrument_ids):
-            stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
-            if not stock_code:
-                continue
-            weight = self._planner_current_weight(instrument_id)
-            if weight is not None:
-                weights[stock_code] = weight
-        return weights
-
-    def _planner_current_weight(self, instrument_id_text: str) -> float | None:
-        current_weight = self._current_weight(instrument_id_text)
-        if current_weight is not None:
-            return current_weight
-        close_price = self._last_close.get(instrument_id_text)
-        if close_price is None or close_price <= 0:
-            return None
-        portfolio_value = self._portfolio_value()
-        if portfolio_value <= 0:
-            return None
-        quantity = self._current_quantity(InstrumentId.from_str(instrument_id_text))
-        if quantity <= 0:
-            return 0.0
-        return float(quantity * Decimal(str(close_price)) / portfolio_value)
 
     def _plan_version(self, plan: ModelTargetPlan) -> str:
         signal_text = "none" if plan.signal_date is None else plan.signal_date.isoformat()
