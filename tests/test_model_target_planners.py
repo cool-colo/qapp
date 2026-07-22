@@ -234,7 +234,9 @@ class ModelTargetPlannerTest(unittest.TestCase):
             signal_date=date(2026, 7, 1),
             active_instrument_ids=["000001.SZ.QMT"],
             candidates=[
-                ModelTargetCandidate("000001.SZ.QMT", "000001.SZ", 0.12, expected_return=0.02),
+                ModelTargetCandidate(
+                    "000001.SZ.QMT", "000001.SZ", 0.12, open_price=10.0, expected_return=0.02,
+                ),
             ],
             current_holdings=[],
             target_cash_buffer_percent=0.05,

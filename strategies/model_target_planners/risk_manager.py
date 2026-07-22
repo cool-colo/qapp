@@ -106,18 +106,16 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
 
     @staticmethod
     def _candidate_payload(candidate: ModelTargetCandidate) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        # Candidates are built with a guaranteed open price and pred_return_live
+        # (see TargetModelPredictionsStrategy._build_candidates), so both are sent
+        # unconditionally here.
+        return {
             "stock_code": candidate.stock_code,
             "score": candidate.score,
             "is_tradable": True,
+            "expected_return": float(candidate.expected_return),
+            "price": float(candidate.open_price),
         }
-        # ``expected_return`` is the model's pred_return_live for this candidate. Omit
-        # when unknown so the service applies its own default rather than a fabricated
-        # constant.
-        #payload["expected_return"] = float(candidate.expected_return)
-        payload["expected_return"] = 0.01 + 0.1 * candidate.score
-        payload["price"] = float(candidate.open_price)
-        return payload
 
     def _request_id(self, request: ModelTargetPlanningRequest) -> str:
         signal_text = "none" if request.signal_date is None else request.signal_date.isoformat()

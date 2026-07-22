@@ -608,7 +608,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 continue
             seen.add(instrument_id)
             skip_reason = self._entry_skip_reason(stock_code, trading_date)
-            if skip_reason is None and self._today_open_price(instrument_id) is None:
+            price = self._today_open_price(instrument_id)
+            if skip_reason is None and price is None:
                 self._log_missing_new_entry_open_price(
                     trading_date=trading_date,
                     signal_date=signal["date"],
@@ -629,9 +630,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     extra={"reason": skip_reason},
                 )
                 continue
-            price, _source = self._open_price_with_source(instrument_id)
-            if price is not None:
-                open_prices[instrument_id] = price
+            open_prices[instrument_id] = price
             entry_rank += 1
             candidates.append(
                 ModelTargetCandidate(
@@ -685,8 +684,14 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             exclusion = self._holding_exclusion(trading_date, signal_date, instrument_id, exit_rank)
             if exclusion is not None:
                 continue
-            price, _source = self._open_price_with_source(instrument_id)
+            price = self._today_open_price(instrument_id)
             if price is None:
+                self._log_missing_new_entry_open_price(
+                    trading_date=trading_date,
+                    signal_date=signal_date or trading_date,
+                    instrument_id=instrument_id,
+                    stock_code=stock_code,
+                )
                 continue
             open_prices.setdefault(instrument_id, price)
             recent_target_date = recent_target_dates.get(instrument_id)
@@ -760,8 +765,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
 
     def _recent_holding_days(self, trading_date: date, recent_target_date: date | None) -> int:
         """
-        Count trading days from ``recent_target_date`` to ``trading_date`` inclusive
-        (today == recent_target_date → 1; 3 trading days back → 3). Returns 0 when the
+        Count the number of trading days elapsed since ``recent_target_date``, with a
+        floor of 1: today == recent_target_date → 1; 1 trading day back → 1; 3 trading
+        days back → 3 (i.e. the trading-day index distance, min 1). Returns 0 when the
         recent target date is unknown.
         """
         if recent_target_date is None:
@@ -772,7 +778,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         except ValueError:
             # Today may not be in the loaded calendar (e.g. edge dates): fall back to a
             # calendar-day span so we never report a negative / zero span.
-            return max(1, (trading_date - recent_target_date).days + 1)
+            return max(1, (trading_date - recent_target_date).days)
         recent_index = None
         for index, value in enumerate(trading_dates):
             if value >= recent_target_date:
@@ -780,7 +786,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 break
         if recent_index is None:
             return 1
-        return max(1, today_index - recent_index + 1)
+        return max(1, today_index - recent_index)
 
     def _open_price_with_source(self, instrument_id_text: str) -> tuple[float | None, str | None]:
         """

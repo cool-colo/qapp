@@ -231,6 +231,7 @@ def build_node(args: argparse.Namespace) -> "TradingNode":
                 account_id=args.account_id,
                 account_type=args.account_type,
                 base_url_http=args.base_url_http,
+                base_url_ws=args.base_url_ws,
                 api_key=args.api_key,
                 instrument_provider=instrument_provider,
                 poll_interval_secs=args.poll_interval_secs,
