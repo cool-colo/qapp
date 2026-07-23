@@ -21,6 +21,8 @@ from strategies.model_target_planners import CurrentHolding
 from strategies.model_target_planners import ModelTargetCandidate
 from strategies.model_target_planners import ModelTargetPlan
 from strategies.model_target_planners import ModelTargetPlanningRequest
+from strategies.model_target_planners import RequestInfo
+from strategies.model_target_planners import TargetInfo
 from strategies.model_target_planners import build_model_target_planner
 from strategies.model_target_planners import normalize_stock_code
 from strategies.target_quantities import TargetQuantityStrategy
@@ -238,7 +240,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         # executor trades toward those quantities. Weights on the plan are audit-only
         # and are not consulted for execution.
         self.update_target_quantities(
-            quantities=plan.target_qty,
+            quantities=self._target_quantities_from_plan(plan),
             target_date=trading_date,
             reason=plan.reason,
             version=self._plan_version(plan),
@@ -531,39 +533,43 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
     ) -> ModelTargetPlan:
         """
         Stamp the sizing-input audit fields onto the plan so the bar path and the
-        snapshot recorder persist consistent open prices, price sources, and asset
-        figures without recomputing them. Planners stay unaware of price provenance.
+        snapshot recorder persist consistent request metadata and asset figures
+        without recomputing them. Planners stay unaware of price provenance.
         """
-        price_sources = {
-            instrument_id: source
-            for instrument_id in request.open_prices
-            for _price, source in (self._open_price_with_source(instrument_id),)
-            if source is not None
-        }
-        expected_returns = {
-            candidate.instrument_id: float(candidate.expected_return)
-            for candidate in request.candidates
-            if candidate.expected_return is not None
-        }
-        holding_meta = {
-            holding.instrument_id: {
-                "recent_buy_date": (
-                    None
-                    if holding.recent_target_date is None
-                    else holding.recent_target_date.isoformat()
+        candidates = {candidate.instrument_id: candidate for candidate in request.candidates}
+        holdings = {holding.instrument_id: holding for holding in request.current_holdings}
+        targets: list[TargetInfo] = []
+        for target in plan.targets:
+            candidate = candidates.get(target.instrument_id)
+            holding = holdings.get(target.instrument_id)
+            price_source = self._open_price_with_source(target.instrument_id)[1]
+            targets.append(
+                dataclasses.replace(
+                    target,
+                    request_info=RequestInfo(
+                        price=request.open_prices.get(target.instrument_id),
+                        price_source=price_source,
+                        score=None if candidate is None else float(candidate.score),
+                        expected_return=(
+                            None
+                            if candidate is None or candidate.expected_return is None
+                            else float(candidate.expected_return)
+                        ),
+                        current_qty=None if holding is None else int(holding.quantity),
+                        recent_target_date=(
+                            None if holding is None else holding.recent_target_date
+                        ),
+                        recent_holding_days=None
+                        if holding is None
+                        else int(holding.recent_holding_days),
+                    ),
                 ),
-                "recent_holding_days": int(holding.recent_holding_days),
-            }
-            for holding in request.current_holdings
-        }
+            )
         return dataclasses.replace(
             plan,
-            open_prices=dict(request.open_prices),
-            price_sources=price_sources,
+            targets=targets,
             total_asset=request.total_asset,
             investable_asset=request.investable_asset,
-            expected_returns=expected_returns,
-            holding_meta=holding_meta,
         )
 
     def _target_planning_request(
@@ -833,8 +839,17 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
 
     def _plan_version(self, plan: ModelTargetPlan) -> str:
         signal_text = "none" if plan.signal_date is None else plan.signal_date.isoformat()
-        total = sum(int(qty) for qty in plan.target_qty.values())
-        return f"model-{plan.trading_date.isoformat()}-{signal_text}-{len(plan.target_qty)}-{total}"
+        quantities = self._target_quantities_from_plan(plan)
+        total = sum(int(qty) for qty in quantities.values())
+        return f"model-{plan.trading_date.isoformat()}-{signal_text}-{len(quantities)}-{total}"
+
+    @staticmethod
+    def _target_quantities_from_plan(plan: ModelTargetPlan) -> dict[str, int]:
+        return {
+            target.instrument_id: int(target.quantity)
+            for target in plan.targets
+            if target.quantity is not None
+        }
 
     def _entry_skip_reason(self, stock_code: str, trading_date: date) -> str | None:
         name_reason = self._name_skip_reason(stock_code)

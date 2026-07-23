@@ -95,11 +95,26 @@ class ModelTargetPlannerTest(unittest.TestCase):
                     "risk_model_id": "cn_a_basic_constraints_integer_lots",
                     "asof_date": "2026-07-01",
                     "target_weights": [
-                        {"stock_code": "000002.SZ", "target_weight": 0.40, "target_quantity": 19000},
-                        {"stock_code": "000001.SZ", "target_weight": 0.30, "target_quantity": 28500},
+                        {
+                            "stock_code": "000002.SZ",
+                            "target_weight": 0.40,
+                            "target_quantity": 19000,
+                            "is_locked": False,
+                        },
+                        {
+                            "stock_code": "000001.SZ",
+                            "target_weight": 0.30,
+                            "target_quantity": 28500,
+                            "is_locked": True,
+                        },
                         {"stock_code": "999999.SZ", "target_weight": 0.20, "target_quantity": 100},
                         # A liquidation row for a holding not in candidates maps back too.
-                        {"stock_code": "000004.SZ", "target_weight": 0.0, "target_quantity": 0},
+                        {
+                            "stock_code": "000004.SZ",
+                            "target_weight": 0.0,
+                            "target_quantity": 0,
+                            "is_locked": False,
+                        },
                     ],
                 },
             )
@@ -163,9 +178,14 @@ class ModelTargetPlannerTest(unittest.TestCase):
         self.assertEqual(plan.reason, "risk_manager_optimize")
         self.assertEqual(plan.signal_date, date(2026, 7, 1))
         self.assertEqual(request.signal_date, date(2026, 7, 1))
+        targets = {target.instrument_id: target for target in plan.targets}
+        self.assertEqual(
+            sorted(targets),
+            ["000001.SZ.QMT", "000002.SZ.QMT", "000004.SZ.QMT"],
+        )
         # Weights map to instrument ids for known candidates; unknown 999999.SZ dropped.
         self.assertEqual(
-            plan.weights,
+            {instrument_id: target.weight for instrument_id, target in targets.items() if target.weight is not None},
             {
                 "000001.SZ.QMT": 0.30,
                 "000002.SZ.QMT": 0.40,
@@ -174,13 +194,16 @@ class ModelTargetPlannerTest(unittest.TestCase):
         # Service-provided share counts flow through verbatim, including the 0
         # (liquidation) target for a current holding not among candidates.
         self.assertEqual(
-            plan.target_qty,
+            {instrument_id: target.quantity for instrument_id, target in targets.items()},
             {
                 "000001.SZ.QMT": 28500,
                 "000002.SZ.QMT": 19000,
                 "000004.SZ.QMT": 0,
             },
         )
+        self.assertTrue(targets["000001.SZ.QMT"].is_locked)
+        self.assertFalse(targets["000002.SZ.QMT"].is_locked)
+        self.assertFalse(targets["000004.SZ.QMT"].is_locked)
 
     def test_risk_manager_planner_maps_quantity_only_row(self) -> None:
         request = ModelTargetPlanningRequest(
@@ -227,10 +250,15 @@ class ModelTargetPlannerTest(unittest.TestCase):
         with patch("strategies.model_target_planners.risk_manager.urlopen", side_effect=fake_urlopen):
             plan = planner.plan(request)
 
-        self.assertEqual(plan.target_qty, {"000001.SZ.QMT": 30000, "000003.SZ.QMT": 4000})
-        self.assertAlmostEqual(plan.weights["000001.SZ.QMT"], 0.30)
+        targets = {target.instrument_id: target for target in plan.targets}
+        self.assertEqual(
+            {instrument_id: target.quantity for instrument_id, target in targets.items()},
+            {"000001.SZ.QMT": 30000, "000003.SZ.QMT": 4000},
+        )
+        self.assertAlmostEqual(targets["000001.SZ.QMT"].weight, 0.30)
         # Quantity-only row has no positive weight entry (nothing synthesized).
-        self.assertNotIn("000003.SZ.QMT", plan.weights)
+        self.assertIsNone(targets["000003.SZ.QMT"].weight)
+        self.assertIsNone(targets["000003.SZ.QMT"].is_locked)
 
     def test_risk_manager_planner_returns_empty_plan_when_nothing_to_do(self) -> None:
         request = ModelTargetPlanningRequest(
@@ -253,8 +281,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
             plan = planner.plan(request)
 
         urlopen_mock.assert_not_called()
-        self.assertEqual(plan.target_qty, {})
-        self.assertEqual(plan.weights, {})
+        self.assertEqual(plan.targets, [])
 
     def test_risk_manager_planner_raises_on_service_failure(self) -> None:
         request = ModelTargetPlanningRequest(

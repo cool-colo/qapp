@@ -8,6 +8,12 @@ from unittest.mock import MagicMock
 from nautilus_trader.model.identifiers import InstrumentId
 
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
+from strategies.model_target_planners import CurrentHolding
+from strategies.model_target_planners import ModelTargetCandidate
+from strategies.model_target_planners import ModelTargetPlan
+from strategies.model_target_planners import ModelTargetPlanningRequest
+from strategies.model_target_planners import RequestInfo
+from strategies.model_target_planners import TargetInfo
 
 
 class HoldingExclusionTest(unittest.TestCase):
@@ -221,7 +227,12 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
         strategy.log = MagicMock()
         strategy._seed_active_positions_from_portfolio = MagicMock()
         strategy._target_plan = MagicMock(
-            return_value=SimpleNamespace(target_qty={}, reason="test"),
+            return_value=ModelTargetPlan(
+                trading_date=date(2026, 7, 8),
+                signal_date=signal_date,
+                targets=[],
+                reason="test",
+            ),
         )
         strategy._signals_by_date = {signal_date: signals}
         strategy._trading_dates = [signal_date, date(2026, 7, 8)]
@@ -246,6 +257,69 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
 
         strategy._seed_active_positions_from_portfolio.assert_called_once_with(date(2026, 7, 8))
         strategy._target_plan.assert_called_once_with(date(2026, 7, 8), signal_date)
+
+
+class AnnotatePlanTest(unittest.TestCase):
+    def test_current_holding_quantity_is_stamped_on_request_info(self) -> None:
+        class AnnotateStub:
+            _annotate_plan = TargetModelPredictionsStrategy._annotate_plan
+            _open_price_with_source = TargetModelPredictionsStrategy._open_price_with_source
+
+        strategy = AnnotateStub()
+        strategy._today_open = {"000001.SZ.QMT": 10.1}
+        strategy._last_close = {"000001.SZ.QMT": 10.0}
+        plan = ModelTargetPlan(
+            trading_date=date(2026, 7, 8),
+            signal_date=date(2026, 7, 7),
+            targets=[
+                TargetInfo(
+                    stock_code="000001.SZ",
+                    weight=0.2,
+                    quantity=2000,
+                    request_info=RequestInfo(),
+                    target_version=None,
+                    instrument_id="000001.SZ.QMT",
+                    is_locked=True,
+                ),
+            ],
+            reason="risk_manager_optimize",
+        )
+        request = ModelTargetPlanningRequest(
+            trading_date=date(2026, 7, 8),
+            signal_date=date(2026, 7, 7),
+            active_instrument_ids=["000001.SZ.QMT"],
+            candidates=[
+                ModelTargetCandidate(
+                    "000001.SZ.QMT",
+                    "000001.SZ",
+                    0.8,
+                    open_price=10.1,
+                    expected_return=0.03,
+                ),
+            ],
+            current_holdings=[
+                CurrentHolding(
+                    "000001.SZ.QMT",
+                    "000001.SZ",
+                    quantity=1200,
+                    price=10.1,
+                    recent_target_date=date(2026, 7, 1),
+                    recent_holding_days=5,
+                ),
+            ],
+            target_cash_buffer_percent=0.05,
+            max_position_percent=0.03,
+            total_asset=1_000_000,
+            investable_asset=950_000,
+            open_prices={"000001.SZ.QMT": 10.1},
+        )
+
+        annotated = strategy._annotate_plan(plan, request)
+
+        request_info = annotated.targets[0].request_info
+        self.assertEqual(request_info.current_qty, 1200)
+        self.assertEqual(request_info.price_source, "open")
+        self.assertEqual(request_info.recent_target_date, date(2026, 7, 1))
 
 
 class BuildCandidatesTest(unittest.TestCase):

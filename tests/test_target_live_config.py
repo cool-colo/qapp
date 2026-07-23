@@ -31,6 +31,9 @@ from lives.snapshot_recorder import SnapshotRecorderConfig
 from lives.live_qmt_target_model_predictions import normalize_refresh_time
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig
+from strategies.model_target_planners import ModelTargetPlan
+from strategies.model_target_planners import RequestInfo
+from strategies.model_target_planners import TargetInfo
 from strategies.target_quantities import TargetQuantityStrategy
 
 
@@ -88,7 +91,22 @@ class TargetLiveConfigTest(unittest.TestCase):
     def test_process_trading_day_computes_when_live_target_portfolio_missing(self) -> None:
         strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
         trading_date = date(2026, 7, 8)
-        plan = SimpleNamespace(target_qty={"000001.SZ.QMT": 1000}, reason="computed")
+        plan = ModelTargetPlan(
+            trading_date=trading_date,
+            signal_date=date(2026, 7, 7),
+            targets=[
+                TargetInfo(
+                    stock_code="000001.SZ",
+                    weight=None,
+                    quantity=1000,
+                    request_info=RequestInfo(),
+                    target_version=None,
+                    instrument_id="000001.SZ.QMT",
+                    is_locked=False,
+                ),
+            ],
+            reason="computed",
+        )
         strategy._live_target_portfolio_loader = MagicMock(return_value=[])
         strategy._resolve_signal_date = MagicMock(return_value=date(2026, 7, 7))
         strategy.compute_daily_target_plan = MagicMock(return_value=plan)
@@ -374,8 +392,10 @@ class TargetLiveConfigTest(unittest.TestCase):
                     10.0,             # open_price
                     "open",           # price_source
                     1000,             # target_qty
+                    500,              # current_qty
                     1.2,              # score
                     0.03,             # expected_return
+                    False,            # is_locked
                     "loaded_target",  # reason
                     CONTINUOUS_TRADING,  # snapshot_type
                 )],
@@ -393,7 +413,56 @@ class TargetLiveConfigTest(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["snapshot_type"], CONTINUOUS_TRADING)
+        self.assertEqual(rows[0]["current_qty"], 500)
+        self.assertFalse(rows[0]["is_locked"])
         self.assertEqual(writer._query.call_count, 2)
+
+    def test_writer_ensure_target_columns_adds_current_qty_and_is_locked(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._query = MagicMock(
+            return_value=[
+                ("position_snapshot_id",),
+                ("investable_asset",),
+                ("price_source",),
+                ("expected_return",),
+            ],
+        )
+        writer._execute = MagicMock()
+
+        writer._ensure_target_columns()
+
+        self.assertEqual(
+            writer._execute.call_args_list,
+            [
+                call(
+                    "ALTER TABLE `live_target_portfolio` ADD COLUMN `current_qty` BIGINT NULL",
+                    (),
+                ),
+                call(
+                    "ALTER TABLE `live_target_portfolio` ADD COLUMN `is_locked` BOOLEAN NULL",
+                    (),
+                ),
+            ],
+        )
+
+    def test_writer_load_recent_target_dates_allows_unlocked_or_increased_locked_targets(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._query = MagicMock(return_value=[("000001.SZ", date(2026, 7, 7))])
+
+        result = writer.load_recent_target_dates(
+            "ACC",
+            "TRADER",
+            date(2026, 7, 8),
+            date(2026, 6, 1),
+            ["000001.SZ"],
+        )
+
+        self.assertEqual(result, {"000001.SZ": date(2026, 7, 7)})
+        sql = writer._query.call_args.args[0]
+        self.assertIn(
+            "(`is_locked` != TRUE OR (`is_locked` = TRUE AND `target_qty` > `current_qty`))",
+            sql,
+        )
 
     def test_writer_execute_commits_through_pooled_connection(self) -> None:
         # The writer now checks out a connection from the pool (here a single-connection
@@ -459,7 +528,9 @@ class TargetLiveConfigTest(unittest.TestCase):
                     open_price=Decimal("10.0"),
                     price_source="open",
                     target_qty=10000,
+                    current_qty=5000,
                     score=Decimal("0.5"),
+                    is_locked=False,
                     reason="risk_manager_optimize",
                     extra={},
                     created_at=datetime(2026, 7, 10, 9, 27),
@@ -478,6 +549,98 @@ class TargetLiveConfigTest(unittest.TestCase):
                 "snapshot_type",
                 "instrument_id",
             ),
+        )
+
+    def test_snapshot_recorder_persists_target_info_rows(self) -> None:
+        trading_date = date(2026, 7, 10)
+        signal_date = date(2026, 7, 9)
+        plan = ModelTargetPlan(
+            trading_date=trading_date,
+            signal_date=signal_date,
+            targets=[
+                TargetInfo(
+                    stock_code="000001.SZ",
+                    weight=0.12,
+                    quantity=10000,
+                    request_info=RequestInfo(
+                        price=10.5,
+                        price_source="open",
+                        score=0.8,
+                        expected_return=0.03,
+                        current_qty=5000,
+                        recent_target_date=date(2026, 7, 1),
+                        recent_holding_days=6,
+                    ),
+                    target_version=None,
+                    instrument_id="000001.SZ.QMT",
+                    is_locked=False,
+                ),
+            ],
+            reason="risk_manager_optimize",
+            request_id="req-1",
+            total_asset=1_000_000.0,
+            investable_asset=950_000.0,
+        )
+        writer = SimpleNamespace(write_target_portfolios=MagicMock())
+        strategy = SimpleNamespace(
+            compute_daily_target_plan=MagicMock(return_value=plan),
+            plan_version=MagicMock(return_value="ver-1"),
+        )
+        recorder = SimpleNamespace()
+        recorder.config = SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER")
+        recorder.log = MagicMock()
+        recorder._writer = writer
+        recorder._strategy = strategy
+        recorder._now_naive = MagicMock(return_value=datetime(2026, 7, 10, 9, 27))
+        recorder._position_snapshot_anchor = MagicMock(return_value=7)
+        recorder._apply_target = MagicMock()
+        recorder._decimal_or_none = SnapshotRecorder._decimal_or_none
+        recorder._int_or_none = SnapshotRecorder._int_or_none
+        recorder._frozen_total_asset = MagicMock()
+        recorder._plan_total_asset = lambda target_plan: SnapshotRecorder._plan_total_asset(
+            recorder,
+            target_plan,
+        )
+        recorder._plan_investable_asset = (
+            lambda target_plan, total_asset: SnapshotRecorder._plan_investable_asset(
+                recorder,
+                target_plan,
+                total_asset,
+            )
+        )
+
+        SnapshotRecorder._generate_and_persist_target(
+            recorder,
+            trading_date,
+            BEFORE_TRADING,
+            signal_date,
+            asset_id=5,
+        )
+
+        record = writer.write_target_portfolios.call_args.args[0][0]
+        self.assertEqual(record.instrument_id, "000001.SZ.QMT")
+        self.assertEqual(record.stock_code, "000001.SZ")
+        self.assertEqual(record.target_weight, Decimal("0.12"))
+        self.assertEqual(record.open_price, Decimal("10.5"))
+        self.assertEqual(record.price_source, "open")
+        self.assertEqual(record.target_qty, 10000)
+        self.assertEqual(record.current_qty, 5000)
+        self.assertEqual(record.score, Decimal("0.8"))
+        self.assertEqual(record.expected_return, Decimal("0.03"))
+        self.assertFalse(record.is_locked)
+        self.assertEqual(
+            record.extra,
+            {
+                "target_version": "ver-1",
+                "recent_buy_date": "2026-07-01",
+                "recent_holding_days": 6,
+            },
+        )
+        recorder._apply_target.assert_called_once_with(
+            trading_date,
+            {"000001.SZ.QMT": 10000},
+            "risk_manager_optimize",
+            "ver-1",
         )
 
     def test_writer_ensure_target_indexes_upgrades_uk_target_to_include_snapshot_type(self) -> None:
@@ -515,6 +678,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                 ("id",),
                 ("trade_date",),
                 ("client_order_id",),
+                ("source",),
             ],
         )
         writer._execute = MagicMock()
@@ -576,6 +740,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                 ("target_weight",),
                 ("open_price",),
                 ("book_snapshot",),
+                ("source",),
             ],
         )
         writer._execute = MagicMock()

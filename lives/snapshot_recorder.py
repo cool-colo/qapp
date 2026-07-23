@@ -410,30 +410,25 @@ class SnapshotRecorder(Actor):
         # figures match exactly what was sent to the risk manager.
         total_asset = self._plan_total_asset(plan)
         investable_asset = self._plan_investable_asset(plan, total_asset)
-        open_prices = dict(plan.open_prices) if plan.open_prices else self._current_open_prices()
-        price_sources = dict(plan.price_sources)
-        expected_returns = dict(plan.expected_returns)
-        holding_meta = dict(plan.holding_meta)
         # The risk-manager planner commits explicit share counts (固定目标股数, 0 kept).
         # These drive execution; weights are persisted for audit only.
-        target_qty = self._plan_target_quantities(plan)
+        target_qty = {
+            target.instrument_id: int(target.quantity)
+            for target in plan.targets
+            if target.quantity is not None
+        }
         version = self._strategy.plan_version(plan)
         plan_signal_date = plan.signal_date or signal_date
         position_id = self._position_snapshot_anchor(trading_date)
-        # Persist a row per committed target (union of weighted + quantity-bearing
-        # instruments) so qty==0 liquidation targets are recorded, not dropped.
-        instrument_ids = sorted(set(plan.weights) | set(target_qty))
         records: list[LiveTargetRecord] = []
-        for instrument_id_text in instrument_ids:
-            weight = plan.weights.get(instrument_id_text)
-            qty = target_qty.get(instrument_id_text)
-            expected_return = expected_returns.get(instrument_id_text)
-            # Rows whose instrument is a current holding carry its recency
-            # (recent_buy_date / recent_holding_days) in ``extra``.
-            extra: dict[str, Any] = {"target_version": version}
-            meta = holding_meta.get(instrument_id_text)
-            if meta:
-                extra.update(meta)
+        for target in plan.targets:
+            request_info = target.request_info
+            row_version = target.target_version or version
+            extra: dict[str, Any] = {"target_version": row_version}
+            if request_info.recent_target_date is not None:
+                extra["recent_buy_date"] = request_info.recent_target_date.isoformat()
+            if request_info.recent_holding_days is not None:
+                extra["recent_holding_days"] = int(request_info.recent_holding_days)
             records.append(
                 LiveTargetRecord(
                     trade_date=trading_date,
@@ -447,15 +442,21 @@ class SnapshotRecorder(Actor):
                     total_asset=self._decimal_or_none(total_asset),
                     investable_asset=self._decimal_or_none(investable_asset),
                     request_id=plan.request_id,
-                    target_version=version,
-                    instrument_id=instrument_id_text,
-                    stock_code=self._stock_code(instrument_id_text),
-                    target_weight=None if weight is None else Decimal(str(weight)),
-                    open_price=self._decimal_or_none(open_prices.get(instrument_id_text)),
-                    price_source=price_sources.get(instrument_id_text),
-                    target_qty=self._int_or_none(qty),
-                    score=self._instrument_score(instrument_id_text),
-                    expected_return=self._decimal_or_none(expected_return),
+                    target_version=row_version,
+                    instrument_id=target.instrument_id,
+                    stock_code=target.stock_code,
+                    target_weight=(
+                        None
+                        if target.weight is None
+                        else Decimal(str(target.weight))
+                    ),
+                    open_price=self._decimal_or_none(request_info.price),
+                    price_source=request_info.price_source,
+                    target_qty=self._int_or_none(target.quantity),
+                    current_qty=self._int_or_none(request_info.current_qty),
+                    score=self._decimal_or_none(request_info.score),
+                    expected_return=self._decimal_or_none(request_info.expected_return),
+                    is_locked=target.is_locked,
                     reason=plan.reason,
                     extra=extra,
                     created_at=self._now_naive(),
@@ -469,27 +470,20 @@ class SnapshotRecorder(Actor):
         self._apply_target(trading_date, target_qty, plan.reason, version)
         self.log.info(
             f"generated & persisted daily target: date={trading_date} signal_date={plan_signal_date} "
-            f"weights={len(plan.weights)} frozen_qty={len(target_qty)} "
+            f"targets={len(plan.targets)} frozen_qty={len(target_qty)} "
             f"total_asset={total_asset} investable_asset={investable_asset}",
             color=LogColor.GREEN,
         )
 
-    def _plan_target_quantities(self, plan: Any) -> dict[str, Any]:
-        plan_qty = getattr(plan, "target_qty", None)
-        if isinstance(plan_qty, dict) and plan_qty:
-            # Keep every entry, including committed 0 (liquidate) targets.
-            return {str(instrument_id): qty for instrument_id, qty in plan_qty.items()}
-        return {}
-
     def _plan_total_asset(self, plan: Any) -> Decimal:
-        value = getattr(plan, "total_asset", None)
+        value = plan.total_asset
         coerced = self._decimal_or_none(value)
         if coerced is not None and coerced > 0:
             return coerced
         return self._frozen_total_asset()
 
     def _plan_investable_asset(self, plan: Any, total_asset: Decimal) -> Decimal:
-        value = getattr(plan, "investable_asset", None)
+        value = plan.investable_asset
         coerced = self._decimal_or_none(value)
         if coerced is not None and coerced > 0:
             return coerced
@@ -1069,14 +1063,6 @@ class SnapshotRecorder(Actor):
             return None
         return self._decimal_or_none(value)
 
-    def _current_open_prices(self) -> dict[str, float]:
-        opens = getattr(self._strategy, "_today_open", None)
-        if isinstance(opens, dict) and opens:
-            return dict(opens)
-        # Fall back to last closes so a target can still be sized if opens are absent.
-        closes = getattr(self._strategy, "_last_close", None)
-        return dict(closes) if isinstance(closes, dict) else {}
-
     def _resolve_signal_date(self, trading_date: date) -> date | None:
         resolver = getattr(self._strategy, "_resolve_signal_date", None)
         if resolver is None:
@@ -1116,17 +1102,6 @@ class SnapshotRecorder(Actor):
             return code
         text = instrument_id_text.upper()
         return text[:-4] if text.endswith(".QMT") else text
-
-    def _instrument_score(self, instrument_id_text: str) -> Decimal | None:
-        active = getattr(self._strategy, "_active_positions", {})
-        if isinstance(active, dict):
-            state = active.get(instrument_id_text)
-            if isinstance(state, dict) and state.get("score") is not None:
-                try:
-                    return Decimal(str(state["score"]))
-                except Exception:
-                    return None
-        return None
 
     def _strategy_last_close(self, instrument_id_text: str) -> float | None:
         closes = getattr(self._strategy, "_last_close", None)

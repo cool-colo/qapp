@@ -163,8 +163,10 @@ CREATE TABLE IF NOT EXISTS `live_target_portfolio` (
   `open_price`    DECIMAL(20,4) NULL,
   `price_source`  VARCHAR(16)  NULL,
   `target_qty`    BIGINT       NULL,
+  `current_qty`   BIGINT       NULL,
   `score`         DECIMAL(20,8) NULL,
   `expected_return` DECIMAL(20,8) NULL,
+  `is_locked`     BOOLEAN      NULL,
   `reason`        VARCHAR(64)  NULL,
   `extra`         JSON         NULL,
   `created_at`    DATETIME     NOT NULL,
@@ -370,7 +372,9 @@ class LiveSnapshotWriter:
             "position_snapshot_id": "BIGINT NULL",
             "investable_asset": "DECIMAL(20,4) NULL",
             "price_source": "VARCHAR(16) NULL",
+            "current_qty": "BIGINT NULL",
             "expected_return": "DECIMAL(20,8) NULL",
+            "is_locked": "BOOLEAN NULL",
         }
         try:
             existing = {
@@ -698,8 +702,10 @@ class LiveSnapshotWriter:
             "open_price",
             "price_source",
             "target_qty",
+            "current_qty",
             "score",
             "expected_return",
+            "is_locked",
             "reason",
             "snapshot_type",
         ]
@@ -730,9 +736,10 @@ class LiveSnapshotWriter:
         """
         Resolve, per stock, the most recent ``trade_date`` that carried a positive
         target (``target_qty > 0``) within the window ``[cutoff_trade_date, trade_date)``
-        — i.e. excluding today. ``before_trading`` rows win over other snapshot types on
-        the same date. Returns ``{stock_code: recent_target_date}``; stocks with no
-        qualifying row are absent.
+        — i.e. excluding today. Unlocked rows qualify directly; locked rows qualify
+        only when the target is an increase over ``current_qty``. ``before_trading`` rows
+        win over other snapshot types on the same date. Returns
+        ``{stock_code: recent_target_date}``; stocks with no qualifying row are absent.
 
         Used to populate the risk-manager request's ``recent_buy_date`` /
         ``recent_holding_days`` for currently-held positions.
@@ -749,6 +756,7 @@ class LiveSnapshotWriter:
             "WHERE `account_id`=%s AND `trader_id`=%s "
             "AND `trade_date` >= %s AND `trade_date` < %s "
             "AND `target_qty` IS NOT NULL AND `target_qty` > 0 "
+            "AND ((`is_locked` IS NULL or `is_locked` != TRUE) OR (`is_locked` = TRUE AND `target_qty` > `current_qty`)) "
             f"AND `stock_code` IN ({placeholders}) "
             "GROUP BY `stock_code`"
         )
@@ -927,8 +935,10 @@ class LiveSnapshotWriter:
             "open_price": record.open_price,
             "price_source": record.price_source,
             "target_qty": record.target_qty,
+            "current_qty": record.current_qty,
             "score": record.score,
             "expected_return": record.expected_return,
+            "is_locked": record.is_locked,
             "reason": record.reason,
             "extra": _json_dumps(record.extra),
             "created_at": _timestamp(record.created_at),

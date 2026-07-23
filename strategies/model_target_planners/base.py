@@ -7,28 +7,36 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class RequestInfo:
+    price: float | None = None
+    price_source: str | None = None
+    score: float | None = None
+    expected_return: float | None = None
+    current_qty: int | None = None
+    recent_target_date: date | None = None
+    recent_holding_days: int | None = None
+
+
+@dataclass(frozen=True)
+class TargetInfo:
+    stock_code: str
+    weight: float | None
+    quantity: int | None
+    request_info: RequestInfo
+    target_version: str | None
+    instrument_id: str
+    is_locked: bool | None
+
+
+@dataclass(frozen=True)
 class ModelTargetPlan:
     trading_date: date
     signal_date: date | None
-    weights: dict[str, float]
+    targets: list[TargetInfo]
     reason: str
     request_id: str | None = None
-    # instrument_id -> committed target share count (固定目标股数). Empty when the
-    # planner sizes by weight only (e.g. the equal-weight fallback). ``0`` is a valid
-    # entry (liquidate / hold-none) and is retained, not dropped.
-    target_qty: dict[str, int] = field(default_factory=dict)
-    # Audit fields describing the sizing inputs the plan was built from. Filled by the
-    # strategy layer (planners stay unaware of price provenance / asset accounting) so
-    # both the bar path and the snapshot recorder persist consistent values.
-    open_prices: dict[str, float] = field(default_factory=dict)
-    price_sources: dict[str, str] = field(default_factory=dict)  # instrument_id -> open|prev_close
     total_asset: float | None = None  # raw total asset
     investable_asset: float | None = None  # total asset net of trading buffer
-    # instrument_id -> pred_return_live used for that candidate (audit; persisted).
-    expected_returns: dict[str, float] = field(default_factory=dict)
-    # instrument_id -> {"recent_buy_date", "recent_holding_days"} for instruments that
-    # are current holdings, so persisted target rows carry the recency in ``extra``.
-    holding_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

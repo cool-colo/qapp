@@ -16,6 +16,8 @@ from strategies.model_target_planners.base import ModelTargetCandidate
 from strategies.model_target_planners.base import ModelTargetPlan
 from strategies.model_target_planners.base import ModelTargetPlanner
 from strategies.model_target_planners.base import ModelTargetPlanningRequest
+from strategies.model_target_planners.base import RequestInfo
+from strategies.model_target_planners.base import TargetInfo
 from strategies.model_target_planners.base import normalize_stock_code
 
 
@@ -48,7 +50,12 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
     def plan(self, request: ModelTargetPlanningRequest) -> ModelTargetPlan:
         # Nothing to optimize when there are neither signal candidates nor holdings.
         if not request.candidates and not request.current_holdings:
-            return ModelTargetPlan(request.trading_date, request.signal_date, {}, self.reason)
+            return ModelTargetPlan(
+                trading_date=request.trading_date,
+                signal_date=request.signal_date,
+                targets=[],
+                reason=self.reason,
+            )
         request_id = self._request_id(request)
         response = self._post_json(self._payload(request, request_id))
         if not bool(response.get("success")):
@@ -60,15 +67,13 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         # Response rows may reference either a signal candidate (buy/hold) or a current
         # holding being liquidated (target_qty == 0), so map both back to instrument ids.
         stock_to_instrument = self._stock_to_instrument(request)
-        target_qty = self._target_quantities(response, stock_to_instrument)
-        weights = self._audit_weights(response, stock_to_instrument)
+        targets = self._targets(response, stock_to_instrument)
         return ModelTargetPlan(
             trading_date=request.trading_date,
             signal_date=request.signal_date,
-            weights=weights,
+            targets=targets,
             reason=self.reason,
             request_id=request_id,
-            target_qty=target_qty,
         )
 
     def _payload(self, request: ModelTargetPlanningRequest, request_id: str) -> dict[str, Any]:
@@ -195,60 +200,39 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         self.log.info(f"{label}: {payload_text}", color=LogColor.BLUE)
 
-    def _target_quantities(
+    def _targets(
         self,
         response: dict[str, Any],
         stock_to_instrument: dict[str, str],
-    ) -> dict[str, int]:
+    ) -> list[TargetInfo]:
         """
-        Map the service-provided ``target_quantity`` per row to instrument ids.
+        Map service-provided target rows to first-class target records.
 
-        ``target_quantity == 0`` is a valid target (liquidate / hold none) and is kept;
-        only a missing or non-numeric value is skipped.
+        ``target_quantity == 0`` is a valid target (liquidate / hold none) and is kept.
+        Missing or non-positive weights remain absent; no synthetic weight is fabricated.
         """
-        rows = self._target_rows(response)
-        quantities: dict[str, int] = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            instrument_id = stock_to_instrument.get(normalize_stock_code(row.get("stock_code")))
-            if instrument_id is None:
-                continue
-            raw_qty = row.get("target_quantity")
-            if raw_qty is None:
-                continue
-            try:
-                qty = int(round(float(raw_qty)))
-            except (TypeError, ValueError):
-                continue
-            if qty < 0:
-                continue
-            quantities[instrument_id] = qty
-        return dict(sorted(quantities.items()))
-
-    def _audit_weights(
-        self,
-        response: dict[str, Any],
-        stock_to_instrument: dict[str, str],
-    ) -> dict[str, float]:
-        """
-        Map the service-provided ``target_weight`` per row to instrument ids.
-
-        Weights are recorded to MySQL for audit only — execution is driven entirely by
-        ``target_qty``. Rows the service sized by quantity only (no positive weight)
-        simply have no weight entry; no synthetic weight is fabricated.
-        """
-        weights: dict[str, float] = {}
+        targets: list[TargetInfo] = []
         for row in self._target_rows(response):
             if not isinstance(row, dict):
                 continue
-            instrument_id = stock_to_instrument.get(normalize_stock_code(row.get("stock_code")))
+            stock_code = normalize_stock_code(row.get("stock_code"))
+            instrument_id = stock_to_instrument.get(stock_code)
             if instrument_id is None:
                 continue
             weight = self._coerce_float(row.get("target_weight", row.get("weight")))
-            if weight is not None and weight > 0:
-                weights[instrument_id] = weight
-        return dict(sorted(weights.items()))
+            quantity = self._target_quantity(row.get("target_quantity"))
+            targets.append(
+                TargetInfo(
+                    stock_code=stock_code,
+                    weight=weight if weight is not None and weight > 0 else None,
+                    quantity=quantity,
+                    request_info=RequestInfo(),
+                    target_version=None,
+                    instrument_id=instrument_id,
+                    is_locked=self._is_locked(row),
+                ),
+            )
+        return sorted(targets, key=lambda target: target.instrument_id)
 
     @staticmethod
     def _stock_to_instrument(request: ModelTargetPlanningRequest) -> dict[str, str]:
@@ -272,3 +256,24 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _target_quantity(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            quantity = int(round(float(value)))
+        except (TypeError, ValueError):
+            return None
+        if quantity < 0:
+            return None
+        return quantity
+
+    @staticmethod
+    def _is_locked(row: dict[str, Any]) -> bool | None:
+        value = row.get("is_locked")
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        raise RuntimeError("risk-manager optimize response is_locked must be a boolean when present")
