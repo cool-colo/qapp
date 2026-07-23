@@ -67,14 +67,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
 
     def __init__(self, config: TargetModelPredictionsStrategyConfig) -> None:
         super().__init__(config)
-        self._stock_by_instrument = {
-            str(instrument_id): stock_code
-            for instrument_id, stock_code in config.instrument_stock_codes.items()
-        }
-        self._instrument_by_stock = {
-            stock_code: InstrumentId.from_str(instrument_id)
-            for instrument_id, stock_code in self._stock_by_instrument.items()
-        }
+        self._stock_by_instrument: dict[str, str] = {}
+        self._instrument_by_stock: dict[str, InstrumentId] = {}
+        self._update_instrument_stock_codes(config.instrument_stock_codes)
         self._signals_by_date = normalize_signals(config.signals_by_date)
         self._latest_signal_by_stock_date = latest_signal_index(self._signals_by_date)
         self._trading_dates = [pd.Timestamp(value).date() for value in config.trading_dates]
@@ -90,7 +85,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         }
         self._active_positions = normalize_initial_active_positions(config.initial_active_positions)
         self._processed_dates: set[date] = set()
-        self._target_planner = build_model_target_planner(config)
+        self._target_planner = build_model_target_planner(config, self.log)
         self._live_target_portfolio_loader: Callable[[date, date | None], list[dict[str, Any]]] | None = None
         self._recent_target_loader: Callable[[date, date, list[str]], dict[str, date]] | None = None
         self.signal_events: list[ModelPredictionSignalEvent] = []
@@ -123,6 +118,32 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         """
         self._recent_target_loader = loader
 
+    def _update_instrument_stock_codes(
+        self,
+        instrument_stock_codes: dict[str, str],
+    ) -> None:
+        for instrument_id, stock_code in instrument_stock_codes.items():
+            normalized = normalize_stock_code(stock_code)
+            if normalized:
+                self._stock_by_instrument[str(instrument_id)] = normalized
+        self._instrument_by_stock = {
+            stock_code: InstrumentId.from_str(instrument_id)
+            for instrument_id, stock_code in self._stock_by_instrument.items()
+        }
+
+    def _stock_code_for_instrument(self, instrument_id_text: str) -> str:
+        stock_code = normalize_stock_code(
+            self._stock_by_instrument.get(instrument_id_text),
+        )
+        if stock_code:
+            return stock_code
+        instrument_id = InstrumentId.from_str(instrument_id_text)
+        stock_code = normalize_stock_code(instrument_id.symbol)
+        if stock_code:
+            self._stock_by_instrument[instrument_id_text] = stock_code
+            self._instrument_by_stock[stock_code] = instrument_id
+        return stock_code
+
     def refresh_reference_data(
         self,
         instrument_ids: list[InstrumentId],
@@ -144,16 +165,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             subscribe_new_bars=subscribe_new_bars,
             unsubscribe_removed_bars=unsubscribe_removed_bars,
         )
-        self._stock_by_instrument.update(
-            {
-                str(instrument_id): stock_code
-                for instrument_id, stock_code in instrument_stock_codes.items()
-            },
-        )
-        self._instrument_by_stock = {
-            stock_code: InstrumentId.from_str(instrument_id)
-            for instrument_id, stock_code in self._stock_by_instrument.items()
-        }
+        self._update_instrument_stock_codes(instrument_stock_codes)
         self._signals_by_date = normalize_signals(signals_by_date)
         self._latest_signal_by_stock_date = latest_signal_index(self._signals_by_date)
         refreshed_trading_dates = [pd.Timestamp(value).date() for value in trading_dates]
@@ -360,7 +372,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             entry_price = avg_px_open if avg_px_open > 0 else close_price
             if entry_price is None or entry_price <= 0:
                 continue
-            stock_code = self._stock_by_instrument.get(instrument_id_text, "")
+            stock_code = self._stock_code_for_instrument(instrument_id_text)
             signal_state = self._latest_signal_state(stock_code, trading_date)
             self._active_positions[instrument_id_text] = {
                 "entry_date": trading_date,
@@ -414,12 +426,12 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             self._log_missing_exit_open_price(
                 trading_date=trading_date,
                 instrument_id=instrument_id,
-                stock_code=self._stock_by_instrument.get(instrument_id, ""),
+                stock_code=self._stock_code_for_instrument(instrument_id),
                 fallback_price=exit_price,
             )
         cost_price = float(state.get("entry_price") or exit_price or 0.0)
         trailing = self._update_trailing_state(state, exit_price, cost_price)
-        stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
+        stock_code = self._stock_code_for_instrument(instrument_id)
         untradable = self._untradable_reason(stock_code, trading_date)
         stop_triggered = (
             exit_price is not None
@@ -438,7 +450,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self._record_signal(
             signal_date=signal_date or trading_date,
             instrument_id=instrument_id,
-            stock_code=self._stock_by_instrument.get(instrument_id, ""),
+            stock_code=stock_code,
             signal_name=signal_name,
             score=state.get("score"),
             rank=exit_rank,
@@ -679,15 +691,18 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         holdings: list[CurrentHolding] = []
         exit_rank = 0
         for instrument_id in held_ids:
-            stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
+            stock_code = self._stock_code_for_instrument(instrument_id)
             if not stock_code:
+                self.log.warning(f"Skipping holding with invalid stock code: {instrument_id}")
                 continue
             quantity = int(self._current_quantity(InstrumentId.from_str(instrument_id)))
             if quantity <= 0:
+                self.log.warning(f"Skipping holding with zero or negative quantity: {instrument_id}")
                 continue
             exit_rank += 1
             exclusion = self._holding_exclusion(trading_date, signal_date, instrument_id, exit_rank)
             if exclusion is not None:
+                self.log.warning(f"Excluding holding from current_holdings: {instrument_id} reason={exclusion}")
                 continue
             price = self._today_open_price(instrument_id)
             if price is None:
@@ -711,6 +726,11 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     recent_holding_days=recent_holding_days,
                 ),
             )
+        self.log.info(
+            f"Built current_holdings list with {len(holdings)} items., "
+            f"original held={len(held_ids)}",
+            color=LogColor.BLUE,
+        )
         return holdings
 
     def _recent_target_dates(
@@ -731,7 +751,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         if loader is not None:
             cutoff = self._recent_target_cutoff_date(trading_date)
             stock_codes = [
-                normalize_stock_code(self._stock_by_instrument.get(instrument_id))
+                self._stock_code_for_instrument(instrument_id)
                 for instrument_id in held_ids
             ]
             stock_codes = [code for code in stock_codes if code]
@@ -743,7 +763,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 raw = {}
             by_stock = {normalize_stock_code(code): value for code, value in (raw or {}).items()}
             for instrument_id in held_ids:
-                stock_code = normalize_stock_code(self._stock_by_instrument.get(instrument_id))
+                stock_code = self._stock_code_for_instrument(instrument_id)
                 value = by_stock.get(stock_code)
                 if value is not None:
                     result[instrument_id] = pd.Timestamp(value).date()
@@ -909,6 +929,12 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 selected=selected,
                 extra=extra or {},
             ),
+        )
+        self.log.info(
+            f"recorded signal event: date={signal_date} instrument_id={instrument_id} "
+            f"stock_code={stock_code} signal_name={signal_name} score={score} "
+            f"rank={rank} side={side} selected={selected} extra={extra}",
+            color=LogColor.BLUE,
         )
 
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import time
 from typing import Any
 from uuid import uuid4
@@ -10,15 +9,14 @@ from urllib.error import URLError
 from urllib.request import Request
 from urllib.request import urlopen
 
+from nautilus_trader.common.enums import LogColor
+
 from strategies.model_target_planners.base import CurrentHolding
 from strategies.model_target_planners.base import ModelTargetCandidate
 from strategies.model_target_planners.base import ModelTargetPlan
 from strategies.model_target_planners.base import ModelTargetPlanner
 from strategies.model_target_planners.base import ModelTargetPlanningRequest
 from strategies.model_target_planners.base import normalize_stock_code
-
-
-_LOGGER = logging.getLogger(__name__)
 
 
 class RiskManagerModelTargetPlanner(ModelTargetPlanner):
@@ -29,12 +27,17 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         base_url: str,
         risk_model_id: str,
         mode: str,
+        *,
+        log: Any,
         timeout_secs: float = 10.0,
     ) -> None:
         self.base_url = str(base_url or "").rstrip("/")
         self.risk_model_id = str(risk_model_id or "").strip()
         self.mode = str(mode or "").strip()
         self.timeout_secs = float(timeout_secs)
+        if log is None:
+            raise ValueError("log is required for risk_manager target planner")
+        self.log = log
         if not self.base_url:
             raise ValueError("risk_manager_base_url is required for risk_manager target planner")
         if not self.risk_model_id:
@@ -127,6 +130,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
     def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         endpoint = f"{self.base_url}/v1/portfolio/optimize"
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._log_payload_info("risk-manager optimize request payload", payload)
         max_retries = 5
         max_attempts = max_retries + 1
         for attempt in range(1, max_attempts + 1):
@@ -144,6 +148,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
                 with urlopen(request, timeout=self.timeout_secs) as response:
                     body = response.read().decode("utf-8")
                 loaded = json.loads(body)
+                self._log_payload_info("risk-manager optimize response payload", loaded)
                 if not isinstance(loaded, dict):
                     raise RuntimeError("risk-manager optimize returned a non-object JSON payload")
                 return loaded
@@ -161,11 +166,12 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
                 error = exc
 
             if attempt >= max_attempts:
-                _LOGGER.error(
-                    "risk-manager optimize request failed after %d attempts (%d retries): %s",
-                    max_attempts,
-                    max_retries,
-                    error,
+                self.log.error(
+                    (
+                        "risk-manager optimize request failed after "
+                        f"{max_attempts} attempts ({max_retries} retries): {error}"
+                    ),
+                    color=LogColor.RED,
                 )
                 if cause is not None:
                     raise error from cause
@@ -173,18 +179,21 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
 
             retry_number = attempt
             retry_delay_secs = retry_number
-            _LOGGER.warning(
-                "risk-manager optimize request failed (attempt %d/%d), retry %d/%d in %ds: %s",
-                attempt,
-                max_attempts,
-                retry_number,
-                max_retries,
-                retry_delay_secs,
-                error,
+            self.log.warning(
+                (
+                    "risk-manager optimize request failed "
+                    f"(attempt {attempt}/{max_attempts}), "
+                    f"retry {retry_number}/{max_retries} in {retry_delay_secs}s: {error}"
+                ),
+                color=LogColor.YELLOW,
             )
             time.sleep(retry_delay_secs)
 
         raise RuntimeError(f"risk-manager optimize request failed after {max_attempts} attempts")
+
+    def _log_payload_info(self, label: str, payload: Any) -> None:
+        payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        self.log.info(f"{label}: {payload_text}", color=LogColor.BLUE)
 
     def _target_quantities(
         self,

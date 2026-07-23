@@ -6,6 +6,8 @@ from datetime import date
 from urllib.error import URLError
 from unittest.mock import patch
 
+from nautilus_trader.common.enums import LogColor
+
 from strategies.model_target_planners import CurrentHolding
 from strategies.model_target_planners import ModelTargetCandidate
 from strategies.model_target_planners import ModelTargetPlanningRequest
@@ -24,6 +26,22 @@ class FakeResponse:
 
     def read(self) -> bytes:
         return json.dumps(self.body).encode("utf-8")
+
+
+class FakeLog:
+    def __init__(self) -> None:
+        self.infos = []
+        self.warnings = []
+        self.errors = []
+
+    def info(self, *args, **kwargs) -> None:
+        self.infos.append((args, kwargs))
+
+    def warning(self, *args, **kwargs) -> None:
+        self.warnings.append((args, kwargs))
+
+    def error(self, *args, **kwargs) -> None:
+        self.errors.append((args, kwargs))
 
 
 class ModelTargetPlannerTest(unittest.TestCase):
@@ -86,11 +104,13 @@ class ModelTargetPlannerTest(unittest.TestCase):
                 },
             )
 
+        log = FakeLog()
         planner = RiskManagerModelTargetPlanner(
             base_url="http://risk-manager.local/",
             risk_model_id="cn_a_basic_constraints_integer_lots",
             mode="live",
             timeout_secs=3.5,
+            log=log,
         )
         with patch("strategies.model_target_planners.risk_manager.urlopen", side_effect=fake_urlopen):
             plan = planner.plan(request)
@@ -134,6 +154,12 @@ class ModelTargetPlannerTest(unittest.TestCase):
             ],
         )
         self.assertNotIn("previous_position_total", captured["payload"])
+        self.assertEqual(len(log.infos), 2)
+        self.assertIn("risk-manager optimize request payload", log.infos[0][0][0])
+        self.assertIn("risk-manager optimize response payload", log.infos[1][0][0])
+        self.assertEqual(log.infos[0][1]["color"], LogColor.BLUE)
+        self.assertIn('"current_weights"', log.infos[0][0][0])
+        self.assertIn('"target_weights"', log.infos[1][0][0])
         self.assertEqual(plan.reason, "risk_manager_optimize")
         self.assertEqual(plan.signal_date, date(2026, 7, 1))
         self.assertEqual(request.signal_date, date(2026, 7, 1))
@@ -196,6 +222,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
             base_url="http://risk-manager.local",
             risk_model_id="cn_a_basic_constraints_integer_lots",
             mode="live",
+            log=FakeLog(),
         )
         with patch("strategies.model_target_planners.risk_manager.urlopen", side_effect=fake_urlopen):
             plan = planner.plan(request)
@@ -219,6 +246,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
             base_url="http://risk-manager.local",
             risk_model_id="cn_a_basic_constraints_integer_lots",
             mode="simulation",
+            log=FakeLog(),
         )
 
         with patch("strategies.model_target_planners.risk_manager.urlopen") as urlopen_mock:
@@ -246,6 +274,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
             base_url="http://risk-manager.local",
             risk_model_id="cn_a_basic_constraints_integer_lots",
             mode="simulation",
+            log=FakeLog(),
         )
 
         with patch(
@@ -256,10 +285,12 @@ class ModelTargetPlannerTest(unittest.TestCase):
                 planner.plan(request)
 
     def test_risk_manager_post_json_retries_transient_failures(self) -> None:
+        log = FakeLog()
         planner = RiskManagerModelTargetPlanner(
             base_url="http://risk-manager.local",
             risk_model_id="cn_a_basic_constraints_integer_lots",
             mode="simulation",
+            log=log,
         )
         responses = [
             URLError("temporary failure 1"),
@@ -277,7 +308,6 @@ class ModelTargetPlannerTest(unittest.TestCase):
         with (
             patch("strategies.model_target_planners.risk_manager.urlopen", side_effect=fake_urlopen) as urlopen_mock,
             patch("strategies.model_target_planners.risk_manager.time.sleep") as sleep_mock,
-            self.assertLogs("strategies.model_target_planners.risk_manager", level="WARNING") as logs,
         ):
             payload = planner._post_json({"request_id": "retry-test"})
 
@@ -286,14 +316,19 @@ class ModelTargetPlannerTest(unittest.TestCase):
         sleep_mock.assert_any_call(1)
         sleep_mock.assert_any_call(2)
         self.assertEqual(sleep_mock.call_count, 2)
-        self.assertEqual(len(logs.records), 2)
-        self.assertEqual([record.levelname for record in logs.records], ["WARNING", "WARNING"])
+        self.assertEqual(len(log.warnings), 2)
+        self.assertEqual([entry[1]["color"] for entry in log.warnings], [LogColor.YELLOW, LogColor.YELLOW])
+        self.assertEqual(len(log.infos), 2)
+        self.assertIn("risk-manager optimize request payload", log.infos[0][0][0])
+        self.assertIn("risk-manager optimize response payload", log.infos[1][0][0])
 
     def test_risk_manager_post_json_logs_error_after_retry_exhaustion(self) -> None:
+        log = FakeLog()
         planner = RiskManagerModelTargetPlanner(
             base_url="http://risk-manager.local",
             risk_model_id="cn_a_basic_constraints_integer_lots",
             mode="simulation",
+            log=log,
         )
 
         with (
@@ -302,15 +337,15 @@ class ModelTargetPlannerTest(unittest.TestCase):
                 side_effect=URLError("risk manager unavailable"),
             ) as urlopen_mock,
             patch("strategies.model_target_planners.risk_manager.time.sleep") as sleep_mock,
-            self.assertLogs("strategies.model_target_planners.risk_manager", level="ERROR") as logs,
         ):
             with self.assertRaisesRegex(RuntimeError, "risk-manager optimize request failed"):
                 planner._post_json({"request_id": "retry-exhausted"})
 
         self.assertEqual(urlopen_mock.call_count, 6)
         self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [1, 2, 3, 4, 5])
-        self.assertEqual(len(logs.records), 1)
-        self.assertEqual(logs.records[0].levelname, "ERROR")
+        self.assertEqual(len(log.errors), 1)
+        self.assertEqual(log.errors[0][1]["color"], LogColor.RED)
+        self.assertIn("risk-manager optimize request failed after", log.errors[0][0][0])
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ class HoldingExclusionTest(unittest.TestCase):
             _holding_exclusion = TargetModelPredictionsStrategy._holding_exclusion
             _untradable_reason = TargetModelPredictionsStrategy._untradable_reason
             _exit_price_with_source = TargetModelPredictionsStrategy._exit_price_with_source
+            _stock_code_for_instrument = TargetModelPredictionsStrategy._stock_code_for_instrument
             _today_open_price = TargetModelPredictionsStrategy._today_open_price
             _log_missing_exit_open_price = TargetModelPredictionsStrategy._log_missing_exit_open_price
             _update_trailing_state = TargetModelPredictionsStrategy._update_trailing_state
@@ -47,6 +48,7 @@ class HoldingExclusionTest(unittest.TestCase):
         strategy._today_open = today_open
         strategy._last_close = last_close
         strategy._stock_by_instrument = {"000001.SZ.QMT": "000001.SZ"}
+        strategy._instrument_by_stock = {"000001.SZ": InstrumentId.from_str("000001.SZ.QMT")}
         strategy._st_by_date = st_by_date or {}
         strategy._suspended_by_date = suspended_by_date or {}
         strategy.signal_events = []
@@ -161,6 +163,51 @@ class HoldingExclusionTest(unittest.TestCase):
 
         self.assertEqual(reason, "suspended")
         self.assertEqual(strategy.signal_events[0].signal_name, "suspended")
+
+
+class BuildCurrentHoldingsTest(unittest.TestCase):
+    def _make_stub(self):
+        class HoldingStub:
+            _build_current_holdings = TargetModelPredictionsStrategy._build_current_holdings
+            _recent_target_dates = TargetModelPredictionsStrategy._recent_target_dates
+            _recent_target_cutoff_date = TargetModelPredictionsStrategy._recent_target_cutoff_date
+            _recent_holding_days = TargetModelPredictionsStrategy._recent_holding_days
+            _stock_code_for_instrument = TargetModelPredictionsStrategy._stock_code_for_instrument
+            _today_open_price = TargetModelPredictionsStrategy._today_open_price
+
+        strategy = HoldingStub()
+        strategy.log = MagicMock()
+        strategy._stock_by_instrument = {}
+        strategy._instrument_by_stock = {}
+        strategy._recent_target_loader = None
+        strategy._trading_dates = [date(2026, 7, 22), date(2026, 7, 23)]
+        strategy._active_positions = {
+            "000157.SZ.QMT": {"entry_date": date(2026, 7, 22)},
+        }
+        strategy._today_open = {"000157.SZ.QMT": 10.1}
+        strategy._held_instrument_ids = MagicMock(return_value={"000157.SZ.QMT"})
+        strategy._current_quantity = MagicMock(return_value=100)
+        strategy._holding_exclusion = MagicMock(return_value=None)
+        strategy._log_missing_new_entry_open_price = MagicMock()
+        return strategy
+
+    def test_holding_stock_code_comes_from_nautilus_instrument_symbol(self) -> None:
+        strategy = self._make_stub()
+        open_prices: dict[str, float] = {}
+
+        holdings = strategy._build_current_holdings(
+            date(2026, 7, 23),
+            date(2026, 7, 22),
+            open_prices,
+        )
+
+        self.assertEqual(len(holdings), 1)
+        self.assertEqual(holdings[0].instrument_id, "000157.SZ.QMT")
+        self.assertEqual(holdings[0].stock_code, "000157.SZ")
+        self.assertEqual(strategy._stock_by_instrument["000157.SZ.QMT"], "000157.SZ")
+        self.assertEqual(str(strategy._instrument_by_stock["000157.SZ"]), "000157.SZ.QMT")
+        self.assertEqual(open_prices["000157.SZ.QMT"], 10.1)
+        strategy.log.warning.assert_not_called()
 
 
 class ComputeDailyTargetPlanTest(unittest.TestCase):
