@@ -23,6 +23,7 @@ from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import BookType
+from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.events import OrderFilled
@@ -38,6 +39,28 @@ from strategies.order_splitter import NotionalOrderSplitter
 
 async def _await_awaitable(awaitable: Any) -> Any:
     return await awaitable
+
+
+# QMT repurposes the full-tick ``open_int`` field as a real-time market-status code
+# (the ISO-10383-style trading-phase state machine). Map each known code to a
+# nautilus ``MarketStatusAction``. Codes not in this table (0/10/21 未知/异常, or any
+# other int) map to ``MarketStatusAction.NONE``; a non-int / missing value maps to
+# Python ``None`` (status unknown). Only code 1 (停牌) is treated as SUSPEND.
+_OPEN_INT_TO_MARKET_STATUS: dict[int, MarketStatusAction] = {
+    1: MarketStatusAction.SUSPEND,  # 停牌
+    11: MarketStatusAction.PRE_OPEN,  # 开盘前 (S)
+    12: MarketStatusAction.PRE_OPEN,  # 集合竞价时段 (C)
+    13: MarketStatusAction.TRADING,  # 连续交易时段 (T)
+    14: MarketStatusAction.PAUSE,  # 休市 (B)
+    15: MarketStatusAction.CLOSE,  # 闭市 (E)
+    16: MarketStatusAction.PAUSE,  # 波动性中断 (V)
+    17: MarketStatusAction.PAUSE,  # 临时停牌 (P)
+    18: MarketStatusAction.PRE_CLOSE,  # 收盘集合竞价 (U)
+    19: MarketStatusAction.PRE_OPEN,  # 盘中集合竞价 (M)
+    20: MarketStatusAction.HALT,  # 暂停交易至闭市 (N)
+    22: MarketStatusAction.POST_CLOSE,  # 盘后固定价格行情
+    23: MarketStatusAction.CLOSE,  # 盘后固定价格行情完毕
+}
 
 
 @dataclass(frozen=True)
@@ -246,6 +269,10 @@ class TargetQuantityStrategy(Strategy):
         # Instruments whose _today_open came from an authoritative source (real
         # bar open or QMT full-tick).
         self._authoritative_open: set[str] = set()
+        # Latest market status per instrument, derived from the full-tick open_int
+        # field (QMT repurposes open_int as a real-time market-status code). Reset
+        # per day in _roll_trading_day. None means "unknown / unparseable".
+        self._market_status: dict[str, MarketStatusAction | None] = {}
         # True once the first depth-driven convergence of the current trading day
         # has fired (reset per day in _roll_trading_day). Lets the earliest
         # order-book depth callback submit orders as early as possible.
@@ -420,9 +447,9 @@ class TargetQuantityStrategy(Strategy):
         """
         Apply an authoritative full-tick snapshot keyed by instrument id. Each
         value is a per-instrument field mapping (e.g. ``{"open": ..., "last_price":
-        ...}``). Today only the ``open`` field is consumed (to anchor pricing); the
-        snapshot shape is deliberately open so future fields can be used without a
-        signature change.
+        ..., "open_int": ...}``). The ``open`` field anchors pricing and ``open_int``
+        carries QMT's real-time market status; the snapshot shape is deliberately open
+        so future fields can be used without a signature change.
         """
         if not isinstance(snapshot, dict) or not snapshot:
             self.log.warning(f"full-tick snapshot is invalid! ({trigger})")
@@ -430,6 +457,10 @@ class TargetQuantityStrategy(Strategy):
         trading_date = self._clock_date()
         updated = 0
         for instrument_id, fields in snapshot.items():
+            # Store the market status first: a suspended stock has open==0 and would
+            # otherwise `continue` on the invalid-open path before status is recorded.
+            self._roll_trading_day(trading_date)
+            self._market_status[str(instrument_id)] = self._market_status_from_open_int(fields)
             open_price = self._full_tick_open(fields)
             if open_price is None:
                 self.log.warning(f"full-tick snapshot contains invalid open price for {instrument_id} ({trigger})")
@@ -442,6 +473,29 @@ class TargetQuantityStrategy(Strategy):
                 f"date={trading_date} count={updated}",
                 color=LogColor.BLUE,
             )
+
+    @staticmethod
+    def _market_status_from_open_int(fields: Any) -> MarketStatusAction | None:
+        """
+        Derive a ``MarketStatusAction`` from a full-tick value's ``open_int`` field.
+
+        Returns ``None`` when the value is missing/unparseable (status unknown), and
+        ``MarketStatusAction.NONE`` when it is a valid int with no known mapping.
+        """
+        raw = fields.get("open_int", fields.get("openInt")) if isinstance(fields, dict) else None
+        try:
+            code = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return _OPEN_INT_TO_MARKET_STATUS.get(code, MarketStatusAction.NONE)
+
+    def _market_status_for(self, instrument_id: str) -> MarketStatusAction | None:
+        """Latest market status for an instrument, or None if unknown."""
+        return self._market_status.get(instrument_id)
+
+    def _is_suspended_status(self, instrument_id: str) -> bool:
+        """True when the instrument's latest full-tick status is SUSPEND (停牌)."""
+        return self._market_status.get(instrument_id) == MarketStatusAction.SUSPEND
 
     @staticmethod
     def _full_tick_open(fields: Any) -> float | None:
@@ -795,6 +849,7 @@ class TargetQuantityStrategy(Strategy):
         self._trading_day = trading_date
         self._today_open = {}
         self._authoritative_open = set()
+        self._market_status = {}
         self._depth_books = {}
         self._depth_converged_today = False
         self._cancel_count_buy = {}
@@ -2043,6 +2098,7 @@ class TargetQuantityStrategy(Strategy):
             return broker_total_asset
         nautilus_equity = self._nautilus_portfolio_equity()
         if nautilus_equity is not None:
+            self.log.warning("Using nautilus portfolio equity as fallback for portfolio value.")
             return nautilus_equity
         return Decimal(str(self.config.initial_cash))
 

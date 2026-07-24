@@ -16,7 +16,7 @@ from strategies.model_target_planners.base import ModelTargetCandidate
 from strategies.model_target_planners.base import ModelTargetPlan
 from strategies.model_target_planners.base import ModelTargetPlanner
 from strategies.model_target_planners.base import ModelTargetPlanningRequest
-from strategies.model_target_planners.base import RequestInfo
+from strategies.model_target_planners.base import TargetContext
 from strategies.model_target_planners.base import TargetInfo
 from strategies.model_target_planners.base import normalize_stock_code
 
@@ -226,7 +226,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
                     stock_code=stock_code,
                     weight=weight if weight is not None and weight > 0 else None,
                     quantity=quantity,
-                    request_info=RequestInfo(),
+                    target_context=TargetContext(),
                     target_version=None,
                     instrument_id=instrument_id,
                     is_locked=self._is_locked(row),

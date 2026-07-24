@@ -22,6 +22,7 @@ from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_writer import LiveSnapshotWriter
 from nautilus_trader.common.enums import LogColor
+from nautilus_trader.model.enums import MarketStatusAction
 
 from lives.live_qmt_target_model_predictions import _emit_snapshot_status
 from lives.live_qmt_target_model_predictions import parse_args
@@ -32,7 +33,7 @@ from lives.live_qmt_target_model_predictions import normalize_refresh_time
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig
 from strategies.model_target_planners import ModelTargetPlan
-from strategies.model_target_planners import RequestInfo
+from strategies.model_target_planners import TargetContext
 from strategies.model_target_planners import TargetInfo
 from strategies.target_quantities import TargetQuantityStrategy
 
@@ -99,7 +100,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                     stock_code="000001.SZ",
                     weight=None,
                     quantity=1000,
-                    request_info=RequestInfo(),
+                    target_context=TargetContext(),
                     target_version=None,
                     instrument_id="000001.SZ.QMT",
                     is_locked=False,
@@ -562,7 +563,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                     stock_code="000001.SZ",
                     weight=0.12,
                     quantity=10000,
-                    request_info=RequestInfo(
+                    target_context=TargetContext(
                         price=10.5,
                         price_source="open",
                         score=0.8,
@@ -570,6 +571,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                         current_qty=5000,
                         recent_target_date=date(2026, 7, 1),
                         recent_holding_days=6,
+                        market_status=MarketStatusAction.SUSPEND,
                     ),
                     target_version=None,
                     instrument_id="000001.SZ.QMT",
@@ -634,6 +636,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                 "target_version": "ver-1",
                 "recent_buy_date": "2026-07-01",
                 "recent_holding_days": 6,
+                "market_status": "SUSPEND",
             },
         )
         recorder._apply_target.assert_called_once_with(

@@ -5,9 +5,11 @@ from dataclasses import field
 from datetime import date
 from typing import Any
 
+from nautilus_trader.model.enums import MarketStatusAction
+
 
 @dataclass(frozen=True)
-class RequestInfo:
+class TargetContext:
     price: float | None = None
     price_source: str | None = None
     score: float | None = None
@@ -15,6 +17,7 @@ class RequestInfo:
     current_qty: int | None = None
     recent_target_date: date | None = None
     recent_holding_days: int | None = None
+    market_status: MarketStatusAction | None = None
 
 
 @dataclass(frozen=True)
@@ -22,7 +25,7 @@ class TargetInfo:
     stock_code: str
     weight: float | None
     quantity: int | None
-    request_info: RequestInfo
+    target_context: TargetContext
     target_version: str | None
     instrument_id: str
     is_locked: bool | None

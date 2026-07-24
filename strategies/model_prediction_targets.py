@@ -21,7 +21,7 @@ from strategies.model_target_planners import CurrentHolding
 from strategies.model_target_planners import ModelTargetCandidate
 from strategies.model_target_planners import ModelTargetPlan
 from strategies.model_target_planners import ModelTargetPlanningRequest
-from strategies.model_target_planners import RequestInfo
+from strategies.model_target_planners import TargetContext
 from strategies.model_target_planners import TargetInfo
 from strategies.model_target_planners import build_model_target_planner
 from strategies.model_target_planners import normalize_stock_code
@@ -546,7 +546,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             targets.append(
                 dataclasses.replace(
                     target,
-                    request_info=RequestInfo(
+                    target_context=TargetContext(
                         price=request.open_prices.get(target.instrument_id),
                         price_source=price_source,
                         score=None if candidate is None else float(candidate.score),
@@ -562,6 +562,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                         recent_holding_days=None
                         if holding is None
                         else int(holding.recent_holding_days),
+                        market_status=self._market_status_for(target.instrument_id),
                     ),
                 ),
             )
@@ -631,6 +632,10 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 continue
             seen.add(instrument_id)
             skip_reason = self._entry_skip_reason(stock_code, trading_date)
+            # Live suspension (from the full-tick open_int status) filters the
+            # candidate out — a suspended stock cannot be entered today.
+            if skip_reason is None and self._is_suspended_status(instrument_id):
+                skip_reason = "suspended"
             price = self._today_open_price(instrument_id)
             if skip_reason is None and price is None:
                 self._log_missing_new_entry_open_price(
@@ -706,6 +711,40 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 self.log.warning(f"Skipping holding with zero or negative quantity: {instrument_id}")
                 continue
             exit_rank += 1
+            # A live-suspended holding (from the full-tick open_int status) is frozen:
+            # kept as-is rather than routed through the exit/exclusion logic. A
+            # suspended stock has no open price, so bypass the open-price gate, price
+            # it at last_close, and set recent_holding_days=0 so the risk manager
+            # emits no adjustment signal and the position is held unchanged.
+            if self._is_suspended_status(instrument_id):
+                recent_target_date = recent_target_dates.get(instrument_id)
+                last_close = self._last_close.get(instrument_id)
+                if last_close is None or last_close <= 0:
+                    self.log.warning(
+                        f"Skipping suspended holding with no last_close price: "
+                        f"{instrument_id} stock_code={stock_code}",
+                        color=LogColor.YELLOW,
+                    )
+                    continue
+                price = float(last_close)
+                self.log.warning(
+                    f"Suspended holding frozen (SUSPEND): instrument_id={instrument_id} "
+                    f"stock_code={stock_code} price=last_close({price}) recent_holding_days=0 "
+                    f"quantity={quantity}",
+                    color=LogColor.YELLOW,
+                )
+                open_prices.setdefault(instrument_id, price)
+                holdings.append(
+                    CurrentHolding(
+                        instrument_id=instrument_id,
+                        stock_code=stock_code,
+                        quantity=quantity,
+                        price=price,
+                        recent_target_date=recent_target_date,
+                        recent_holding_days=0,
+                    ),
+                )
+                continue
             exclusion = self._holding_exclusion(trading_date, signal_date, instrument_id, exit_rank)
             if exclusion is not None:
                 self.log.warning(f"Excluding holding from current_holdings: {instrument_id} reason={exclusion}")
@@ -784,8 +823,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 result[instrument_id] = pd.Timestamp(entry_date).date()
         return result
 
-    def _recent_target_cutoff_date(self, trading_date: date, window: int = 30) -> date:
-        """The 30th-prior trading day (inclusive lower bound of the recency window)."""
+    def _recent_target_cutoff_date(self, trading_date: date, window: int = 90) -> date:
+        """The 90th-prior trading day (inclusive lower bound of the recency window)."""
         prior_dates = [value for value in self._trading_dates if value < trading_date]
         if not prior_dates:
             return trading_date

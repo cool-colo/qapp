@@ -11,6 +11,7 @@ import pandas as pd
 
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import BookType
+from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.identifiers import InstrumentId
@@ -353,6 +354,9 @@ class TestableTargetQuantityStrategy:
     _set_authoritative_open = TargetQuantityStrategy._set_authoritative_open
     _apply_full_tick = TargetQuantityStrategy._apply_full_tick
     _full_tick_open = staticmethod(TargetQuantityStrategy._full_tick_open)
+    _market_status_from_open_int = staticmethod(TargetQuantityStrategy._market_status_from_open_int)
+    _market_status_for = TargetQuantityStrategy._market_status_for
+    _is_suspended_status = TargetQuantityStrategy._is_suspended_status
     configure_full_tick_source = TargetQuantityStrategy.configure_full_tick_source
     _start_full_tick_refresh = TargetQuantityStrategy._start_full_tick_refresh
     _schedule_full_tick_prefetch = TargetQuantityStrategy._schedule_full_tick_prefetch
@@ -471,6 +475,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             for instrument_id, price in initial_open_prices.items()
         }
         strategy._authoritative_open = set()
+        strategy._market_status = {}
         strategy._full_tick_source = None
         strategy._full_tick_prefetch_time = TargetQuantityStrategy._parse_hh_mm(
             strategy.config.full_tick_prefetch_time,
@@ -1499,6 +1504,49 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertIsNone(TargetQuantityStrategy._full_tick_open({"open": 0.0}))
         self.assertIsNone(TargetQuantityStrategy._full_tick_open({"open": None}))
         self.assertIsNone(TargetQuantityStrategy._full_tick_open({"last_price": 1.0}))
+
+    def test_market_status_from_open_int(self) -> None:
+        m = TargetQuantityStrategy._market_status_from_open_int
+        # Known codes map per the QMT open_int table.
+        self.assertEqual(m({"open_int": 1}), MarketStatusAction.SUSPEND)  # 停牌
+        self.assertEqual(m({"open_int": 13}), MarketStatusAction.TRADING)  # 连续交易
+        self.assertEqual(m({"open_int": 15}), MarketStatusAction.CLOSE)  # 闭市
+        self.assertEqual(m({"open_int": 20}), MarketStatusAction.HALT)  # 暂停至闭市
+        self.assertEqual(m({"open_int": "1"}), MarketStatusAction.SUSPEND)  # string coerced
+        self.assertEqual(m({"openInt": 1}), MarketStatusAction.SUSPEND)  # camelCase key
+        # Valid int with no known mapping → NONE enum.
+        self.assertEqual(m({"open_int": 0}), MarketStatusAction.NONE)
+        self.assertEqual(m({"open_int": 99}), MarketStatusAction.NONE)
+        # Missing / unparseable → Python None (status unknown).
+        self.assertIsNone(m({"open_int": None}))
+        self.assertIsNone(m({"open_int": "abc"}))
+        self.assertIsNone(m({"last_price": 1.0}))
+        self.assertIsNone(m(53.09))
+
+    def test_apply_full_tick_stores_status_even_when_suspended_open_zero(self) -> None:
+        # A suspended stock reports open==0 (invalid), which short-circuits the
+        # open-price path — status must still be recorded.
+        strategy = self.make_strategy(open_prices={INST_A: 42.14})
+        strategy._trading_day = date(2026, 7, 2)
+        strategy._apply_full_tick(
+            {str(INST_A): {"open": 0.0, "last_price": 19.09, "open_int": 1}},
+            "prefetch",
+        )
+        self.assertEqual(strategy._market_status_for(str(INST_A)), MarketStatusAction.SUSPEND)
+        self.assertTrue(strategy._is_suspended_status(str(INST_A)))
+        # Normal trading stock stores TRADING and is not suspended.
+        strategy._apply_full_tick({str(INST_B): {"open": 20.0, "open_int": 13}}, "prefetch")
+        self.assertEqual(strategy._market_status_for(str(INST_B)), MarketStatusAction.TRADING)
+        self.assertFalse(strategy._is_suspended_status(str(INST_B)))
+
+    def test_roll_trading_day_clears_market_status(self) -> None:
+        strategy = self.make_strategy(open_prices={INST_A: 10.0})
+        strategy._trading_day = date(2026, 7, 2)
+        strategy._apply_full_tick({str(INST_A): {"open": 0.0, "open_int": 1}}, "prefetch")
+        self.assertTrue(strategy._is_suspended_status(str(INST_A)))
+        # New trading day rolls the per-day status store.
+        strategy._roll_trading_day(date(2026, 7, 3))
+        self.assertIsNone(strategy._market_status_for(str(INST_A)))
 
     def test_buy_price_uses_gap_up_open_not_stale_seed(self) -> None:
         # End-to-end: after a full-tick refresh, a gap-up open drives the buy

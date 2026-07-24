@@ -422,13 +422,15 @@ class SnapshotRecorder(Actor):
         position_id = self._position_snapshot_anchor(trading_date)
         records: list[LiveTargetRecord] = []
         for target in plan.targets:
-            request_info = target.request_info
+            target_context = target.target_context
             row_version = target.target_version or version
             extra: dict[str, Any] = {"target_version": row_version}
-            if request_info.recent_target_date is not None:
-                extra["recent_buy_date"] = request_info.recent_target_date.isoformat()
-            if request_info.recent_holding_days is not None:
-                extra["recent_holding_days"] = int(request_info.recent_holding_days)
+            if target_context.recent_target_date is not None:
+                extra["recent_buy_date"] = target_context.recent_target_date.isoformat()
+            if target_context.recent_holding_days is not None:
+                extra["recent_holding_days"] = int(target_context.recent_holding_days)
+            if target_context.market_status is not None:
+                extra["market_status"] = target_context.market_status.name
             records.append(
                 LiveTargetRecord(
                     trade_date=trading_date,
@@ -450,12 +452,12 @@ class SnapshotRecorder(Actor):
                         if target.weight is None
                         else Decimal(str(target.weight))
                     ),
-                    open_price=self._decimal_or_none(request_info.price),
-                    price_source=request_info.price_source,
+                    open_price=self._decimal_or_none(target_context.price),
+                    price_source=target_context.price_source,
                     target_qty=self._int_or_none(target.quantity),
-                    current_qty=self._int_or_none(request_info.current_qty),
-                    score=self._decimal_or_none(request_info.score),
-                    expected_return=self._decimal_or_none(request_info.expected_return),
+                    current_qty=self._int_or_none(target_context.current_qty),
+                    score=self._decimal_or_none(target_context.score),
+                    expected_return=self._decimal_or_none(target_context.expected_return),
                     is_locked=target.is_locked,
                     reason=plan.reason,
                     extra=extra,

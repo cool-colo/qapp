@@ -5,6 +5,7 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.identifiers import InstrumentId
 
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
@@ -12,7 +13,7 @@ from strategies.model_target_planners import CurrentHolding
 from strategies.model_target_planners import ModelTargetCandidate
 from strategies.model_target_planners import ModelTargetPlan
 from strategies.model_target_planners import ModelTargetPlanningRequest
-from strategies.model_target_planners import RequestInfo
+from strategies.model_target_planners import TargetContext
 from strategies.model_target_planners import TargetInfo
 
 
@@ -180,12 +181,15 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
             _recent_holding_days = TargetModelPredictionsStrategy._recent_holding_days
             _stock_code_for_instrument = TargetModelPredictionsStrategy._stock_code_for_instrument
             _today_open_price = TargetModelPredictionsStrategy._today_open_price
+            _is_suspended_status = TargetModelPredictionsStrategy._is_suspended_status
 
         strategy = HoldingStub()
         strategy.log = MagicMock()
         strategy._stock_by_instrument = {}
         strategy._instrument_by_stock = {}
         strategy._recent_target_loader = None
+        strategy._market_status = {}
+        strategy._last_close = {}
         strategy._trading_dates = [date(2026, 7, 22), date(2026, 7, 23)]
         strategy._active_positions = {
             "000157.SZ.QMT": {"entry_date": date(2026, 7, 22)},
@@ -214,6 +218,63 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         self.assertEqual(str(strategy._instrument_by_stock["000157.SZ"]), "000157.SZ.QMT")
         self.assertEqual(open_prices["000157.SZ.QMT"], 10.1)
         strategy.log.warning.assert_not_called()
+
+    def test_suspended_holding_is_frozen_priced_at_last_close(self) -> None:
+        strategy = self._make_stub()
+        # No open price today (suspended stock has none); status is SUSPEND and a
+        # previous close is available.
+        strategy._today_open = {}
+        strategy._market_status = {"000157.SZ.QMT": MarketStatusAction.SUSPEND}
+        strategy._last_close = {"000157.SZ.QMT": 9.5}
+        strategy._holding_exclusion = MagicMock()
+        open_prices: dict[str, float] = {}
+
+        holdings = strategy._build_current_holdings(
+            date(2026, 7, 23),
+            date(2026, 7, 22),
+            open_prices,
+        )
+
+        self.assertEqual(len(holdings), 1)
+        holding = holdings[0]
+        self.assertEqual(holding.instrument_id, "000157.SZ.QMT")
+        # Priced at last_close, held quantity kept, recency zeroed to freeze it.
+        self.assertEqual(holding.price, 9.5)
+        self.assertEqual(holding.quantity, 100)
+        self.assertEqual(holding.recent_holding_days, 0)
+        self.assertEqual(open_prices["000157.SZ.QMT"], 9.5)
+        # Frozen: the exit/exclusion logic is bypassed entirely.
+        strategy._holding_exclusion.assert_not_called()
+        # A warning documents the suspended special-handling.
+        strategy.log.warning.assert_called()
+
+    def test_suspended_holding_without_last_close_is_skipped(self) -> None:
+        strategy = self._make_stub()
+        strategy._today_open = {}
+        strategy._market_status = {"000157.SZ.QMT": MarketStatusAction.SUSPEND}
+        strategy._last_close = {}
+        strategy._holding_exclusion = MagicMock()
+        open_prices: dict[str, float] = {}
+
+        holdings = strategy._build_current_holdings(
+            date(2026, 7, 23),
+            date(2026, 7, 22),
+            open_prices,
+        )
+
+        self.assertEqual(holdings, [])
+        strategy.log.warning.assert_called()
+
+    def test_recent_target_cutoff_window_defaults_to_90(self) -> None:
+        strategy = self._make_stub()
+        # 120 prior trading days: the default window (90) selects the 90th-prior day.
+        strategy._trading_dates = [date(2020, 1, 1)] + [
+            date(2026, 1, 1) + __import__("datetime").timedelta(days=i) for i in range(120)
+        ]
+        trading_date = date(2027, 1, 1)
+        prior = sorted(d for d in strategy._trading_dates if d < trading_date)
+        cutoff = strategy._recent_target_cutoff_date(trading_date)
+        self.assertEqual(cutoff, prior[-90])
 
 
 class ComputeDailyTargetPlanTest(unittest.TestCase):
@@ -260,14 +321,16 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
 
 
 class AnnotatePlanTest(unittest.TestCase):
-    def test_current_holding_quantity_is_stamped_on_request_info(self) -> None:
+    def test_current_holding_quantity_is_stamped_on_target_context(self) -> None:
         class AnnotateStub:
             _annotate_plan = TargetModelPredictionsStrategy._annotate_plan
             _open_price_with_source = TargetModelPredictionsStrategy._open_price_with_source
+            _market_status_for = TargetModelPredictionsStrategy._market_status_for
 
         strategy = AnnotateStub()
         strategy._today_open = {"000001.SZ.QMT": 10.1}
         strategy._last_close = {"000001.SZ.QMT": 10.0}
+        strategy._market_status = {}
         plan = ModelTargetPlan(
             trading_date=date(2026, 7, 8),
             signal_date=date(2026, 7, 7),
@@ -276,7 +339,7 @@ class AnnotatePlanTest(unittest.TestCase):
                     stock_code="000001.SZ",
                     weight=0.2,
                     quantity=2000,
-                    request_info=RequestInfo(),
+                    target_context=TargetContext(),
                     target_version=None,
                     instrument_id="000001.SZ.QMT",
                     is_locked=True,
@@ -316,10 +379,10 @@ class AnnotatePlanTest(unittest.TestCase):
 
         annotated = strategy._annotate_plan(plan, request)
 
-        request_info = annotated.targets[0].request_info
-        self.assertEqual(request_info.current_qty, 1200)
-        self.assertEqual(request_info.price_source, "open")
-        self.assertEqual(request_info.recent_target_date, date(2026, 7, 1))
+        target_context = annotated.targets[0].target_context
+        self.assertEqual(target_context.current_qty, 1200)
+        self.assertEqual(target_context.price_source, "open")
+        self.assertEqual(target_context.recent_target_date, date(2026, 7, 1))
 
 
 class BuildCandidatesTest(unittest.TestCase):
@@ -333,11 +396,13 @@ class BuildCandidatesTest(unittest.TestCase):
                 TargetModelPredictionsStrategy._log_missing_new_entry_open_price
             )
             _record_signal = TargetModelPredictionsStrategy._record_signal
+            _is_suspended_status = TargetModelPredictionsStrategy._is_suspended_status
 
         strategy = CandidateStub()
         signal_date = date(2026, 7, 7)
         instrument_id = InstrumentId.from_str("000001.SZ.QMT")
         strategy.log = MagicMock()
+        strategy._market_status = {}
         strategy._signals_by_date = {signal_date: signals}
         strategy._instrument_by_stock = {"000001.SZ": instrument_id}
         strategy._stock_by_instrument = {str(instrument_id): "000001.SZ"}
@@ -391,6 +456,28 @@ class BuildCandidatesTest(unittest.TestCase):
         self.assertEqual(strategy.signal_events[0].signal_name, "entry_filtered")
         self.assertEqual(strategy.signal_events[0].extra["reason"], "missing_open_price")
         strategy.log.warning.assert_called_once()
+
+    def test_suspended_signal_is_filtered_out_of_candidates(self) -> None:
+        strategy, instrument_id, signal_date = self._make_stub(
+            signals=[
+                {
+                    "date": date(2026, 7, 7),
+                    "stock_code": "000001.SZ",
+                    "score": 0.9,
+                    "rank": 1,
+                    "pred_return_live": 0.02,
+                },
+            ],
+            today_open={"000001.SZ.QMT": 10.1},
+        )
+        strategy._market_status = {instrument_id: MarketStatusAction.SUSPEND}
+        open_prices: dict[str, float] = {}
+
+        candidates = strategy._build_candidates(date(2026, 7, 8), signal_date, open_prices)
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(strategy.signal_events[0].signal_name, "entry_filtered")
+        self.assertEqual(strategy.signal_events[0].extra["reason"], "suspended")
 
 
 if __name__ == "__main__":
