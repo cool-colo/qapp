@@ -1092,10 +1092,7 @@ class SnapshotRecorder(Actor):
         return result
 
     def _venue_can_use(self, instrument_id_text: str) -> Decimal | None:
-        venue_map = getattr(self._strategy, "_venue_sellable", None)
-        if isinstance(venue_map, dict):
-            return venue_map.get(instrument_id_text)
-        return None
+        return self._strategy.venue_sellable_quantity(instrument_id_text)
 
     def _stock_code(self, instrument_id_text: str) -> str:
         mapping = getattr(self._strategy, "_stock_by_instrument", {})

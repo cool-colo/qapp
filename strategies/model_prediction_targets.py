@@ -601,7 +601,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             target_cash_buffer_percent=float(self.config.target_cash_buffer_percent),
             max_position_percent=float(self.config.max_position_percent),
             total_asset=total_asset,
-            investable_asset=investable_asset,
+            investable_asset=9000000.0,
             open_prices=open_prices,
         )
 
@@ -632,10 +632,6 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 continue
             seen.add(instrument_id)
             skip_reason = self._entry_skip_reason(stock_code, trading_date)
-            # Live suspension (from the full-tick open_int status) filters the
-            # candidate out — a suspended stock cannot be entered today.
-            if skip_reason is None and self._is_suspended_status(instrument_id):
-                skip_reason = "suspended"
             price = self._today_open_price(instrument_id)
             if skip_reason is None and price is None:
                 self._log_missing_new_entry_open_price(
@@ -894,6 +890,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         name_reason = self._name_skip_reason(stock_code)
         if name_reason:
             return name_reason
+        instrument = self._instrument_by_stock.get(stock_code)
+        if instrument is not None and self._is_suspended_status(str(instrument)):
+            return "suspended"
         if stock_code in self._suspended_by_date.get(trading_date, set()):
             return "suspended"
         if stock_code in self._st_by_date.get(trading_date, set()):

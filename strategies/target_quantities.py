@@ -12,6 +12,7 @@ from datetime import date
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
+from typing import Callable
 
 import pandas as pd
 
@@ -31,15 +32,12 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.trading.strategy import Strategy
 
+from strategies.async_scheduling import AsyncAwaitableScheduler
+from strategies.execution_reconciliation import ExecutionStateReconciler
 from strategies.pricing import OpenOffsetBuyPriceStrategy
 from strategies.pricing import OpenOffsetSellPriceStrategy
 from strategies.pricing import PriceContext
 from strategies.order_splitter import NotionalOrderSplitter
-
-
-async def _await_awaitable(awaitable: Any) -> Any:
-    return await awaitable
-
 
 # QMT repurposes the full-tick ``open_int`` field as a real-time market-status code
 # (the ISO-10383-style trading-phase state machine). Map each known code to a
@@ -223,7 +221,6 @@ class TargetQuantityStrategy(Strategy):
         "limit_down",
         "\u8dcc\u505c\u4ef7",
     )
-    _PRE_OPEN_RECONCILE_ALERT = "TARGET-WEIGHT-PRE-OPEN-RECONCILE"
     _FULL_TICK_REFRESH_TIMER = "TARGET-WEIGHT-FULL-TICK-REFRESH"
     _FULL_TICK_PREFETCH_ALERT = "TARGET-WEIGHT-FULL-TICK-PREFETCH"
     _TERMINAL_ORDER_STATUSES = {
@@ -295,45 +292,37 @@ class TargetQuantityStrategy(Strategy):
         }
         self._subscribed_quote_tick_probe_instruments: set[str] = set()
         self._convergence_suspended = False
-        self._pre_open_reconcile = None
-        self._pre_open_reconcile_time: tuple[int, int] | None = None
-        self._pre_open_reconcile_timeout_secs = 30.0
-        self._pre_open_reconcile_task: asyncio.Future[Any] | ConcurrentFuture[Any] | None = None
-        # Node event loop for marshalling async callbacks. LiveClock time-alert callbacks
-        # (pre-open reconcile, full-tick fetch) fire on the Rust timer thread, NOT the
-        # asyncio loop thread, so async work must be scheduled onto this loop via
-        # run_coroutine_threadsafe. None in backtest (callbacks never wired).
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self._async_scheduler = AsyncAwaitableScheduler()
+        self._execution_state_reconciler = ExecutionStateReconciler(
+            clock=self.clock,
+            log=self.log,
+            timezone_name=config.timezone_name,
+            async_scheduler=self._async_scheduler,
+        )
         self._full_tick_source: Any | None = None
         self._full_tick_prefetch_time: tuple[int, int] | None = self._parse_hh_mm(
             config.full_tick_prefetch_time,
         )
         self._full_tick_task: asyncio.Future[Any] | ConcurrentFuture[Any] | None = None
         self._sellable_exhausted: dict[str, date] = {}
-        # Broker-reported sellable quantity per instrument (QMT `can_use_volume`), refreshed
-        # from execution mass-status reports. Empty in backtest (no venue reports) -> the
-        # fill-based estimate is used. When populated it is authoritative over the estimate.
-        self._venue_sellable: dict[str, Decimal] = {}
-        self._venue_sellable_ts: int = 0
         self._last_account_sizing_snapshot: str | None = None
         self.target_events: list[TargetQuantityTargetEvent] = []
         self.order_events: list[TargetQuantityOrderEvent] = []
 
     def configure_pre_open_reconciliation(
         self,
-        reconcile: Any,
+        reconcile: Callable[..., Any],
         reconcile_time: str,
         timeout_secs: float,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
-        self._pre_open_reconcile = reconcile
-        parsed_time = self._parse_hh_mm(reconcile_time)
-        if parsed_time is None:
-            raise ValueError("pre-open reconcile time is required")
-        self._pre_open_reconcile_time = parsed_time
-        self._pre_open_reconcile_timeout_secs = float(timeout_secs)
         if loop is not None:
-            self._loop = loop
+            self._async_scheduler.set_loop(loop)
+        self._execution_state_reconciler.configure(
+            reconcile=reconcile,
+            reconcile_time=reconcile_time,
+            timeout_secs=timeout_secs,
+        )
 
     def configure_full_tick_source(self, fetch_full_tick: Any | None) -> None:
         """
@@ -348,21 +337,18 @@ class TargetQuantityStrategy(Strategy):
         self._full_tick_source = fetch_full_tick
 
     def on_start(self) -> None:
-        # Capture the node event loop while running on the loop thread. Used to
-        # marshal async callbacks (reconcile, full-tick) that later fire on the
-        # LiveClock timer thread. An explicit loop from configure_* wins if set.
-        if self._loop is None:
-            try:
-                self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                self._loop = None
+        self._async_scheduler.capture_running_loop()
         self.log.info(
             f"target-weight executor start: instruments={len(self._instrument_ids)} "
             f"bar_types={len(self._bar_types)} target_version={self._target_version or '<none>'}",
             color=LogColor.BLUE,
         )
-        self._schedule_pre_open_reconcile()
-        self._subscribe_execution_mass_status()
+        self._execution_state_reconciler.schedule_daily()
+        if self._instrument_ids:
+            self._execution_state_reconciler.subscribe_mass_status(
+                venue=self._instrument_ids[0].venue,
+                msgbus=self.msgbus,
+            )
         if not self._bar_types:
             self.log.warning("target-weight executor has no bar_types configured")
         for bar_type in self._bar_types.values():
@@ -428,9 +414,7 @@ class TargetQuantityStrategy(Strategy):
         if not inspect.isawaitable(result):
             self._apply_full_tick(result, trigger)
             return
-        task = self._schedule_on_loop(result)
-        if task is None:
-            return
+        task = self._async_scheduler.schedule(result)
         self._full_tick_task = task
         task.add_done_callback(lambda t: self._on_full_tick_fetch_done(t, trigger))
 
@@ -540,101 +524,18 @@ class TargetQuantityStrategy(Strategy):
             target = target + pd.Timedelta(days=1)
         return target
 
-    def _schedule_pre_open_reconcile(self) -> None:
-        alert_time = self._next_daily_time(self._pre_open_reconcile_time)
-        self.clock.set_time_alert(
-            name=self._PRE_OPEN_RECONCILE_ALERT,
-            alert_time=alert_time,
-            callback=self._on_pre_open_reconcile_timer,
-            override=True,
-        )
-        self.log.info(
-            f"Next pre-open execution-state reconciliation scheduled for {alert_time.isoformat()} "
-            f"({self.config.timezone_name})",
-            color=LogColor.BLUE,
-        )
-
-    def _on_pre_open_reconcile_timer(self, _event: Any) -> None:
-        self._schedule_pre_open_reconcile()
-        self._run_pre_open_reconcile()
-
-    def _schedule_on_loop(
-        self,
-        awaitable: Any,
-    ) -> asyncio.Future[Any] | ConcurrentFuture[Any] | None:
-        """
-        Schedule an awaitable onto the node's event loop and return a future.
-
-        LiveClock time-alert callbacks fire on the Rust timer thread, so there is no
-        running loop here and the awaitable's I/O (aiohttp) is bound to the node loop
-        on another thread. Marshal onto that loop with run_coroutine_threadsafe; the
-        returned concurrent.futures.Future exposes done()/result()/add_done_callback()
-        just like an asyncio.Future.
-
-        When no node loop is available (backtest/tests, or a plain-async callback whose
-        I/O is not bound to another loop) the awaitable is run synchronously to
-        completion and an already-resolved future is returned, so the caller's
-        add_done_callback still fires (immediately) and result-logging is preserved.
-        Returns None only if the awaitable could not be run at all.
-        """
-        loop = self._loop
-        if loop is not None and loop.is_running():
-            return asyncio.run_coroutine_threadsafe(_await_awaitable(awaitable), loop)
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is not None:
-            return asyncio.ensure_future(awaitable, loop=running)
-        resolved: ConcurrentFuture[Any] = ConcurrentFuture()
-        try:
-            resolved.set_result(asyncio.run(_await_awaitable(awaitable)))
-        except Exception as exc:  # noqa: BLE001 - surfaced via the future
-            resolved.set_exception(exc)
-        return resolved
-
-    def _run_pre_open_reconcile(self) -> None:
-        if self._pre_open_reconcile_task is not None and not self._pre_open_reconcile_task.done():
-            self.log.warning("Previous pre-open execution-state reconciliation is still running; skipping")
-            return
-        try:
-            result = self._pre_open_reconcile(timeout_secs=self._pre_open_reconcile_timeout_secs)
-        except Exception as exc:
-            self.log.warning(f"Pre-open execution-state reconciliation failed to start: {exc}")
-            return
-        if inspect.isawaitable(result):
-            task = self._schedule_on_loop(result)
-            if task is None:
-                return
-            self._pre_open_reconcile_task = task
-            task.add_done_callback(self._on_pre_open_reconcile_done)
-            self.log.info("Started pre-open execution-state reconciliation", color=LogColor.BLUE)
-            return
-        self._log_pre_open_reconcile_result(bool(result))
-
     def request_execution_reconcile(self) -> None:
         """
         Trigger an execution-state reconcile using the configured pre-open callback,
-        if available. Used to refresh the broker sellable map (``_venue_sellable``)
+        if available. Used to refresh broker-reported sellable quantities
         outside the scheduled pre-open window (e.g. on the periodic refresh timer).
         Live target-model nodes configure this callback during startup.
         """
-        self._run_pre_open_reconcile()
+        self._execution_state_reconciler.run()
 
-    def _on_pre_open_reconcile_done(self, task: asyncio.Future[Any]) -> None:
-        self._pre_open_reconcile_task = None
-        try:
-            result = task.result()
-        except Exception as exc:
-            self.log.warning(f"Pre-open execution-state reconciliation failed: {exc}")
-            return
-        self._log_pre_open_reconcile_result(bool(result))
-
-    def _log_pre_open_reconcile_result(self, succeeded: bool) -> None:
-        if succeeded:
-            self.log.info("Pre-open execution-state reconciliation succeeded", color=LogColor.GREEN)
-        else:
-            self.log.warning("Pre-open execution-state reconciliation did not complete successfully")
+    def venue_sellable_quantity(self, instrument_id: str) -> Decimal | None:
+        """Return the latest broker-reconciled sellable quantity for an instrument."""
+        return self._execution_state_reconciler.venue_sellable_quantity(instrument_id)
 
     def refresh_target_instruments(
         self,
@@ -1694,7 +1595,7 @@ class TargetQuantityStrategy(Strategy):
         # (which would zero out the fill-based estimate). Fall back to the fill-based estimate
         # in backtest or when no venue report has arrived yet. In both cases still subtract this
         # strategy's own open sells so we do not double-count in-flight sell orders.
-        venue_can_use = self._venue_sellable.get(instrument_id_text)
+        venue_can_use = self.venue_sellable_quantity(instrument_id_text)
         if venue_can_use is not None:
             sellable_base = venue_can_use
             sellable_source = "broker_can_use_volume"
@@ -1765,57 +1666,6 @@ class TargetQuantityStrategy(Strategy):
                 f"intent_context={intent_context.log_text()}",
             )
         return clamped_qty
-
-    def _subscribe_execution_mass_status(self) -> None:
-        """
-        Subscribe to execution mass-status reports so the broker-reported sellable
-        quantity (``can_use_volume``) can be cached per instrument. Inert in backtest,
-        where there is no execution client publishing these reports.
-        """
-        venue = self._instrument_ids[0].venue if self._instrument_ids else None
-        if venue is None:
-            return
-        msgbus = getattr(self, "msgbus", None)
-        if msgbus is None:
-            return
-        try:
-            msgbus.subscribe(
-                topic=f"reports.execution.{venue}",
-                handler=self._on_execution_mass_status,
-            )
-        except Exception as exc:  # pragma: no cover - defensive; backtest has no msgbus reports
-            self.log.warning(f"Could not subscribe to execution mass status: {exc}")
-
-    def _on_execution_mass_status(self, mass_status: Any) -> None:
-        """
-        Rebuild the per-instrument broker sellable map from a mass-status report.
-
-        Replaces the map wholesale each cycle so instruments no longer held drop out.
-        Only entries where the venue actually reported ``can_use_volume`` are kept.
-        """
-        position_reports = getattr(mass_status, "position_reports", None)
-        if not position_reports:
-            return
-        sellable: dict[str, Decimal] = {}
-        for reports in position_reports.values():
-            report_list = reports if isinstance(reports, (list, tuple)) else [reports]
-            for report in report_list:
-                can_use = getattr(report, "can_use_volume", None)
-                if can_use is None:
-                    continue
-                instrument_id = getattr(report, "instrument_id", None)
-                if instrument_id is None:
-                    continue
-                try:
-                    sellable[str(instrument_id)] = Decimal(str(can_use))
-                except Exception:
-                    continue
-        self._venue_sellable = sellable
-        self._venue_sellable_ts = self.clock.timestamp_ns()
-        self.log.info(
-            f"Updated broker sellable map from mass status: instruments={len(sellable)}",
-            color=LogColor.BLUE,
-        )
 
     def _today_fill_snapshot(self, instrument_id: InstrumentId, trading_date: date) -> TodayFillSnapshot:
         buy_qty = Decimal("0")

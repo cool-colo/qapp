@@ -16,6 +16,8 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.identifiers import InstrumentId
 
+from strategies.async_scheduling import AsyncAwaitableScheduler
+from strategies.execution_reconciliation import ExecutionStateReconciler
 from strategies.target_quantities import TargetQuantityStrategyConfig
 from strategies.target_quantities import TargetQuantityStrategy
 from strategies.target_quantities import NotionalOrderSplitter
@@ -252,10 +254,17 @@ class FakeLog:
         self.errors.append((args, kwargs))
 
 
+class FakeMsgBus:
+    def __init__(self) -> None:
+        self.subscriptions: list[tuple[str, object]] = []
+
+    def subscribe(self, topic: str, handler: object) -> None:
+        self.subscriptions.append((topic, handler))
+
+
 class TestableTargetQuantityStrategy:
     _UP_LIMIT_KEYS = TargetQuantityStrategy._UP_LIMIT_KEYS
     _DOWN_LIMIT_KEYS = TargetQuantityStrategy._DOWN_LIMIT_KEYS
-    _PRE_OPEN_RECONCILE_ALERT = TargetQuantityStrategy._PRE_OPEN_RECONCILE_ALERT
     _FULL_TICK_REFRESH_TIMER = TargetQuantityStrategy._FULL_TICK_REFRESH_TIMER
     _FULL_TICK_PREFETCH_ALERT = TargetQuantityStrategy._FULL_TICK_PREFETCH_ALERT
     _TERMINAL_ORDER_STATUSES = TargetQuantityStrategy._TERMINAL_ORDER_STATUSES
@@ -293,7 +302,7 @@ class TestableTargetQuantityStrategy:
     _submit_target_quantity = TargetQuantityStrategy._submit_target_quantity
     _submit_order_quantity = TargetQuantityStrategy._submit_order_quantity
     _clamp_sell_quantity = TargetQuantityStrategy._clamp_sell_quantity
-    _subscribe_execution_mass_status = TargetQuantityStrategy._subscribe_execution_mass_status
+    venue_sellable_quantity = TargetQuantityStrategy.venue_sellable_quantity
     _today_fill_snapshot = TargetQuantityStrategy._today_fill_snapshot
     _event_trading_date = TargetQuantityStrategy._event_trading_date
     _is_reconciliation_order = staticmethod(TargetQuantityStrategy._is_reconciliation_order)
@@ -341,14 +350,9 @@ class TestableTargetQuantityStrategy:
     _record_target = TargetQuantityStrategy._record_target
     _record_order = TargetQuantityStrategy._record_order
     configure_pre_open_reconciliation = TargetQuantityStrategy.configure_pre_open_reconciliation
+    request_execution_reconcile = TargetQuantityStrategy.request_execution_reconcile
     _parse_hh_mm = staticmethod(TargetQuantityStrategy._parse_hh_mm)
     _next_daily_time = TargetQuantityStrategy._next_daily_time
-    _schedule_pre_open_reconcile = TargetQuantityStrategy._schedule_pre_open_reconcile
-    _on_pre_open_reconcile_timer = TargetQuantityStrategy._on_pre_open_reconcile_timer
-    _run_pre_open_reconcile = TargetQuantityStrategy._run_pre_open_reconcile
-    _schedule_on_loop = TargetQuantityStrategy._schedule_on_loop
-    _on_pre_open_reconcile_done = TargetQuantityStrategy._on_pre_open_reconcile_done
-    _log_pre_open_reconcile_result = TargetQuantityStrategy._log_pre_open_reconcile_result
     _roll_trading_day = TargetQuantityStrategy._roll_trading_day
     _update_price_state = TargetQuantityStrategy._update_price_state
     _set_authoritative_open = TargetQuantityStrategy._set_authoritative_open
@@ -445,6 +449,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy.order_factory = FakeOrderFactory()
         strategy.id = "TEST-001"
         strategy.log = FakeLog()
+        strategy.msgbus = FakeMsgBus()
         strategy._instrument_ids = [INST_A, INST_B, INST_C]
         strategy._bar_types = {}
         strategy._target_quantities = {}
@@ -495,14 +500,19 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 10:00:00")
         strategy._convergence_suspended = False
         strategy._converge_lock = threading.Lock()
-        strategy._pre_open_reconcile = lambda timeout_secs: True
-        strategy._pre_open_reconcile_time = (9, 15)
-        strategy._pre_open_reconcile_timeout_secs = 30.0
-        strategy._pre_open_reconcile_task = None
-        strategy._loop = None
+        strategy._async_scheduler = AsyncAwaitableScheduler()
+        strategy._execution_state_reconciler = ExecutionStateReconciler(
+            clock=strategy.clock,
+            log=strategy.log,
+            timezone_name=strategy.config.timezone_name,
+            async_scheduler=strategy._async_scheduler,
+        )
+        strategy.configure_pre_open_reconciliation(
+            reconcile=lambda timeout_secs: True,
+            reconcile_time="09:15",
+            timeout_secs=30.0,
+        )
         strategy._sellable_exhausted = {}
-        strategy._venue_sellable = {}
-        strategy._venue_sellable_ts = 0
         strategy._last_account_sizing_snapshot = None
         strategy.target_events = []
         strategy.order_events = []
@@ -538,6 +548,10 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         self.assertEqual(strategy.subscribed_quote_ticks, [INST_A])
         self.assertEqual(strategy.subscribed_trade_ticks, [INST_A])
+        self.assertEqual(
+            strategy.msgbus.subscriptions[0][0],
+            f"reports.execution.{INST_A.venue}",
+        )
 
     def test_on_start_can_disable_market_data_subscriptions(self) -> None:
         bar_type = BarType.from_str(f"{INST_A}-1-MINUTE-LAST-EXTERNAL")
@@ -1068,7 +1082,21 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             prices={INST_A: 10.0},
             order_slice_notional="1000000",
         )
-        strategy._venue_sellable[str(INST_A)] = Decimal("300")
+        strategy._execution_state_reconciler.update_from_mass_status(
+            type(
+                "MassStatus",
+                (),
+                {
+                    "position_reports": {
+                        INST_A: type(
+                            "PositionReport",
+                            (),
+                            {"instrument_id": INST_A, "can_use_volume": Decimal("300")},
+                        )(),
+                    },
+                },
+            )(),
+        )
 
         strategy.update_target_quantities({INST_A: 0}, date(2026, 7, 2), "clamp")
 
@@ -1386,11 +1414,11 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             reconcile_time="09:15",
             timeout_secs=30.0,
         )
-        strategy._schedule_pre_open_reconcile()
+        strategy._execution_state_reconciler.schedule_daily()
 
         self.assertEqual(len(strategy.clock.time_alerts), 1)
         alert = strategy.clock.time_alerts[0]
-        self.assertEqual(alert["name"], TargetQuantityStrategy._PRE_OPEN_RECONCILE_ALERT)
+        self.assertEqual(alert["name"], ExecutionStateReconciler.PRE_OPEN_ALERT)
         self.assertEqual(alert["alert_time"], pd.Timestamp("2026-07-02 09:15:00", tz="Asia/Shanghai"))
         self.assertTrue(alert["override"])
 
@@ -1408,7 +1436,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             timeout_secs=30.0,
         )
 
-        strategy._run_pre_open_reconcile()
+        strategy.request_execution_reconcile()
 
         self.assertEqual(calls, [30.0])
         self.assertFalse(

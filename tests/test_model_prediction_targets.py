@@ -389,7 +389,8 @@ class BuildCandidatesTest(unittest.TestCase):
     def _make_stub(self, *, signals: list[dict], today_open: dict[str, float]):
         class CandidateStub:
             _build_candidates = TargetModelPredictionsStrategy._build_candidates
-            _entry_skip_reason = MagicMock(return_value=None)
+            _entry_skip_reason = TargetModelPredictionsStrategy._entry_skip_reason
+            _name_skip_reason = MagicMock(return_value=None)
             _today_open_price = TargetModelPredictionsStrategy._today_open_price
             _open_price_with_source = TargetModelPredictionsStrategy._open_price_with_source
             _log_missing_new_entry_open_price = (
@@ -403,6 +404,10 @@ class BuildCandidatesTest(unittest.TestCase):
         instrument_id = InstrumentId.from_str("000001.SZ.QMT")
         strategy.log = MagicMock()
         strategy._market_status = {}
+        strategy._suspended_by_date = {}
+        strategy._st_by_date = {}
+        strategy._listed_dates = {}
+        strategy.config = MagicMock(min_listed_days=0)
         strategy._signals_by_date = {signal_date: signals}
         strategy._instrument_by_stock = {"000001.SZ": instrument_id}
         strategy._stock_by_instrument = {str(instrument_id): "000001.SZ"}
