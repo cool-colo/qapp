@@ -2,14 +2,15 @@
 """
 Poll live-trading + QMT-proxy health and raise alerts, for periodic crontab use.
 
-This is a standalone operational script (not a package module). It fetches two
-status endpoints over HTTP:
+This is a standalone operational script (not a package module). It fetches
+three status signals over HTTP:
 
   * the live trading node's in-process status server (``lives.status_server``),
     default ``http://127.0.0.1:9200/health`` — a JSON snapshot of
     ``TradingNode.health_status()``.
   * the QMT proxy readiness probe, ``<proxy>/health/ready``, which deep-probes
     the xtdata/xttrader connections and returns HTTP 503 when not ready.
+  * ClickHouse's HTTP API, by executing a trivial ``SELECT 1`` query.
 
 It then evaluates a set of *tunable* alert rules (a config dict overridable by
 CLI flags) and, if anything is wrong, dispatches alerts. Alerting is currently a
@@ -59,12 +60,13 @@ logger = logging.getLogger("check_live_status")
 # env var) when a deployment legitimately runs without that guarantee (e.g.
 # reconciliation disabled).
 DEFAULT_ALERT_RULES: dict[str, bool] = {
-    "require_running": True,          # node.is_running must be True
-    "require_reconciliation": True,   # if recon enabled, it must have succeeded
-    "require_data_connected": True,   # all data clients connected
-    "require_exec_connected": True,   # all exec clients connected
-    "require_strategy_running": True, # every strategy state == RUNNING
-    "require_proxy_ready": True,      # proxy /health/ready must be ready
+    "require_running": True,  # node.is_running must be True
+    "require_reconciliation": True,  # if recon enabled, it must have succeeded
+    "require_data_connected": True,  # all data clients connected
+    "require_exec_connected": True,  # all exec clients connected
+    "require_strategy_running": True,  # every strategy state == RUNNING
+    "require_proxy_ready": True,  # proxy /health/ready must be ready
+    "require_clickhouse_ready": True,  # ClickHouse must answer a trivial query
 }
 
 
@@ -81,7 +83,7 @@ def _env(name: str, default: str | None = None) -> str | None:
 @dataclass
 class Alert:
     level: str      # "critical" | "warning"
-    source: str     # "live" | "proxy" | "check"
+    source: str     # "live" | "proxy" | "clickhouse" | "check"
     message: str
     detail: dict = field(default_factory=dict)
 
@@ -142,6 +144,70 @@ def fetch_proxy_ready(base_url: str, timeout: float) -> FetchResult:
     url = base_url.rstrip("/") + "/health/ready"
     # 503 = deep probe ran and reports not-ready; that IS a status, not a failure.
     return fetch_json(url, timeout, ok_codes=(200, 503))
+
+
+def fetch_clickhouse_ready(
+    url: str,
+    database: str | None,
+    user: str | None,
+    password: str | None,
+    timeout: float,
+) -> FetchResult:
+    """Probe ClickHouse over its HTTP API with a trivial query."""
+    headers = {"Content-Type": "text/plain; charset=utf-8"}
+    if user:
+        headers["X-ClickHouse-User"] = user
+    if password:
+        headers["X-ClickHouse-Key"] = password
+
+    params: dict[str, str] = {}
+    if database:
+        params["database"] = database
+
+    try:
+        resp = requests.post(
+            url.rstrip("/"),
+            params=params,
+            data="SELECT 1 AS ok FORMAT JSONEachRow",
+            headers=headers,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        return FetchResult(ok=False, status_code=None, payload=None, error=repr(exc))
+
+    if resp.status_code != 200:
+        return FetchResult(
+            ok=False,
+            status_code=resp.status_code,
+            payload=None,
+            error=f"unexpected status {resp.status_code}: {resp.text[:1000]}",
+        )
+
+    rows: list[dict] = []
+    try:
+        rows = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
+    except ValueError as exc:
+        return FetchResult(
+            ok=False,
+            status_code=resp.status_code,
+            payload=None,
+            error=f"bad json: {exc}",
+        )
+
+    payload = {
+        "ready": bool(rows and rows[0].get("ok") == 1),
+        "rows": rows,
+        "database": database,
+        "user": user,
+    }
+    if not payload["ready"]:
+        return FetchResult(
+            ok=False,
+            status_code=resp.status_code,
+            payload=payload,
+            error="unexpected ClickHouse probe result",
+        )
+    return FetchResult(ok=True, status_code=resp.status_code, payload=payload, error=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -233,8 +299,37 @@ def evaluate_proxy(status: FetchResult, rules: dict[str, bool]) -> list[Alert]:
     return []
 
 
-def evaluate(live: FetchResult, proxy: FetchResult, rules: dict[str, bool]) -> list[Alert]:
-    return evaluate_live(live, rules) + evaluate_proxy(proxy, rules)
+def evaluate_clickhouse(status: FetchResult, rules: dict[str, bool]) -> list[Alert]:
+    if not rules["require_clickhouse_ready"]:
+        return []
+
+    if not status.ok:
+        return [
+            Alert(
+                level="critical",
+                source="clickhouse",
+                message="ClickHouse health check failed",
+                detail={
+                    "status_code": status.status_code,
+                    "error": status.error,
+                    "payload": status.payload,
+                },
+            )
+        ]
+    return []
+
+
+def evaluate(
+    live: FetchResult,
+    proxy: FetchResult,
+    clickhouse: FetchResult,
+    rules: dict[str, bool],
+) -> list[Alert]:
+    return (
+        evaluate_live(live, rules)
+        + evaluate_proxy(proxy, rules)
+        + evaluate_clickhouse(clickhouse, rules)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -280,9 +375,17 @@ def send_dingtalk(
     )
 
 
-def print_status_report(live: FetchResult, proxy: FetchResult) -> None:
+def print_status_report(
+    live: FetchResult,
+    proxy: FetchResult,
+    clickhouse: FetchResult,
+) -> None:
     """Print the full content fetched from each endpoint (URL, code, payload, error)."""
-    for name, result in (("LIVE TRADING", live), ("QMT PROXY", proxy)):
+    for name, result in (
+        ("LIVE TRADING", live),
+        ("QMT PROXY", proxy),
+        ("CLICKHOUSE", clickhouse),
+    ):
         print(f"===== {name} =====")
         print(f"  fetched   : {'ok' if result.ok else 'FAILED'}")
         print(f"  http_code : {result.status_code}")
@@ -306,7 +409,7 @@ def dispatch_alerts(
     """Log + print the structured alerts, then deliver them to DingTalk."""
     if not alerts:
         logger.info("status check OK — no alerts")
-        print("OK: live trading and proxy healthy")
+        print("OK: live trading, proxy, and ClickHouse healthy")
         return
 
     for alert in alerts:
@@ -349,6 +452,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Per-request HTTP timeout.",
     )
     parser.add_argument(
+        "--clickhouse-url",
+        default=_env("CLICKHOUSE_URL", "http://127.0.0.1:8123"),
+        help="ClickHouse HTTP URL.",
+    )
+    parser.add_argument(
+        "--clickhouse-database",
+        default=_env("CLICKHOUSE_DATABASE"),
+        help="Optional ClickHouse database selected for the probe.",
+    )
+    parser.add_argument(
+        "--clickhouse-user",
+        default=_env("CLICKHOUSE_USER", "default"),
+        help="ClickHouse user.",
+    )
+    parser.add_argument(
+        "--clickhouse-password",
+        default=_env("CLICKHOUSE_PASSWORD"),
+        help="ClickHouse password.",
+    )
+    parser.add_argument(
+        "--clickhouse-timeout-secs",
+        type=float,
+        default=float(
+            _env("CLICKHOUSE_TIMEOUT_SECS", _env("MODEL_STATUS_TIMEOUT_SECS", "5")) or "5",
+        ),
+        help="ClickHouse HTTP timeout.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print the raw fetched payloads as a single JSON object instead of the readable report.",
@@ -375,6 +506,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     _add_rule_flag(parser, "require-exec-connected", "require_exec_connected", "exec clients connected")
     _add_rule_flag(parser, "require-strategy-running", "require_strategy_running", "strategies RUNNING")
     _add_rule_flag(parser, "require-proxy-ready", "require_proxy_ready", "proxy ready")
+    _add_rule_flag(parser, "require-clickhouse-ready", "require_clickhouse_ready", "ClickHouse ready")
 
     return parser.parse_args(argv)
 
@@ -399,13 +531,25 @@ def main(argv: list[str] | None = None) -> int:
 
     live = fetch_live_status(args.live_status_url, args.timeout_secs)
     proxy = fetch_proxy_ready(args.proxy_url, args.timeout_secs)
+    clickhouse = fetch_clickhouse_ready(
+        args.clickhouse_url,
+        args.clickhouse_database,
+        args.clickhouse_user,
+        args.clickhouse_password,
+        args.clickhouse_timeout_secs,
+    )
 
     if args.json:
-        print(json.dumps({"live": live.payload, "proxy": proxy.payload}, ensure_ascii=False, default=str, indent=2))
+        payload = {
+            "live": live.payload,
+            "proxy": proxy.payload,
+            "clickhouse": clickhouse.payload,
+        }
+        print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
     elif not args.quiet:
-        print_status_report(live, proxy)
+        print_status_report(live, proxy, clickhouse)
 
-    alerts = evaluate(live, proxy, rules)
+    alerts = evaluate(live, proxy, clickhouse, rules)
     dispatch_alerts(alerts, args.access_token, args.secret, timeout=args.timeout_secs)
 
     return 1 if alerts else 0

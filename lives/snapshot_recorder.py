@@ -9,9 +9,8 @@ via :class:`LiveSnapshotWriter`.
 
 Design boundaries:
 
-- The strategy stays DB-free. This actor owns all MySQL access and only reaches the
-  strategy through the public ``compute_daily_target_plan`` / ``update_target_quantities``
-  methods.
+- The strategy stays DB-free. This actor owns all MySQL access and reaches the
+  strategy through explicit planning, target-update, and full-tick APIs.
 - QMT-reported fields (from ``account.last_event.info`` and position reports) are the
   authoritative values and land in the unprefixed columns; Nautilus-derived values
   land in ``nt_`` columns for comparison. Both raw payloads are kept as JSON.
@@ -30,6 +29,7 @@ from datetime import date
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
+from typing import Callable
 
 import pandas as pd
 
@@ -48,6 +48,7 @@ from backtests.result_writers.live_records import SOURCE_LIVE
 from backtests.result_writers.live_records import LiveAssetSnapshotRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
+from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveTradeRecord
 
@@ -195,6 +196,10 @@ class SnapshotRecorder(Actor):
 
     def _run_after_trading(self, trading_date: date, allow_fallback: bool) -> None:
         source = SOURCE_FALLBACK if allow_fallback else SOURCE_LIVE
+        self._run_full_tick_fetch(
+            trigger=AFTER_TRADING,
+            on_applied=lambda snapshot: self._record_stock_ticks(trading_date, snapshot),
+        )
         self._record_asset(trading_date, AFTER_TRADING, source)
         self._record_positions(trading_date, AFTER_TRADING, source)
         # Reconstruct today's order/trade rows from the QMT broker lists. The live
@@ -663,7 +668,11 @@ class SnapshotRecorder(Actor):
 
     # ---- full tick -----------------------------------------------------------
 
-    def _run_full_tick_fetch(self) -> None:
+    def _run_full_tick_fetch(
+        self,
+        trigger: str = "snapshot",
+        on_applied: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         if self._fetch_full_tick is None:
             return
         result = self._fetch_full_tick()
@@ -674,20 +683,28 @@ class SnapshotRecorder(Actor):
                 result = asyncio.run(self._await(result))
             else:
                 # Fire-and-forget; the strategy also refreshes opens on its own timer.
-                asyncio.ensure_future(self._apply_full_tick_async(result), loop=loop)
+                asyncio.ensure_future(
+                    self._apply_full_tick_async(result, trigger, on_applied),
+                    loop=loop,
+                )
                 return
-        self._apply_full_tick(result)
+        self._apply_full_tick(result, trigger, on_applied)
 
     async def _await(self, awaitable: Any) -> Any:
         return await awaitable
 
-    async def _apply_full_tick_async(self, awaitable: Any) -> None:
+    async def _apply_full_tick_async(
+        self,
+        awaitable: Any,
+        trigger: str,
+        on_applied: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
         try:
             snapshot = await awaitable
         except Exception as exc:
             self.log.warning(f"snapshot full-tick await failed: {exc}")
             return
-        self._apply_full_tick(snapshot)
+        self._apply_full_tick(snapshot, trigger, on_applied)
 
     def _run_position_fetch(
         self,
@@ -1003,26 +1020,73 @@ class SnapshotRecorder(Actor):
         except Exception:
             return None
 
-    def _apply_full_tick(self, snapshot: Any) -> None:
+    def _apply_full_tick(
+        self,
+        snapshot: Any,
+        trigger: str = "snapshot",
+        on_applied: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         if not isinstance(snapshot, dict) or not snapshot:
             return
-        # Feed authoritative opens into the strategy so both pricing and the frozen
-        # target quantities anchor on today's real open.
-        setter = getattr(self._strategy, "_set_authoritative_open", None)
-        if setter is None:
+        self._strategy.apply_full_tick_snapshot(snapshot, trigger)
+        if on_applied is not None:
+            on_applied(snapshot)
+
+    def _record_stock_ticks(self, trading_date: date, snapshot: dict[str, Any]) -> None:
+        held_instrument_ids = {
+            str(position.instrument_id)
+            for position in self._open_positions()
+        }
+        if not held_instrument_ids:
+            self.log.warning(
+                f"after-trading full-tick snapshot has no held instruments: {snapshot.keys()}",
+            )
             return
-        trading_date = self._now().date()
-        for instrument_id, fields in snapshot.items():
-            open_price = fields.get("open") if isinstance(fields, dict) else fields
-            try:
-                price = float(open_price)
-            except (TypeError, ValueError):
+        missing = sorted(held_instrument_ids.difference(snapshot))
+        if missing:
+            self.log.warning(
+                f"after-trading full-tick snapshot missing held instruments: {missing}",
+            )
+        now = self._now_naive()
+        records: list[LiveStockTickSnapshotRecord] = []
+        for instrument_id_text in sorted(held_instrument_ids.intersection(snapshot)):
+            tick = self._strategy.tick_snapshot_for(instrument_id_text)
+            if tick is None:
+                self.log.warning(
+                    f"after-trading full-tick snapshot missing tick for held instrument: {instrument_id_text}",
+                )
                 continue
-            if price > 0:
-                try:
-                    setter(str(instrument_id), trading_date, price)
-                except Exception:
-                    continue
+            records.append(
+                LiveStockTickSnapshotRecord(
+                    trade_date=trading_date,
+                    write_time=now,
+                    snapshot_type=AFTER_TRADING,
+                    instrument_id=instrument_id_text,
+                    stock_code=self._stock_code(instrument_id_text),
+                    market_status=(
+                        None if tick.market_status is None else tick.market_status.name
+                    ),
+                    last_price=self._decimal_or_none(tick.last_price),
+                    open=self._decimal_or_none(tick.open),
+                    high=self._decimal_or_none(tick.high),
+                    low=self._decimal_or_none(tick.low),
+                    last_close=self._decimal_or_none(tick.last_close),
+                    amount=self._decimal_or_none(tick.amount),
+                    volume=tick.volume,
+                    pvolume=tick.pvolume,
+                    open_int=tick.open_int,
+                    last_settlement_price=self._decimal_or_none(
+                        tick.last_settlement_price,
+                    ),
+                    created_at=now,
+                ),
+            )
+        if not records:
+            return
+        try:
+            self._writer.write_stock_tick_snapshots(records)
+        except Exception as exc:
+            self.log.warning(f"stock tick snapshot write failed ({AFTER_TRADING}): {exc}")
 
     # ---- strategy / portfolio readers ---------------------------------------
 

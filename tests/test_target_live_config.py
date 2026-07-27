@@ -20,6 +20,7 @@ from backtests.result_writers.live_records import AFTER_TRADING
 from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveTargetRecord
+from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
 from backtests.result_writers.live_writer import LiveSnapshotWriter
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.enums import MarketStatusAction
@@ -36,6 +37,7 @@ from strategies.model_target_planners import ModelTargetPlan
 from strategies.model_target_planners import TargetContext
 from strategies.model_target_planners import TargetInfo
 from strategies.target_quantities import TargetQuantityStrategy
+from strategies.target_quantities import TickSnapshot
 
 
 class TargetLiveConfigTest(unittest.TestCase):
@@ -552,6 +554,38 @@ class TargetLiveConfigTest(unittest.TestCase):
             ),
         )
 
+    def test_writer_write_stock_ticks_uses_generic_market_key(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._upsert_many = MagicMock()
+        record = LiveStockTickSnapshotRecord(
+            trade_date=date(2026, 7, 10),
+            write_time=datetime(2026, 7, 10, 15, 5),
+            snapshot_type=AFTER_TRADING,
+            instrument_id="000001.SZ.QMT",
+            stock_code="000001.SZ",
+            market_status="CLOSE",
+            last_price=Decimal("10.77"),
+            open=Decimal("10.85"),
+            high=Decimal("10.93"),
+            low=Decimal("10.72"),
+            last_close=Decimal("10.84"),
+            amount=Decimal("864435900"),
+            volume=800766,
+            pvolume=80076623,
+            open_int=15,
+            last_settlement_price=Decimal("10.84"),
+        )
+
+        writer.write_stock_tick_snapshots([record])
+
+        args = writer._upsert_many.call_args.args
+        self.assertEqual(args[0], "live_stock_tick_snapshot")
+        self.assertEqual(args[1][0]["last_price"], Decimal("10.77"))
+        self.assertEqual(
+            writer._upsert_many.call_args.kwargs["key_columns"],
+            ("trade_date", "snapshot_type", "instrument_id"),
+        )
+
     def test_snapshot_recorder_persists_target_info_rows(self) -> None:
         trading_date = date(2026, 7, 10)
         signal_date = date(2026, 7, 9)
@@ -839,6 +873,73 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(record.open_price, Decimal("3.21"))
         self.assertEqual(record.close_price, Decimal("3.32"))
         self.assertEqual(record.qmt_raw["market_value"], "466506.00")
+
+    def test_after_trading_requests_fresh_tick_before_other_snapshots(self) -> None:
+        recorder = SimpleNamespace(
+            _run_full_tick_fetch=MagicMock(),
+            _record_stock_ticks=MagicMock(),
+            _record_asset=MagicMock(),
+            _record_positions=MagicMock(),
+            _backfill_orders=MagicMock(),
+            _backfill_trades=MagicMock(),
+        )
+        trading_date = date(2026, 7, 8)
+
+        SnapshotRecorder._run_after_trading(recorder, trading_date, allow_fallback=False)
+
+        recorder._run_full_tick_fetch.assert_called_once()
+        kwargs = recorder._run_full_tick_fetch.call_args.kwargs
+        self.assertEqual(kwargs["trigger"], AFTER_TRADING)
+        sample = {"000001.SZ.QMT": {"open": 10.85}}
+        kwargs["on_applied"](sample)
+        recorder._record_stock_ticks.assert_called_once_with(trading_date, sample)
+
+    def test_record_stock_ticks_writes_only_held_instruments(self) -> None:
+        writer = SimpleNamespace(write_stock_tick_snapshots=MagicMock())
+        strategy = SimpleNamespace(
+            tick_snapshot_for=MagicMock(
+                return_value=TickSnapshot(
+                    market_status=MarketStatusAction.CLOSE,
+                    last_price=10.77,
+                    open=10.85,
+                    high=10.93,
+                    low=10.72,
+                    last_close=10.84,
+                    amount=864435900.0,
+                    volume=800766,
+                    pvolume=80076623,
+                    open_int=15,
+                    last_settlement_price=10.84,
+                ),
+            ),
+        )
+        recorder = SimpleNamespace(
+            _writer=writer,
+            _strategy=strategy,
+            _open_positions=MagicMock(
+                return_value=[SimpleNamespace(instrument_id="000001.SZ.QMT")],
+            ),
+            _stock_code=MagicMock(return_value="000001.SZ"),
+            _now_naive=MagicMock(return_value=datetime(2026, 7, 8, 15, 5)),
+            _decimal_or_none=SnapshotRecorder._decimal_or_none,
+            log=MagicMock(),
+        )
+        snapshot = {
+            "000001.SZ.QMT": {"open": 10.85},
+            "000002.SZ.QMT": {"open": 20.00},
+        }
+
+        SnapshotRecorder._record_stock_ticks(recorder, date(2026, 7, 8), snapshot)
+
+        records = writer.write_stock_tick_snapshots.call_args.args[0]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.instrument_id, "000001.SZ.QMT")
+        self.assertEqual(record.market_status, "CLOSE")
+        self.assertEqual(record.amount, Decimal("864435900.0"))
+        self.assertEqual(record.volume, 800766)
+        self.assertEqual(record.pvolume, 80076623)
+        self.assertEqual(record.last_settlement_price, Decimal("10.84"))
 
     def test_position_fetch_schedules_awaitable_on_running_loop(self) -> None:
         recorder = SimpleNamespace()

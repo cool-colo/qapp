@@ -15,6 +15,7 @@ from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveAssetSnapshotRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
+from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveTradeRecord
 
@@ -142,6 +143,31 @@ CREATE TABLE IF NOT EXISTS `live_position_snapshot` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
+CREATE TABLE IF NOT EXISTS `live_stock_tick_snapshot` (
+  `id`                    BIGINT        NOT NULL AUTO_INCREMENT,
+  `trade_date`            DATE          NOT NULL,
+  `write_time`            DATETIME      NOT NULL,
+  `snapshot_type`         VARCHAR(24)   NOT NULL,
+  `instrument_id`         VARCHAR(32)   NOT NULL,
+  `stock_code`            VARCHAR(16)   NOT NULL,
+  `market_status`         VARCHAR(24)   NULL,
+  `last_price`            DECIMAL(20,4) NULL,
+  `open`                  DECIMAL(20,4) NULL,
+  `high`                  DECIMAL(20,4) NULL,
+  `low`                   DECIMAL(20,4) NULL,
+  `last_close`            DECIMAL(20,4) NULL,
+  `amount`                DECIMAL(24,4) NULL,
+  `volume`                BIGINT        NULL,
+  `pvolume`               BIGINT        NULL,
+  `open_int`              BIGINT        NULL,
+  `last_settlement_price` DECIMAL(20,4) NULL,
+  `created_at`            DATETIME      NOT NULL,
+  `schema_version`        INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_stock_tick` (`trade_date`,`snapshot_type`,`instrument_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
 CREATE TABLE IF NOT EXISTS `live_target_portfolio` (
   `id`            BIGINT       NOT NULL AUTO_INCREMENT,
   `trade_date`    DATE         NOT NULL,
@@ -238,8 +264,9 @@ CREATE TABLE IF NOT EXISTS `live_trade` (
 
 class LiveSnapshotWriter:
     """
-    Persist live daily snapshots (assets, positions), frozen portfolio targets, and
-    order/trade lifecycle events into the ``live_*`` MySQL schema.
+    Persist live daily snapshots (assets, positions, held-stock ticks), frozen
+    portfolio targets, and order/trade lifecycle events into the ``live_*`` MySQL
+    schema.
 
     Kept independent of the backtest ``bt_*`` writer: the live tables carry a
     snapshot_type and account/trader identity rather than an experiment id, and hold
@@ -567,6 +594,17 @@ class LiveSnapshotWriter:
                 "snapshot_type",
                 "instrument_id",
             ),
+            preserve_columns=("created_at",),
+        )
+
+    def write_stock_tick_snapshots(
+        self,
+        records: Sequence[LiveStockTickSnapshotRecord],
+    ) -> None:
+        self._upsert_many(
+            "live_stock_tick_snapshot",
+            [self._stock_tick_row(record) for record in records],
+            key_columns=("trade_date", "snapshot_type", "instrument_id"),
             preserve_columns=("created_at",),
         )
 
@@ -909,6 +947,29 @@ class LiveSnapshotWriter:
             "source": record.source,
             "qmt_raw": _json_dumps(record.qmt_raw),
             "nt_raw": _json_dumps(record.nt_raw),
+            "created_at": _timestamp(record.created_at),
+            "schema_version": record.schema_version,
+        }
+
+    @staticmethod
+    def _stock_tick_row(record: LiveStockTickSnapshotRecord) -> dict[str, Any]:
+        return {
+            "trade_date": record.trade_date,
+            "write_time": record.write_time,
+            "snapshot_type": record.snapshot_type,
+            "instrument_id": record.instrument_id,
+            "stock_code": record.stock_code,
+            "market_status": record.market_status,
+            "last_price": record.last_price,
+            "open": record.open,
+            "high": record.high,
+            "low": record.low,
+            "last_close": record.last_close,
+            "amount": record.amount,
+            "volume": record.volume,
+            "pvolume": record.pvolume,
+            "open_int": record.open_int,
+            "last_settlement_price": record.last_settlement_price,
             "created_at": _timestamp(record.created_at),
             "schema_version": record.schema_version,
         }

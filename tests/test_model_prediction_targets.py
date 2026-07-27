@@ -15,6 +15,7 @@ from strategies.model_target_planners import ModelTargetPlan
 from strategies.model_target_planners import ModelTargetPlanningRequest
 from strategies.model_target_planners import TargetContext
 from strategies.model_target_planners import TargetInfo
+from strategies.target_quantities import TickSnapshot
 
 
 class HoldingExclusionTest(unittest.TestCase):
@@ -224,7 +225,9 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         # No open price today (suspended stock has none); status is SUSPEND and a
         # previous close is available.
         strategy._today_open = {}
-        strategy._market_status = {"000157.SZ.QMT": MarketStatusAction.SUSPEND}
+        strategy._market_status = {
+            "000157.SZ.QMT": TickSnapshot(market_status=MarketStatusAction.SUSPEND),
+        }
         strategy._last_close = {"000157.SZ.QMT": 9.5}
         strategy._holding_exclusion = MagicMock()
         open_prices: dict[str, float] = {}
@@ -251,7 +254,9 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
     def test_suspended_holding_without_last_close_is_skipped(self) -> None:
         strategy = self._make_stub()
         strategy._today_open = {}
-        strategy._market_status = {"000157.SZ.QMT": MarketStatusAction.SUSPEND}
+        strategy._market_status = {
+            "000157.SZ.QMT": TickSnapshot(market_status=MarketStatusAction.SUSPEND),
+        }
         strategy._last_close = {}
         strategy._holding_exclusion = MagicMock()
         open_prices: dict[str, float] = {}
@@ -475,7 +480,9 @@ class BuildCandidatesTest(unittest.TestCase):
             ],
             today_open={"000001.SZ.QMT": 10.1},
         )
-        strategy._market_status = {instrument_id: MarketStatusAction.SUSPEND}
+        strategy._market_status = {
+            instrument_id: TickSnapshot(market_status=MarketStatusAction.SUSPEND),
+        }
         open_prices: dict[str, float] = {}
 
         candidates = strategy._build_candidates(date(2026, 7, 8), signal_date, open_prices)

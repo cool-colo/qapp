@@ -83,6 +83,28 @@ class LivePositionSnapshotRecord:
 
 
 @dataclass(frozen=True)
+class LiveStockTickSnapshotRecord:
+    trade_date: date
+    write_time: datetime
+    snapshot_type: str
+    instrument_id: str
+    stock_code: str
+    market_status: str | None = None
+    last_price: Decimal | None = None
+    open: Decimal | None = None
+    high: Decimal | None = None
+    low: Decimal | None = None
+    last_close: Decimal | None = None
+    amount: Decimal | None = None
+    volume: int | None = None
+    pvolume: int | None = None
+    open_int: int | None = None
+    last_settlement_price: Decimal | None = None
+    created_at: datetime | None = None
+    schema_version: int = 1
+
+
+@dataclass(frozen=True)
 class LiveTargetRecord:
     trade_date: date
     write_time: datetime

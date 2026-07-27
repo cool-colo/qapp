@@ -20,6 +20,7 @@ from strategies.async_scheduling import AsyncAwaitableScheduler
 from strategies.execution_reconciliation import ExecutionStateReconciler
 from strategies.target_quantities import TargetQuantityStrategyConfig
 from strategies.target_quantities import TargetQuantityStrategy
+from strategies.target_quantities import TickSnapshot
 from strategies.target_quantities import NotionalOrderSplitter
 from strategies.pricing import OpenOffsetBuyPriceStrategy
 from strategies.pricing import OpenOffsetSellPriceStrategy
@@ -357,9 +358,11 @@ class TestableTargetQuantityStrategy:
     _update_price_state = TargetQuantityStrategy._update_price_state
     _set_authoritative_open = TargetQuantityStrategy._set_authoritative_open
     _apply_full_tick = TargetQuantityStrategy._apply_full_tick
+    apply_full_tick_snapshot = TargetQuantityStrategy.apply_full_tick_snapshot
     _full_tick_open = staticmethod(TargetQuantityStrategy._full_tick_open)
     _market_status_from_open_int = staticmethod(TargetQuantityStrategy._market_status_from_open_int)
     _market_status_for = TargetQuantityStrategy._market_status_for
+    tick_snapshot_for = TargetQuantityStrategy.tick_snapshot_for
     _is_suspended_status = TargetQuantityStrategy._is_suspended_status
     configure_full_tick_source = TargetQuantityStrategy.configure_full_tick_source
     _start_full_tick_refresh = TargetQuantityStrategy._start_full_tick_refresh
@@ -1593,6 +1596,45 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._apply_full_tick({str(INST_B): {"open": 20.0, "open_int": 13}}, "prefetch")
         self.assertEqual(strategy._market_status_for(str(INST_B)), MarketStatusAction.TRADING)
         self.assertFalse(strategy._is_suspended_status(str(INST_B)))
+
+    def test_apply_full_tick_stores_complete_tick_snapshot(self) -> None:
+        strategy = self.make_strategy(open_prices={})
+        strategy._trading_day = date(2026, 7, 2)
+
+        strategy.apply_full_tick_snapshot(
+            {
+                str(INST_A): {
+                    "last_price": "10.77",
+                    "open": "10.85",
+                    "high": "10.93",
+                    "low": "10.72",
+                    "last_close": "10.84",
+                    "amount": "864435900",
+                    "volume": "800766",
+                    "pvolume": "80076623",
+                    "open_int": "15",
+                    "last_settlement_price": "10.84",
+                },
+            },
+            "after_trading",
+        )
+
+        self.assertEqual(
+            strategy.tick_snapshot_for(str(INST_A)),
+            TickSnapshot(
+                market_status=MarketStatusAction.CLOSE,
+                last_price=10.77,
+                open=10.85,
+                high=10.93,
+                low=10.72,
+                last_close=10.84,
+                amount=864435900.0,
+                volume=800766,
+                pvolume=80076623,
+                open_int=15,
+                last_settlement_price=10.84,
+            ),
+        )
 
     def test_roll_trading_day_clears_market_status(self) -> None:
         strategy = self.make_strategy(open_prices={INST_A: 10.0})

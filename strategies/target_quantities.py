@@ -13,6 +13,7 @@ from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 from typing import Callable
+from typing import Mapping
 
 import pandas as pd
 
@@ -167,6 +168,61 @@ class TodayFillSnapshot:
     latest_ts_event: int
 
 
+@dataclass(frozen=True)
+class TickSnapshot:
+    """Latest normalized QMT full-tick values for one instrument."""
+
+    market_status: MarketStatusAction | None = None
+    last_price: float | None = None
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    last_close: float | None = None
+    amount: float | None = None
+    volume: int | None = None
+    pvolume: int | None = None
+    open_int: int | None = None
+    last_settlement_price: float | None = None
+
+    @classmethod
+    def from_fields(cls, fields: Any) -> "TickSnapshot":
+        if not isinstance(fields, Mapping):
+            return cls()
+        open_int = cls._int_or_none(fields.get("open_int", fields.get("openInt")))
+        market_status = (
+            None
+            if open_int is None
+            else _OPEN_INT_TO_MARKET_STATUS.get(open_int, MarketStatusAction.NONE)
+        )
+        return cls(
+            market_status=market_status,
+            last_price=cls._float_or_none(fields.get("last_price")),
+            open=cls._float_or_none(fields.get("open")),
+            high=cls._float_or_none(fields.get("high")),
+            low=cls._float_or_none(fields.get("low")),
+            last_close=cls._float_or_none(fields.get("last_close")),
+            amount=cls._float_or_none(fields.get("amount")),
+            volume=cls._int_or_none(fields.get("volume")),
+            pvolume=cls._int_or_none(fields.get("pvolume")),
+            open_int=open_int,
+            last_settlement_price=cls._float_or_none(fields.get("last_settlement_price")),
+        )
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _int_or_none(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+
 
 class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     instrument_ids: list[InstrumentId]
@@ -266,10 +322,9 @@ class TargetQuantityStrategy(Strategy):
         # Instruments whose _today_open came from an authoritative source (real
         # bar open or QMT full-tick).
         self._authoritative_open: set[str] = set()
-        # Latest market status per instrument, derived from the full-tick open_int
-        # field (QMT repurposes open_int as a real-time market-status code). Reset
-        # per day in _roll_trading_day. None means "unknown / unparseable".
-        self._market_status: dict[str, MarketStatusAction | None] = {}
+        # Latest normalized full tick per instrument. ``market_status`` on each value
+        # is derived from QMT's repurposed ``open_int`` field. Reset daily.
+        self._market_status: dict[str, TickSnapshot] = {}
         # True once the first depth-driven convergence of the current trading day
         # has fired (reset per day in _roll_trading_day). Lets the earliest
         # order-book depth callback submit orders as early as possible.
@@ -328,9 +383,8 @@ class TargetQuantityStrategy(Strategy):
         as ``{instrument_id_text: {"open": ..., ...}}``. Called at start, at the
         configured pre-open prefetch time, and every ``full_tick_refresh_secs``
         during the trading window. Nautilus has no full-tick data type, so this
-        callback reaches the QMT proxy directly (infrastructure plumbing). Only the
-        ``open`` field is consumed today; the snapshot carries the full tick so more
-        fields (last price, bid/ask, ...) can be used later without rewiring.
+        callback reaches the QMT proxy directly (infrastructure plumbing). The
+        normalized scalar fields are retained in the strategy's daily tick state.
         """
         self._full_tick_source = fetch_full_tick
 
@@ -429,13 +483,17 @@ class TargetQuantityStrategy(Strategy):
             return
         self._apply_full_tick(result, trigger)
 
+    def apply_full_tick_snapshot(self, snapshot: Any, trigger: str) -> None:
+        """Apply a full-tick snapshot supplied by live infrastructure."""
+        self._apply_full_tick(snapshot, trigger)
+
     def _apply_full_tick(self, snapshot: Any, trigger: str) -> None:
         """
         Apply an authoritative full-tick snapshot keyed by instrument id. Each
         value is a per-instrument field mapping (e.g. ``{"open": ..., "last_price":
         ..., "open_int": ...}``). The ``open`` field anchors pricing and ``open_int``
-        carries QMT's real-time market status; the snapshot shape is deliberately open
-        so future fields can be used without a signature change.
+        carries QMT's real-time market status; the requested scalar fields are retained
+        in ``TickSnapshot`` for persistence and later consumers.
         """
         if not isinstance(snapshot, dict) or not snapshot:
             self.log.warning(f"full-tick snapshot is invalid! ({trigger})")
@@ -446,7 +504,7 @@ class TargetQuantityStrategy(Strategy):
             # Store the market status first: a suspended stock has open==0 and would
             # otherwise `continue` on the invalid-open path before status is recorded.
             self._roll_trading_day(trading_date)
-            self._market_status[str(instrument_id)] = self._market_status_from_open_int(fields)
+            self._market_status[str(instrument_id)] = TickSnapshot.from_fields(fields)
             open_price = self._full_tick_open(fields)
             if open_price is None:
                 self.log.warning(f"full-tick snapshot contains invalid open price for {instrument_id} ({trigger})")
@@ -477,11 +535,20 @@ class TargetQuantityStrategy(Strategy):
 
     def _market_status_for(self, instrument_id: str) -> MarketStatusAction | None:
         """Latest market status for an instrument, or None if unknown."""
+        snapshot = self._market_status.get(instrument_id)
+        return None if snapshot is None else snapshot.market_status
+
+    def tick_snapshot_for(self, instrument_id: str) -> TickSnapshot | None:
+        """Return the latest normalized full tick for ``instrument_id``."""
         return self._market_status.get(instrument_id)
 
     def _is_suspended_status(self, instrument_id: str) -> bool:
         """True when the instrument's latest full-tick status is SUSPEND (停牌)."""
-        return self._market_status.get(instrument_id) == MarketStatusAction.SUSPEND
+        snapshot = self._market_status.get(instrument_id)
+        return (
+            snapshot is not None
+            and snapshot.market_status == MarketStatusAction.SUSPEND
+        )
 
     @staticmethod
     def _full_tick_open(fields: Any) -> float | None:
