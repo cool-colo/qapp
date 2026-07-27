@@ -144,6 +144,22 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the model-prediction strategy as a long-running Nautilus live node via QMT.",
     )
+    parser.add_argument(
+        "--env-file",
+        default=env("QAPP_ENV_FILE"),
+        help="Explicit .env path (else <script dir>/.env, else <cwd>/.env).",
+    )
+    parser.add_argument(
+        "--environment",
+        default=env("QAPP_ENV", "live"),
+        help="Deployment environment label included in operational alerts.",
+    )
+    parser.add_argument(
+        "--dingtalk-timeout-secs",
+        type=float,
+        default=float(env("DINGTALK_TIMEOUT_SECS", "5") or "5"),
+        help="DingTalk webhook request timeout.",
+    )
     parser.add_argument("--predictions-table", default=env("MODEL_PREDICTIONS_TABLE", "daily_model_predictions"))
     parser.add_argument("--stock-codes", default=",".join(env_list("MODEL_STOCK_CODES", "000001.SZ,000002.SZ")))
     parser.add_argument("--all-stocks", action="store_true", default=env_bool("MODEL_ALL_STOCKS", False))

@@ -368,6 +368,7 @@ class TargetQuantityStrategy(Strategy):
         reconcile_time: str,
         timeout_secs: float,
         loop: asyncio.AbstractEventLoop | None = None,
+        event_reporter: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         if loop is not None:
             self._async_scheduler.set_loop(loop)
@@ -375,6 +376,7 @@ class TargetQuantityStrategy(Strategy):
             reconcile=reconcile,
             reconcile_time=reconcile_time,
             timeout_secs=timeout_secs,
+            event_reporter=event_reporter,
         )
 
     def configure_full_tick_source(self, fetch_full_tick: Any | None) -> None:
@@ -458,30 +460,78 @@ class TargetQuantityStrategy(Strategy):
             return
         self._run_full_tick_fetch(trigger="refresh")
 
-    def _run_full_tick_fetch(self, trigger: str) -> None:
+    def _run_full_tick_fetch(
+        self,
+        trigger: str,
+        on_complete: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
 
         if self._full_tick_task is not None and not self._full_tick_task.done():
+            if on_complete is not None:
+                self._notify_full_tick_completion(
+                    on_complete,
+                    "skipped",
+                    {"reason": "previous full-tick fetch is still running"},
+                )
             return
         try:
             result = self._full_tick_source()
         except Exception as exc:
             self.log.warning(f"full-tick fetch failed to start ({trigger}): {exc}")
+            if on_complete is not None:
+                self._notify_full_tick_completion(on_complete, "failed", {"error": str(exc)})
             return
         if not inspect.isawaitable(result):
             self._apply_full_tick(result, trigger)
+            valid = isinstance(result, dict) and bool(result)
+            if on_complete is not None:
+                self._notify_full_tick_completion(
+                    on_complete,
+                    "success" if valid else "failed",
+                    {"instruments": len(result) if isinstance(result, dict) else 0},
+                )
             return
         task = self._async_scheduler.schedule(result)
         self._full_tick_task = task
-        task.add_done_callback(lambda t: self._on_full_tick_fetch_done(t, trigger))
+        task.add_done_callback(
+            lambda t: self._on_full_tick_fetch_done(t, trigger, on_complete),
+        )
 
-    def _on_full_tick_fetch_done(self, task: asyncio.Future[Any], trigger: str) -> None:
+    def _on_full_tick_fetch_done(
+        self,
+        task: asyncio.Future[Any],
+        trigger: str,
+        on_complete: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         self._full_tick_task = None
         try:
             result = task.result()
         except Exception as exc:
             self.log.warning(f"full-tick fetch failed ({trigger}): {exc}")
+            if on_complete is not None:
+                self._notify_full_tick_completion(on_complete, "failed", {"error": str(exc)})
             return
         self._apply_full_tick(result, trigger)
+        valid = isinstance(result, dict) and bool(result)
+        if on_complete is not None:
+            self._notify_full_tick_completion(
+                on_complete,
+                "success" if valid else "failed",
+                {"instruments": len(result) if isinstance(result, dict) else 0},
+            )
+
+    def _notify_full_tick_completion(
+        self,
+        callback: Callable[[str, dict[str, Any]], None] | None,
+        status: str,
+        details: dict[str, Any],
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(status, details)
+        except Exception as exc:
+            self.log.warning(f"full-tick completion callback failed: {exc}")
 
     def apply_full_tick_snapshot(self, snapshot: Any, trigger: str) -> None:
         """Apply a full-tick snapshot supplied by live infrastructure."""

@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import tempfile
 import unittest
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -26,11 +28,13 @@ from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.enums import MarketStatusAction
 
 from lives.live_qmt_target_model_predictions import _emit_snapshot_status
+from lives.live_qmt_target_model_predictions import LiveTargetModelPredictionsStrategy
 from lives.live_qmt_target_model_predictions import parse_args
 from lives.live_qmt_target_model_predictions import _resolve_daily_log_file_name
 from lives.snapshot_recorder import SnapshotRecorder
 from lives.snapshot_recorder import SnapshotRecorderConfig
 from lives.live_qmt_target_model_predictions import normalize_refresh_time
+from monitoring.dingtalk_alert import FixedTimeEventReporter
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig
 from strategies.model_target_planners import ModelTargetPlan
@@ -168,6 +172,46 @@ class TargetLiveConfigTest(unittest.TestCase):
                 args = parse_args()
         self.assertFalse(hasattr(args, "pre_open_reconcile_time"))
 
+    def test_parse_args_loads_explicit_env_file_before_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env_file = Path(tmp_dir) / "live.env"
+            env_file.write_text(
+                "QMT_ACCOUNT_ID=ENV-ACCOUNT\n"
+                "QAPP_ENV=production\n"
+                "DINGTALK_TIMEOUT_SECS=7.5\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                with patch.object(sys, "argv", ["test", "--env-file", str(env_file)]):
+                    args = parse_args()
+
+        self.assertEqual(args.account_id, "ENV-ACCOUNT")
+        self.assertEqual(args.environment, "production")
+        self.assertEqual(args.dingtalk_timeout_secs, 7.5)
+        self.assertEqual(args.env_file, str(env_file))
+
+    def test_fixed_time_reporter_includes_environment_and_identity(self) -> None:
+        alerter = SimpleNamespace(configured=True, send_text=MagicMock(return_value=True))
+        reporter = FixedTimeEventReporter(
+            alerter,
+            environment="production",
+            account_id="ACC",
+            trader_id="TRADER",
+            strategy_name="model",
+        )
+
+        self.assertTrue(reporter.report("SNAPSHOT-AFTER-TRADING", "success", {"rows": 3}))
+        reporter.close(wait=True)
+
+        content = alerter.send_text.call_args.args[0]
+        self.assertEqual(
+            alerter.send_text.call_args.kwargs["title"],
+            "[production] SNAPSHOT-AFTER-TRADING [SUCCESS]",
+        )
+        self.assertIn("environment: production", content)
+        self.assertIn("account: ACC", content)
+        self.assertIn("rows: 3", content)
+
     def test_full_tick_args_default(self) -> None:
         with patch.dict(os.environ, {"QMT_ACCOUNT_ID": "TEST"}, clear=False):
             with patch.object(sys, "argv", ["test"]):
@@ -234,6 +278,86 @@ class TargetLiveConfigTest(unittest.TestCase):
             TargetModelPredictionsStrategy._on_converge_timer,
             TargetQuantityStrategy._on_converge_timer,
         )
+
+    def test_live_target_timer_alerts_only_when_day_is_newly_processed(self) -> None:
+        strategy = LiveTargetModelPredictionsStrategy.__new__(LiveTargetModelPredictionsStrategy)
+        reporter = MagicMock()
+        strategy._event_reporter = SimpleNamespace(report=reporter)
+        strategy._within_trading_window = MagicMock(return_value=True)
+        strategy._clock_date = MagicMock(return_value=date(2026, 7, 8))
+        strategy.signal_events = []
+        strategy.target_events = []
+        strategy.order_events = []
+
+        def process_once(_trading_date: date, _trigger: str) -> bool:
+            strategy.signal_events.append(object())
+            strategy.target_events.extend([object(), object()])
+            strategy.order_events.append(object())
+            return True
+
+        strategy._process_trading_day_once = MagicMock(side_effect=process_once)
+        strategy._on_process_targets_timer(None)
+
+        reporter.assert_called_once()
+        event_name, status, details = reporter.call_args.args
+        self.assertEqual(event_name, TargetModelPredictionsStrategy._PROCESS_TARGETS_TIMER)
+        self.assertEqual(status, "success")
+        self.assertEqual(details["new_signal_events"], 1)
+        self.assertEqual(details["new_target_events"], 2)
+        self.assertEqual(details["new_order_events"], 1)
+
+        reporter.reset_mock()
+        strategy._process_trading_day_once.return_value = False
+        strategy._process_trading_day_once.side_effect = None
+        strategy._on_process_targets_timer(None)
+        reporter.assert_not_called()
+
+    def test_live_fixed_refresh_reports_failure(self) -> None:
+        strategy = SimpleNamespace()
+        reporter = MagicMock()
+        strategy._event_reporter = SimpleNamespace(report=reporter)
+        strategy._REFRESH_ALERT = LiveTargetModelPredictionsStrategy._REFRESH_ALERT
+        strategy._refresh_time = (9, 0)
+        strategy._schedule_daily_refresh = MagicMock()
+        strategy._active_stock_codes = MagicMock(return_value=set())
+        strategy._clock_date = MagicMock(return_value=date(2026, 7, 8))
+        strategy._refresh_context = MagicMock(side_effect=RuntimeError("refresh unavailable"))
+        strategy._execution_reconciliation = SimpleNamespace(
+            request_after_target_refresh=MagicMock(),
+        )
+        strategy.log = MagicMock()
+        strategy._report_event = lambda event, status, details: LiveTargetModelPredictionsStrategy._report_event(
+            strategy,
+            event,
+            status,
+            details,
+        )
+
+        LiveTargetModelPredictionsStrategy._on_refresh_timer(strategy, None)
+
+        strategy._schedule_daily_refresh.assert_called_once_with()
+        event_name, status, details = reporter.call_args.args
+        self.assertEqual(event_name, LiveTargetModelPredictionsStrategy._REFRESH_ALERT)
+        self.assertEqual(status, "failed")
+        self.assertEqual(details["error"], "refresh unavailable")
+
+    def test_live_full_tick_prefetch_reports_completion(self) -> None:
+        strategy = LiveTargetModelPredictionsStrategy.__new__(LiveTargetModelPredictionsStrategy)
+        reporter = MagicMock()
+        strategy._event_reporter = SimpleNamespace(report=reporter)
+        strategy._full_tick_prefetch_time = (9, 27)
+        strategy._schedule_full_tick_prefetch = MagicMock()
+        strategy._clock_date = MagicMock(return_value=date(2026, 7, 8))
+        strategy._run_full_tick_fetch = MagicMock(
+            side_effect=lambda trigger, on_complete: on_complete("success", {"instruments": 4}),
+        )
+
+        strategy._on_full_tick_prefetch_timer(None)
+
+        event_name, status, details = reporter.call_args.args
+        self.assertEqual(event_name, TargetQuantityStrategy._FULL_TICK_PREFETCH_ALERT)
+        self.assertEqual(status, "success")
+        self.assertEqual(details["instruments"], 4)
 
     def test_daily_log_file_name_defaults_to_nautilus_daily_rotation(self) -> None:
         self.assertIsNone(_resolve_daily_log_file_name(None, "Asia/Shanghai"))
@@ -306,6 +430,33 @@ class TargetLiveConfigTest(unittest.TestCase):
             [call(date(2026, 7, 8), allow_fallback=True)],
         )
         recorder._run_after_trading.assert_called_once_with(date(2026, 7, 8), allow_fallback=True)
+
+    def test_snapshot_fixed_timers_report_each_phase(self) -> None:
+        recorder = self._make_snapshot_recorder_stub("2026-07-08 09:27:00")
+        recorder._before_time = (9, 27)
+        recorder._after_time = (15, 40)
+        recorder._schedule_daily = MagicMock()
+        recorder._event_reporter = MagicMock()
+        recorder._BEFORE_ALERT = SnapshotRecorder._BEFORE_ALERT
+        recorder._AFTER_ALERT = SnapshotRecorder._AFTER_ALERT
+        recorder._on_before_timer = MagicMock()
+        recorder._on_after_timer = MagicMock()
+        recorder._report_event = lambda event, status, started, details: SnapshotRecorder._report_event(
+            recorder,
+            event,
+            status,
+            started,
+            details,
+        )
+
+        SnapshotRecorder._on_before_timer(recorder, None)
+        SnapshotRecorder._on_after_timer(recorder, None)
+
+        self.assertEqual(recorder._event_reporter.call_count, 2)
+        self.assertEqual(
+            [item.args[0] for item in recorder._event_reporter.call_args_list],
+            [SnapshotRecorder._BEFORE_ALERT, SnapshotRecorder._AFTER_ALERT],
+        )
 
     def test_warn_if_asset_inconsistent_warns_on_large_gap(self) -> None:
         recorder = SimpleNamespace(log=MagicMock())

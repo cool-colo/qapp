@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,9 @@ from lives.monitoring import PrometheusExporter
 from lives.monitoring import PrometheusExporterConfig
 from lives.status_server import LiveStatusServer
 from lives.status_server import StatusServerConfig
+from monitoring.dingtalk_alert import DingTalkAlerter
+from monitoring.dingtalk_alert import FixedTimeEventReporter
+from monitoring.dingtalk_alert import load_env
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig
 from nautilus_trader.common.enums import LogColor
@@ -45,11 +50,13 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         refresh_context: Any,
         refresh_interval_secs: float = 0.0,
         refresh_time: str | None = "09:00",
+        event_reporter: FixedTimeEventReporter | None = None,
     ) -> None:
         super().__init__(config)
         self._refresh_context = refresh_context
         self._refresh_interval_secs = float(refresh_interval_secs)
         self._refresh_time = self._parse_hh_mm(refresh_time)
+        self._event_reporter = event_reporter
         self._execution_reconciliation = LiveExecutionReconciliation(
             request_reconcile=self.request_execution_reconcile,
             warn=lambda message: self.log.warning(message),
@@ -99,8 +106,12 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         )
 
     def _on_refresh_timer(self, _event: Any) -> None:
+        started = time.monotonic()
+        fixed_time_event = self._refresh_time is not None
         if self._refresh_time is not None:
             self._schedule_daily_refresh()
+        status = "success"
+        details: dict[str, Any] = {}
         try:
             context = self._refresh_context(self._active_stock_codes())
             self.refresh_reference_data(
@@ -123,9 +134,84 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
                 f"Refreshed target-model data: instruments={len(context.instrument_ids)} "
                 f"signals={context.bundle.selected_rows}",
             )
+            details.update(
+                instruments=len(context.instrument_ids),
+                signals=context.bundle.selected_rows,
+            )
         except Exception as exc:
+            status = "failed"
+            details["error"] = str(exc)
             self.log.warning(f"Target-model data refresh failed, keeping previous data: {exc}")
         self._execution_reconciliation.request_after_target_refresh()
+        if fixed_time_event:
+            try:
+                details["trading_date"] = self._clock_date()
+                details["configured_time"] = (
+                    f"{self._refresh_time[0]:02d}:{self._refresh_time[1]:02d}"
+                )
+                details["duration_ms"] = (time.monotonic() - started) * 1000.0
+                self._report_event(self._REFRESH_ALERT, status, details)
+            except Exception as exc:
+                self.log.warning(f"Could not summarize DingTalk event {self._REFRESH_ALERT}: {exc}")
+
+    def _on_process_targets_timer(self, _event: Any) -> None:
+        if not self._within_trading_window():
+            return
+        trading_date = self._clock_date()
+        started = time.monotonic()
+        before = (len(self.signal_events), len(self.target_events), len(self.order_events))
+        try:
+            processed = self._process_trading_day_once(trading_date, "timer")
+        except Exception as exc:
+            self._report_event(
+                self._PROCESS_TARGETS_TIMER,
+                "failed",
+                {
+                    "trading_date": trading_date,
+                    "duration_ms": (time.monotonic() - started) * 1000.0,
+                    "error": str(exc),
+                },
+            )
+            raise
+        if not processed:
+            return
+        after = (len(self.signal_events), len(self.target_events), len(self.order_events))
+        self._report_event(
+            self._PROCESS_TARGETS_TIMER,
+            "success",
+            {
+                "trading_date": trading_date,
+                "duration_ms": (time.monotonic() - started) * 1000.0,
+                "new_signal_events": after[0] - before[0],
+                "new_target_events": after[1] - before[1],
+                "new_order_events": after[2] - before[2],
+            },
+        )
+
+    def _on_full_tick_prefetch_timer(self, _event: Any) -> None:
+        started = time.monotonic()
+        if self._full_tick_prefetch_time is not None:
+            self._schedule_full_tick_prefetch()
+
+        def _completed(status: str, details: dict[str, Any]) -> None:
+            summary = dict(details)
+            summary["duration_ms"] = (time.monotonic() - started) * 1000.0
+            summary["trading_date"] = self._clock_date()
+            if self._full_tick_prefetch_time is not None:
+                summary["configured_time"] = (
+                    f"{self._full_tick_prefetch_time[0]:02d}:{self._full_tick_prefetch_time[1]:02d}"
+                )
+            self._report_event(self._FULL_TICK_PREFETCH_ALERT, status, summary)
+
+        self._run_full_tick_fetch(trigger="prefetch", on_complete=_completed)
+
+    def _report_event(self, event_name: str, status: str, details: dict[str, Any]) -> None:
+        if self._event_reporter is None:
+            return
+        try:
+            self._event_reporter.report(event_name, status, details)
+        except Exception as exc:
+            self.log.warning(f"Could not queue DingTalk event {event_name}: {exc}")
 
     def _active_stock_codes(self) -> set[str]:
         stock_codes = set()
@@ -150,8 +236,19 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         return stock_codes
 
 
+def _preparse_env_file(argv: list[str]) -> str | None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--env-file", default=os.environ.get("QAPP_ENV_FILE"))
+    known, _ = parser.parse_known_args(argv)
+    return known.env_file
+
+
 def parse_args():
     original_argv = sys.argv[:]
+    load_env(
+        _preparse_env_file(original_argv[1:]),
+        script_dir=Path(__file__).resolve().parent,
+    )
     try:
         sys.argv = original_argv
         args = legacy.parse_args()
@@ -248,6 +345,7 @@ def _add_snapshot_recorder(
     fetch_orders: Any | None = None,
     fetch_trades: Any | None = None,
     fetch_open_prices: Any | None = None,
+    event_reporter: FixedTimeEventReporter | None = None,
 ) -> None:
     """Build the MySQL-backed daily-snapshot recorder actor and add it to the node."""
     from backtests.result_writers.live_writer import LiveSnapshotWriter
@@ -315,6 +413,7 @@ def _add_snapshot_recorder(
         fetch_orders=fetch_orders,
         fetch_trades=fetch_trades,
         fetch_open_prices=fetch_open_prices,
+        event_reporter=event_reporter.report if event_reporter is not None else None,
     )
     node.trader.add_actor(recorder)
     _emit_snapshot_status(
@@ -418,6 +517,13 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
         timeout_post_stop=5.0,
     )
     node = TradingNode(config=config_node)
+    event_reporter = FixedTimeEventReporter(
+        DingTalkAlerter.from_env(timeout=args.dingtalk_timeout_secs),
+        environment=args.environment,
+        account_id=str(args.account_id),
+        trader_id=str(args.trader_id),
+        strategy_name=str(args.strategy_name),
+    )
     strategy = LiveTargetModelPredictionsStrategy(
         config=TargetModelPredictionsStrategyConfig(
             instrument_ids=context.instrument_ids,
@@ -477,6 +583,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
         ),
         refresh_interval_secs=args.refresh_interval_secs,
         refresh_time=args.refresh_time,
+        event_reporter=event_reporter,
     )
     # Always wire the reconcile callback: the strategy triggers a reconcile on start
     # and on each refresh to republish the execution mass status — which carries the
@@ -488,6 +595,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
         reconcile_time=_PRE_OPEN_RECONCILE_TIME_SHANGHAI,
         timeout_secs=config_node.timeout_reconciliation,
         loop=node.kernel.exec_engine._loop,
+        event_reporter=event_reporter.report,
     )
 
     def _fetch_full_tick() -> dict[str, dict[str, float]]:
@@ -534,6 +642,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
         _fetch_orders,
         _fetch_trades,
         _fetch_open_prices,
+        event_reporter,
     )
     if args.metrics_port and int(args.metrics_port) > 0:
         exporter = PrometheusExporter(

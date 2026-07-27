@@ -1452,6 +1452,27 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(alert["alert_time"], pd.Timestamp("2026-07-02 09:15:00", tz="Asia/Shanghai"))
         self.assertTrue(alert["override"])
 
+    def test_pre_open_reconciliation_reports_only_scheduled_run(self) -> None:
+        strategy = self.make_strategy()
+        reports = []
+        strategy.configure_pre_open_reconciliation(
+            reconcile=lambda timeout_secs: True,
+            reconcile_time="09:15",
+            timeout_secs=30.0,
+            event_reporter=lambda event, status, details: reports.append(
+                (event, status, details),
+            ),
+        )
+
+        strategy.request_execution_reconcile()
+        self.assertEqual(reports, [])
+
+        strategy._execution_state_reconciler._on_timer(None)
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0][0], ExecutionStateReconciler.PRE_OPEN_ALERT)
+        self.assertEqual(reports[0][1], "success")
+        self.assertTrue(reports[0][2]["reconciled"])
+
     def test_pre_open_reconciliation_async_callback_runs_without_running_loop(self) -> None:
         strategy = self.make_strategy()
         calls = []

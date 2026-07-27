@@ -22,6 +22,7 @@ Credentials are read from the environment (after ``load_env`` has populated it):
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import logging
@@ -29,7 +30,9 @@ import os
 import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 from typing import Mapping
 
 import requests
@@ -193,3 +196,84 @@ class DingTalkAlerter:
         except ValueError:
             ok = False
         return ok
+
+
+class FixedTimeEventReporter:
+    """Queue concise live-event summaries for DingTalk delivery.
+
+    Webhook I/O runs on one worker so a slow DingTalk endpoint cannot block a
+    Nautilus clock callback. The reporter owns only monitoring metadata; timer
+    scheduling and trading behavior remain in their existing components.
+    """
+
+    def __init__(
+        self,
+        alerter: DingTalkAlerter,
+        *,
+        environment: str,
+        account_id: str,
+        trader_id: str,
+        strategy_name: str,
+    ) -> None:
+        self._alerter = alerter
+        self._environment = environment.strip() or "unspecified"
+        self._account_id = account_id
+        self._trader_id = trader_id
+        self._strategy_name = strategy_name
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="qapp-dingtalk",
+        )
+
+    def report(
+        self,
+        event_name: str,
+        status: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Queue one event summary and return whether delivery was scheduled."""
+        if not self._alerter.configured:
+            logger.info(
+                "DingTalk credentials missing; skipping fixed-time event %s",
+                event_name,
+            )
+            return False
+        try:
+            self._executor.submit(
+                self._send,
+                event_name,
+                status,
+                dict(details or {}),
+            )
+        except RuntimeError as exc:
+            logger.error("DingTalk event queue unavailable: %r", exc)
+            return False
+        return True
+
+    def close(self, wait: bool = False) -> None:
+        """Stop accepting event summaries and optionally wait for queued sends."""
+        self._executor.shutdown(wait=wait)
+
+    def _send(self, event_name: str, status: str, details: Mapping[str, Any]) -> None:
+        title = f"[{self._environment}] {event_name} [{status.upper()}]"
+        lines = [
+            f"environment: {self._environment}",
+            f"account: {self._account_id}",
+            f"trader: {self._trader_id}",
+            f"strategy: {self._strategy_name}",
+            f"processed_at: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        ]
+        lines.extend(f"{key}: {self._format_value(value)}" for key, value in sorted(details.items()))
+        try:
+            sent = self._alerter.send_text("\n".join(lines), title=title)
+        except Exception as exc:  # Monitoring must never affect the live node.
+            logger.error("DingTalk fixed-time event delivery failed: %r", exc)
+            return
+        if not sent:
+            logger.warning("DingTalk fixed-time event was not delivered: %s", event_name)
+
+    @staticmethod
+    def _format_value(value: Any) -> str:
+        if isinstance(value, float):
+            return f"{value:.3f}"
+        return str(value)

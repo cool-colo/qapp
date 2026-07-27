@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from concurrent.futures import Future as ConcurrentFuture
 from decimal import Decimal
 from typing import Any
@@ -33,6 +34,7 @@ class ExecutionStateReconciler:
         self._timeout_secs = 30.0
         self._task: asyncio.Future[Any] | ConcurrentFuture[Any] | None = None
         self._venue_sellable: dict[str, Decimal] = {}
+        self._event_reporter: Callable[[str, str, dict[str, Any]], None] | None = None
 
     def bind_runtime(self, clock: Any, log: Any) -> None:
         """Bind dependencies installed by Nautilus when the strategy is registered."""
@@ -44,6 +46,7 @@ class ExecutionStateReconciler:
         reconcile: Callable[..., Any],
         reconcile_time: str,
         timeout_secs: float,
+        event_reporter: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         parsed_time = self._parse_hh_mm(reconcile_time)
         if parsed_time is None:
@@ -51,6 +54,7 @@ class ExecutionStateReconciler:
         self._reconcile = reconcile
         self._reconcile_time = parsed_time
         self._timeout_secs = float(timeout_secs)
+        self._event_reporter = event_reporter
 
     def schedule_daily(self) -> None:
         clock = self._runtime_clock()
@@ -68,14 +72,27 @@ class ExecutionStateReconciler:
             color=LogColor.BLUE,
         )
 
-    def run(self) -> None:
+    def run(self, report_scheduled_event: bool = False) -> None:
+        started = time.monotonic()
         log = self._runtime_log()
         if self._task is not None and not self._task.done():
             log.warning(
                 "Previous pre-open execution-state reconciliation is still running; skipping",
             )
+            self._report_event(
+                report_scheduled_event,
+                "skipped",
+                started,
+                {"reason": "previous reconciliation is still running"},
+            )
             return
         if self._reconcile is None:
+            self._report_event(
+                report_scheduled_event,
+                "failed",
+                started,
+                {"error": "execution-state reconciliation is not configured"},
+            )
             raise RuntimeError("execution-state reconciliation is not configured")
         try:
             result = self._reconcile(timeout_secs=self._timeout_secs)
@@ -83,16 +100,31 @@ class ExecutionStateReconciler:
             log.warning(
                 f"Pre-open execution-state reconciliation failed to start: {exc}",
             )
+            self._report_event(
+                report_scheduled_event,
+                "failed",
+                started,
+                {"error": str(exc)},
+            )
             return
         if inspect.isawaitable(result):
             self._task = self._async_scheduler.schedule(result)
-            self._task.add_done_callback(self._on_done)
+            self._task.add_done_callback(
+                lambda task: self._on_done(task, report_scheduled_event, started),
+            )
             log.info(
                 "Started pre-open execution-state reconciliation",
                 color=LogColor.BLUE,
             )
             return
-        self._log_result(bool(result))
+        succeeded = bool(result)
+        self._log_result(succeeded)
+        self._report_event(
+            report_scheduled_event,
+            "success" if succeeded else "failed",
+            started,
+            {"reconciled": succeeded},
+        )
 
     def subscribe_mass_status(self, venue: Any, msgbus: Any) -> None:
         """Subscribe to reconciled execution reports for broker sellable quantities."""
@@ -133,11 +165,13 @@ class ExecutionStateReconciler:
 
     def _on_timer(self, _event: Any) -> None:
         self.schedule_daily()
-        self.run()
+        self.run(report_scheduled_event=True)
 
     def _on_done(
         self,
         task: asyncio.Future[Any] | ConcurrentFuture[Any],
+        report_scheduled_event: bool = False,
+        started: float | None = None,
     ) -> None:
         self._task = None
         try:
@@ -146,8 +180,44 @@ class ExecutionStateReconciler:
             self._runtime_log().warning(
                 f"Pre-open execution-state reconciliation failed: {exc}",
             )
+            self._report_event(
+                report_scheduled_event,
+                "failed",
+                started,
+                {"error": str(exc)},
+            )
             return
-        self._log_result(bool(result))
+        succeeded = bool(result)
+        self._log_result(succeeded)
+        self._report_event(
+            report_scheduled_event,
+            "success" if succeeded else "failed",
+            started,
+            {"reconciled": succeeded},
+        )
+
+    def _report_event(
+        self,
+        enabled: bool,
+        status: str,
+        started: float | None,
+        details: dict[str, Any],
+    ) -> None:
+        if not enabled or self._event_reporter is None:
+            return
+        summary = dict(details)
+        if self._reconcile_time is not None:
+            summary["configured_time"] = (
+                f"{self._reconcile_time[0]:02d}:{self._reconcile_time[1]:02d}"
+            )
+        if started is not None:
+            summary["duration_ms"] = (time.monotonic() - started) * 1000.0
+        try:
+            self._event_reporter(self.PRE_OPEN_ALERT, status, summary)
+        except Exception as exc:
+            self._runtime_log().warning(
+                f"Could not queue DingTalk event {self.PRE_OPEN_ALERT}: {exc}",
+            )
 
     def _log_result(self, succeeded: bool) -> None:
         log = self._runtime_log()

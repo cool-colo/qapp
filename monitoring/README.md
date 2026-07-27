@@ -42,3 +42,29 @@ curl -s localhost:9100/metrics | grep qapp_
 | `qapp_exporter_up` | 1 if the last collection succeeded, 0 on failure |
 
 All carry an `account` label (from `--metrics-account-label`) so several nodes can share one scraper.
+
+## DingTalk fixed-time events
+
+`lives/live_qmt_target_model_predictions.py` sends non-blocking DingTalk summaries
+for daily target processing, model-data refresh, pre-open reconciliation,
+full-tick prefetch, and the before/after-trading snapshot timers. High-frequency
+convergence, full-tick refresh, and metrics timers are not sent.
+
+Configure the deployment through an explicit env file:
+
+```dotenv
+QAPP_ENV=production
+DINGTALK_ACCESS_TOKEN=your_robot_access_token
+DINGTALK_SECRET=your_robot_signing_secret
+DINGTALK_TIMEOUT_SECS=5
+```
+
+```bash
+python lives/live_qmt_target_model_predictions.py \
+    --env-file /path/to/production.env \
+    --environment production
+```
+
+`--env-file` defaults to `QAPP_ENV_FILE`, and `--environment` defaults to
+`QAPP_ENV` (or `live` when unset). Missing DingTalk credentials disable delivery
+without stopping the live node.

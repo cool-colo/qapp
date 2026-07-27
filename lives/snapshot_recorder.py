@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import inspect
 import asyncio
+import time
 from datetime import date
 from datetime import datetime
 from decimal import Decimal
@@ -95,6 +96,7 @@ class SnapshotRecorder(Actor):
         fetch_orders: Any | None = None,
         fetch_trades: Any | None = None,
         fetch_open_prices: Any | None = None,
+        event_reporter: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         super().__init__(config)
         self._writer = writer
@@ -104,6 +106,7 @@ class SnapshotRecorder(Actor):
         self._fetch_orders = fetch_orders
         self._fetch_trades = fetch_trades
         self._fetch_open_prices = fetch_open_prices
+        self._event_reporter = event_reporter
         self._writer.set_logger(self.log)
         self._before_time = self._parse_hh_mm(config.before_time)
         self._after_time = self._parse_hh_mm(config.after_time)
@@ -158,17 +161,74 @@ class SnapshotRecorder(Actor):
             self._run_continuous_trading(today, allow_fallback=not self._within_trading_window())
 
     def _on_before_timer(self, _event: Any) -> None:
+        started = time.monotonic()
         self._schedule_daily(self._BEFORE_ALERT, self._before_time, self._on_before_timer)
         today = self._now().date()
         try:
             self._run_full_tick_fetch()
         except Exception as exc:
             self.log.warning(f"snapshot before-trading full-tick fetch failed: {exc}")
-        self._run_before_trading(today, allow_fallback=False)
+        try:
+            self._run_before_trading(today, allow_fallback=False)
+        except Exception as exc:
+            self._report_event(
+                self._BEFORE_ALERT,
+                "failed",
+                started,
+                {"trading_date": today, "snapshot_type": BEFORE_TRADING, "error": str(exc)},
+            )
+            raise
+        self._report_event(
+            self._BEFORE_ALERT,
+            "processed",
+            started,
+            {
+                "trading_date": today,
+                "snapshot_type": BEFORE_TRADING,
+                "configured_time": self.config.before_time,
+            },
+        )
 
     def _on_after_timer(self, _event: Any) -> None:
+        started = time.monotonic()
         self._schedule_daily(self._AFTER_ALERT, self._after_time, self._on_after_timer)
-        self._run_after_trading(self._now().date(), allow_fallback=False)
+        today = self._now().date()
+        try:
+            self._run_after_trading(today, allow_fallback=False)
+        except Exception as exc:
+            self._report_event(
+                self._AFTER_ALERT,
+                "failed",
+                started,
+                {"trading_date": today, "snapshot_type": AFTER_TRADING, "error": str(exc)},
+            )
+            raise
+        self._report_event(
+            self._AFTER_ALERT,
+            "processed",
+            started,
+            {
+                "trading_date": today,
+                "snapshot_type": AFTER_TRADING,
+                "configured_time": self.config.after_time,
+            },
+        )
+
+    def _report_event(
+        self,
+        event_name: str,
+        status: str,
+        started: float,
+        details: dict[str, Any],
+    ) -> None:
+        if self._event_reporter is None:
+            return
+        summary = dict(details)
+        summary["duration_ms"] = (time.monotonic() - started) * 1000.0
+        try:
+            self._event_reporter(event_name, status, summary)
+        except Exception as exc:
+            self.log.warning(f"Could not queue DingTalk event {event_name}: {exc}")
 
     def _schedule_keepalive(self) -> None:  # retained as a no-op for backward compat
         # Removed: the MySQL connection pool (LiveSnapshotWriter, SQLAlchemy QueuePool
