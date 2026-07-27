@@ -431,7 +431,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
         recorder._run_after_trading.assert_called_once_with(date(2026, 7, 8), allow_fallback=True)
 
-    def test_snapshot_fixed_timers_report_each_phase(self) -> None:
+    def test_snapshot_fixed_timers_enable_per_task_reporting(self) -> None:
         recorder = self._make_snapshot_recorder_stub("2026-07-08 09:27:00")
         recorder._before_time = (9, 27)
         recorder._after_time = (15, 40)
@@ -452,10 +452,16 @@ class TargetLiveConfigTest(unittest.TestCase):
         SnapshotRecorder._on_before_timer(recorder, None)
         SnapshotRecorder._on_after_timer(recorder, None)
 
-        self.assertEqual(recorder._event_reporter.call_count, 2)
-        self.assertEqual(
-            [item.args[0] for item in recorder._event_reporter.call_args_list],
-            [SnapshotRecorder._BEFORE_ALERT, SnapshotRecorder._AFTER_ALERT],
+        recorder._event_reporter.assert_not_called()
+        recorder._run_before_trading.assert_called_once_with(
+            date(2026, 7, 8),
+            allow_fallback=False,
+            report_tasks=True,
+        )
+        recorder._run_after_trading.assert_called_once_with(
+            date(2026, 7, 8),
+            allow_fallback=False,
+            report_tasks=True,
         )
 
     def test_warn_if_asset_inconsistent_warns_on_large_gap(self) -> None:
@@ -1045,6 +1051,106 @@ class TargetLiveConfigTest(unittest.TestCase):
         kwargs["on_applied"](sample)
         recorder._record_stock_ticks.assert_called_once_with(trading_date, sample)
 
+    def test_after_trading_reports_each_synced_table_with_row_count(self) -> None:
+        reporter = MagicMock()
+        recorder = SimpleNamespace(
+            config=SnapshotRecorderConfig(
+                account_id="ACC",
+                trader_id="TRADER",
+                after_time="15:40",
+            ),
+            _event_reporter=reporter,
+            _AFTER_ALERT=SnapshotRecorder._AFTER_ALERT,
+        )
+        recorder._report_event = lambda event, status, started, details: SnapshotRecorder._report_event(
+            recorder,
+            event,
+            status,
+            started,
+            details,
+        )
+        recorder._sync_task_callback = lambda event, table, trading_date, snapshot_type, configured_time: (
+            SnapshotRecorder._sync_task_callback(
+                recorder,
+                event,
+                table,
+                trading_date,
+                snapshot_type,
+                configured_time,
+            )
+        )
+        recorder._run_full_tick_fetch = MagicMock(
+            side_effect=lambda trigger, on_applied, on_failed: on_applied(
+                {"000001.SZ.QMT": {"open": 10.0}},
+            ),
+        )
+        recorder._record_stock_ticks = MagicMock(
+            side_effect=lambda trading_date, snapshot, on_complete: on_complete(
+                "success",
+                1,
+                {"source_instruments": len(snapshot)},
+            ),
+        )
+        recorder._record_asset = MagicMock(
+            side_effect=lambda trading_date, snapshot_type, source, on_complete: (
+                on_complete("success", 1, {"row_id": 7}) or 7
+            ),
+        )
+        recorder._record_positions = MagicMock(
+            side_effect=lambda trading_date, snapshot_type, source, on_complete: on_complete(
+                "success",
+                3,
+                {"broker_positions": 3},
+            ),
+        )
+        recorder._backfill_orders = MagicMock(
+            side_effect=lambda trading_date, on_complete: on_complete(
+                "success",
+                4,
+                {"source_rows": 4, "failed_rows": 0},
+            ),
+        )
+        recorder._backfill_trades = MagicMock(
+            side_effect=lambda trading_date, on_complete: on_complete(
+                "success",
+                5,
+                {"source_rows": 5, "failed_rows": 0},
+            ),
+        )
+
+        SnapshotRecorder._run_after_trading(
+            recorder,
+            date(2026, 7, 8),
+            allow_fallback=False,
+            report_tasks=True,
+        )
+
+        self.assertEqual(reporter.call_count, 5)
+        self.assertEqual(
+            {item.args[0] for item in reporter.call_args_list},
+            {
+                "SNAPSHOT-AFTER-TRADING/live_stock_tick_snapshot",
+                "SNAPSHOT-AFTER-TRADING/live_asset_snapshot",
+                "SNAPSHOT-AFTER-TRADING/live_position_snapshot",
+                "SNAPSHOT-AFTER-TRADING/live_order",
+                "SNAPSHOT-AFTER-TRADING/live_trade",
+            },
+        )
+        reports = {
+            item.args[2]["table"]: (item.args[1], item.args[2]["rows"])
+            for item in reporter.call_args_list
+        }
+        self.assertEqual(
+            reports,
+            {
+                "live_stock_tick_snapshot": ("success", 1),
+                "live_asset_snapshot": ("success", 1),
+                "live_position_snapshot": ("success", 3),
+                "live_order": ("success", 4),
+                "live_trade": ("success", 5),
+            },
+        )
+
     def test_record_stock_ticks_writes_only_held_instruments(self) -> None:
         writer = SimpleNamespace(write_stock_tick_snapshots=MagicMock())
         strategy = SimpleNamespace(
@@ -1080,7 +1186,13 @@ class TargetLiveConfigTest(unittest.TestCase):
             "000002.SZ.QMT": {"open": 20.00},
         }
 
-        SnapshotRecorder._record_stock_ticks(recorder, date(2026, 7, 8), snapshot)
+        completed = MagicMock()
+        SnapshotRecorder._record_stock_ticks(
+            recorder,
+            date(2026, 7, 8),
+            snapshot,
+            on_complete=completed,
+        )
 
         records = writer.write_stock_tick_snapshots.call_args.args[0]
         self.assertEqual(len(records), 1)
@@ -1091,6 +1203,15 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(record.volume, 800766)
         self.assertEqual(record.pvolume, 80076623)
         self.assertEqual(record.last_settlement_price, Decimal("10.84"))
+        completed.assert_called_once_with(
+            "success",
+            1,
+            {
+                "held_instruments": 1,
+                "source_instruments": 2,
+                "missing_instruments": 0,
+            },
+        )
 
     def test_position_fetch_schedules_awaitable_on_running_loop(self) -> None:
         recorder = SimpleNamespace()
@@ -1113,6 +1234,65 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder._on_position_fetch_done.assert_called_once()
         task = recorder._on_position_fetch_done.call_args.args[0]
         self.assertEqual(task.result(), {"000720.SZ.QMT": {"market_value": "466506.00"}})
+
+    def test_full_tick_await_failure_reports_task_failure_without_running_loop(self) -> None:
+        async def fail_fetch() -> dict[str, Any]:
+            raise RuntimeError("full-tick unavailable")
+
+        recorder = SimpleNamespace(
+            _fetch_full_tick=fail_fetch,
+            _await=lambda awaitable: SnapshotRecorder._await(recorder, awaitable),
+            log=MagicMock(),
+        )
+        failed = MagicMock()
+
+        SnapshotRecorder._run_full_tick_fetch(recorder, on_failed=failed)
+
+        failed.assert_called_once_with("full-tick unavailable")
+
+    def test_full_tick_apply_failure_reports_task_failure(self) -> None:
+        recorder = SimpleNamespace(
+            _strategy=SimpleNamespace(
+                apply_full_tick_snapshot=MagicMock(
+                    side_effect=RuntimeError("invalid full-tick payload"),
+                ),
+            ),
+            log=MagicMock(),
+        )
+        failed = MagicMock()
+
+        SnapshotRecorder._apply_full_tick(
+            recorder,
+            {"000001.SZ.QMT": {"open": 10.0}},
+            on_failed=failed,
+        )
+
+        failed.assert_called_once_with("invalid full-tick payload")
+
+    def test_backfill_reporting_does_not_mutate_sink_stats(self) -> None:
+        stats = {
+            "written_rows": 2,
+            "source_rows": 3,
+            "skipped_rows": 1,
+            "failed_rows": 0,
+        }
+        completed = MagicMock()
+        recorder = SimpleNamespace(log=MagicMock())
+
+        SnapshotRecorder._invoke_sink(
+            recorder,
+            [{}, {}, {}],
+            lambda rows: stats,
+            "order",
+            on_complete=completed,
+        )
+
+        self.assertEqual(stats["written_rows"], 2)
+        completed.assert_called_once_with(
+            "success",
+            2,
+            {"source_rows": 3, "skipped_rows": 1, "failed_rows": 0},
+        )
 
     def test_order_event_truncates_reason_for_live_order_but_keeps_full_payload(self) -> None:
         writer = SimpleNamespace(upsert_order=MagicMock())

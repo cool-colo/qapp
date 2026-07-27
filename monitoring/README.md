@@ -50,6 +50,15 @@ for daily target processing, model-data refresh, pre-open reconciliation,
 full-tick prefetch, and the before/after-trading snapshot timers. High-frequency
 convergence, full-tick refresh, and metrics timers are not sent.
 
+Snapshot timer summaries are emitted per database synchronization task instead
+of as one phase-level success message. Before trading, the tasks cover
+`live_asset_snapshot`, `live_position_snapshot`, and `live_target_portfolio`.
+After trading, they cover `live_stock_tick_snapshot`, `live_asset_snapshot`,
+`live_position_snapshot`, `live_order`, and `live_trade`. Each message includes
+the table name, rows written, task status, trading date, snapshot type, configured
+time, and relevant source/skipped/failed counts. A phase-level failure message is
+retained for unexpected timer-handler exceptions.
+
 Configure the deployment through an explicit env file:
 
 ```dotenv

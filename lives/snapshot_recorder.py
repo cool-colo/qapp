@@ -54,6 +54,9 @@ from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveTradeRecord
 
 
+SyncTaskCallback = Callable[[str, int, dict[str, Any]], None]
+
+
 class SnapshotRecorderConfig(ActorConfig, frozen=True):
     account_id: str
     trader_id: str
@@ -169,7 +172,7 @@ class SnapshotRecorder(Actor):
         except Exception as exc:
             self.log.warning(f"snapshot before-trading full-tick fetch failed: {exc}")
         try:
-            self._run_before_trading(today, allow_fallback=False)
+            self._run_before_trading(today, allow_fallback=False, report_tasks=True)
         except Exception as exc:
             self._report_event(
                 self._BEFORE_ALERT,
@@ -178,23 +181,13 @@ class SnapshotRecorder(Actor):
                 {"trading_date": today, "snapshot_type": BEFORE_TRADING, "error": str(exc)},
             )
             raise
-        self._report_event(
-            self._BEFORE_ALERT,
-            "processed",
-            started,
-            {
-                "trading_date": today,
-                "snapshot_type": BEFORE_TRADING,
-                "configured_time": self.config.before_time,
-            },
-        )
 
     def _on_after_timer(self, _event: Any) -> None:
         started = time.monotonic()
         self._schedule_daily(self._AFTER_ALERT, self._after_time, self._on_after_timer)
         today = self._now().date()
         try:
-            self._run_after_trading(today, allow_fallback=False)
+            self._run_after_trading(today, allow_fallback=False, report_tasks=True)
         except Exception as exc:
             self._report_event(
                 self._AFTER_ALERT,
@@ -203,16 +196,6 @@ class SnapshotRecorder(Actor):
                 {"trading_date": today, "snapshot_type": AFTER_TRADING, "error": str(exc)},
             )
             raise
-        self._report_event(
-            self._AFTER_ALERT,
-            "processed",
-            started,
-            {
-                "trading_date": today,
-                "snapshot_type": AFTER_TRADING,
-                "configured_time": self.config.after_time,
-            },
-        )
 
     def _report_event(
         self,
@@ -230,6 +213,29 @@ class SnapshotRecorder(Actor):
         except Exception as exc:
             self.log.warning(f"Could not queue DingTalk event {event_name}: {exc}")
 
+    def _sync_task_callback(
+        self,
+        event_name: str,
+        table: str,
+        trading_date: date,
+        snapshot_type: str,
+        configured_time: str,
+    ) -> SyncTaskCallback:
+        started = time.monotonic()
+
+        def _completed(status: str, rows: int, details: dict[str, Any]) -> None:
+            summary = {
+                "table": table,
+                "rows": rows,
+                "trading_date": trading_date,
+                "snapshot_type": snapshot_type,
+                "configured_time": configured_time,
+            }
+            summary.update(details)
+            self._report_event(f"{event_name}/{table}", status, started, summary)
+
+        return _completed
+
     def _schedule_keepalive(self) -> None:  # retained as a no-op for backward compat
         # Removed: the MySQL connection pool (LiveSnapshotWriter, SQLAlchemy QueuePool
         # with pool_pre_ping) now owns connection health. Each DB op checks out its own
@@ -240,11 +246,42 @@ class SnapshotRecorder(Actor):
 
     # ---- phase runners -------------------------------------------------------
 
-    def _run_before_trading(self, trading_date: date, allow_fallback: bool) -> None:
+    def _run_before_trading(
+        self,
+        trading_date: date,
+        allow_fallback: bool,
+        report_tasks: bool = False,
+    ) -> None:
         source = SOURCE_FALLBACK if allow_fallback and not self._within_trading_window() else SOURCE_LIVE
-        asset_id = self._record_asset(trading_date, BEFORE_TRADING, source)
-        self._record_positions(trading_date, BEFORE_TRADING, source)
-        self._ensure_daily_target(trading_date, BEFORE_TRADING, asset_id)
+        callback = lambda table: (
+            self._sync_task_callback(
+                self._BEFORE_ALERT,
+                table,
+                trading_date,
+                BEFORE_TRADING,
+                self.config.before_time,
+            )
+            if report_tasks
+            else None
+        )
+        asset_id = self._record_asset(
+            trading_date,
+            BEFORE_TRADING,
+            source,
+            on_complete=callback("live_asset_snapshot"),
+        )
+        self._record_positions(
+            trading_date,
+            BEFORE_TRADING,
+            source,
+            on_complete=callback("live_position_snapshot"),
+        )
+        self._ensure_daily_target(
+            trading_date,
+            BEFORE_TRADING,
+            asset_id,
+            on_complete=callback("live_target_portfolio"),
+        )
 
     def _run_continuous_trading(self, trading_date: date, allow_fallback: bool = False) -> None:
         source = SOURCE_FALLBACK if allow_fallback and not self._within_trading_window() else SOURCE_LIVE
@@ -254,31 +291,89 @@ class SnapshotRecorder(Actor):
         # target if before-trading never ran (e.g. started mid-session same day).
         self._ensure_daily_target(trading_date, CONTINUOUS_TRADING, asset_id)
 
-    def _run_after_trading(self, trading_date: date, allow_fallback: bool) -> None:
+    def _run_after_trading(
+        self,
+        trading_date: date,
+        allow_fallback: bool,
+        report_tasks: bool = False,
+    ) -> None:
         source = SOURCE_FALLBACK if allow_fallback else SOURCE_LIVE
+        callback = lambda table: (
+            self._sync_task_callback(
+                self._AFTER_ALERT,
+                table,
+                trading_date,
+                AFTER_TRADING,
+                self.config.after_time,
+            )
+            if report_tasks
+            else None
+        )
+        tick_callback = callback("live_stock_tick_snapshot")
+
+        def _record_ticks(snapshot: dict[str, Any]) -> None:
+            if tick_callback is None:
+                self._record_stock_ticks(trading_date, snapshot)
+            else:
+                self._record_stock_ticks(
+                    trading_date,
+                    snapshot,
+                    on_complete=tick_callback,
+                )
+
         self._run_full_tick_fetch(
             trigger=AFTER_TRADING,
-            on_applied=lambda snapshot: self._record_stock_ticks(trading_date, snapshot),
+            on_applied=_record_ticks,
+            on_failed=(
+                None
+                if tick_callback is None
+                else lambda error: tick_callback("failed", 0, {"error": error})
+            ),
         )
-        self._record_asset(trading_date, AFTER_TRADING, source)
-        self._record_positions(trading_date, AFTER_TRADING, source)
+        asset_id = self._record_asset(
+            trading_date,
+            AFTER_TRADING,
+            source,
+            on_complete=callback("live_asset_snapshot"),
+        )
+        self._record_positions(
+            trading_date,
+            AFTER_TRADING,
+            source,
+            on_complete=callback("live_position_snapshot"),
+        )
         # Reconstruct today's order/trade rows from the QMT broker lists. The live
         # msgbus path may have missed or mis-recorded them; QMT is authoritative after
         # close, so these upserts (idempotent on client_order_id / trade_id) overwrite
         # whatever the live path left behind.
-        self._backfill_orders(trading_date)
-        self._backfill_trades(trading_date)
+        self._backfill_orders(
+            trading_date,
+            on_complete=callback("live_order"),
+        )
+        self._backfill_trades(
+            trading_date,
+            on_complete=callback("live_trade"),
+        )
 
     # ---- asset snapshot ------------------------------------------------------
 
-    def _record_asset(self, trading_date: date, snapshot_type: str, source: str) -> int | None:
+    def _record_asset(
+        self,
+        trading_date: date,
+        snapshot_type: str,
+        source: str,
+        on_complete: SyncTaskCallback | None = None,
+    ) -> int | None:
         try:
             if self._writer.has_asset_snapshot(
                 self.config.account_id, self.config.trader_id, trading_date, snapshot_type,
             ):
-                return self._writer.asset_snapshot_id(
+                row_id = self._writer.asset_snapshot_id(
                     self.config.account_id, self.config.trader_id, trading_date, snapshot_type,
                 )
+                if on_complete is not None:
+                    on_complete("skipped", 0, {"reason": "already exists", "row_id": row_id})
+                return row_id
         except Exception as exc:
             self.log.warning(f"asset snapshot existence check failed: {exc}")
         account = self._first_account()
@@ -323,9 +418,14 @@ class SnapshotRecorder(Actor):
             created_at=self._now_naive(),
         )
         try:
-            return self._writer.write_asset_snapshot(record)
+            row_id = self._writer.write_asset_snapshot(record)
+            if on_complete is not None:
+                on_complete("success", 1, {"row_id": row_id})
+            return row_id
         except Exception as exc:
             self.log.warning(f"asset snapshot write failed ({snapshot_type}): {exc}")
+            if on_complete is not None:
+                on_complete("failed", 0, {"error": str(exc)})
             return None
 
     # Warn past this relative gap between total_asset and its components. A healthy
@@ -365,11 +465,31 @@ class SnapshotRecorder(Actor):
 
     # ---- position snapshot ---------------------------------------------------
 
-    def _record_positions(self, trading_date: date, snapshot_type: str, source: str) -> None:
-        broker_positions = self._run_position_fetch(trading_date, snapshot_type, source)
+    def _record_positions(
+        self,
+        trading_date: date,
+        snapshot_type: str,
+        source: str,
+        on_complete: SyncTaskCallback | None = None,
+    ) -> None:
+        broker_positions = self._run_position_fetch(
+            trading_date,
+            snapshot_type,
+            source,
+            on_complete=on_complete,
+        )
         if broker_positions is None:
             return
-        self._record_positions_with_broker(trading_date, snapshot_type, source, broker_positions)
+        if on_complete is None:
+            self._record_positions_with_broker(trading_date, snapshot_type, source, broker_positions)
+        else:
+            self._record_positions_with_broker(
+                trading_date,
+                snapshot_type,
+                source,
+                broker_positions,
+                on_complete=on_complete,
+            )
 
     def _record_positions_with_broker(
         self,
@@ -377,6 +497,7 @@ class SnapshotRecorder(Actor):
         snapshot_type: str,
         source: str,
         broker_positions: dict[str, dict[str, Any]],
+        on_complete: SyncTaskCallback | None = None,
     ) -> None:
         records: list[LivePositionSnapshotRecord] = []
         for position in self._open_positions():
@@ -435,16 +556,46 @@ class SnapshotRecorder(Actor):
                 ),
             )
         if not records:
+            if on_complete is not None:
+                on_complete(
+                    "success",
+                    0,
+                    {"broker_positions": len(broker_positions)},
+                )
             return
         try:
             self._writer.write_position_snapshots(records)
+            if on_complete is not None:
+                on_complete(
+                    "success",
+                    len(records),
+                    {"broker_positions": len(broker_positions)},
+                )
         except Exception as exc:
             self.log.warning(f"position snapshot write failed ({snapshot_type}): {exc}")
+            if on_complete is not None:
+                on_complete(
+                    "failed",
+                    0,
+                    {
+                        "attempted_rows": len(records),
+                        "broker_positions": len(broker_positions),
+                        "error": str(exc),
+                    },
+                )
 
     # ---- daily target (frozen shares) ---------------------------------------
 
-    def _ensure_daily_target(self, trading_date: date, snapshot_type: str, asset_id: int | None) -> None:
+    def _ensure_daily_target(
+        self,
+        trading_date: date,
+        snapshot_type: str,
+        asset_id: int | None,
+        on_complete: SyncTaskCallback | None = None,
+    ) -> None:
         if trading_date in self._applied_target_dates:
+            if on_complete is not None:
+                on_complete("skipped", 0, {"reason": "already applied in this process"})
             return
         signal_date = self._resolve_signal_date(trading_date)
         # Reuse a persisted target for the (account, trader, date, signal_date)
@@ -454,8 +605,20 @@ class SnapshotRecorder(Actor):
         if loaded:
             self._apply_loaded_target(trading_date, loaded)
             self._applied_target_dates.add(trading_date)
+            if on_complete is not None:
+                on_complete(
+                    "skipped",
+                    0,
+                    {"reason": "loaded existing target", "existing_rows": len(loaded)},
+                )
             return
-        self._generate_and_persist_target(trading_date, snapshot_type, signal_date, asset_id)
+        self._generate_and_persist_target(
+            trading_date,
+            snapshot_type,
+            signal_date,
+            asset_id,
+            on_complete=on_complete,
+        )
         self._applied_target_dates.add(trading_date)
 
     def _generate_and_persist_target(
@@ -464,11 +627,14 @@ class SnapshotRecorder(Actor):
         snapshot_type: str,
         signal_date: date | None,
         asset_id: int | None,
+        on_complete: SyncTaskCallback | None = None,
     ) -> None:
         try:
             plan = self._strategy.compute_daily_target_plan(trading_date)
         except Exception as exc:
             self.log.warning(f"daily target plan computation failed: {exc}")
+            if on_complete is not None:
+                on_complete("failed", 0, {"error": str(exc)})
             return
         # Raw total asset and the buffer-adjusted investable basis both come from the
         # plan (stamped by the strategy when it built the request) so the persisted
@@ -532,8 +698,26 @@ class SnapshotRecorder(Actor):
         if records:
             try:
                 self._writer.write_target_portfolios(records)
+                if on_complete is not None:
+                    on_complete(
+                        "success",
+                        len(records),
+                        {"signal_date": plan_signal_date},
+                    )
             except Exception as exc:
                 self.log.warning(f"target portfolio write failed: {exc}")
+                if on_complete is not None:
+                    on_complete(
+                        "failed",
+                        0,
+                        {
+                            "attempted_rows": len(records),
+                            "signal_date": plan_signal_date,
+                            "error": str(exc),
+                        },
+                    )
+        elif on_complete is not None:
+            on_complete("success", 0, {"signal_date": plan_signal_date})
         self._apply_target(trading_date, target_qty, plan.reason, version)
         self.log.info(
             f"generated & persisted daily target: date={trading_date} signal_date={plan_signal_date} "
@@ -732,23 +916,38 @@ class SnapshotRecorder(Actor):
         self,
         trigger: str = "snapshot",
         on_applied: Callable[[dict[str, Any]], None] | None = None,
+        on_failed: Callable[[str], None] | None = None,
     ) -> None:
         if self._fetch_full_tick is None:
+            if on_failed is not None:
+                on_failed("full-tick source is not configured")
             return
-        result = self._fetch_full_tick()
+        try:
+            result = self._fetch_full_tick()
+        except Exception as exc:
+            self.log.warning(f"snapshot full-tick fetch failed: {exc}")
+            if on_failed is not None:
+                on_failed(str(exc))
+            return
         if inspect.isawaitable(result):
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
-                result = asyncio.run(self._await(result))
+                try:
+                    result = asyncio.run(self._await(result))
+                except Exception as exc:
+                    self.log.warning(f"snapshot full-tick await failed: {exc}")
+                    if on_failed is not None:
+                        on_failed(str(exc))
+                    return
             else:
                 # Fire-and-forget; the strategy also refreshes opens on its own timer.
                 asyncio.ensure_future(
-                    self._apply_full_tick_async(result, trigger, on_applied),
+                    self._apply_full_tick_async(result, trigger, on_applied, on_failed),
                     loop=loop,
                 )
                 return
-        self._apply_full_tick(result, trigger, on_applied)
+        self._apply_full_tick(result, trigger, on_applied, on_failed)
 
     async def _await(self, awaitable: Any) -> Any:
         return await awaitable
@@ -758,19 +957,23 @@ class SnapshotRecorder(Actor):
         awaitable: Any,
         trigger: str,
         on_applied: Callable[[dict[str, Any]], None] | None,
+        on_failed: Callable[[str], None] | None,
     ) -> None:
         try:
             snapshot = await awaitable
         except Exception as exc:
             self.log.warning(f"snapshot full-tick await failed: {exc}")
+            if on_failed is not None:
+                on_failed(str(exc))
             return
-        self._apply_full_tick(snapshot, trigger, on_applied)
+        self._apply_full_tick(snapshot, trigger, on_applied, on_failed)
 
     def _run_position_fetch(
         self,
         trading_date: date,
         snapshot_type: str,
         source: str,
+        on_complete: SyncTaskCallback | None = None,
     ) -> dict[str, dict[str, Any]] | None:
         if self._fetch_positions is None:
             return {}
@@ -778,6 +981,9 @@ class SnapshotRecorder(Actor):
             result = self._fetch_positions()
         except Exception as exc:
             self.log.warning(f"snapshot broker-position fetch failed: {exc}")
+            if on_complete is not None:
+                on_complete("failed", 0, {"error": str(exc)})
+                return None
             return {}
         if inspect.isawaitable(result):
             try:
@@ -787,6 +993,9 @@ class SnapshotRecorder(Actor):
                     result = asyncio.run(self._await(result))
                 except Exception as exc:
                     self.log.warning(f"snapshot broker-position fetch failed: {exc}")
+                    if on_complete is not None:
+                        on_complete("failed", 0, {"error": str(exc)})
+                        return None
                     return {}
             else:
                 task = asyncio.ensure_future(result, loop=loop)
@@ -796,6 +1005,7 @@ class SnapshotRecorder(Actor):
                         trading_date,
                         snapshot_type,
                         source,
+                        on_complete,
                     ),
                 )
                 return None
@@ -807,43 +1017,79 @@ class SnapshotRecorder(Actor):
         trading_date: date,
         snapshot_type: str,
         source: str,
+        on_complete: SyncTaskCallback | None = None,
     ) -> None:
         try:
             result = task.result()
         except Exception as exc:
             self.log.warning(f"snapshot broker-position fetch failed: {exc}")
+            if on_complete is not None:
+                on_complete("failed", 0, {"error": str(exc)})
+                return
             result = {}
         try:
-            self._record_positions_with_broker(
-                trading_date,
-                snapshot_type,
-                source,
-                result if isinstance(result, dict) else {},
-            )
+            broker_positions = result if isinstance(result, dict) else {}
+            if on_complete is None:
+                self._record_positions_with_broker(
+                    trading_date,
+                    snapshot_type,
+                    source,
+                    broker_positions,
+                )
+            else:
+                self._record_positions_with_broker(
+                    trading_date,
+                    snapshot_type,
+                    source,
+                    broker_positions,
+                    on_complete=on_complete,
+                )
         except Exception as exc:
             self.log.warning(f"position snapshot async write failed ({snapshot_type}): {exc}")
+            if on_complete is not None:
+                on_complete("failed", 0, {"error": str(exc)})
 
     # ---- order / trade backfill (QMT authoritative, after close) -------------
 
-    def _backfill_orders(self, trading_date: date) -> None:
+    def _backfill_orders(
+        self,
+        trading_date: date,
+        on_complete: SyncTaskCallback | None = None,
+    ) -> None:
         if self._fetch_orders is None:
+            if on_complete is not None:
+                on_complete("skipped", 0, {"reason": "broker order source is not configured"})
             return
         self._resolve_list_fetch(
             self._fetch_orders,
             lambda rows: self._write_backfilled_orders(trading_date, rows),
             "order",
+            on_complete=on_complete,
         )
 
-    def _backfill_trades(self, trading_date: date) -> None:
+    def _backfill_trades(
+        self,
+        trading_date: date,
+        on_complete: SyncTaskCallback | None = None,
+    ) -> None:
         if self._fetch_trades is None:
+            if on_complete is not None:
+                on_complete("skipped", 0, {"reason": "broker trade source is not configured"})
             return
         self._resolve_list_fetch(
             self._fetch_trades,
             lambda rows: self._write_backfilled_trades(trading_date, rows),
             "trade",
+            on_complete=on_complete,
         )
 
-    def _resolve_list_fetch(self, fetch: Any, sink: Any, label: str) -> None:
+    def _resolve_list_fetch(
+        self,
+        fetch: Any,
+        sink: Any,
+        label: str,
+        on_complete: SyncTaskCallback | None = None,
+    ) -> None:
         """
         Call ``fetch`` (which may return a list or an awaitable), then hand the resulting
         list of broker dicts to ``sink``. Mirrors _run_position_fetch's async handling so
@@ -853,6 +1099,8 @@ class SnapshotRecorder(Actor):
             result = fetch()
         except Exception as exc:
             self.log.warning(f"snapshot broker-{label} fetch failed: {exc}")
+            if on_complete is not None:
+                on_complete("failed", 0, {"error": str(exc)})
             return
         if inspect.isawaitable(result):
             try:
@@ -862,67 +1110,125 @@ class SnapshotRecorder(Actor):
                     result = asyncio.run(self._await(result))
                 except Exception as exc:
                     self.log.warning(f"snapshot broker-{label} fetch failed: {exc}")
+                    if on_complete is not None:
+                        on_complete("failed", 0, {"error": str(exc)})
                     return
             else:
                 task = asyncio.ensure_future(result, loop=loop)
                 task.add_done_callback(
-                    lambda done: self._on_list_fetch_done(done, sink, label),
+                    lambda done: self._on_list_fetch_done(
+                        done,
+                        sink,
+                        label,
+                        on_complete,
+                    ),
                 )
                 return
-        self._invoke_sink(result, sink, label)
+        self._invoke_sink(result, sink, label, on_complete=on_complete)
 
-    def _on_list_fetch_done(self, task: asyncio.Future[Any], sink: Any, label: str) -> None:
+    def _on_list_fetch_done(
+        self,
+        task: asyncio.Future[Any],
+        sink: Any,
+        label: str,
+        on_complete: SyncTaskCallback | None = None,
+    ) -> None:
         try:
             result = task.result()
         except Exception as exc:
             self.log.warning(f"snapshot broker-{label} fetch failed: {exc}")
+            if on_complete is not None:
+                on_complete("failed", 0, {"error": str(exc)})
             return
-        self._invoke_sink(result, sink, label)
+        self._invoke_sink(result, sink, label, on_complete=on_complete)
 
-    def _invoke_sink(self, result: Any, sink: Any, label: str) -> None:
+    def _invoke_sink(
+        self,
+        result: Any,
+        sink: Any,
+        label: str,
+        on_complete: SyncTaskCallback | None = None,
+    ) -> None:
         rows = result if isinstance(result, list) else []
         try:
-            sink(rows)
+            stats = sink(rows)
         except Exception as exc:
             self.log.warning(f"snapshot broker-{label} backfill write failed: {exc}")
+            if on_complete is not None:
+                on_complete(
+                    "failed",
+                    0,
+                    {"source_rows": len(rows), "error": str(exc)},
+                )
+            return
+        if on_complete is not None:
+            details = dict(stats) if isinstance(stats, dict) else {"source_rows": len(rows)}
+            written_rows = int(details.pop("written_rows", 0))
+            failed_rows = int(details.get("failed_rows", 0))
+            on_complete(
+                "partial_failure" if failed_rows else "success",
+                written_rows,
+                details,
+            )
 
-    def _write_backfilled_orders(self, trading_date: date, rows: list[Any]) -> None:
+    def _write_backfilled_orders(self, trading_date: date, rows: list[Any]) -> dict[str, int]:
         # Resolve open prices synchronously for exactly the stocks in these orders, once
         # the full order list is known (authoritative full-tick open per instrument, no
         # universe coverage gap, no reliance on the async _today_open).
         open_prices = self._backfill_open_prices(rows)
         count = 0
+        skipped = 0
+        failed = 0
         for row in rows:
             record = self._order_record_from_broker(trading_date, row, open_prices)
             if record is None:
+                skipped += 1
                 continue
             try:
                 self._writer.upsert_order(record)
                 count += 1
             except Exception as exc:
+                failed += 1
                 self.log.warning(f"backfilled order upsert failed: {exc}")
         if count:
             self.log.info(
                 f"backfilled {count} order(s) from QMT for {trading_date}",
                 color=LogColor.GREEN,
             )
+        return {
+            "written_rows": count,
+            "source_rows": len(rows),
+            "skipped_rows": skipped,
+            "failed_rows": failed,
+            "open_prices": len(open_prices),
+        }
 
-    def _write_backfilled_trades(self, trading_date: date, rows: list[Any]) -> None:
+    def _write_backfilled_trades(self, trading_date: date, rows: list[Any]) -> dict[str, int]:
         count = 0
+        skipped = 0
+        failed = 0
         for row in rows:
             record = self._trade_record_from_broker(trading_date, row)
             if record is None:
+                skipped += 1
                 continue
             try:
                 self._writer.upsert_trade(record)
                 count += 1
             except Exception as exc:
+                failed += 1
                 self.log.warning(f"backfilled trade upsert failed: {exc}")
         if count:
             self.log.info(
                 f"backfilled {count} trade(s) from QMT for {trading_date}",
                 color=LogColor.GREEN,
             )
+        return {
+            "written_rows": count,
+            "source_rows": len(rows),
+            "skipped_rows": skipped,
+            "failed_rows": failed,
+        }
 
     def _order_record_from_broker(
         self,
@@ -1085,14 +1391,29 @@ class SnapshotRecorder(Actor):
         snapshot: Any,
         trigger: str = "snapshot",
         on_applied: Callable[[dict[str, Any]], None] | None = None,
+        on_failed: Callable[[str], None] | None = None,
     ) -> None:
         if not isinstance(snapshot, dict) or not snapshot:
+            if on_failed is not None:
+                on_failed("full-tick snapshot is empty or invalid")
             return
-        self._strategy.apply_full_tick_snapshot(snapshot, trigger)
-        if on_applied is not None:
-            on_applied(snapshot)
+        try:
+            self._strategy.apply_full_tick_snapshot(snapshot, trigger)
+            if on_applied is not None:
+                on_applied(snapshot)
+        except Exception as exc:
+            self.log.warning(f"snapshot full-tick apply failed: {exc}")
+            if on_failed is not None:
+                on_failed(str(exc))
+                return
+            raise
 
-    def _record_stock_ticks(self, trading_date: date, snapshot: dict[str, Any]) -> None:
+    def _record_stock_ticks(
+        self,
+        trading_date: date,
+        snapshot: dict[str, Any],
+        on_complete: SyncTaskCallback | None = None,
+    ) -> None:
         held_instrument_ids = {
             str(position.instrument_id)
             for position in self._open_positions()
@@ -1101,6 +1422,12 @@ class SnapshotRecorder(Actor):
             self.log.warning(
                 f"after-trading full-tick snapshot has no held instruments: {snapshot.keys()}",
             )
+            if on_complete is not None:
+                on_complete(
+                    "skipped",
+                    0,
+                    {"reason": "no held instruments", "source_instruments": len(snapshot)},
+                )
             return
         missing = sorted(held_instrument_ids.difference(snapshot))
         if missing:
@@ -1142,11 +1469,43 @@ class SnapshotRecorder(Actor):
                 ),
             )
         if not records:
+            if on_complete is not None:
+                on_complete(
+                    "success",
+                    0,
+                    {
+                        "held_instruments": len(held_instrument_ids),
+                        "source_instruments": len(snapshot),
+                        "missing_instruments": len(missing),
+                    },
+                )
             return
         try:
             self._writer.write_stock_tick_snapshots(records)
+            if on_complete is not None:
+                on_complete(
+                    "success",
+                    len(records),
+                    {
+                        "held_instruments": len(held_instrument_ids),
+                        "source_instruments": len(snapshot),
+                        "missing_instruments": len(missing),
+                    },
+                )
         except Exception as exc:
             self.log.warning(f"stock tick snapshot write failed ({AFTER_TRADING}): {exc}")
+            if on_complete is not None:
+                on_complete(
+                    "failed",
+                    0,
+                    {
+                        "attempted_rows": len(records),
+                        "held_instruments": len(held_instrument_ids),
+                        "source_instruments": len(snapshot),
+                        "missing_instruments": len(missing),
+                        "error": str(exc),
+                    },
+                )
 
     # ---- strategy / portfolio readers ---------------------------------------
 
