@@ -21,13 +21,11 @@ class ExecutionStateReconciler:
 
     def __init__(
         self,
-        clock: Any,
-        log: Any,
         timezone_name: str,
         async_scheduler: AsyncAwaitableScheduler,
     ) -> None:
-        self._clock = clock
-        self._log = log
+        self._clock: Any | None = None
+        self._log: Any | None = None
         self._timezone_name = timezone_name
         self._async_scheduler = async_scheduler
         self._reconcile: Callable[..., Any] | None = None
@@ -35,6 +33,11 @@ class ExecutionStateReconciler:
         self._timeout_secs = 30.0
         self._task: asyncio.Future[Any] | ConcurrentFuture[Any] | None = None
         self._venue_sellable: dict[str, Decimal] = {}
+
+    def bind_runtime(self, clock: Any, log: Any) -> None:
+        """Bind dependencies installed by Nautilus when the strategy is registered."""
+        self._clock = clock
+        self._log = log
 
     def configure(
         self,
@@ -50,22 +53,25 @@ class ExecutionStateReconciler:
         self._timeout_secs = float(timeout_secs)
 
     def schedule_daily(self) -> None:
+        clock = self._runtime_clock()
+        log = self._runtime_log()
         alert_time = self._next_daily_time()
-        self._clock.set_time_alert(
+        clock.set_time_alert(
             name=self.PRE_OPEN_ALERT,
             alert_time=alert_time,
             callback=self._on_timer,
             override=True,
         )
-        self._log.info(
+        log.info(
             f"Next pre-open execution-state reconciliation scheduled for {alert_time.isoformat()} "
             f"({self._timezone_name})",
             color=LogColor.BLUE,
         )
 
     def run(self) -> None:
+        log = self._runtime_log()
         if self._task is not None and not self._task.done():
-            self._log.warning(
+            log.warning(
                 "Previous pre-open execution-state reconciliation is still running; skipping",
             )
             return
@@ -74,14 +80,14 @@ class ExecutionStateReconciler:
         try:
             result = self._reconcile(timeout_secs=self._timeout_secs)
         except Exception as exc:
-            self._log.warning(
+            log.warning(
                 f"Pre-open execution-state reconciliation failed to start: {exc}",
             )
             return
         if inspect.isawaitable(result):
             self._task = self._async_scheduler.schedule(result)
             self._task.add_done_callback(self._on_done)
-            self._log.info(
+            log.info(
                 "Started pre-open execution-state reconciliation",
                 color=LogColor.BLUE,
             )
@@ -90,13 +96,14 @@ class ExecutionStateReconciler:
 
     def subscribe_mass_status(self, venue: Any, msgbus: Any) -> None:
         """Subscribe to reconciled execution reports for broker sellable quantities."""
+        log = self._runtime_log()
         try:
             msgbus.subscribe(
                 topic=f"reports.execution.{venue}",
                 handler=self.update_from_mass_status,
             )
         except Exception as exc:  # pragma: no cover - defensive for backtests
-            self._log.warning(f"Could not subscribe to execution mass status: {exc}")
+            log.warning(f"Could not subscribe to execution mass status: {exc}")
 
     def update_from_mass_status(self, mass_status: Any) -> None:
         """Replace broker sellable quantities from one execution mass-status report."""
@@ -116,7 +123,7 @@ class ExecutionStateReconciler:
                 except Exception:
                     continue
         self._venue_sellable = sellable
-        self._log.info(
+        self._runtime_log().info(
             f"Updated broker sellable map from mass status: instruments={len(sellable)}",
             color=LogColor.BLUE,
         )
@@ -136,30 +143,45 @@ class ExecutionStateReconciler:
         try:
             result = task.result()
         except Exception as exc:
-            self._log.warning(f"Pre-open execution-state reconciliation failed: {exc}")
+            self._runtime_log().warning(
+                f"Pre-open execution-state reconciliation failed: {exc}",
+            )
             return
         self._log_result(bool(result))
 
     def _log_result(self, succeeded: bool) -> None:
+        log = self._runtime_log()
         if succeeded:
-            self._log.info(
+            log.info(
                 "Pre-open execution-state reconciliation succeeded",
                 color=LogColor.GREEN,
             )
         else:
-            self._log.warning(
+            log.warning(
                 "Pre-open execution-state reconciliation did not complete successfully",
             )
 
     def _next_daily_time(self) -> pd.Timestamp:
         if self._reconcile_time is None:
             raise RuntimeError("execution-state reconciliation is not configured")
-        now = pd.Timestamp(self._clock.utc_now()).tz_convert(self._timezone_name)
+        now = pd.Timestamp(self._runtime_clock().utc_now()).tz_convert(
+            self._timezone_name,
+        )
         hh, mm = self._reconcile_time
         target = now.normalize() + pd.Timedelta(hours=hh, minutes=mm)
         if target <= now:
             target = target + pd.Timedelta(days=1)
         return target
+
+    def _runtime_clock(self) -> Any:
+        if self._clock is None:
+            raise RuntimeError("execution-state reconciler runtime clock is not bound")
+        return self._clock
+
+    def _runtime_log(self) -> Any:
+        if self._log is None:
+            raise RuntimeError("execution-state reconciler runtime log is not bound")
+        return self._log
 
     @staticmethod
     def _parse_hh_mm(value: str | None) -> tuple[int, int] | None:

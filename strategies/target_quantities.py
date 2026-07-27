@@ -294,8 +294,6 @@ class TargetQuantityStrategy(Strategy):
         self._convergence_suspended = False
         self._async_scheduler = AsyncAwaitableScheduler()
         self._execution_state_reconciler = ExecutionStateReconciler(
-            clock=self.clock,
-            log=self.log,
             timezone_name=config.timezone_name,
             async_scheduler=self._async_scheduler,
         )
@@ -338,6 +336,10 @@ class TargetQuantityStrategy(Strategy):
 
     def on_start(self) -> None:
         self._async_scheduler.capture_running_loop()
+        self._execution_state_reconciler.bind_runtime(
+            clock=self.clock,
+            log=self.log,
+        )
         self.log.info(
             f"target-weight executor start: instruments={len(self._instrument_ids)} "
             f"bar_types={len(self._bar_types)} target_version={self._target_version or '<none>'}",

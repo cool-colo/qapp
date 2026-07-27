@@ -502,10 +502,12 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._converge_lock = threading.Lock()
         strategy._async_scheduler = AsyncAwaitableScheduler()
         strategy._execution_state_reconciler = ExecutionStateReconciler(
-            clock=strategy.clock,
-            log=strategy.log,
             timezone_name=strategy.config.timezone_name,
             async_scheduler=strategy._async_scheduler,
+        )
+        strategy._execution_state_reconciler.bind_runtime(
+            clock=strategy.clock,
+            log=strategy.log,
         )
         strategy.configure_pre_open_reconciliation(
             reconcile=lambda timeout_secs: True,
@@ -551,6 +553,31 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(
             strategy.msgbus.subscriptions[0][0],
             f"reports.execution.{INST_A.venue}",
+        )
+
+    def test_on_start_rebinds_reconciler_to_runtime_clock_and_log(self) -> None:
+        strategy = self.make_strategy()
+        construction_clock = strategy.clock
+        construction_log = strategy.log
+        runtime_clock = FakeClock()
+        runtime_clock.now = pd.Timestamp("2026-07-03 00:00:00", tz="UTC")
+        runtime_log = FakeLog()
+        strategy.clock = runtime_clock
+        strategy.log = runtime_log
+
+        strategy.on_start()
+
+        self.assertEqual(construction_clock.time_alerts, [])
+        self.assertEqual(construction_log.infos, [])
+        self.assertEqual(
+            runtime_clock.time_alerts[0]["alert_time"],
+            pd.Timestamp("2026-07-03 09:15:00", tz="Asia/Shanghai"),
+        )
+        self.assertTrue(
+            any(
+                "Next pre-open execution-state reconciliation" in args[0]
+                for args, _kwargs in runtime_log.infos
+            ),
         )
 
     def test_on_start_can_disable_market_data_subscriptions(self) -> None:
