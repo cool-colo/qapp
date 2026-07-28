@@ -56,6 +56,10 @@ class ExecutionStateReconciler:
         self._timeout_secs = float(timeout_secs)
         self._event_reporter = event_reporter
 
+    @property
+    def is_configured(self) -> bool:
+        return self._reconcile is not None and self._reconcile_time is not None
+
     def schedule_daily(self) -> None:
         clock = self._runtime_clock()
         log = self._runtime_log()

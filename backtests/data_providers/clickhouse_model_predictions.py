@@ -146,7 +146,7 @@ ORDER BY date
             values = ", ".join(quote_literal(to_prediction_table_stock_code(code)) for code in stock_codes)
             where.insert(0, f"stock_code IN ({values})")
         sql = f"""
-SELECT stock_code, pred_date AS date, score, pred_return_live_position_window as pred_return_live
+SELECT stock_code, pred_date AS date, score,  pred_return_live
 FROM {quote_identifier(table)}
 WHERE {" AND ".join(where)}
 ORDER BY date, score DESC

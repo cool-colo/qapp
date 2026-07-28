@@ -401,7 +401,8 @@ class TargetQuantityStrategy(Strategy):
             f"bar_types={len(self._bar_types)} target_version={self._target_version or '<none>'}",
             color=LogColor.BLUE,
         )
-        self._execution_state_reconciler.schedule_daily()
+        if self._execution_state_reconciler.is_configured:
+            self._execution_state_reconciler.schedule_daily()
         if self._instrument_ids:
             self._execution_state_reconciler.subscribe_mass_status(
                 venue=self._instrument_ids[0].venue,

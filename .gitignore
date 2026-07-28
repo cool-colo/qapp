@@ -35,5 +35,6 @@ Thumbs.db
 .gitignore
 logs
 start_qapp.sh
+start_calculate_daily_returns.sh
 .envs
 
