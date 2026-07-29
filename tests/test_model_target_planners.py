@@ -158,6 +158,8 @@ class ModelTargetPlannerTest(unittest.TestCase):
                     "price": 10.0,
                     "recent_buy_date": "2026-06-20",
                     "recent_holding_days": 8,
+                    "can_buy": True,
+                    "can_sell": True,
                 },
                 {
                     "stock_code": "000004.SZ",
@@ -165,6 +167,8 @@ class ModelTargetPlannerTest(unittest.TestCase):
                     "price": 30.0,
                     "recent_buy_date": None,
                     "recent_holding_days": 0,
+                    "can_buy": True,
+                    "can_sell": True,
                 },
             ],
         )

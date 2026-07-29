@@ -67,6 +67,8 @@ class CurrentHolding:
     price: float  # current price, defaults to today's open
     recent_target_date: date | None = None
     recent_holding_days: int = 0
+    can_buy: bool = True
+    can_sell: bool = True
 
 
 @dataclass(frozen=False)

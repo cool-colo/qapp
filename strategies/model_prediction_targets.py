@@ -601,7 +601,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             target_cash_buffer_percent=float(self.config.target_cash_buffer_percent),
             max_position_percent=float(self.config.max_position_percent),
             total_asset=total_asset,
-            investable_asset=9000000.0,
+            investable_asset= holdings_value * 1.10,  # TODO REMOVE hardcode,
             open_prices=open_prices,
         )
 
@@ -707,12 +707,14 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 self.log.warning(f"Skipping holding with zero or negative quantity: {instrument_id}")
                 continue
             exit_rank += 1
-            # A live-suspended holding (from the full-tick open_int status) is frozen:
-            # kept as-is rather than routed through the exit/exclusion logic. A
-            # suspended stock has no open price, so bypass the open-price gate, price
-            # it at last_close, and set recent_holding_days=0 so the risk manager
-            # emits no adjustment signal and the position is held unchanged.
-            if self._is_suspended_status(instrument_id):
+            # Suspended holdings stay in current_weights so the risk manager can
+            # preserve them. They cannot be bought or sold, whether suspension is
+            # reported by live market status or the daily suspension calendar.
+            is_suspended = (
+                self._is_suspended_status(instrument_id)
+                or stock_code in self._suspended_by_date.get(trading_date, set())
+            )
+            if is_suspended:
                 recent_target_date = recent_target_dates.get(instrument_id)
                 last_close = self._last_close.get(instrument_id)
                 if last_close is None or last_close <= 0:
@@ -724,9 +726,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     continue
                 price = float(last_close)
                 self.log.warning(
-                    f"Suspended holding frozen (SUSPEND): instrument_id={instrument_id} "
+                    f"Suspended holding frozen: instrument_id={instrument_id} "
                     f"stock_code={stock_code} price=last_close({price}) recent_holding_days=0 "
-                    f"quantity={quantity}",
+                    f"quantity={quantity} can_buy=False can_sell=False",
                     color=LogColor.YELLOW,
                 )
                 open_prices.setdefault(instrument_id, price)
@@ -738,6 +740,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                         price=price,
                         recent_target_date=recent_target_date,
                         recent_holding_days=0,
+                        can_buy=False,
+                        can_sell=False,
                     ),
                 )
                 continue

@@ -540,7 +540,6 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             },
             max_positions=args.max_positions,
             max_position_percent=args.max_position_percent,
-            holding_days=args.holding_days,
             stop_loss=args.stop_loss,
             trailing_take_profit=args.trailing_take_profit,
             trailing_take_profit_start=args.trailing_take_profit_start,

@@ -191,6 +191,7 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         strategy._recent_target_loader = None
         strategy._market_status = {}
         strategy._last_close = {}
+        strategy._suspended_by_date = {}
         strategy._trading_dates = [date(2026, 7, 22), date(2026, 7, 23)]
         strategy._active_positions = {
             "000157.SZ.QMT": {"entry_date": date(2026, 7, 22)},
@@ -245,6 +246,8 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         self.assertEqual(holding.price, 9.5)
         self.assertEqual(holding.quantity, 100)
         self.assertEqual(holding.recent_holding_days, 0)
+        self.assertFalse(holding.can_buy)
+        self.assertFalse(holding.can_sell)
         self.assertEqual(open_prices["000157.SZ.QMT"], 9.5)
         # Frozen: the exit/exclusion logic is bypassed entirely.
         strategy._holding_exclusion.assert_not_called()
@@ -269,6 +272,24 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
 
         self.assertEqual(holdings, [])
         strategy.log.warning.assert_called()
+
+    def test_calendar_suspended_holding_is_frozen_and_non_tradable(self) -> None:
+        strategy = self._make_stub()
+        strategy._today_open = {}
+        strategy._last_close = {"000157.SZ.QMT": 9.5}
+        strategy._suspended_by_date = {date(2026, 7, 23): {"000157.SZ"}}
+        open_prices: dict[str, float] = {}
+
+        holdings = strategy._build_current_holdings(
+            date(2026, 7, 23),
+            date(2026, 7, 22),
+            open_prices,
+        )
+
+        self.assertEqual(len(holdings), 1)
+        self.assertFalse(holdings[0].can_buy)
+        self.assertFalse(holdings[0].can_sell)
+        strategy._holding_exclusion.assert_not_called()
 
     def test_recent_target_cutoff_window_defaults_to_90(self) -> None:
         strategy = self._make_stub()

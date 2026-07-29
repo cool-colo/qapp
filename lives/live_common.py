@@ -172,7 +172,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(env("MODEL_MAX_POSITION_PERCENT", "0.03")),
     )
-    parser.add_argument("--holding-days", type=int, default=int(env("MODEL_HOLDING_DAYS", "10")))
     parser.add_argument("--stop-loss", type=float, default=float(env("MODEL_STOP_LOSS", "0.1")))
     parser.add_argument(
         "--trailing-take-profit",

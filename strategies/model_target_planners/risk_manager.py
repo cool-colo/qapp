@@ -109,6 +109,8 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
                 None if holding.recent_target_date is None else holding.recent_target_date.isoformat()
             ),
             "recent_holding_days": int(holding.recent_holding_days),
+            # "can_buy": bool(holding.can_buy),
+            # "can_sell": bool(holding.can_sell),
         }
         return payload
 
