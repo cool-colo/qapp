@@ -467,6 +467,24 @@ class TargetLiveConfigTest(unittest.TestCase):
             report_tasks=True,
         )
 
+    def test_snapshot_fixed_timers_skip_non_trading_days(self) -> None:
+        recorder = self._make_snapshot_recorder_stub("2026-07-11 09:27:00")
+        recorder._before_time = (9, 27)
+        recorder._after_time = (15, 40)
+        recorder._schedule_daily = MagicMock()
+        recorder._strategy = SimpleNamespace(_trading_dates=[date(2026, 7, 10)])
+        recorder._BEFORE_ALERT = SnapshotRecorder._BEFORE_ALERT
+        recorder._AFTER_ALERT = SnapshotRecorder._AFTER_ALERT
+        recorder._on_before_timer = MagicMock()
+        recorder._on_after_timer = MagicMock()
+
+        SnapshotRecorder._on_before_timer(recorder, None)
+        SnapshotRecorder._on_after_timer(recorder, None)
+
+        recorder._run_full_tick_fetch.assert_not_called()
+        recorder._run_before_trading.assert_not_called()
+        recorder._run_after_trading.assert_not_called()
+
     def test_warn_if_asset_inconsistent_warns_on_large_gap(self) -> None:
         recorder = SimpleNamespace(log=MagicMock())
         # total_asset overshoots components by ~2% (unsettled T+1 proceeds): warn.
@@ -1431,6 +1449,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder._in_range = lambda current, start, end: SnapshotRecorder._in_range(recorder, current, start, end)
         recorder._past_time = lambda current, boundary: SnapshotRecorder._past_time(current, boundary)
         recorder._within_trading_window = lambda: SnapshotRecorder._within_trading_window(recorder)
+        recorder._strategy = SimpleNamespace(_trading_dates=[pd.Timestamp(now_text).date()])
         return recorder
 
 

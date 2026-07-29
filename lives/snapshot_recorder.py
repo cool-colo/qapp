@@ -167,6 +167,8 @@ class SnapshotRecorder(Actor):
         started = time.monotonic()
         self._schedule_daily(self._BEFORE_ALERT, self._before_time, self._on_before_timer)
         today = self._now().date()
+        if today not in self._strategy._trading_dates:
+            return
         try:
             self._run_full_tick_fetch()
         except Exception as exc:
@@ -186,6 +188,8 @@ class SnapshotRecorder(Actor):
         started = time.monotonic()
         self._schedule_daily(self._AFTER_ALERT, self._after_time, self._on_after_timer)
         today = self._now().date()
+        if today not in self._strategy._trading_dates:
+            return
         try:
             self._run_after_trading(today, allow_fallback=False, report_tasks=True)
         except Exception as exc:
