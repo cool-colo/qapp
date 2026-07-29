@@ -90,6 +90,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self._target_planner = build_model_target_planner(config, self.log)
         self._live_target_portfolio_loader: Callable[[date, date | None], list[dict[str, Any]]] | None = None
         self._recent_target_loader: Callable[[date, date, list[str]], dict[str, date]] | None = None
+        self._signal_date_alert_reporter: Callable[[str, str, dict[str, Any]], bool | None] | None = None
         self.signal_events: list[ModelPredictionSignalEvent] = []
 
     def configure_live_target_portfolio_loader(
@@ -119,6 +120,13 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         fall back to each position's entry date.
         """
         self._recent_target_loader = loader
+
+    def configure_signal_date_alert_reporter(
+        self,
+        reporter: Callable[[str, str, dict[str, Any]], bool | None] | None,
+    ) -> None:
+        """Inject the live monitoring reporter used for signal-date failures."""
+        self._signal_date_alert_reporter = reporter
 
     def _update_instrument_stock_codes(
         self,
@@ -225,6 +233,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         return True
 
     def _process_trading_day(self, trading_date: date) -> None:
+        if not self._has_expected_signal_date(trading_date):
+            return
         loaded_target = self._live_target_portfolio_target(trading_date)
         if loaded_target is not None:
             quantities, reason, version = loaded_target
@@ -236,6 +246,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             )
             return
         plan = self.compute_daily_target_plan(trading_date)
+        if plan is None:
+            return
         # The risk-manager planner commits explicit share counts (固定目标股数); the
         # executor trades toward those quantities. Weights on the plan are audit-only
         # and are not consulted for execution.
@@ -308,7 +320,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             raise RuntimeError("live_target_portfolio rows contain no target_qty values")
         return quantities, reason, version
 
-    def compute_daily_target_plan(self, trading_date: date) -> ModelTargetPlan:
+    def compute_daily_target_plan(self, trading_date: date) -> ModelTargetPlan | None:
         """
         Build the risk-manager request for the day and return the resulting plan
         **without submitting orders or accepting the target**.
@@ -325,6 +337,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         via update_target_quantities. The snapshot recorder uses it before-trading to
         derive the day's frozen share counts. Both paths therefore run the same logic.
         """
+        if not self._has_expected_signal_date(trading_date):
+            return None
         self._seed_active_positions_from_portfolio(trading_date)
         signal_date = self._resolve_signal_date(trading_date)
         today_signals = self._signals_by_date.get(signal_date, []) if signal_date else []
@@ -334,6 +348,34 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             color=LogColor.BLUE,
         )
         return self._target_plan(trading_date, signal_date)
+
+    def _has_expected_signal_date(self, trading_date: date) -> bool:
+        expected_signal_date = previous_trading_date(self._trading_dates, trading_date)
+        resolved_signal_date = self._resolve_signal_date(trading_date)
+        if resolved_signal_date == expected_signal_date:
+            return True
+        message = (
+            "Refusing to process model targets because the resolved signal date does not match "
+            f"the previous trading date: trading_date={trading_date} "
+            f"expected_signal_date={expected_signal_date} resolved_signal_date={resolved_signal_date}"
+        )
+        self.log.error(message)
+        reporter = self._signal_date_alert_reporter
+        if reporter is None:
+            return False
+        try:
+            reporter(
+                "TARGET-MODEL-SIGNAL-DATE-MISMATCH",
+                "failed",
+                {
+                    "trading_date": trading_date,
+                    "expected_signal_date": expected_signal_date,
+                    "resolved_signal_date": resolved_signal_date,
+                },
+            )
+        except Exception as exc:
+            self.log.warning(f"Could not queue DingTalk signal-date mismatch alert: {exc}")
+        return False
 
     def plan_version(self, plan: ModelTargetPlan) -> str:
         """Public alias of the version string used by update_target_quantities."""

@@ -636,6 +636,12 @@ class SnapshotRecorder(Actor):
             if on_complete is not None:
                 on_complete("failed", 0, {"error": str(exc)})
             return
+        if plan is None:
+            message = "daily target plan was skipped because its signal date is not the previous trading date"
+            self.log.warning(message)
+            if on_complete is not None:
+                on_complete("failed", 0, {"error": message})
+            return
         # Raw total asset and the buffer-adjusted investable basis both come from the
         # plan (stamped by the strategy when it built the request) so the persisted
         # figures match exactly what was sent to the risk manager.

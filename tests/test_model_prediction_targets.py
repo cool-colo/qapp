@@ -307,6 +307,7 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
     def _make_stub(self, *, signals: list[dict]):
         class PlanStub:
             compute_daily_target_plan = TargetModelPredictionsStrategy.compute_daily_target_plan
+            _has_expected_signal_date = TargetModelPredictionsStrategy._has_expected_signal_date
             _resolve_signal_date = TargetModelPredictionsStrategy._resolve_signal_date
 
         strategy = PlanStub()
@@ -344,6 +345,27 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
 
         strategy._seed_active_positions_from_portfolio.assert_called_once_with(date(2026, 7, 8))
         strategy._target_plan.assert_called_once_with(date(2026, 7, 8), signal_date)
+
+    def test_skips_plan_and_reports_when_signal_date_is_not_previous_trading_date(self) -> None:
+        strategy = self._make_stub(signals=[])
+        strategy._signals_by_date = {date(2026, 7, 6): []}
+        strategy._signal_date_alert_reporter = MagicMock(return_value=True)
+
+        result = strategy.compute_daily_target_plan(date(2026, 7, 8))
+
+        self.assertIsNone(result)
+        strategy._seed_active_positions_from_portfolio.assert_not_called()
+        strategy._target_plan.assert_not_called()
+        strategy.log.error.assert_called_once()
+        strategy._signal_date_alert_reporter.assert_called_once_with(
+            "TARGET-MODEL-SIGNAL-DATE-MISMATCH",
+            "failed",
+            {
+                "trading_date": date(2026, 7, 8),
+                "expected_signal_date": date(2026, 7, 7),
+                "resolved_signal_date": date(2026, 7, 6),
+            },
+        )
 
 
 class AnnotatePlanTest(unittest.TestCase):

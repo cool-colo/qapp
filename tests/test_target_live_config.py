@@ -80,6 +80,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             ],
         )
         strategy._live_target_portfolio_loader = loader
+        strategy._trading_dates = [signal_date, trading_date]
         strategy._resolve_signal_date = MagicMock(return_value=signal_date)
         strategy.compute_daily_target_plan = MagicMock()
         strategy.update_target_quantities = MagicMock()
@@ -115,6 +116,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             reason="computed",
         )
         strategy._live_target_portfolio_loader = MagicMock(return_value=[])
+        strategy._trading_dates = [date(2026, 7, 7), trading_date]
         strategy._resolve_signal_date = MagicMock(return_value=date(2026, 7, 7))
         strategy.compute_daily_target_plan = MagicMock(return_value=plan)
         strategy._plan_version = MagicMock(return_value="computed-ver")
@@ -142,6 +144,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                 },
             ],
         )
+        strategy._trading_dates = [date(2026, 7, 7), date(2026, 7, 8)]
         strategy._resolve_signal_date = MagicMock(return_value=date(2026, 7, 7))
         strategy.compute_daily_target_plan = MagicMock()
         strategy.update_target_quantities = MagicMock()

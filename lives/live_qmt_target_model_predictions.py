@@ -57,6 +57,9 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         self._refresh_interval_secs = float(refresh_interval_secs)
         self._refresh_time = self._parse_hh_mm(refresh_time)
         self._event_reporter = event_reporter
+        self.configure_signal_date_alert_reporter(
+            event_reporter.report if event_reporter is not None else None,
+        )
         self._execution_reconciliation = LiveExecutionReconciliation(
             request_reconcile=self.request_execution_reconcile,
             warn=lambda message: self.log.warning(message),
