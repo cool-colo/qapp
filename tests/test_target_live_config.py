@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
+from unittest.mock import PropertyMock
 from unittest.mock import call
 from unittest.mock import patch
 
@@ -80,6 +81,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             ],
         )
         strategy._live_target_portfolio_loader = loader
+        strategy._live_target_plan_persister = MagicMock()
         strategy._trading_dates = [signal_date, trading_date]
         strategy._resolve_signal_date = MagicMock(return_value=signal_date)
         strategy.compute_daily_target_plan = MagicMock()
@@ -95,6 +97,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             reason="risk_manager_optimize",
             version="ver-1",
         )
+        strategy._live_target_plan_persister.assert_not_called()
 
     def test_process_trading_day_computes_when_live_target_portfolio_missing(self) -> None:
         strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
@@ -116,6 +119,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             reason="computed",
         )
         strategy._live_target_portfolio_loader = MagicMock(return_value=[])
+        strategy._live_target_plan_persister = MagicMock()
         strategy._trading_dates = [date(2026, 7, 7), trading_date]
         strategy._resolve_signal_date = MagicMock(return_value=date(2026, 7, 7))
         strategy.compute_daily_target_plan = MagicMock(return_value=plan)
@@ -131,6 +135,95 @@ class TargetLiveConfigTest(unittest.TestCase):
             reason="computed",
             version="computed-ver",
         )
+        strategy._live_target_plan_persister.assert_called_once_with(plan)
+
+    def test_process_trading_day_persists_generated_plan_before_applying_it(self) -> None:
+        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        trading_date = date(2026, 7, 8)
+        plan = ModelTargetPlan(
+            trading_date=trading_date,
+            signal_date=date(2026, 7, 7),
+            targets=[
+                TargetInfo(
+                    stock_code="000001.SZ",
+                    weight=None,
+                    quantity=1000,
+                    target_context=TargetContext(),
+                    target_version=None,
+                    instrument_id="000001.SZ.QMT",
+                    is_locked=False,
+                ),
+            ],
+            reason="computed",
+        )
+        events: list[str] = []
+        strategy._live_target_portfolio_loader = MagicMock(return_value=[])
+        strategy._live_target_plan_persister = MagicMock(
+            side_effect=lambda _: (events.append("persist") or True),
+        )
+        strategy._trading_dates = [date(2026, 7, 7), trading_date]
+        strategy._resolve_signal_date = MagicMock(return_value=date(2026, 7, 7))
+        strategy.compute_daily_target_plan = MagicMock(return_value=plan)
+        strategy._plan_version = MagicMock(return_value="computed-ver")
+        strategy.update_target_quantities = MagicMock(side_effect=lambda **_: events.append("apply"))
+
+        strategy._process_trading_day(trading_date)
+
+        self.assertEqual(events, ["persist", "apply"])
+
+    def test_process_trading_day_does_not_apply_unpersisted_plan(self) -> None:
+        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        trading_date = date(2026, 7, 8)
+        plan = ModelTargetPlan(
+            trading_date=trading_date,
+            signal_date=date(2026, 7, 7),
+            targets=[],
+            reason="computed",
+        )
+        strategy._live_target_portfolio_loader = MagicMock(return_value=[])
+        strategy._live_target_plan_persister = MagicMock(return_value=False)
+        strategy._trading_dates = [date(2026, 7, 7), trading_date]
+        strategy._resolve_signal_date = MagicMock(return_value=date(2026, 7, 7))
+        strategy.compute_daily_target_plan = MagicMock(return_value=plan)
+        strategy._plan_version = MagicMock()
+        strategy.update_target_quantities = MagicMock()
+        logger = MagicMock()
+        with patch.object(TargetModelPredictionsStrategy, "log", new_callable=PropertyMock) as log:
+            log.return_value = logger
+            strategy._process_trading_day(trading_date)
+
+        strategy.update_target_quantities.assert_not_called()
+        logger.warning.assert_called_once_with(
+            "generated live target plan was not persisted; target not applied",
+        )
+
+    def test_recorder_persists_timer_plan_as_continuous_when_missing(self) -> None:
+        trading_date = date(2026, 7, 8)
+        plan = SimpleNamespace(trading_date=trading_date, signal_date=date(2026, 7, 7))
+        writer = SimpleNamespace(asset_snapshot_id=MagicMock(return_value=12))
+        recorder = SimpleNamespace(
+            config=SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER"),
+            _writer=writer,
+            _load_target=MagicMock(return_value=[]),
+            _persist_target_plan=MagicMock(return_value=True),
+        )
+
+        self.assertTrue(SnapshotRecorder.persist_strategy_target_plan(recorder, plan))
+
+        recorder._load_target.assert_called_once_with(trading_date, plan.signal_date)
+        writer.asset_snapshot_id.assert_called_once_with(
+            "ACC",
+            "TRADER",
+            trading_date,
+            CONTINUOUS_TRADING,
+        )
+        recorder._persist_target_plan.assert_called_once_with(
+            plan,
+            CONTINUOUS_TRADING,
+            12,
+            plan.signal_date,
+            apply_target=False,
+        )
 
     def test_process_trading_day_fails_when_live_target_rows_have_no_quantities(self) -> None:
         strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
@@ -144,6 +237,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                 },
             ],
         )
+        strategy._live_target_plan_persister = MagicMock()
         strategy._trading_dates = [date(2026, 7, 7), date(2026, 7, 8)]
         strategy._resolve_signal_date = MagicMock(return_value=date(2026, 7, 7))
         strategy.compute_daily_target_plan = MagicMock()
@@ -820,6 +914,18 @@ class TargetLiveConfigTest(unittest.TestCase):
                 recorder,
                 target_plan,
                 total_asset,
+            )
+        )
+        recorder._persist_target_plan = (
+            lambda target_plan, snapshot_type, asset_id, resolved_signal_date, apply_target,
+            on_complete=None: SnapshotRecorder._persist_target_plan(
+                recorder,
+                target_plan,
+                snapshot_type,
+                asset_id,
+                resolved_signal_date,
+                apply_target,
+                on_complete,
             )
         )
 

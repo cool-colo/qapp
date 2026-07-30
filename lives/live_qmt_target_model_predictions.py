@@ -418,6 +418,7 @@ def _add_snapshot_recorder(
         fetch_open_prices=fetch_open_prices,
         event_reporter=event_reporter.report if event_reporter is not None else None,
     )
+    strategy.configure_live_target_plan_persister(recorder.persist_strategy_target_plan)
     node.trader.add_actor(recorder)
     _emit_snapshot_status(
         node,

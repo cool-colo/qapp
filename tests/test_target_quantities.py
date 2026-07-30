@@ -1706,13 +1706,13 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         trading_date = date(2026, 7, 2)
         strategy = self.make_strategy(prices={INST_A: 10.0})
         strategy._today_open = {str(INST_A): 10.0}
-        # cap = 10 + max(10*10bps=0.01, 0.01) = 10.01; order resting at the cap
+        # cap = 10 + max(10*100bps=0.10, 0.01) = 10.10; order resting at the cap
         order = FakeOrder(
             client_order_id="B-1",
             instrument_id=INST_A,
             side=OrderSide.BUY,
             quantity=Decimal("100"),
-            price=Decimal("10.01"),
+            price=Decimal("10.10"),
             status=OrderStatus.ACCEPTED,
             ts_last=1,
         )

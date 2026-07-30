@@ -239,7 +239,7 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     target_cash_buffer_percent: float = 0.05
     buy_offset_bps: float = 5.0
     sell_offset_bps: float = 5.0
-    buy_max_price_bps: float = 10.0
+    buy_max_price_bps: float = 100.0
     buy_cancel_threshold: int = 2
     sell_cancel_threshold: int = 1
     exit_non_targets: bool = True
