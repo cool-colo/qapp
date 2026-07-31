@@ -27,6 +27,12 @@ def _json_default(value: Any) -> Any:
         return str(value)
     if isinstance(value, (date, datetime)):
         return value.isoformat()
+    # Nautilus numeric types (Price, Quantity, Money, …) are Cython objects that
+    # are not JSON-serializable but support float() conversion.
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 

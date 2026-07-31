@@ -656,7 +656,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             holdings_value = sum(
                 holding.quantity * holding.price for holding in current_holdings
             )
-            investable_asset = float(holdings_value * 1.10)
+            investable_asset = float(holdings_value * 1.01)
         if investable_asset <= 0:
             investable_asset = float(self.config.initial_cash)
         return ModelTargetPlanningRequest(
