@@ -826,6 +826,15 @@ class TargetLiveConfigTest(unittest.TestCase):
             ),
         )
 
+    def test_writer_can_use_separate_backtest_target_table(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._target_portfolio_table = "backtest_target_portfolio"
+        writer._upsert_many = MagicMock()
+
+        writer.write_target_portfolios([])
+
+        self.assertEqual(writer._upsert_many.call_args.args[0], "backtest_target_portfolio")
+
     def test_writer_write_stock_ticks_uses_generic_market_key(self) -> None:
         writer = object.__new__(LiveSnapshotWriter)
         writer._upsert_many = MagicMock()

@@ -79,6 +79,9 @@ class TargetPortfolioRecord:
     target_weight: Decimal | None = None
     current_weight: Decimal | None = None
     delta_weight: Decimal | None = None
+    target_qty: int | None = None
+    current_qty: int | None = None
+    delta_qty: int | None = None
     source_signal_name: str | None = None
     source_model_id: str | None = None
     reason: str | None = None
@@ -103,6 +106,7 @@ class OrderRecord:
     quantity: int | None = None
     amount: Decimal | None = None
     target_weight: Decimal | None = None
+    target_qty: int | None = None
     filled_quantity: int = 0
     avg_fill_price: Decimal | None = None
     filled_amount: Decimal = Decimal("0")

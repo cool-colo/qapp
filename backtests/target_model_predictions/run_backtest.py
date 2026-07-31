@@ -5,6 +5,7 @@ import argparse
 import os
 import sys
 import uuid
+from datetime import date
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -45,14 +46,96 @@ from backtests.result_writers import SignalRecord  # noqa: E402
 from backtests.result_writers import SummaryMetricRecord  # noqa: E402
 from backtests.result_writers import TargetPortfolioRecord  # noqa: E402
 from backtests.result_writers import TradeRecord  # noqa: E402
+from backtests.result_writers.live_records import CONTINUOUS_TRADING  # noqa: E402
+from backtests.result_writers.live_writer import LiveSnapshotWriter  # noqa: E402
+from lives.snapshot_recorder import SnapshotRecorder  # noqa: E402
+from lives.snapshot_recorder import SnapshotRecorderConfig  # noqa: E402
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy  # noqa: E402
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig  # noqa: E402
+from nautilus_trader.core.data import Data  # noqa: E402
+from nautilus_trader.model.data import Bar  # noqa: E402
+from nautilus_trader.model.data import CustomData  # noqa: E402
+from nautilus_trader.model.data import DataType  # noqa: E402
+from nautilus_trader.model.data import QuoteTick  # noqa: E402
+from nautilus_trader.model.identifiers import ClientId  # noqa: E402
 
 
 STRATEGY_ID = os.getenv("BACKTEST_STRATEGY_ID", "nautilus_target_model_predictions")
 STRATEGY_VERSION_ID = os.getenv("BACKTEST_STRATEGY_VERSION_ID", "dev")
 REPORT_DECIMAL_QUANTUM = Decimal("0.001")
 REPORT_PROCESSOR = BaseBacktest(REPORT_DECIMAL_QUANTUM, csv_index=True)
+PLANNING_CLIENT_ID = ClientId("BACKTEST_PLANNING")
+HEARTBEAT_TIME = "09:30:00"
+PLANNING_TIME = "09:30:01"
+EXECUTION_BAR_TIME = "09:31:00"
+
+
+class DailyPlanningEvent(Data):
+    """Backtest-only daily trigger carrying the live-equivalent full-tick snapshot."""
+
+    def __init__(
+        self,
+        trading_date: date,
+        full_tick_snapshot: dict[str, dict[str, Any]],
+        previous_closes: dict[str, float],
+        ts_event: int,
+        ts_init: int,
+    ) -> None:
+        self.trading_date = trading_date
+        self.full_tick_snapshot = full_tick_snapshot
+        self.previous_closes = previous_closes
+        self._ts_event = int(ts_event)
+        self._ts_init = int(ts_init)
+
+    @property
+    def ts_event(self) -> int:
+        return self._ts_event
+
+    @property
+    def ts_init(self) -> int:
+        return self._ts_init
+
+
+class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
+    """Target-model strategy driven by explicit daily planning events, not bars."""
+
+    def on_start(self) -> None:
+        super().on_start()
+        self.subscribe_data(
+            DataType(DailyPlanningEvent),
+            client_id=PLANNING_CLIENT_ID,
+        )
+
+    def _start_full_tick_refresh(self) -> None:
+        # The historical full-tick equivalent arrives in DailyPlanningEvent.
+        return
+
+    def _refresh_order_book_depth_subscriptions(
+        self,
+        quantities: dict[str, Decimal],
+    ) -> None:
+        # Daily bars are the venue's execution data; no L2 stream exists in this backtest.
+        return
+
+    def on_data(self, data: Data) -> None:
+        if not isinstance(data, DailyPlanningEvent):
+            return
+        self._roll_trading_day(data.trading_date)
+        self.refresh_target_instruments(
+            instrument_ids=[],
+            bar_types={},
+            last_closes=data.previous_closes,
+            subscribe_new_bars=False,
+        )
+        self.apply_full_tick_snapshot(data.full_tick_snapshot, "backtest_planning")
+        self._process_trading_day_once(data.trading_date, "planning_event")
+
+
+class BacktestTargetPlanRecorder(SnapshotRecorder):
+    """Reuse live target persistence without installing live snapshot timers."""
+
+    def on_start(self) -> None:
+        return
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -89,7 +172,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", default=env("BACKTEST_END_DATE", "2025-12-31"))
     parser.add_argument(
         "--predictions-table",
-        default=env("TARGET_MODEL_PREDICTIONS_TABLE", "model_predictions"),
+        default=env("TARGET_MODEL_PREDICTIONS_TABLE", "daily_model_predictions"),
     )
     parser.add_argument("--stock-codes", default=",".join(env_list("MODEL_STOCK_CODES", "000001.SZ,000002.SZ")))
     parser.add_argument("--all-stocks", action="store_true", default=env_bool("MODEL_ALL_STOCKS", False))
@@ -217,12 +300,154 @@ def load_bars(
     return bar_types, bars_by_stock, skipped_rows
 
 
+def exchange_timestamp_ns(
+    trading_date: date,
+    time_text: str,
+    timezone_name: str,
+) -> int:
+    timestamp = pd.Timestamp(f"{trading_date.isoformat()} {time_text}")
+    return int(timestamp.tz_localize(timezone_name).tz_convert("UTC").value)
+
+
+def bar_trading_date(bar: Bar, timezone_name: str) -> date:
+    return pd.Timestamp(bar.ts_event, unit="ns", tz="UTC").tz_convert(timezone_name).date()
+
+
+def bar_with_timestamp(bar: Bar, timestamp_ns: int) -> Bar:
+    return Bar(
+        bar_type=bar.bar_type,
+        open=bar.open,
+        high=bar.high,
+        low=bar.low,
+        close=bar.close,
+        volume=bar.volume,
+        ts_event=timestamp_ns,
+        ts_init=timestamp_ns,
+    )
+
+
+def prepare_backtest_event_data(
+    args: argparse.Namespace,
+    bundle: PredictionDataBundle,
+    bars_by_stock: dict[str, list[Bar]],
+    instruments_by_stock: dict[str, Any],
+) -> tuple[list[CustomData], list[QuoteTick], dict[str, list[Bar]]]:
+    """
+    Build a deterministic live-like daily event sequence.
+
+    The planning snapshot is the strategy input. Quotes only open the executor's
+    exchange-time gate, and bars arrive afterward solely for venue matching and
+    portfolio valuation.
+    """
+    raw_bars_by_date: dict[date, dict[str, Bar]] = {}
+    for stock_code, bars in bars_by_stock.items():
+        for bar in bars:
+            trading_date = bar_trading_date(bar, args.exchange_timezone)
+            if stock_code in raw_bars_by_date.setdefault(trading_date, {}):
+                raise RuntimeError(
+                    f"multiple daily bars for {stock_code} on {trading_date}",
+                )
+            raw_bars_by_date[trading_date][stock_code] = bar
+
+    configured_dates = {
+        value
+        for value in bundle.trading_dates
+        if pd.Timestamp(args.start).date() <= value <= pd.Timestamp(args.end).date()
+    }
+    trading_dates = sorted(configured_dates.union(raw_bars_by_date))
+    previous_closes: dict[str, float] = {}
+    normalized_bars: dict[str, list[Bar]] = {stock_code: [] for stock_code in bars_by_stock}
+    planning_events: list[CustomData] = []
+    heartbeats: list[QuoteTick] = []
+    data_type = DataType(DailyPlanningEvent)
+
+    for trading_date in trading_dates:
+        bars_for_date = raw_bars_by_date.get(trading_date, {})
+        suspended = bundle.suspended_by_date.get(trading_date, set())
+        snapshot: dict[str, dict[str, Any]] = {}
+        heartbeat_stock: str | None = None
+
+        for stock_code in sorted(bars_by_stock):
+            instrument = instruments_by_stock[stock_code]
+            instrument_id = str(instrument.id)
+            bar = bars_for_date.get(stock_code)
+            last_close = previous_closes.get(stock_code)
+            if stock_code in suspended:
+                snapshot[instrument_id] = {
+                    "open": 0.0,
+                    "last_price": last_close,
+                    "last_close": last_close,
+                    "open_int": 1,
+                }
+                continue
+            if bar is None:
+                continue
+            open_price = float(bar.open)
+            snapshot[instrument_id] = {
+                "open": open_price,
+                "last_price": open_price,
+                "last_close": last_close,
+                "open_int": 13,
+            }
+            if heartbeat_stock is None:
+                heartbeat_stock = stock_code
+
+        planning_ts = exchange_timestamp_ns(
+            trading_date,
+            PLANNING_TIME,
+            args.exchange_timezone,
+        )
+        planning_event = DailyPlanningEvent(
+            trading_date=trading_date,
+            full_tick_snapshot=snapshot,
+            previous_closes={
+                str(instruments_by_stock[stock_code].id): close
+                for stock_code, close in previous_closes.items()
+            },
+            ts_event=planning_ts,
+            ts_init=planning_ts,
+        )
+        planning_events.append(CustomData(data_type, planning_event))
+
+        if heartbeat_stock is not None:
+            heartbeat_bar = bars_for_date[heartbeat_stock]
+            heartbeat_instrument = instruments_by_stock[heartbeat_stock]
+            heartbeat_ts = exchange_timestamp_ns(
+                trading_date,
+                HEARTBEAT_TIME,
+                args.exchange_timezone,
+            )
+            open_price = float(heartbeat_bar.open)
+            heartbeats.append(
+                QuoteTick(
+                    instrument_id=heartbeat_instrument.id,
+                    bid_price=heartbeat_instrument.make_price(open_price),
+                    ask_price=heartbeat_instrument.make_price(open_price),
+                    bid_size=heartbeat_instrument.make_qty(100),
+                    ask_size=heartbeat_instrument.make_qty(100),
+                    ts_event=heartbeat_ts,
+                    ts_init=heartbeat_ts,
+                ),
+            )
+
+        execution_ts = exchange_timestamp_ns(
+            trading_date,
+            EXECUTION_BAR_TIME,
+            args.exchange_timezone,
+        )
+        for stock_code, bar in sorted(bars_for_date.items()):
+            normalized_bars[stock_code].append(bar_with_timestamp(bar, execution_ts))
+            previous_closes[stock_code] = float(bar.close)
+
+    return planning_events, heartbeats, normalized_bars
+
+
 def build_engine(
     args: argparse.Namespace,
     bundle: PredictionDataBundle,
     bar_types: dict[str, Any],
     bars_by_stock: dict[str, list[Any]],
-) -> tuple[Any, TargetModelPredictionsStrategy]:
+) -> tuple[Any, BacktestTargetModelPredictionsStrategy, dict[str, list[Bar]]]:
     from nautilus_trader.adapters.qmt.common import parse_equity
     from nautilus_trader.adapters.qmt.common import qmt_symbol_to_instrument_id
     from nautilus_trader.adapters.qmt.constants import QMT_VENUE
@@ -257,7 +482,7 @@ def build_engine(
     instrument_ids = []
     config_bar_types = {}
     instrument_stock_codes = {}
-    all_bars = []
+    instruments_by_stock = {}
     for stock_code in loaded_stock_codes:
         bars = bars_by_stock[stock_code]
         instrument = parse_equity(
@@ -271,13 +496,35 @@ def build_engine(
         )
         engine.add_instrument(instrument)
         instrument_id = qmt_symbol_to_instrument_id(qmt_symbol(stock_code))
+        if instrument.id != instrument_id:
+            raise RuntimeError(
+                f"parsed instrument id mismatch for {stock_code}: "
+                f"{instrument.id} != {instrument_id}",
+            )
+        instruments_by_stock[stock_code] = instrument
         instrument_ids.append(instrument_id)
         config_bar_types[str(instrument_id)] = bar_types[stock_code]
         instrument_stock_codes[str(instrument_id)] = stock_code
-        all_bars.extend(bars)
 
-    engine.add_data(sorted(all_bars, key=lambda bar: bar.ts_init))
-    strategy = TargetModelPredictionsStrategy(
+    planning_events, heartbeats, execution_bars_by_stock = prepare_backtest_event_data(
+        args=args,
+        bundle=bundle,
+        bars_by_stock=bars_by_stock,
+        instruments_by_stock=instruments_by_stock,
+    )
+    execution_bars = [
+        bar
+        for stock_code in loaded_stock_codes
+        for bar in execution_bars_by_stock[stock_code]
+    ]
+    if heartbeats:
+        engine.add_data(heartbeats, sort=False)
+    if planning_events:
+        engine.add_data(planning_events, client_id=PLANNING_CLIENT_ID, sort=False)
+    engine.add_data(execution_bars, sort=False)
+    engine.sort_data()
+
+    strategy = BacktestTargetModelPredictionsStrategy(
         config=TargetModelPredictionsStrategyConfig(
             instrument_ids=instrument_ids,
             bar_types=config_bar_types,
@@ -315,11 +562,16 @@ def build_engine(
             risk_manager_mode=env("RISK_MANAGER_MODE", "backtest"),
             risk_manager_timeout_secs=float(env("RISK_MANAGER_TIMEOUT_SECS", "10")),
             order_slice_notional=parse_decimal(env("TARGET_MODEL_ORDER_SLICE_NOTIONAL", "300000")),
-            require_account_cash=False,
+            require_account_cash=True,
+            unfilled_timeout_secs=0,
+            subscribe_bars=False,
+            subscribe_quote_ticks=True,
+            subscribe_trade_ticks=False,
+            subscribe_order_book_depth=False,
         ),
     )
     engine.add_strategy(strategy)
-    return engine, strategy
+    return engine, strategy, execution_bars_by_stock
 
 
 def signals_config(bundle: PredictionDataBundle, loaded_stock_codes: set[str]) -> dict[str, list[dict[str, Any]]]:
@@ -346,14 +598,75 @@ def signals_config(bundle: PredictionDataBundle, loaded_stock_codes: set[str]) -
 def build_result_writer(args: argparse.Namespace):
     if not args.write_results:
         return None
-    return MySQLResultWriter.from_pymysql_kwargs(
-        host=env("MYSQL_HOST", "localhost"),
-        port=int(env("MYSQL_PORT", "3306")),
-        user=env("MYSQL_USER", "root"),
-        password=env("MYSQL_PASSWORD", ""),
-        database=env("MYSQL_DATABASE", "backtest"),
-        charset="utf8mb4",
+    return MySQLResultWriter.from_pymysql_kwargs(**mysql_connection_kwargs())
+
+
+def mysql_connection_kwargs() -> dict[str, Any]:
+    return {
+        "host": env("MYSQL_HOST", "localhost"),
+        "port": int(env("MYSQL_PORT", "3306")),
+        "user": env("MYSQL_USER", "root"),
+        "password": env("MYSQL_PASSWORD", ""),
+        "database": env("MYSQL_DATABASE", "backtest"),
+        "charset": "utf8mb4",
+    }
+
+
+def configure_target_plan_persistence(
+    args: argparse.Namespace,
+    engine: Any,
+    strategy: BacktestTargetModelPredictionsStrategy,
+    experiment_id_value: str,
+) -> LiveSnapshotWriter | None:
+    if not args.write_results:
+        return None
+    writer = LiveSnapshotWriter.from_pymysql_kwargs(
+        logger=None,
+        target_portfolio_table=env(
+            "BACKTEST_TARGET_PORTFOLIO_TABLE",
+            "backtest_target_portfolio",
+        ),
+        **mysql_connection_kwargs(),
     )
+
+    def load_target_portfolio(trading_date: date, signal_date: date | None):
+        return writer.load_target_portfolios(
+            experiment_id_value,
+            str(args.trader_id),
+            trading_date,
+            signal_date,
+            preferred_snapshot_type=CONTINUOUS_TRADING,
+        )
+
+    def load_recent_target_dates(
+        trading_date: date,
+        cutoff_trade_date: date,
+        stock_codes: list[str],
+    ):
+        return writer.load_recent_target_dates(
+            experiment_id_value,
+            str(args.trader_id),
+            trading_date,
+            cutoff_trade_date,
+            stock_codes,
+        )
+
+    strategy.configure_live_target_portfolio_loader(load_target_portfolio)
+    strategy.configure_recent_target_loader(load_recent_target_dates)
+    recorder = BacktestTargetPlanRecorder(
+        config=SnapshotRecorderConfig(
+            account_id=experiment_id_value,
+            trader_id=str(args.trader_id),
+            timezone_name=args.exchange_timezone,
+            before_time="",
+            after_time="",
+        ),
+        writer=writer,
+        strategy_ref=strategy,
+    )
+    strategy.configure_live_target_plan_persister(recorder.persist_strategy_target_plan)
+    engine.add_actor(recorder)
+    return writer
 
 
 def experiment_id() -> str:
@@ -498,9 +811,9 @@ def target_records(experiment_id_value: str, strategy: TargetModelPredictionsStr
             target_date=event.target_date,
             execute_date=event.execute_date,
             instrument_id=event.instrument_id,
-            target_weight=decimal_or_none(event.target_weight),
-            current_weight=decimal_or_none(event.current_weight),
-            delta_weight=decimal_or_none(event.delta_weight),
+            target_qty=int(event.target_qty),
+            current_qty=None if event.current_qty is None else int(event.current_qty),
+            delta_qty=None if event.delta_qty is None else int(event.delta_qty),
             source_signal_name="model_prediction_score",
             reason=event.reason,
             extra=event.extra,
@@ -520,10 +833,10 @@ def order_records(experiment_id_value: str, strategy: TargetModelPredictionsStra
                 submit_time=datetime.combine(event.trading_date, datetime.min.time()),
                 instrument_id=event.instrument_id,
                 side=event.side,
-                order_type="target_weight",
+                order_type="target_quantity",
                 price_type="market",
                 quantity=event.quantity,
-                target_weight=decimal_or_none(event.target_weight),
+                target_qty=int(event.target_qty),
                 status=event.status,
                 rejected_reason=event.reason if event.status == "rejected" else None,
                 extra=event.extra,
@@ -774,9 +1087,9 @@ def strategy_target_frame(strategy: TargetModelPredictionsStrategy) -> pd.DataFr
                 "target_date": event.target_date,
                 "execute_date": event.execute_date,
                 "instrument_id": event.instrument_id,
-                "target_weight": event.target_weight,
-                "current_weight": event.current_weight,
-                "delta_weight": event.delta_weight,
+                "target_qty": event.target_qty,
+                "current_qty": event.current_qty,
+                "delta_qty": event.delta_qty,
                 "reason": event.reason,
                 "extra": event.extra,
             }
@@ -794,7 +1107,7 @@ def strategy_order_frame(strategy: TargetModelPredictionsStrategy) -> pd.DataFra
                 "instrument_id": event.instrument_id,
                 "side": event.side,
                 "quantity": event.quantity,
-                "target_weight": event.target_weight,
+                "target_qty": event.target_qty,
                 "status": event.status,
                 "reason": event.reason,
                 "extra": event.extra,
@@ -886,10 +1199,26 @@ def main() -> None:
         writer.create_experiment(create_experiment_record(args, experiment_id_value, started_at))
         writer.write_experiment_params(experiment_params(args, experiment_id_value))
 
-    engine, strategy = build_engine(args, bundle, bar_types, bars_by_stock)
+    engine, strategy, execution_bars_by_stock = build_engine(
+        args,
+        bundle,
+        bar_types,
+        bars_by_stock,
+    )
+    target_plan_writer = configure_target_plan_persistence(
+        args,
+        engine,
+        strategy,
+        experiment_id_value,
+    )
     try:
         engine.run()
-        complete_report = build_complete_report(args, engine, strategy, bars_by_stock)
+        complete_report = build_complete_report(
+            args,
+            engine,
+            strategy,
+            execution_bars_by_stock,
+        )
         complete_report = apply_benchmark_to_reports(args, connection, complete_report)
         tearsheet_path = REPORT_PROCESSOR.write_tearsheet(args, engine, complete_report)
         if tearsheet_path:
@@ -910,6 +1239,8 @@ def main() -> None:
     finally:
         if writer is not None:
             writer.close()
+        if target_plan_writer is not None:
+            target_plan_writer.close()
         engine.dispose()
 
 

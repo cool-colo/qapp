@@ -40,16 +40,260 @@ def _timestamp(value: datetime | None) -> datetime:
     return value or datetime.now()
 
 
-class MySQLResultWriter(ResultWriter):
-    """Persist migrated Nautilus backtest records into the existing bt_* schema."""
+CREATE_TABLES_SQL = (
+    """
+CREATE TABLE IF NOT EXISTS `bt_experiment` (
+  `experiment_id`      VARCHAR(128)  NOT NULL,
+  `experiment_name`    VARCHAR(255)  NOT NULL,
+  `strategy_id`        VARCHAR(128)  NOT NULL,
+  `strategy_version_id` VARCHAR(128) NOT NULL,
+  `model_id`           VARCHAR(128)  NULL,
+  `data_snapshot_id`   VARCHAR(128)  NULL,
+  `start_date`         DATE          NOT NULL,
+  `end_date`           DATE          NOT NULL,
+  `frequency`          VARCHAR(32)   NOT NULL,
+  `benchmark`          VARCHAR(128)  NULL,
+  `initial_cash`       DECIMAL(30,8) NOT NULL,
+  `currency`           VARCHAR(16)   NOT NULL,
+  `universe_id`        VARCHAR(128)  NULL,
+  `engine_name`        VARCHAR(64)   NOT NULL,
+  `engine_version`     VARCHAR(64)   NULL,
+  `cost_config`        JSON          NOT NULL,
+  `slippage_config`    JSON          NOT NULL,
+  `risk_config`        JSON          NOT NULL,
+  `run_config`         JSON          NOT NULL,
+  `status`             VARCHAR(32)   NOT NULL,
+  `error_message`      TEXT          NULL,
+  `started_at`         DATETIME      NULL,
+  `finished_at`        DATETIME      NULL,
+  `created_at`         DATETIME      NOT NULL,
+  `schema_version`     INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`experiment_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `bt_experiment_param` (
+  `id`             BIGINT       NOT NULL AUTO_INCREMENT,
+  `experiment_id`  VARCHAR(128) NOT NULL,
+  `param_group`    VARCHAR(128) NOT NULL DEFAULT '',
+  `param_name`     VARCHAR(128) NOT NULL,
+  `param_value`    TEXT         NOT NULL,
+  `param_type`     VARCHAR(32)  NOT NULL,
+  `created_at`     DATETIME     NOT NULL,
+  `schema_version` INT          NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_experiment_param` (`experiment_id`,`param_group`,`param_name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `bt_signal` (
+  `id`             BIGINT        NOT NULL AUTO_INCREMENT,
+  `experiment_id`  VARCHAR(128)  NOT NULL,
+  `signal_date`    DATE          NOT NULL,
+  `instrument_id`  VARCHAR(64)   NOT NULL,
+  `signal_name`    VARCHAR(128)  NOT NULL,
+  `model_id`       VARCHAR(128)  NOT NULL DEFAULT '',
+  `signal_value`   DECIMAL(30,10) NULL,
+  `score`          DECIMAL(30,10) NULL,
+  `signal_rank`    INT           NULL,
+  `selected`       BOOLEAN       NOT NULL DEFAULT FALSE,
+  `reason`         VARCHAR(255)  NULL,
+  `extra`          JSON          NULL,
+  `created_at`     DATETIME      NOT NULL,
+  `schema_version` INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_signal` (`experiment_id`,`signal_date`,`instrument_id`,`signal_name`,`model_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `bt_target_portfolio` (
+  `id`                 BIGINT        NOT NULL AUTO_INCREMENT,
+  `experiment_id`      VARCHAR(128)  NOT NULL,
+  `target_id`          VARCHAR(128)  NOT NULL,
+  `target_date`        DATE          NOT NULL,
+  `execute_date`       DATE          NOT NULL,
+  `instrument_id`      VARCHAR(64)   NOT NULL,
+  `target_weight`      DECIMAL(20,10) NULL,
+  `current_weight`     DECIMAL(20,10) NULL,
+  `delta_weight`       DECIMAL(20,10) NULL,
+  `target_qty`         BIGINT        NULL,
+  `current_qty`        BIGINT        NULL,
+  `delta_qty`          BIGINT        NULL,
+  `source_signal_name` VARCHAR(128)  NULL,
+  `source_model_id`    VARCHAR(128)  NULL,
+  `reason`             VARCHAR(255)  NULL,
+  `extra`              JSON          NULL,
+  `created_at`         DATETIME      NOT NULL,
+  `schema_version`     INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_target_portfolio` (`experiment_id`,`target_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `bt_order` (
+  `id`                BIGINT        NOT NULL AUTO_INCREMENT,
+  `experiment_id`     VARCHAR(128)  NOT NULL,
+  `order_id`          VARCHAR(128)  NOT NULL,
+  `source_target_id`  VARCHAR(128)  NULL,
+  `trading_date`      DATE          NOT NULL,
+  `submit_time`       DATETIME      NOT NULL,
+  `instrument_id`     VARCHAR(64)   NOT NULL,
+  `side`              VARCHAR(16)   NOT NULL,
+  `order_type`        VARCHAR(32)   NOT NULL,
+  `price_type`        VARCHAR(32)   NOT NULL,
+  `limit_price`       DECIMAL(30,10) NULL,
+  `quantity`          BIGINT        NULL,
+  `amount`            DECIMAL(30,10) NULL,
+  `target_weight`     DECIMAL(20,10) NULL,
+  `target_qty`        BIGINT        NULL,
+  `status`            VARCHAR(32)   NOT NULL,
+  `filled_quantity`   BIGINT        NOT NULL DEFAULT 0,
+  `avg_fill_price`    DECIMAL(30,10) NULL,
+  `filled_amount`     DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `rejected_reason`   TEXT          NULL,
+  `cancelled_reason`  TEXT          NULL,
+  `extra`             JSON          NULL,
+  `created_at`        DATETIME      NOT NULL,
+  `updated_at`        DATETIME      NOT NULL,
+  `schema_version`    INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_order` (`experiment_id`,`order_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `bt_trade` (
+  `id`             BIGINT        NOT NULL AUTO_INCREMENT,
+  `experiment_id`  VARCHAR(128)  NOT NULL,
+  `trade_id`       VARCHAR(128)  NOT NULL,
+  `order_id`       VARCHAR(128)  NOT NULL,
+  `trading_date`   DATE          NOT NULL,
+  `trade_time`     DATETIME      NOT NULL,
+  `instrument_id`  VARCHAR(64)   NOT NULL,
+  `side`           VARCHAR(16)   NOT NULL,
+  `price`          DECIMAL(30,10) NOT NULL,
+  `quantity`       BIGINT        NOT NULL,
+  `amount`         DECIMAL(30,10) NOT NULL,
+  `commission`     DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `tax`            DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `slippage_cost`  DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `total_cost`     DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `created_at`     DATETIME      NOT NULL,
+  `schema_version` INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_trade` (`experiment_id`,`trade_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `bt_daily_position` (
+  `id`                BIGINT        NOT NULL AUTO_INCREMENT,
+  `experiment_id`     VARCHAR(128)  NOT NULL,
+  `trading_date`      DATE          NOT NULL,
+  `instrument_id`     VARCHAR(64)   NOT NULL,
+  `quantity`          BIGINT        NOT NULL,
+  `sellable_quantity` BIGINT        NOT NULL,
+  `avg_cost`          DECIMAL(30,10) NOT NULL,
+  `last_price`        DECIMAL(30,10) NOT NULL,
+  `market_value`      DECIMAL(30,10) NOT NULL,
+  `weight`            DECIMAL(20,10) NOT NULL,
+  `unrealized_pnl`    DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `realized_pnl`      DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `holding_days`      INT           NOT NULL DEFAULT 0,
+  `created_at`        DATETIME      NOT NULL,
+  `schema_version`    INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_daily_position` (`experiment_id`,`trading_date`,`instrument_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `bt_daily_account` (
+  `id`             BIGINT        NOT NULL AUTO_INCREMENT,
+  `experiment_id`  VARCHAR(128)  NOT NULL,
+  `trading_date`   DATE          NOT NULL,
+  `cash`           DECIMAL(30,10) NOT NULL,
+  `frozen_cash`    DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `market_value`   DECIMAL(30,10) NOT NULL,
+  `total_value`    DECIMAL(30,10) NOT NULL,
+  `net_value`      DECIMAL(30,10) NOT NULL,
+  `daily_deposit`  DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `daily_withdraw` DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `cash_flow`      DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `commission`     DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `tax`            DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `slippage_cost`  DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `total_cost`     DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `created_at`     DATETIME      NOT NULL,
+  `schema_version` INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_daily_account` (`experiment_id`,`trading_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `bt_daily_performance` (
+  `id`                       BIGINT        NOT NULL AUTO_INCREMENT,
+  `experiment_id`            VARCHAR(128)  NOT NULL,
+  `trading_date`             DATE          NOT NULL,
+  `net_value`                DECIMAL(30,10) NOT NULL,
+  `daily_return`             DECIMAL(30,10) NOT NULL,
+  `cum_return`               DECIMAL(30,10) NOT NULL,
+  `benchmark_net_value`      DECIMAL(30,10) NULL,
+  `benchmark_daily_return`   DECIMAL(30,10) NULL,
+  `benchmark_cum_return`     DECIMAL(30,10) NULL,
+  `daily_excess_return`      DECIMAL(30,10) NULL,
+  `cum_excess_return`        DECIMAL(30,10) NULL,
+  `drawdown`                 DECIMAL(30,10) NOT NULL,
+  `turnover`                 DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `commission`               DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `tax`                      DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `slippage_cost`            DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `total_cost`               DECIMAL(30,10) NOT NULL DEFAULT 0,
+  `created_at`               DATETIME      NOT NULL,
+  `schema_version`           INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_daily_performance` (`experiment_id`,`trading_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `bt_summary_metric` (
+  `id`                BIGINT        NOT NULL AUTO_INCREMENT,
+  `experiment_id`     VARCHAR(128)  NOT NULL,
+  `metric_group`      VARCHAR(128)  NOT NULL,
+  `metric_name`       VARCHAR(128)  NOT NULL,
+  `metric_value`      DECIMAL(30,10) NULL,
+  `metric_text_value` TEXT          NULL,
+  `metric_unit`       VARCHAR(64)   NULL,
+  `metric_value_type` VARCHAR(32)   NOT NULL,
+  `created_at`        DATETIME      NOT NULL,
+  `schema_version`    INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_summary_metric` (`experiment_id`,`metric_group`,`metric_name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+)
 
-    def __init__(self, connection=None, connect_kwargs: Mapping[str, Any] | None = None, commit: bool = True) -> None:
+
+class MySQLResultWriter(ResultWriter):
+    """Persist Nautilus backtest records into an idempotently-created bt_* schema."""
+
+    def __init__(
+        self,
+        connection=None,
+        connect_kwargs: Mapping[str, Any] | None = None,
+        commit: bool = True,
+        create_tables: bool = True,
+    ) -> None:
         self._connection = connection or self._create_connection(connect_kwargs or {})
         self._commit = commit
+        if create_tables:
+            self.create_tables()
 
     @classmethod
-    def from_pymysql_kwargs(cls, **connect_kwargs: Any) -> "MySQLResultWriter":
-        return cls(connect_kwargs=connect_kwargs)
+    def from_pymysql_kwargs(
+        cls,
+        *,
+        create_tables: bool = True,
+        **connect_kwargs: Any,
+    ) -> "MySQLResultWriter":
+        return cls(connect_kwargs=connect_kwargs, create_tables=create_tables)
 
     @staticmethod
     def _create_connection(connect_kwargs: Mapping[str, Any]):
@@ -63,6 +307,34 @@ class MySQLResultWriter(ResultWriter):
         close = getattr(self._connection, "close", None)
         if close is not None:
             close()
+
+    def create_tables(self) -> None:
+        for statement in CREATE_TABLES_SQL:
+            self._execute(statement, ())
+        self._ensure_columns(
+            "bt_target_portfolio",
+            {
+                "target_qty": "BIGINT NULL",
+                "current_qty": "BIGINT NULL",
+                "delta_qty": "BIGINT NULL",
+            },
+        )
+        self._ensure_columns("bt_order", {"target_qty": "BIGINT NULL"})
+
+    def _ensure_columns(self, table: str, additions: Mapping[str, str]) -> None:
+        table_sql = self._quote_identifier(table)
+        existing = {
+            str(row[0])
+            for row in self._query(f"SHOW COLUMNS FROM {table_sql}", ())
+        }
+        for column, definition in additions.items():
+            if column in existing:
+                continue
+            self._execute(
+                f"ALTER TABLE {table_sql} "
+                f"ADD COLUMN {self._quote_identifier(column)} {definition}",
+                (),
+            )
 
     def create_experiment(self, experiment: ExperimentRecord) -> None:
         self._upsert_one(
@@ -177,6 +449,9 @@ class MySQLResultWriter(ResultWriter):
                     "target_weight": record.target_weight,
                     "current_weight": record.current_weight,
                     "delta_weight": record.delta_weight,
+                    "target_qty": record.target_qty,
+                    "current_qty": record.current_qty,
+                    "delta_qty": record.delta_qty,
                     "source_signal_name": record.source_signal_name,
                     "source_model_id": record.source_model_id,
                     "reason": record.reason,
@@ -208,6 +483,7 @@ class MySQLResultWriter(ResultWriter):
                     "quantity": record.quantity,
                     "amount": record.amount,
                     "target_weight": record.target_weight,
+                    "target_qty": record.target_qty,
                     "status": record.status,
                     "filled_quantity": record.filled_quantity,
                     "avg_fill_price": record.avg_fill_price,
@@ -399,6 +675,14 @@ class MySQLResultWriter(ResultWriter):
         except Exception:
             self._rollback_if_needed()
             raise
+        finally:
+            self._close_cursor(cursor)
+
+    def _query(self, sql: str, params: Sequence[Any]) -> list[tuple[Any, ...]]:
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute(sql, params)
+            return list(cursor.fetchall())
         finally:
             self._close_cursor(cursor)
 

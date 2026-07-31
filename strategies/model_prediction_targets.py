@@ -102,8 +102,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         Inject a loader for persisted daily live targets.
 
         The strategy remains storage-agnostic: live wiring owns MySQL access and
-        provides rows from ``live_target_portfolio``. Backtests leave this unset and
-        use the computed plan path.
+        provides rows from its configured target-portfolio table. Callers without a
+        persisted daily target leave this unset and use the computed plan path.
         """
         self._live_target_portfolio_loader = loader
 
@@ -125,7 +125,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         {stock_code: recent_target_date}``. Live wiring queries ``live_target_portfolio``
         for the last ``target_qty > 0`` date (before_trading preferred) within the
         window ``[cutoff_trade_date, trading_date)``. Backtests leave this unset and
-        fall back to each position's entry date.
+        fall back to each position's entry date when no loader is configured.
         """
         self._recent_target_loader = loader
 
@@ -648,12 +648,17 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             | {holding.instrument_id for holding in current_holdings},
         )
         total_asset = float(self._portfolio_value())
-        investable_asset = float(self.investable_total_asset())
-        holdings_value = sum(
-            holding.quantity * holding.price for holding in current_holdings
-        )
-        if investable_asset < holdings_value:
-            investable_asset = float(holdings_value)
+        if self.config.risk_manager_mode == "backtest":
+            investable_asset = total_asset * (
+                1.0 - float(self.config.target_cash_buffer_percent)
+            )
+        else:
+            holdings_value = sum(
+                holding.quantity * holding.price for holding in current_holdings
+            )
+            investable_asset = float(holdings_value * 1.10)
+        if investable_asset <= 0:
+            investable_asset = float(self.config.initial_cash)
         return ModelTargetPlanningRequest(
             trading_date=trading_date,
             signal_date=signal_date,
@@ -663,7 +668,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             target_cash_buffer_percent=float(self.config.target_cash_buffer_percent),
             max_position_percent=float(self.config.max_position_percent),
             total_asset=total_asset,
-            investable_asset= holdings_value * 1.10,  # TODO REMOVE hardcode,
+            investable_asset=investable_asset,
             open_prices=open_prices,
         )
 
@@ -849,9 +854,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         Resolve each held instrument's most-recent positive-target date (internal name
         ``recent_target_date``), keyed by instrument id.
 
-        Live: query ``live_target_portfolio`` (the last ``target_qty > 0`` date within
-        the trailing 30-trading-day window, excluding today) via the injected loader.
-        Backtest: fall back to the position's entry date from ``_active_positions``.
+        Query the configured target-portfolio store (the last ``target_qty > 0`` date
+        within the trailing window, excluding today) via the injected loader. Without
+        a loader, fall back to the position's entry date from ``_active_positions``.
         """
         result: dict[str, date] = {}
         loader = self._recent_target_loader

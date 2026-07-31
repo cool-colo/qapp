@@ -846,6 +846,11 @@ class TargetQuantityStrategy(Strategy):
         # and may still refine it.
         self._roll_trading_day(trading_date)
         if instrument_id not in self._authoritative_open:
+            self.log.info(
+                f"accepting authoritative open from bar for {instrument_id} "
+                f"date={trading_date} open={bar.open}",
+                color=LogColor.BLUE,
+            )
             self._set_authoritative_open(instrument_id, trading_date, float(bar.open))
         within_window = self._within_trading_window()
         self._convergence_suspended = not within_window

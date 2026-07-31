@@ -275,6 +275,8 @@ class LiveSnapshotWriter:
     idempotent and order status updates overwrite prior rows.
     """
 
+    _target_portfolio_table = "live_target_portfolio"
+
     def __init__(
         self,
         engine=None,
@@ -282,8 +284,10 @@ class LiveSnapshotWriter:
         commit: bool = True,
         create_tables: bool = True,
         logger: Any | None = None,
+        target_portfolio_table: str = "live_target_portfolio",
     ) -> None:
         self._logger = logger
+        self._target_portfolio_table = self._validated_identifier(target_portfolio_table)
         # Keep the connect kwargs for reference/debugging. The engine below builds
         # each pooled connection from them via pymysql; the pool (not this class)
         # owns connection lifecycle and health.
@@ -304,9 +308,16 @@ class LiveSnapshotWriter:
         cls,
         *,
         logger: Any,
+        target_portfolio_table: str = "live_target_portfolio",
+        create_tables: bool = True,
         **connect_kwargs: Any,
     ) -> "LiveSnapshotWriter":
-        return cls(connect_kwargs=connect_kwargs, logger=logger)
+        return cls(
+            connect_kwargs=connect_kwargs,
+            logger=logger,
+            target_portfolio_table=target_portfolio_table,
+            create_tables=create_tables,
+        )
 
     @classmethod
     def for_testing(
@@ -314,6 +325,7 @@ class LiveSnapshotWriter:
         connection: Any,
         commit: bool = False,
         logger: Any | None = None,
+        target_portfolio_table: str = "live_target_portfolio",
     ) -> "LiveSnapshotWriter":
         """
         Build a writer around an already-constructed (mock) connection without touching
@@ -326,6 +338,7 @@ class LiveSnapshotWriter:
         writer._connect_kwargs = {}
         writer._engine = _SingleConnectionEngine(connection)
         writer._commit = commit
+        writer._target_portfolio_table = writer._validated_identifier(target_portfolio_table)
         return writer
 
     def set_logger(self, logger: Any) -> None:
@@ -382,12 +395,34 @@ class LiveSnapshotWriter:
 
     def create_tables(self) -> None:
         for statement in CREATE_TABLES_SQL:
+            if "CREATE TABLE IF NOT EXISTS `live_target_portfolio`" in statement:
+                statement = statement.replace(
+                    "`live_target_portfolio`",
+                    self._target_table_sql,
+                )
             self._execute(statement, ())
         self._ensure_target_columns()
         self._ensure_position_columns()
         self._ensure_order_columns()
         self._ensure_trade_columns()
         self._ensure_target_indexes()
+
+    def create_target_table(self) -> None:
+        statement = next(
+            value
+            for value in CREATE_TABLES_SQL
+            if "CREATE TABLE IF NOT EXISTS `live_target_portfolio`" in value
+        )
+        self._execute(
+            statement.replace("`live_target_portfolio`", self._target_table_sql),
+            (),
+        )
+        self._ensure_target_columns()
+        self._ensure_target_indexes()
+
+    @property
+    def _target_table_sql(self) -> str:
+        return self._quote_identifier(self._target_portfolio_table)
 
     def _ensure_target_columns(self) -> None:
         """
@@ -406,7 +441,7 @@ class LiveSnapshotWriter:
         try:
             existing = {
                 str(row[0])
-                for row in self._query("SHOW COLUMNS FROM `live_target_portfolio`", ())
+                for row in self._query(f"SHOW COLUMNS FROM {self._target_table_sql}", ())
             }
         except Exception:
             return
@@ -415,7 +450,7 @@ class LiveSnapshotWriter:
                 continue
             try:
                 self._execute(
-                    f"ALTER TABLE `live_target_portfolio` ADD COLUMN `{column}` {ddl}",
+                    f"ALTER TABLE {self._target_table_sql} ADD COLUMN `{column}` {ddl}",
                     (),
                 )
             except Exception:
@@ -540,7 +575,7 @@ class LiveSnapshotWriter:
             "instrument_id",
         )
         try:
-            rows = self._query("SHOW INDEX FROM `live_target_portfolio`", ())
+            rows = self._query(f"SHOW INDEX FROM {self._target_table_sql}", ())
         except Exception:
             return
         current = tuple(
@@ -554,9 +589,9 @@ class LiveSnapshotWriter:
             return
         try:
             if current:
-                self._execute("ALTER TABLE `live_target_portfolio` DROP INDEX `uk_target`", ())
+                self._execute(f"ALTER TABLE {self._target_table_sql} DROP INDEX `uk_target`", ())
             self._execute(
-                "ALTER TABLE `live_target_portfolio` "
+                f"ALTER TABLE {self._target_table_sql} "
                 "ADD UNIQUE KEY `uk_target` "
                 "(`account_id`,`trader_id`,`trade_date`,`signal_date`,`snapshot_type`,`instrument_id`)",
                 (),
@@ -610,7 +645,7 @@ class LiveSnapshotWriter:
 
     def write_target_portfolios(self, records: Sequence[LiveTargetRecord]) -> None:
         self._upsert_many(
-            "live_target_portfolio",
+            self._target_portfolio_table,
             [self._target_row(record) for record in records],
             key_columns=(
                 "account_id",
@@ -747,7 +782,10 @@ class LiveSnapshotWriter:
             "reason",
             "snapshot_type",
         ]
-        base_sql = f"SELECT {', '.join('`' + c + '`' for c in columns)} FROM `live_target_portfolio` "
+        base_sql = (
+            f"SELECT {', '.join('`' + c + '`' for c in columns)} "
+            f"FROM {self._target_table_sql} "
+        )
         if preferred_snapshot_type is None:
             rows = self._query(f"{base_sql}WHERE {where}", params)
             return [dict(zip(columns, row)) for row in rows]
@@ -790,7 +828,7 @@ class LiveSnapshotWriter:
         # before_trading (snapshot_type ordering weight 0) over other snapshot types (1).
         sql = (
             "SELECT `stock_code`, MAX(`trade_date`) AS recent_target_date "
-            "FROM `live_target_portfolio` "
+            f"FROM {self._target_table_sql} "
             "WHERE `account_id`=%s AND `trader_id`=%s "
             "AND `trade_date` >= %s AND `trade_date` < %s "
             "AND `target_qty` IS NOT NULL AND `target_qty` > 0 "
@@ -1145,6 +1183,12 @@ class LiveSnapshotWriter:
         close = getattr(cursor, "close", None)
         if close is not None:
             close()
+
+    @staticmethod
+    def _validated_identifier(value: str) -> str:
+        value = str(value).strip()
+        LiveSnapshotWriter._quote_identifier(value)
+        return value
 
     @staticmethod
     def _quote_identifier(value: str) -> str:
