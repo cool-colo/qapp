@@ -36,5 +36,6 @@ Thumbs.db
 logs
 start_qapp.sh
 start_calculate_daily_returns.sh
+start_big_qmt_live_trading.sh
 .envs
 

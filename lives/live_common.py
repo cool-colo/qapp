@@ -569,16 +569,20 @@ def qmt_symbol(stock_code: str) -> str:
 
 def stock_code_from_instrument_id(instrument_id: Any) -> str | None:
     text = str(instrument_id).strip().upper()
-    if text.endswith(".QMT"):
-        text = text[:-4]
+    for suffix in (".BIGQMT", ".QMT"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
     return normalize_stock_code(text)
 
 
-def build_bar_type(stock_code: str):
-    from nautilus_trader.adapters.qmt.common import qmt_symbol_to_instrument_id
+def build_bar_type(stock_code: str, venue: str = "QMT"):
     from nautilus_trader.model.data import BarType
+    from nautilus_trader.model.identifiers import InstrumentId
+    from nautilus_trader.model.identifiers import Symbol
+    from nautilus_trader.model.identifiers import Venue
 
-    instrument_id = qmt_symbol_to_instrument_id(qmt_symbol(stock_code))
+    instrument_id = InstrumentId(symbol=Symbol(qmt_symbol(stock_code)), venue=Venue(venue))
     return BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
 
 
@@ -612,11 +616,22 @@ def rolling_request_dates(args: argparse.Namespace) -> tuple[str, str, pd.Timest
 
 
 class LivePredictionDataLoader:
-    def __init__(self, args: argparse.Namespace, connection: ClickHouseConnectionConfig) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        connection: ClickHouseConnectionConfig,
+        broker_source: Any = None,
+    ) -> None:
+        from lives.broker_data_source import build_broker_data_source
+
         self.args = args
         self.connection = connection
         self.prediction_provider = ClickHouseModelPredictionDataProvider(connection)
         self.bar_provider = ClickHouseBarDataProvider(connection=connection, schema=ClickHouseBarSchema())
+        # The broker source owns the venue-specific full-tick / broker snapshot calls
+        # (QMT HTTP proxy vs Big QMT Redis RPC). Defaults to QMT for backward
+        # compatibility with the existing QMT entrypoint.
+        self._broker_source = broker_source or build_broker_data_source(args)
 
     def load(self, extra_stock_codes: set[str] | None = None) -> LivePredictionContext:
         start, end, now = rolling_request_dates(self.args)
@@ -625,7 +640,8 @@ class LivePredictionDataLoader:
         if self.args.max_universe > 0:
             selected_codes = selected_codes[: self.args.max_universe]
         stock_codes = sorted(set(selected_codes).union(normalized_stock_codes(extra_stock_codes or set())))
-        bar_types = {stock_code: build_bar_type(stock_code) for stock_code in stock_codes}
+        venue = self._broker_source.venue
+        bar_types = {stock_code: build_bar_type(stock_code, venue) for stock_code in stock_codes}
         instrument_ids = [bar_types[stock_code].instrument_id for stock_code in stock_codes]
         instrument_stock_codes = {
             str(bar_types[stock_code].instrument_id): stock_code
@@ -677,240 +693,41 @@ GROUP BY source_code
 
     def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float]]:
         """
-        Authoritative full-tick snapshot per instrument id from the QMT proxy
-        ``get_full_tick`` endpoint (``POST /api/v1/data/full-tick``).
+        Authoritative full-tick snapshot per instrument id from the broker gateway.
 
-        This is infrastructure plumbing — Nautilus has no full-tick data type. The
-        proxy tick carries open/last_price/high/low/last_close/bid-ask; the whole
-        normalized tick is returned per instrument id (same keying as
-        ``last_closes``) so callers can consume whichever fields they need. Symbols
-        that return no usable tick are omitted. The strategy currently uses only
-        ``open`` to anchor pricing.
+        Infrastructure plumbing — Nautilus has no full-tick data type. The tick
+        carries open/last_price/high/low/last_close/bid-ask; the whole normalized
+        tick is returned per instrument id (same keying as ``last_closes``). Symbols
+        that return no usable tick are omitted. Delegated to the venue broker source.
         """
-        if not stock_codes:
-            _LOGGER.error("full-tick snapshot requested with empty stock_codes")
-            return {}
-        base_url = str(getattr(self.args, "base_url_http", "") or "").rstrip("/")
-        if not base_url:
-            _LOGGER.error("full-tick snapshot requires base_url_http")
-            return {}
-        api_key = getattr(self.args, "api_key", None)
-        symbol_to_stock = {qmt_symbol(code): code for code in stock_codes}
-        by_stock: dict[str, dict[str, float]] = {}
-        for chunk in chunks(sorted(symbol_to_stock), 500):
-            payload = self._post_full_tick(base_url, api_key, chunk)
-            for item in payload:
-                symbol = str(item.get("symbol", "")).strip().upper()
-                stock_code = symbol_to_stock.get(symbol)
-                if not stock_code:
-                    _LOGGER.warning("full-tick snapshot returned unrequested symbol: %s", symbol)
-                    continue
-                tick = self._coerce_tick_fields(item.get("tick"))
-                if tick:
-                    by_stock[stock_code] = tick
-                else:
-                    _LOGGER.error("full-tick snapshot returned unusable tick for %s: %s", stock_code, item.get("tick"))
-        return {
-            str(build_bar_type(stock_code).instrument_id): tick
-            for stock_code, tick in by_stock.items()
-        }
+        return self._broker_source.full_tick_snapshot(stock_codes)
 
     async def broker_position_snapshot(self) -> dict[str, dict[str, Any]]:
         """
         Broker-reported position snapshot keyed by Nautilus instrument id.
 
-        This is infrastructure plumbing for persistence only. Strategy decisions
-        continue to use the Nautilus portfolio/cache state.
+        Infrastructure plumbing for persistence only. Strategy decisions continue to
+        use the Nautilus portfolio/cache state.
         """
-        return self._normalize_broker_positions(await self._fetch_broker_positions())
+        return await self._broker_source.broker_position_snapshot()
 
     async def broker_order_snapshot(self) -> list[dict[str, Any]]:
         """
-        Broker-reported order list for the account (proxy ``_convert_order`` dicts),
-        each enriched with a normalized ``stock_code`` and Nautilus ``instrument_id``.
+        Broker-reported order list for the account, each enriched with a normalized
+        ``stock_code`` and Nautilus ``instrument_id``.
 
-        Persistence plumbing only: used by the after-close SnapshotRecorder backfill to
-        reconstruct ``live_order`` from QMT's authoritative order list when the live
-        msgbus path missed or mis-recorded the day's orders.
+        Persistence plumbing only: used by the after-close SnapshotRecorder backfill.
         """
-        rows = await self._with_broker_session(
-            lambda client, session_id: client.get_orders(session_id),
-        )
-        return self._enrich_broker_rows(rows)
+        return await self._broker_source.broker_order_snapshot()
 
     async def broker_trade_snapshot(self) -> list[dict[str, Any]]:
         """
-        Broker-reported trade list for the account (proxy ``_convert_trade`` dicts),
-        each enriched with a normalized ``stock_code`` and Nautilus ``instrument_id``.
+        Broker-reported trade list for the account, each enriched with a normalized
+        ``stock_code`` and Nautilus ``instrument_id``.
 
-        Persistence plumbing only: the after-close backfill counterpart for
-        ``live_trade`` (see :meth:`broker_order_snapshot`).
+        Persistence plumbing only: the after-close backfill counterpart for trades.
         """
-        rows = await self._with_broker_session(
-            lambda client, session_id: client.get_trades(session_id),
-        )
-        return self._enrich_broker_rows(rows)
-
-    @classmethod
-    def _enrich_broker_rows(cls, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """
-        Attach a normalized ``stock_code`` and derived ``instrument_id`` to each broker
-        order/trade dict so the recorder stays QMT-symbol-agnostic. Rows without a
-        resolvable stock code are passed through unchanged.
-        """
-        enriched: list[dict[str, Any]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            stock_code = cls._position_stock_code(row)
-            item = dict(row)
-            if stock_code:
-                item["stock_code"] = stock_code
-                item["instrument_id"] = str(build_bar_type(stock_code).instrument_id)
-            enriched.append(item)
-        return enriched
-
-    async def _fetch_broker_positions(self) -> list[dict[str, Any]]:
-        return await self._with_broker_session(
-            lambda client, session_id: client.get_positions(session_id),
-        )
-
-    async def _with_broker_session(self, action: Any) -> list[dict[str, Any]]:
-        """
-        Open a short-lived QMT trading session, run ``action(client, session_id)``
-        (an awaitable), and always close the session/client. Returns ``[]`` when the
-        base URL or account id is not configured. Shared by the position/order/trade
-        broker snapshots so the session dance lives in one place.
-        """
-        base_url = str(getattr(self.args, "base_url_http", "") or "").rstrip("/")
-        account_id = str(getattr(self.args, "account_id", "") or "").strip()
-        if not base_url or not account_id:
-            return []
-        from nautilus_trader.adapters.qmt.http import QMTHttpClient
-
-        client = QMTHttpClient(
-            base_url=base_url,
-            api_key=getattr(self.args, "api_key", None),
-            timeout_secs=float(getattr(self.args, "clickhouse_timeout_secs", 10.0) or 10.0),
-        )
-        session_id: str | None = None
-        try:
-            await client.connect()
-            session = await client.open_session(
-                account_id,
-                str(getattr(self.args, "account_type", "STOCK") or "STOCK"),
-            )
-            session_id = str(session["session_id"])
-            return list(await action(client, session_id))
-        finally:
-            if session_id is not None:
-                await client.close_session(session_id)
-            await client.close()
-
-    @classmethod
-    def _normalize_broker_positions(cls, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        by_instrument: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            stock_code = cls._position_stock_code(row)
-            if not stock_code:
-                continue
-            instrument_id = str(build_bar_type(stock_code).instrument_id)
-            snapshot = {
-                "stock_code": stock_code,
-                "volume": cls._first_position_value(row, "volume", "current_amount", "total_volume"),
-                "can_use_volume": cls._first_position_value(row, "can_use_volume", "available_volume"),
-                "avg_price": cls._first_position_value(row, "avg_price", "open_price", "cost_price"),
-                "market_value": cls._first_position_value(row, "market_value"),
-                "last_price": cls._first_position_value(row, "last_price"),
-                "raw": row,
-            }
-            by_instrument[instrument_id] = snapshot
-        return by_instrument
-
-    @staticmethod
-    def _position_stock_code(row: dict[str, Any]) -> str | None:
-        for key in ("stock_code", "instrument_id", "symbol"):
-            value = row.get(key)
-            if value is None:
-                continue
-            stock_code = normalize_stock_code(str(value).strip().upper().removesuffix(".QMT"))
-            stock_code = LivePredictionDataLoader._with_inferred_exchange(stock_code)
-            if stock_code:
-                return stock_code
-        return None
-
-    @staticmethod
-    def _with_inferred_exchange(stock_code: str | None) -> str | None:
-        if not stock_code or "." in stock_code:
-            return stock_code
-        if len(stock_code) != 6 or not stock_code.isdigit():
-            return stock_code
-        if stock_code.startswith(("6", "9")):
-            return f"{stock_code}.SH"
-        if stock_code.startswith(("0", "2", "3")):
-            return f"{stock_code}.SZ"
-        if stock_code.startswith(("4", "8")):
-            return f"{stock_code}.BJ"
-        return stock_code
-
-    @staticmethod
-    def _first_position_value(row: dict[str, Any], *keys: str) -> Any:
-        for key in keys:
-            value = row.get(key)
-            if value not in (None, ""):
-                return value
-        return None
-
-    @staticmethod
-    def _coerce_tick_fields(tick: Any) -> dict[str, float]:
-        if not isinstance(tick, dict):
-            return {}
-        coerced: dict[str, float] = {}
-        for key, value in tick.items():
-            try:
-                coerced[str(key)] = float(value)
-            except (TypeError, ValueError):
-                continue
-        return coerced
-
-    def _post_full_tick(
-        self,
-        base_url: str,
-        api_key: str | None,
-        symbols: list[str],
-    ) -> list[dict[str, Any]]:
-        url = f"{base_url}/api/v1/data/full-tick"
-        body = json.dumps({"symbols": symbols}).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        timeout = float(getattr(self.args, "clickhouse_timeout_secs", 10.0) or 10.0)
-        max_attempts = 5
-        for attempt in range(1, max_attempts + 1):
-            request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            try:
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                if isinstance(payload, dict) and not payload.get("success", True):
-                    raise RuntimeError(str(payload.get("message") or payload))
-                data = payload.get("data", payload) if isinstance(payload, dict) else payload
-                if isinstance(data, dict):
-                    return list(data.get("items", []))
-                return list(data or [])
-            except (urllib.error.URLError, ValueError, TimeoutError, RuntimeError) as exc:
-                if attempt >= max_attempts:
-                    raise RuntimeError(f"QMT full-tick request failed after {max_attempts} attempts: {exc}") from exc
-                _LOGGER.warning(
-                    "QMT full-tick request failed (attempt %d/%d), retrying in 1s: %s",
-                    attempt,
-                    max_attempts,
-                    exc,
-                )
-                time.sleep(1)
-
-        raise RuntimeError(f"QMT full-tick request failed after {max_attempts} attempts")
+        return await self._broker_source.broker_trade_snapshot()
 
 
 def normalized_stock_codes(values: set[str] | list[str]) -> set[str]:

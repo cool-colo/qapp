@@ -63,13 +63,13 @@ class SnapshotRecorderConfig(ActorConfig, frozen=True):
     timezone_name: str = "Asia/Shanghai"
     before_time: str = "09:27"
     # After-trading snapshot fires shortly after market close (15:00). Note QMT may not
-    # have finished end-of-day settlement yet at 15:05: frozen cash can still be locked
+    # have finished end-of-day settlement yet at 15:02: frozen cash can still be locked
     # and same-day sells unsettled (T+1 在途), so total_asset may not reconcile against
     # market_value+cash+frozen and the figures may not match the settled QMT UI. The
     # reconciliation check below downgrades to a warning rather than blocking the write.
     # If the process starts after this time and the after-trading snapshot is missing,
     # `_catch_up_on_start` backfills one.
-    after_time: str = "15:05"
+    after_time: str = "15:02"
     trading_windows: str = "09:30-11:30,13:00-14:55"
     # The before-trading catch-up window: a start within this HH:MM range (inclusive)
     # still runs the before-trading phase even if before_time already passed.
@@ -325,6 +325,11 @@ class SnapshotRecorder(Actor):
                     on_complete=tick_callback,
                 )
 
+        before_trading_stock_codes = self._writer.load_before_trading_stock_codes(
+            self.config.account_id,
+            self.config.trader_id,
+            trading_date,
+        )
         self._run_full_tick_fetch(
             trigger=AFTER_TRADING,
             on_applied=_record_ticks,
@@ -333,6 +338,7 @@ class SnapshotRecorder(Actor):
                 if tick_callback is None
                 else lambda error: tick_callback("failed", 0, {"error": error})
             ),
+            extra_stock_codes=before_trading_stock_codes,
         )
         asset_id = self._record_asset(
             trading_date,
@@ -977,11 +983,38 @@ class SnapshotRecorder(Actor):
         trigger: str = "snapshot",
         on_applied: Callable[[dict[str, Any]], None] | None = None,
         on_failed: Callable[[str], None] | None = None,
+        extra_stock_codes: list[str] | None = None,
     ) -> None:
         if self._fetch_full_tick is None:
             if on_failed is not None:
                 on_failed("full-tick source is not configured")
             return
+        additional_snapshot: dict[str, Any] = {}
+        if extra_stock_codes:
+            if self._fetch_open_prices is None:
+                if on_failed is not None:
+                    on_failed(
+                        "full-tick source for before-trading positions is not configured",
+                    )
+                return
+            try:
+                additional_result = self._fetch_open_prices(
+                    sorted(set(extra_stock_codes)),
+                )
+            except Exception as exc:
+                self.log.warning(
+                    f"snapshot before-trading-position full-tick fetch failed: {exc}",
+                )
+                if on_failed is not None:
+                    on_failed(str(exc))
+                return
+            if not isinstance(additional_result, dict):
+                error = "before-trading-position full-tick snapshot is invalid"
+                self.log.warning(error)
+                if on_failed is not None:
+                    on_failed(error)
+                return
+            additional_snapshot = additional_result
         try:
             result = self._fetch_full_tick()
         except Exception as exc:
@@ -1003,11 +1036,23 @@ class SnapshotRecorder(Actor):
             else:
                 # Fire-and-forget; the strategy also refreshes opens on its own timer.
                 asyncio.ensure_future(
-                    self._apply_full_tick_async(result, trigger, on_applied, on_failed),
+                    self._apply_full_tick_async(
+                        result,
+                        trigger,
+                        on_applied,
+                        on_failed,
+                        additional_snapshot,
+                    ),
                     loop=loop,
                 )
                 return
-        self._apply_full_tick(result, trigger, on_applied, on_failed)
+        self._apply_full_tick(
+            result,
+            trigger,
+            on_applied,
+            on_failed,
+            additional_snapshot,
+        )
 
     async def _await(self, awaitable: Any) -> Any:
         return await awaitable
@@ -1018,6 +1063,7 @@ class SnapshotRecorder(Actor):
         trigger: str,
         on_applied: Callable[[dict[str, Any]], None] | None,
         on_failed: Callable[[str], None] | None,
+        additional_snapshot: dict[str, Any] | None = None,
     ) -> None:
         try:
             snapshot = await awaitable
@@ -1026,7 +1072,13 @@ class SnapshotRecorder(Actor):
             if on_failed is not None:
                 on_failed(str(exc))
             return
-        self._apply_full_tick(snapshot, trigger, on_applied, on_failed)
+        self._apply_full_tick(
+            snapshot,
+            trigger,
+            on_applied,
+            on_failed,
+            additional_snapshot,
+        )
 
     def _run_position_fetch(
         self,
@@ -1452,7 +1504,10 @@ class SnapshotRecorder(Actor):
         trigger: str = "snapshot",
         on_applied: Callable[[dict[str, Any]], None] | None = None,
         on_failed: Callable[[str], None] | None = None,
+        additional_snapshot: dict[str, Any] | None = None,
     ) -> None:
+        if isinstance(snapshot, dict) and additional_snapshot:
+            snapshot = {**snapshot, **additional_snapshot}
         if not isinstance(snapshot, dict) or not snapshot:
             if on_failed is not None:
                 on_failed("full-tick snapshot is empty or invalid")
@@ -1474,34 +1529,17 @@ class SnapshotRecorder(Actor):
         snapshot: dict[str, Any],
         on_complete: SyncTaskCallback | None = None,
     ) -> None:
-        held_instrument_ids = {
-            str(position.instrument_id)
-            for position in self._open_positions()
-        }
-        if not held_instrument_ids:
-            self.log.warning(
-                f"after-trading full-tick snapshot has no held instruments: {snapshot.keys()}",
-            )
-            if on_complete is not None:
-                on_complete(
-                    "skipped",
-                    0,
-                    {"reason": "no held instruments", "source_instruments": len(snapshot)},
-                )
-            return
-        missing = sorted(held_instrument_ids.difference(snapshot))
-        if missing:
-            self.log.warning(
-                f"after-trading full-tick snapshot missing held instruments: {missing}",
-            )
         now = self._now_naive()
         records: list[LiveStockTickSnapshotRecord] = []
-        for instrument_id_text in sorted(held_instrument_ids.intersection(snapshot)):
+        missing: list[str] = []
+        instrument_ids = sorted(str(instrument_id) for instrument_id in snapshot)
+        for instrument_id_text in instrument_ids:
             tick = self._strategy.tick_snapshot_for(instrument_id_text)
             if tick is None:
                 self.log.warning(
-                    f"after-trading full-tick snapshot missing tick for held instrument: {instrument_id_text}",
+                    f"after-trading full-tick snapshot missing normalized tick: {instrument_id_text}",
                 )
+                missing.append(instrument_id_text)
                 continue
             records.append(
                 LiveStockTickSnapshotRecord(
@@ -1534,7 +1572,6 @@ class SnapshotRecorder(Actor):
                     "success",
                     0,
                     {
-                        "held_instruments": len(held_instrument_ids),
                         "source_instruments": len(snapshot),
                         "missing_instruments": len(missing),
                     },
@@ -1547,7 +1584,6 @@ class SnapshotRecorder(Actor):
                     "success",
                     len(records),
                     {
-                        "held_instruments": len(held_instrument_ids),
                         "source_instruments": len(snapshot),
                         "missing_instruments": len(missing),
                     },
@@ -1560,7 +1596,6 @@ class SnapshotRecorder(Actor):
                     0,
                     {
                         "attempted_rows": len(records),
-                        "held_instruments": len(held_instrument_ids),
                         "source_instruments": len(snapshot),
                         "missing_instruments": len(missing),
                         "error": str(exc),

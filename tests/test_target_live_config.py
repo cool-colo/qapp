@@ -739,6 +739,28 @@ class TargetLiveConfigTest(unittest.TestCase):
             sql,
         )
 
+    def test_writer_load_before_trading_stock_codes(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._query = MagicMock(
+            return_value=[
+                ("000729.SZ",),
+                ("000001.SZ",),
+                ("000729.SZ",),
+            ],
+        )
+
+        result = writer.load_before_trading_stock_codes(
+            "ACC",
+            "TRADER",
+            date(2026, 8, 4),
+        )
+
+        self.assertEqual(result, ["000001.SZ", "000729.SZ"])
+        sql, params = writer._query.call_args.args
+        self.assertIn("`live_position_snapshot`", sql)
+        self.assertIn("`snapshot_type`='before_trading'", sql)
+        self.assertEqual(params, ("ACC", "TRADER", date(2026, 8, 4)))
+
     def test_writer_execute_commits_through_pooled_connection(self) -> None:
         # The writer now checks out a connection from the pool (here a single-connection
         # engine shim), runs on its cursor, commits, and returns it to the pool. Verify
@@ -1169,6 +1191,12 @@ class TargetLiveConfigTest(unittest.TestCase):
 
     def test_after_trading_requests_fresh_tick_before_other_snapshots(self) -> None:
         recorder = SimpleNamespace(
+            config=SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER"),
+            _writer=SimpleNamespace(
+                load_before_trading_stock_codes=MagicMock(
+                    return_value=["000729.SZ"],
+                ),
+            ),
             _run_full_tick_fetch=MagicMock(),
             _record_stock_ticks=MagicMock(),
             _record_asset=MagicMock(),
@@ -1183,6 +1211,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder._run_full_tick_fetch.assert_called_once()
         kwargs = recorder._run_full_tick_fetch.call_args.kwargs
         self.assertEqual(kwargs["trigger"], AFTER_TRADING)
+        self.assertEqual(kwargs["extra_stock_codes"], ["000729.SZ"])
         sample = {"000001.SZ.QMT": {"open": 10.85}}
         kwargs["on_applied"](sample)
         recorder._record_stock_ticks.assert_called_once_with(trading_date, sample)
@@ -1193,7 +1222,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             config=SnapshotRecorderConfig(
                 account_id="ACC",
                 trader_id="TRADER",
-                after_time="15:40",
+                after_time="15:02",
             ),
             _event_reporter=reporter,
             _AFTER_ALERT=SnapshotRecorder._AFTER_ALERT,
@@ -1216,8 +1245,13 @@ class TargetLiveConfigTest(unittest.TestCase):
             )
         )
         recorder._run_full_tick_fetch = MagicMock(
-            side_effect=lambda trigger, on_applied, on_failed: on_applied(
+            side_effect=lambda trigger, on_applied, on_failed, extra_stock_codes: on_applied(
                 {"000001.SZ.QMT": {"open": 10.0}},
+            ),
+        )
+        recorder._writer = SimpleNamespace(
+            load_before_trading_stock_codes=MagicMock(
+                return_value=["000001.SZ"],
             ),
         )
         recorder._record_stock_ticks = MagicMock(
@@ -1287,7 +1321,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             },
         )
 
-    def test_record_stock_ticks_writes_only_held_instruments(self) -> None:
+    def test_record_stock_ticks_writes_all_snapshot_instruments(self) -> None:
         writer = SimpleNamespace(write_stock_tick_snapshots=MagicMock())
         strategy = SimpleNamespace(
             tick_snapshot_for=MagicMock(
@@ -1309,10 +1343,9 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder = SimpleNamespace(
             _writer=writer,
             _strategy=strategy,
-            _open_positions=MagicMock(
-                return_value=[SimpleNamespace(instrument_id="000001.SZ.QMT")],
+            _stock_code=MagicMock(
+                side_effect=lambda instrument_id: instrument_id.removesuffix(".QMT"),
             ),
-            _stock_code=MagicMock(return_value="000001.SZ"),
             _now_naive=MagicMock(return_value=datetime(2026, 7, 8, 15, 5)),
             _decimal_or_none=SnapshotRecorder._decimal_or_none,
             log=MagicMock(),
@@ -1331,7 +1364,11 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
 
         records = writer.write_stock_tick_snapshots.call_args.args[0]
-        self.assertEqual(len(records), 1)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            [record.instrument_id for record in records],
+            ["000001.SZ.QMT", "000002.SZ.QMT"],
+        )
         record = records[0]
         self.assertEqual(record.instrument_id, "000001.SZ.QMT")
         self.assertEqual(record.market_status, "CLOSE")
@@ -1341,9 +1378,8 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(record.last_settlement_price, Decimal("10.84"))
         completed.assert_called_once_with(
             "success",
-            1,
+            2,
             {
-                "held_instruments": 1,
                 "source_instruments": 2,
                 "missing_instruments": 0,
             },
@@ -1385,6 +1421,38 @@ class TargetLiveConfigTest(unittest.TestCase):
         SnapshotRecorder._run_full_tick_fetch(recorder, on_failed=failed)
 
         failed.assert_called_once_with("full-tick unavailable")
+
+    def test_full_tick_fetch_merges_daily_stocks_after_restart(self) -> None:
+        applied = MagicMock()
+        fetch_daily = MagicMock(
+            return_value={"000729.SZ.QMT": {"last_close": 11.25}},
+        )
+        recorder = SimpleNamespace(
+            _fetch_full_tick=MagicMock(
+                return_value={"000001.SZ.QMT": {"last_close": 10.0}},
+            ),
+            _fetch_open_prices=fetch_daily,
+            _strategy=SimpleNamespace(apply_full_tick_snapshot=MagicMock()),
+            log=MagicMock(),
+        )
+        recorder._apply_full_tick = lambda *args: SnapshotRecorder._apply_full_tick(
+            recorder,
+            *args,
+        )
+
+        SnapshotRecorder._run_full_tick_fetch(
+            recorder,
+            trigger=AFTER_TRADING,
+            on_applied=applied,
+            extra_stock_codes=["000729.SZ"],
+        )
+
+        fetch_daily.assert_called_once_with(["000729.SZ"])
+        snapshot = applied.call_args.args[0]
+        self.assertEqual(
+            set(snapshot),
+            {"000001.SZ.QMT", "000729.SZ.QMT"},
+        )
 
     def test_full_tick_apply_failure_reports_task_failure(self) -> None:
         recorder = SimpleNamespace(

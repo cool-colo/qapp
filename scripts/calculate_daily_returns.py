@@ -2,7 +2,7 @@
 """Calculate and persist daily realised/unrealised stock returns.
 
 The calculation is intentionally an operations/reporting script.  It reads the
-live MySQL snapshots and trades, reads yesterday's close from ClickHouse, and
+live MySQL snapshots and trades, uses the tick snapshot's previous close, and
 writes one idempotent result table in MySQL.  It does not participate in any
 strategy or order-routing decision.
 
@@ -29,8 +29,6 @@ import json
 import logging
 import os
 import sys
-import urllib.error
-import urllib.request
 from collections import defaultdict
 from datetime import date
 from datetime import datetime
@@ -38,7 +36,6 @@ from decimal import Decimal
 from decimal import ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -149,7 +146,6 @@ def calculate_records(
     before_positions: list[dict[str, Any]],
     after_positions: list[dict[str, Any]],
     ticks: list[dict[str, Any]],
-    eod_prices: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Build detail and summary rows without database side effects.
 
@@ -165,7 +161,7 @@ def calculate_records(
 
     close_prices = _price_lookup(ticks, "last_price")
     open_prices = _price_lookup(ticks, "open")
-    pre_close_prices = _price_lookup(eod_prices, "pre_close")
+    pre_close_prices = _price_lookup(ticks, "last_close")
     all_keys = set(before_by_key) | set(after_by_key) | set(trades_by_key)
     details: list[dict[str, Any]] = []
 
@@ -200,13 +196,10 @@ def calculate_records(
         close = _find_price(close_prices, stock_code, instrument_id)
         pre_close = _find_price(pre_close_prices, stock_code, instrument_id)
         open_price = _find_price(open_prices, stock_code, instrument_id)
-        # The after-trading tick recorder persists held instruments.  A stock sold
-        # completely during the day therefore has no tick row, which is fine: the
-        # sell formula deliberately uses only fill price and pre-close.
         if (buy_qty or unchanged_qty) and close is None:
             raise ValueError(f"missing today close in live_stock_tick_snapshot for {instrument_id} on {trade_date_text}")
         if (sell_qty or unchanged_qty) and pre_close is None:
-            raise ValueError(f"missing pre_close in dwd_stock_eod_price for {instrument_id} on {trade_date_text}")
+            raise ValueError(f"missing last_close in live_stock_tick_snapshot for {instrument_id} on {trade_date_text}")
 
         cost_price = _decimal((before or after or {}).get("avg_price"), default=ZERO) or None
         common = {
@@ -294,14 +287,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mysql-password", default=_env("MYSQL_PASSWORD", ""))
     parser.add_argument("--mysql-database", default=_env("MYSQL_DATABASE", "backtest"))
     parser.add_argument("--mysql-result-table", default=_env("DAILY_RETURN_MYSQL_TABLE", "live_daily_stock_return"))
-    parser.add_argument("--clickhouse-url", default=_env("CLICKHOUSE_URL", "http://127.0.0.1:8123"))
-    parser.add_argument("--clickhouse-database", default=_env("CLICKHOUSE_DATABASE"))
-    parser.add_argument("--clickhouse-user", default=_env("CLICKHOUSE_USER", "default"))
-    parser.add_argument("--clickhouse-password", default=_env("CLICKHOUSE_PASSWORD"))
-    parser.add_argument("--clickhouse-timeout-secs", type=float, default=float(_env("CLICKHOUSE_TIMEOUT_SECS", "30") or "30"))
-    parser.add_argument("--eod-table", default=_env("DAILY_RETURN_EOD_TABLE", "dwd_stock_eod_price"))
-    parser.add_argument("--eod-date-column", default=_env("DAILY_RETURN_EOD_DATE_COLUMN", "trade_date"))
-    parser.add_argument("--eod-pre-close-column", default=_env("DAILY_RETURN_EOD_PRE_CLOSE_COLUMN", "pre_close"))
     parser.add_argument("--no-create-table", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--log-level", default=_env("QMT_LOG_LEVEL", "INFO"))
@@ -380,43 +365,13 @@ def fetch_mysql_inputs(connection, args: argparse.Namespace, trade_date: str) ->
         )
         trades = list(cursor.fetchall())
         cursor.execute(
-            "SELECT `instrument_id`, `stock_code`, `last_price`, `open` FROM `live_stock_tick_snapshot` "
+            "SELECT `instrument_id`, `stock_code`, `last_price`, `open`, `last_close` "
+            "FROM `live_stock_tick_snapshot` "
             "WHERE `trade_date` = %s AND `snapshot_type` = 'after_trading'",
             (trade_date,),
         )
         ticks = list(cursor.fetchall())
     return trades, before, after, ticks
-
-
-def _ch_identifier(value: str) -> str:
-    if not value.replace("_", "").isalnum() or not value or value[0].isdigit():
-        raise ValueError(f"invalid ClickHouse identifier: {value!r}")
-    return f"`{value}`"
-
-
-def fetch_eod_prices(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any]]:
-    table = _ch_identifier(args.eod_table)
-    symbol = _ch_identifier("ts_code")
-    date_column = _ch_identifier(args.eod_date_column)
-    pre_close = _ch_identifier(args.eod_pre_close_column)
-    sql = f"SELECT {symbol} AS symbol, {pre_close} AS pre_close FROM {table} WHERE {date_column} = '{trade_date}' FORMAT JSONEachRow"
-    params: dict[str, str] = {"query": sql}
-    if args.clickhouse_database:
-        params["database"] = args.clickhouse_database
-    headers = {"Accept": "application/json"}
-    if args.clickhouse_user:
-        headers["X-ClickHouse-User"] = args.clickhouse_user
-    if args.clickhouse_password:
-        headers["X-ClickHouse-Key"] = args.clickhouse_password
-    request = urllib.request.Request(f"{args.clickhouse_url.rstrip('/')}/?{urlencode(params)}", headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=args.clickhouse_timeout_secs) as response:
-            return [json.loads(line) for line in response.read().decode("utf-8").splitlines() if line.strip()]
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"ClickHouse HTTP {exc.code}: {detail[:1000]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"ClickHouse request failed: {exc}") from exc
 
 
 def create_table(connection, table: str) -> None:
@@ -475,8 +430,7 @@ def main(argv: list[str] | None = None) -> int:
     connection = _connect_mysql(args)
     try:
         trades, before, after, ticks = fetch_mysql_inputs(connection, args, trade_date)
-        eod = fetch_eod_prices(args, trade_date)
-        rows = calculate_records(trade_date, trades, before, after, ticks, eod)
+        rows = calculate_records(trade_date, trades, before, after, ticks)
         LOGGER.info("calculated %d daily-return rows from %d trades, %d before positions, %d after positions", len(rows), len(trades), len(before), len(after))
         if args.dry_run:
             LOGGER.info("--dry-run: skipping MySQL result write")

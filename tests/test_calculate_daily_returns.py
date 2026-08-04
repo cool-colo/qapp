@@ -42,8 +42,10 @@ class DailyReturnCalculationTests(unittest.TestCase):
                     "stock_code": "600000.SH", "volume": 400, "avg_price": "9.2",
                 },
             ],
-            ticks=[{"instrument_id": "600000.SSE", "stock_code": "600000.SH", "last_price": "10.5", "open": "10.1"}],
-            eod_prices=[{"symbol": "600000.SH", "pre_close": "10"}],
+            ticks=[{
+                "instrument_id": "600000.SSE", "stock_code": "600000.SH",
+                "last_price": "10.5", "open": "10.1", "last_close": "10",
+            }],
         )
         by_type = {row["calculation_type"]: row for row in rows if row["stock_code"] != "summary"}
         self.assertEqual(set(by_type), {"buy", "sell", "hold", "all"})
@@ -68,11 +70,10 @@ class DailyReturnCalculationTests(unittest.TestCase):
                 after_positions=[
                     {"account_id": "a", "trader_id": "t", "instrument_id": "000001.SZ", "stock_code": "000001.SZ", "volume": 200},
                 ],
-                ticks=[{"instrument_id": "000001.SZ", "last_price": "10"}],
-                eod_prices=[{"symbol": "000001.SZ", "pre_close": "9"}],
+                ticks=[{"instrument_id": "000001.SZ", "last_price": "10", "last_close": "9"}],
             )
 
-    def test_allows_fully_sold_stock_without_after_trading_tick(self) -> None:
+    def test_uses_tick_last_close_for_fully_sold_stock(self) -> None:
         rows = calculate_records(
             "2026-07-27",
             trades=[
@@ -89,11 +90,11 @@ class DailyReturnCalculationTests(unittest.TestCase):
                 },
             ],
             after_positions=[],
-            ticks=[],
-            eod_prices=[{"symbol": "000001.SZ", "pre_close": "9"}],
+            ticks=[{"instrument_id": "000001.SZ", "last_close": "9"}],
         )
         sell = next(row for row in rows if row["calculation_type"] == "sell")
         self.assertEqual(sell["close_price"], None)
+        self.assertEqual(sell["pre_close"], Decimal("9"))
         self.assertEqual(sell["return_amount"], Decimal("94.9500"))
 
     def test_ignores_zero_volume_snapshot_without_trades(self) -> None:
@@ -109,7 +110,6 @@ class DailyReturnCalculationTests(unittest.TestCase):
                 ],
                 after_positions=[],
                 ticks=[],
-                eod_prices=[],
             ),
             [],
         )
