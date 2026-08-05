@@ -312,10 +312,12 @@ class TargetQuantityStrategy(Strategy):
             offset_bps=float(config.buy_offset_bps),
             max_price_bps=float(config.buy_max_price_bps),
             cancel_threshold=int(config.buy_cancel_threshold),
+            logger=self.log,
         )
         self._sell_pricer = OpenOffsetSellPriceStrategy(
             offset_bps=float(config.sell_offset_bps),
             cancel_threshold=int(config.sell_cancel_threshold),
+            logger=self.log,
         )
         # Today's open price per instrument (first bar of the trading date wins).
         self._today_open: dict[str, float] = {}

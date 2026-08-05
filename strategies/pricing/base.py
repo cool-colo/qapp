@@ -3,10 +3,17 @@ from __future__ import annotations
 from abc import ABC
 from abc import abstractmethod
 from decimal import Decimal
+from typing import Protocol
 
 from nautilus_trader.model.enums import OrderSide
 
 from strategies.pricing.context import PriceContext
+
+
+class PriceStrategyLogger(Protocol):
+    """The logging interface supplied by the strategy which owns a pricer."""
+
+    def warning(self, message: str) -> None: ...
 
 
 def base_offset(base_price: float, tick: float, offset_bps: float) -> float:
@@ -57,6 +64,9 @@ class PriceStrategy(ABC):
 
     Implementations MUST NOT retain state across calls.
     """
+
+    def __init__(self, *, logger: PriceStrategyLogger) -> None:
+        self.logger = logger
 
     @abstractmethod
     def compute(self, ctx: PriceContext) -> float | None:  # pragma: no cover - interface

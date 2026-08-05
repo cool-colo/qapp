@@ -471,10 +471,12 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             offset_bps=strategy.config.buy_offset_bps,
             max_price_bps=strategy.config.buy_max_price_bps,
             cancel_threshold=strategy.config.buy_cancel_threshold,
+            logger=strategy.log,
         )
         strategy._sell_pricer = OpenOffsetSellPriceStrategy(
             offset_bps=strategy.config.sell_offset_bps,
             cancel_threshold=strategy.config.sell_cancel_threshold,
+            logger=strategy.log,
         )
         initial_prices = prices or {INST_A: 10.0, INST_B: 20.0, INST_C: 25.0}
         initial_open_prices = initial_prices if open_prices is None else open_prices

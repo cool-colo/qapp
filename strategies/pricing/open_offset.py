@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from strategies.pricing.base import BuyPriceStrategy
+from strategies.pricing.base import PriceStrategyLogger
 from strategies.pricing.base import SellPriceStrategy
 from strategies.pricing.base import base_offset
 from strategies.pricing.base import walk_book
@@ -20,13 +21,21 @@ class OpenOffsetSellPriceStrategy(SellPriceStrategy):
     the exchange down-limit is handled by the executor's symbol-freeze logic.
     """
 
-    def __init__(self, offset_bps: float = 5.0, cancel_threshold: int = 1) -> None:
+    def __init__(
+        self,
+        offset_bps: float = 5.0,
+        cancel_threshold: int = 1,
+        *,
+        logger: PriceStrategyLogger,
+    ) -> None:
+        super().__init__(logger=logger)
         self.offset_bps = float(offset_bps)
         self.cancel_threshold = int(cancel_threshold)
 
     def _compute_sell(self, ctx: PriceContext) -> float | None:
         base = ctx.base_price()
         if base is None:
+            self.logger.warning("No base price available for sell price computation")
             return None
         offset = base_offset(base, ctx.tick, self.offset_bps)
         base_price = base - offset
@@ -70,7 +79,10 @@ class OpenOffsetBuyPriceStrategy(BuyPriceStrategy):
         offset_bps: float = 5.0,
         max_price_bps: float = 100.0,
         cancel_threshold: int = 2,
+        *,
+        logger: PriceStrategyLogger,
     ) -> None:
+        super().__init__(logger=logger)
         self.offset_bps = float(offset_bps)
         self.max_price_bps = float(max_price_bps)
         self.cancel_threshold = int(cancel_threshold)
@@ -84,6 +96,7 @@ class OpenOffsetBuyPriceStrategy(BuyPriceStrategy):
     def _compute_buy(self, ctx: PriceContext) -> float | None:
         base = ctx.base_price()
         if base is None:
+            self.logger.warning("No base price available for buy price computation")
             return None
         offset = base_offset(base, ctx.tick, self.offset_bps)
         base_price = base + offset

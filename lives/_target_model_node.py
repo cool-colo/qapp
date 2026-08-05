@@ -398,6 +398,13 @@ def build_target_model_node(
         # out of the universe.
         stock_codes = set(strategy._stock_by_instrument.values())
         stock_codes.update(strategy._active_stock_codes())
+        # Current target instruments too: after a mid-session restart the pre-open
+        # prefetch is gone, and a target activated later must still get its open so
+        # the pricer can anchor. _target_quantities is keyed by instrument-id text.
+        for instrument_id in strategy._target_quantities:
+            stock_code = legacy.stock_code_from_instrument_id(instrument_id)
+            if stock_code:
+                stock_codes.add(stock_code)
         if not stock_codes:
             return {}
         return loader.full_tick_snapshot(sorted(stock_codes))
