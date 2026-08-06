@@ -52,6 +52,7 @@ from lives.snapshot_recorder import SnapshotRecorder  # noqa: E402
 from lives.snapshot_recorder import SnapshotRecorderConfig  # noqa: E402
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy  # noqa: E402
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig  # noqa: E402
+from strategies.strategy_params import StrategyParams  # noqa: E402
 from nautilus_trader.core.data import Data  # noqa: E402
 from nautilus_trader.model.data import Bar  # noqa: E402
 from nautilus_trader.model.data import CustomData  # noqa: E402
@@ -171,6 +172,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", default=env("BACKTEST_START_DATE", "2025-01-02"))
     parser.add_argument("--end", default=env("BACKTEST_END_DATE", "2025-12-31"))
     parser.add_argument(
+        "--config",
+        default=env("STRATEGY_CONFIG_FILE"),
+        help="Path to the strategy-params YAML file (see configs/strategy.yaml). Required.",
+    )
+    parser.add_argument(
         "--predictions-table",
         default=env("TARGET_MODEL_PREDICTIONS_TABLE", "daily_model_predictions"),
     )
@@ -180,24 +186,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-score", type=float, default=parse_optional_float(env("MODEL_MIN_SCORE")))
     parser.add_argument("--top-frac", type=float, default=float(env("MODEL_TOP_FRAC", "0.10")))
     parser.add_argument("--max-positions", type=int, default=int(env("MODEL_MAX_POSITIONS", "50")))
-    parser.add_argument(
-        "--max-position-percent",
-        type=float,
-        default=float(env("MODEL_MAX_POSITION_PERCENT", "0.03")),
-    )
-    parser.add_argument("--holding-days", type=int, default=int(env("MODEL_HOLDING_DAYS", "10")))
-    parser.add_argument("--stop-loss", type=float, default=float(env("MODEL_STOP_LOSS", "0.05")))
-    parser.add_argument(
-        "--trailing-take-profit",
-        type=float,
-        default=float(env("MODEL_TRAILING_TAKE_PROFIT", "0.0")),
-    )
-    parser.add_argument(
-        "--trailing-take-profit-start",
-        type=float,
-        default=float(env("MODEL_TRAILING_TAKE_PROFIT_START", "0.0")),
-    )
-    parser.add_argument("--min-listed-days", type=int, default=int(env("MODEL_MIN_LISTED_DAYS", "120")))
     parser.add_argument("--signal-warmup-days", type=int, default=int(env("MODEL_SIGNAL_WARMUP_DAYS", "7")))
     parser.add_argument("--max-universe", type=int, default=int(env("MODEL_MAX_UNIVERSE", "0")))
     parser.add_argument("--clickhouse-url", default=env("CLICKHOUSE_URL", "http://127.0.0.1:8123"))
@@ -226,7 +214,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-results", action="store_true", default=env_bool("BACKTEST_RESULT_WRITE_ENABLED", False))
     add_benchmark_args(parser)
     REPORT_PROCESSOR.add_tearsheet_args(parser)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.config:
+        parser.error("--config is required, or set STRATEGY_CONFIG_FILE (see configs/strategy.yaml)")
+    return args
 
 
 def build_connection(args: argparse.Namespace) -> ClickHouseConnectionConfig:
@@ -461,6 +452,8 @@ def build_engine(
     from nautilus_trader.model.identifiers import TraderId
     from nautilus_trader.model.objects import Money
 
+    params = StrategyParams.from_yaml(args.config)
+
     engine = BacktestEngine(
         config=BacktestEngineConfig(
             trader_id=TraderId(args.trader_id),
@@ -468,6 +461,7 @@ def build_engine(
             risk_engine=RiskEngineConfig(bypass=True),
         ),
     )
+    params.log(engine.logger, source=args.config)
     engine.add_venue(
         venue=QMT_VENUE,
         oms_type=OmsType.NETTING,
@@ -538,30 +532,29 @@ def build_engine(
                 for key, values in bundle.suspended_by_date.items()
             },
             max_positions=args.max_positions,
-            max_position_percent=args.max_position_percent,
-            holding_days=args.holding_days,
-            stop_loss=args.stop_loss,
-            trailing_take_profit=args.trailing_take_profit,
-            trailing_take_profit_start=args.trailing_take_profit_start,
-            min_listed_days=args.min_listed_days,
+            max_position_percent=params.max_position_percent,
+            holding_days=params.holding_days,
+            stop_loss=params.stop_loss,
+            trailing_take_profit=params.trailing_take_profit,
+            trailing_take_profit_start=params.trailing_take_profit_start,
+            min_listed_days=params.min_listed_days,
             initial_cash=args.starting_cash,
             timezone_name=args.exchange_timezone,
-            target_cash_buffer_percent=float(
-                env("TARGET_MODEL_CASH_BUFFER_PERCENT", "0.05"),
-            ),
-            target_weight_planner=env("TARGET_MODEL_WEIGHT_PLANNER", "risk_manager"),
-            target_weight_planner_error_policy=env(
-                "TARGET_MODEL_WEIGHT_PLANNER_ERROR_POLICY",
-                "raise",
-            ),
-            risk_manager_base_url=env("RISK_MANAGER_BASE_URL", "http://127.0.0.1:8000"),
-            risk_manager_risk_model_id=env(
-                "RISK_MANAGER_RISK_MODEL_ID",
-                "cn_a_basic_constraints_integer_lots",
-            ),
-            risk_manager_mode=env("RISK_MANAGER_MODE", "backtest"),
-            risk_manager_timeout_secs=float(env("RISK_MANAGER_TIMEOUT_SECS", "10")),
-            order_slice_notional=parse_decimal(env("TARGET_MODEL_ORDER_SLICE_NOTIONAL", "300000")),
+            excluded_name_prefixes=params.excluded_name_prefixes,
+            target_cash_buffer_percent=params.target_cash_buffer_percent,
+            cash_buffer_percent=params.cash_buffer_percent,
+            target_weight_planner=params.target_weight_planner,
+            target_weight_planner_error_policy=params.target_weight_planner_error_policy,
+            risk_manager_base_url=params.risk_manager_base_url,
+            risk_manager_risk_model_id=params.risk_manager_risk_model_id,
+            risk_manager_mode=params.risk_manager_mode,
+            risk_manager_timeout_secs=params.risk_manager_timeout_secs,
+            order_slice_notional=params.order_slice_notional,
+            limit_stop_mode=params.limit_stop_mode,
+            exit_non_targets=params.exit_non_targets,
+            trading_windows=params.trading_windows,
+            exchange_trading_windows=params.exchange_trading_windows,
+            stop_time=params.stop_time,
             require_account_cash=True,
             unfilled_timeout_secs=0,
             subscribe_bars=False,
@@ -723,6 +716,7 @@ def experiment_params(args: argparse.Namespace, experiment_id_value: str) -> lis
 
 
 def run_config(args: argparse.Namespace) -> dict[str, Any]:
+    params = StrategyParams.from_yaml(args.config)
     return {
         "strategy.predictions_table": args.predictions_table,
         "strategy.stock_codes": args.stock_codes,
@@ -731,26 +725,20 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.min_score": args.min_score,
         "strategy.top_frac": args.top_frac,
         "strategy.max_positions": args.max_positions,
-        "strategy.max_position_percent": args.max_position_percent,
-        "strategy.holding_days": args.holding_days,
-        "strategy.stop_loss": args.stop_loss,
-        "strategy.trailing_take_profit": args.trailing_take_profit,
-        "strategy.trailing_take_profit_start": args.trailing_take_profit_start,
-        "strategy.min_listed_days": args.min_listed_days,
-        "strategy.target_cash_buffer_percent": env("TARGET_MODEL_CASH_BUFFER_PERCENT", "0.05"),
-        "strategy.target_weight_planner": env("TARGET_MODEL_WEIGHT_PLANNER", "risk_manager"),
-        "strategy.target_weight_planner_error_policy": env(
-            "TARGET_MODEL_WEIGHT_PLANNER_ERROR_POLICY",
-            "raise",
-        ),
-        "strategy.risk_manager_base_url": env("RISK_MANAGER_BASE_URL", "http://127.0.0.1:8000"),
-        "strategy.risk_manager_risk_model_id": env(
-            "RISK_MANAGER_RISK_MODEL_ID",
-            "cn_a_basic_constraints_integer_lots",
-        ),
-        "strategy.risk_manager_mode": env("RISK_MANAGER_MODE", "backtest"),
-        "strategy.risk_manager_timeout_secs": env("RISK_MANAGER_TIMEOUT_SECS", "10"),
-        "strategy.order_slice_notional": env("TARGET_MODEL_ORDER_SLICE_NOTIONAL", "300000"),
+        "strategy.max_position_percent": params.max_position_percent,
+        "strategy.holding_days": params.holding_days,
+        "strategy.stop_loss": params.stop_loss,
+        "strategy.trailing_take_profit": params.trailing_take_profit,
+        "strategy.trailing_take_profit_start": params.trailing_take_profit_start,
+        "strategy.min_listed_days": params.min_listed_days,
+        "strategy.target_cash_buffer_percent": params.target_cash_buffer_percent,
+        "strategy.target_weight_planner": params.target_weight_planner,
+        "strategy.target_weight_planner_error_policy": params.target_weight_planner_error_policy,
+        "strategy.risk_manager_base_url": params.risk_manager_base_url,
+        "strategy.risk_manager_risk_model_id": params.risk_manager_risk_model_id,
+        "strategy.risk_manager_mode": params.risk_manager_mode,
+        "strategy.risk_manager_timeout_secs": params.risk_manager_timeout_secs,
+        "strategy.order_slice_notional": params.order_slice_notional,
         "base.start_date": args.start,
         "base.end_date": args.end,
         "base.initial_cash": args.starting_cash,

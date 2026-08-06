@@ -27,6 +27,7 @@ from monitoring.dingtalk_alert import DingTalkAlerter
 from monitoring.dingtalk_alert import FixedTimeEventReporter
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig
+from strategies.strategy_params import StrategyParams
 from nautilus_trader.common.enums import LogColor
 
 
@@ -265,6 +266,7 @@ def build_target_model_node(
     from nautilus_trader.live.node import TradingNode
     from nautilus_trader.model.identifiers import TraderId
 
+    params = StrategyParams.from_yaml(args.config)
     extra_stock_codes = legacy.normalized_stock_codes(legacy.env_list_from_value(args.extra_stock_codes))
     context = loader.load(extra_stock_codes=extra_stock_codes)
     venue_clients: VenueClients = make_venue_clients(args, context)
@@ -313,6 +315,7 @@ def build_target_model_node(
         timeout_post_stop=5.0,
     )
     node = TradingNode(config=config_node)
+    params.log(node.get_logger(), source=args.config)
     event_reporter = FixedTimeEventReporter(
         DingTalkAlerter.from_env(timeout=args.dingtalk_timeout_secs),
         environment=args.environment,
@@ -335,43 +338,43 @@ def build_target_model_node(
                 for key, values in context.bundle.suspended_by_date.items()
             },
             max_positions=args.max_positions,
-            max_position_percent=args.max_position_percent,
-            stop_loss=args.stop_loss,
-            trailing_take_profit=args.trailing_take_profit,
-            trailing_take_profit_start=args.trailing_take_profit_start,
-            min_listed_days=args.min_listed_days,
-            initial_cash=args.initial_cash,
+            max_position_percent=params.max_position_percent,
+            stop_loss=params.stop_loss,
+            trailing_take_profit=params.trailing_take_profit,
+            trailing_take_profit_start=params.trailing_take_profit_start,
+            min_listed_days=params.min_listed_days,
+            initial_cash=params.initial_cash,
             timezone_name=args.exchange_timezone,
             initial_last_closes=context.last_closes,
-            excluded_name_prefixes=tuple(legacy.env_list_from_value(args.excluded_name_prefixes)),
-            target_weight_planner=args.target_weight_planner,
-            target_weight_planner_error_policy=args.target_weight_planner_error_policy,
-            risk_manager_base_url=args.risk_manager_base_url,
-            risk_manager_risk_model_id=args.risk_manager_risk_model_id,
-            risk_manager_mode=args.risk_manager_mode,
-            risk_manager_timeout_secs=args.risk_manager_timeout_secs,
-            unfilled_timeout_secs=args.unfilled_timeout_secs,
-            resubmit_check_interval_secs=args.resubmit_interval_secs,
-            cash_buffer_percent=args.cash_buffer_percent,
-            target_cash_buffer_percent=args.target_cash_buffer_percent,
-            stop_time=args.stop_time,
-            limit_stop_mode=args.limit_stop_mode,
-            exit_non_targets=not args.leave_non_targets,
-            order_slice_notional=args.order_slice_notional,
-            trade_tick_log_sample_rate=args.trade_tick_log_sample_rate,
-            order_book_depth_log_sample_rate=args.order_book_depth_log_sample_rate,
-            trading_windows=args.trading_windows,
-            exchange_trading_windows=args.exchange_trading_windows,
-            order_id_tag=args.order_id_tag,
+            excluded_name_prefixes=params.excluded_name_prefixes,
+            target_weight_planner=params.target_weight_planner,
+            target_weight_planner_error_policy=params.target_weight_planner_error_policy,
+            risk_manager_base_url=params.risk_manager_base_url,
+            risk_manager_risk_model_id=params.risk_manager_risk_model_id,
+            risk_manager_mode=params.risk_manager_mode,
+            risk_manager_timeout_secs=params.risk_manager_timeout_secs,
+            unfilled_timeout_secs=params.unfilled_timeout_secs,
+            resubmit_check_interval_secs=params.resubmit_interval_secs,
+            cash_buffer_percent=params.cash_buffer_percent,
+            target_cash_buffer_percent=params.target_cash_buffer_percent,
+            stop_time=params.stop_time,
+            limit_stop_mode=params.limit_stop_mode,
+            exit_non_targets=params.exit_non_targets,
+            order_slice_notional=params.order_slice_notional,
+            trade_tick_log_sample_rate=params.trade_tick_log_sample_rate,
+            order_book_depth_log_sample_rate=params.order_book_depth_log_sample_rate,
+            trading_windows=params.trading_windows,
+            exchange_trading_windows=params.exchange_trading_windows,
+            order_id_tag=params.order_id_tag,
             subscribe_bars=False,
             subscribe_quote_ticks=False,
             subscribe_trade_ticks=False,
             quote_tick_window_probe_instrument_ids=tuple(context.instrument_ids[:2]),
             subscribe_order_book_depth=True,
-            full_tick_refresh_secs=args.full_tick_refresh_secs,
-            full_tick_prefetch_time=args.full_tick_prefetch_time,
+            full_tick_refresh_secs=params.full_tick_refresh_secs,
+            full_tick_prefetch_time=params.full_tick_prefetch_time,
             process_targets_on_timer=True,
-            process_targets_interval_secs=args.resubmit_interval_secs,
+            process_targets_interval_secs=params.resubmit_interval_secs,
         ),
         refresh_context=lambda active_stock_codes: loader.load(
             extra_stock_codes=extra_stock_codes.union(active_stock_codes),

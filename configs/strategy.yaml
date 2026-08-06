@@ -1,0 +1,66 @@
+# Strategy-tuning parameters for the target model-prediction strategy.
+#
+# Loaded by StrategyParams.from_yaml() and shared by:
+#   - lives/live_qmt_target_model_predictions.py    (--config)
+#   - lives/live_bigqmt_target_model_predictions.py (--config)
+#   - backtests/target_model_predictions/run_backtest.py (--config)
+#
+# Point at it with --config <path> (or the STRATEGY_CONFIG_FILE env var).
+# Only STRATEGY-tuning knobs live here. Node/infra params (account id, redis,
+# clickhouse, logging, metrics, data universe) stay on CLI/env.
+#
+# Unknown keys raise an error (typos fail loudly). Any key you omit falls back to
+# the default shown below. Every value below is the current default.
+#
+# NOTE: live vs backtest differ only in `risk_manager_mode` (live -> "live",
+# backtest -> "backtest"). Keep a separate YAML per context, or edit that one key.
+# max_positions and exchange_timezone stay on CLI/env (--max-positions,
+# --exchange-timezone) because they are consumed before the strategy is built.
+
+# --- Position sizing / rotation ---
+max_position_percent: 0.03
+stop_loss: 0.1
+trailing_take_profit: 0.0
+trailing_take_profit_start: 0.0
+min_listed_days: 120
+holding_days: 10           # backtest rebalance cadence (unused by live target-timer path)
+initial_cash: 1000000
+
+# --- Order lifecycle / cash gating ---
+unfilled_timeout_secs: 60.0
+resubmit_interval_secs: 10.0     # feeds resubmit_check_interval_secs AND process_targets_interval_secs
+cash_buffer_percent: 0.0
+target_cash_buffer_percent: 0.05
+order_slice_notional: 300000     # CNY notional per order slice; 0 disables splitting
+limit_stop_mode: freeze_symbol
+leave_non_targets: false         # false => exit holdings absent from latest targets
+stop_time: "14:55"
+
+# --- Target weight planning / risk manager ---
+target_weight_planner: risk_manager            # equal_weight | risk_manager
+target_weight_planner_error_policy: raise       # raise | equal_weight
+risk_manager_base_url: http://127.0.0.1:8000
+risk_manager_risk_model_id: cn_a_basic_constraints_integer_lots
+risk_manager_mode: live                          # backtest | simulation | live
+risk_manager_timeout_secs: 10.0
+
+# --- Universe name filtering ---
+excluded_name_prefixes:
+  - "*ST"
+  - "ST"
+  - "退市"
+
+# --- Exchange windows (timezone stays on CLI: --exchange-timezone) ---
+trading_windows: "09:29-11:30,13:00-14:55"
+exchange_trading_windows: "09:30-11:30,13:00-14:55"
+
+# --- Full-tick snapshot ---
+full_tick_refresh_secs: 1.0
+full_tick_prefetch_time: "09:27"
+
+# --- Order tagging (live) ---
+order_id_tag: "001"
+
+# --- Logging sample rates ---
+trade_tick_log_sample_rate: 0.0
+order_book_depth_log_sample_rate: 0.01

@@ -18,16 +18,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Run everything from the repo root.
 
+Strategy-tuning parameters (position sizing, stop-loss, risk-manager, order slicing,
+trading windows, full-tick, etc.) live in a **YAML config file** — see
+`configs/strategy.yaml` for the annotated template. Point at it with `--config <path>`
+(or set `STRATEGY_CONFIG_FILE`); it is **required** for both the live entrypoints and the
+target-model backtest. Node/infra params (account id, redis, clickhouse, logging, metrics)
+and data-universe params (`--all-stocks`, `--stock-codes`, `--top-frac`, `--max-positions`,
+`--exchange-timezone`, `--history-days`) stay on CLI/env. Live and backtest share the same
+schema; they differ only in `risk_manager_mode` (`live` vs `backtest`), so keep a separate
+YAML per context or edit that one key.
+
 ```bash
-# Backtest the model-prediction strategy (main strategy)
-python -m backtests.model_predictions.run_backtest --start 2025-01-02 --end 2025-12-31 --all-stocks
+# Backtest the target model-prediction strategy (main strategy)
+python -m backtests.target_model_predictions.run_backtest --config configs/strategy.yaml --start 2025-01-02 --end 2025-12-31 --all-stocks
 
 # Inspect selected signals without running the engine
-python -m backtests.model_predictions.run_backtest --print-signals --all-stocks
+python -m backtests.target_model_predictions.run_backtest --config configs/strategy.yaml --print-signals --all-stocks
 # Load data / build only, no engine run (fast smoke test of DB wiring)
-python -m backtests.model_predictions.run_backtest --load-only --all-stocks
+python -m backtests.target_model_predictions.run_backtest --config configs/strategy.yaml --load-only --all-stocks
 # Persist results to MySQL + write CSV reports
-python -m backtests.model_predictions.run_backtest --all-stocks --write-results --report-dir output/run1
+python -m backtests.target_model_predictions.run_backtest --config configs/strategy.yaml --all-stocks --write-results --report-dir output/run1
 
 # MACD smoke backtest (secondary / example)
 python -m backtests.macd_smoke.run_backtest
@@ -36,9 +46,9 @@ python -m backtests.macd_smoke.run_backtest
 python backtests/qmt_ema_cross_clickhouse.py
 
 # Live trading against the QMT venue (the same strategy as the backtest)
-python lives/live_qmt_model_predictions.py --account-id <id> --all-stocks
+python lives/live_qmt_target_model_predictions.py --config configs/strategy.yaml --account-id <id> --all-stocks
 # Validate live wiring without connecting (build the node, then exit)
-python lives/live_qmt_model_predictions.py --build-only --all-stocks
+python lives/live_qmt_target_model_predictions.py --config configs/strategy.yaml --build-only --all-stocks --account-id <id>
 
 # Liquidate all sellable positions (operational tool)
 python lives/sell_all_sellable.py --account-id <id>

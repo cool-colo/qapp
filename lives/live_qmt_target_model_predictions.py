@@ -203,7 +203,7 @@ def _add_snapshot_recorder(
             timezone_name=args.exchange_timezone,
             before_time=args.snapshot_before_time,
             after_time=args.snapshot_after_time,
-            trading_windows=args.trading_windows,
+            trading_windows=strategy.config.trading_windows,
         ),
         writer=writer,
         strategy_ref=strategy,

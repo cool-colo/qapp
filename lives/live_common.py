@@ -150,6 +150,11 @@ def parse_args() -> argparse.Namespace:
         help="Explicit .env path (else <script dir>/.env, else <cwd>/.env).",
     )
     parser.add_argument(
+        "--config",
+        default=env("STRATEGY_CONFIG_FILE"),
+        help="Path to the strategy-params YAML file (see configs/strategy.yaml). Required.",
+    )
+    parser.add_argument(
         "--environment",
         default=env("QAPP_ENV", "live"),
         help="Deployment environment label included in operational alerts.",
@@ -168,136 +173,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-frac", type=float, default=float(env("MODEL_TOP_FRAC", "0.10")))
     parser.add_argument("--max-positions", type=int, default=int(env("MODEL_MAX_POSITIONS", "50")))
     parser.add_argument(
-        "--max-position-percent",
-        type=float,
-        default=float(env("MODEL_MAX_POSITION_PERCENT", "0.03")),
-    )
-    parser.add_argument("--stop-loss", type=float, default=float(env("MODEL_STOP_LOSS", "0.1")))
-    parser.add_argument(
-        "--trailing-take-profit",
-        type=float,
-        default=float(env("MODEL_TRAILING_TAKE_PROFIT", "0.0")),
-    )
-    parser.add_argument(
-        "--trailing-take-profit-start",
-        type=float,
-        default=float(env("MODEL_TRAILING_TAKE_PROFIT_START", "0.0")),
-    )
-    parser.add_argument("--min-listed-days", type=int, default=int(env("MODEL_MIN_LISTED_DAYS", "120")))
-    parser.add_argument(
-        "--unfilled-timeout-secs",
-        type=float,
-        default=float(env("MODEL_UNFILLED_TIMEOUT_SECS", "60")),
-        help="Cancel and resubmit an order that stays unfilled longer than this (0 disables).",
-    )
-    parser.add_argument(
-        "--resubmit-interval-secs",
-        type=float,
-        default=float(env("MODEL_RESUBMIT_INTERVAL_SECS", "10")),
-        help="How often to check for stale unfilled orders to cancel/resubmit.",
-    )
-    parser.add_argument(
-        "--cash-buffer-percent",
-        type=float,
-        default=float(env("MODEL_CASH_BUFFER_PERCENT", "0.00")),
-        help="Fraction of free cash held back when sizing/gating buys (commission + slippage margin).",
-    )
-    parser.add_argument(
-        "--target-cash-buffer-percent",
-        type=float,
-        default=float(env("MODEL_TARGET_CASH_BUFFER_PERCENT", "0.05")),
-        help="Framework target cash reserve; target model weights normally sum to 1 minus this value.",
-    )
-    parser.add_argument(
-        "--target-weight-planner",
-        default=env("MODEL_TARGET_WEIGHT_PLANNER", "risk_manager"),
-        choices=["equal_weight", "risk_manager"],
-        help="Target weight planner used after model entry/exit selection.",
-    )
-    parser.add_argument(
-        "--target-weight-planner-error-policy",
-        default=env("MODEL_TARGET_WEIGHT_PLANNER_ERROR_POLICY", "raise"),
-        choices=["raise", "equal_weight"],
-        help="How to handle target planner failures.",
-    )
-    parser.add_argument(
-        "--risk-manager-base-url",
-        default=env("RISK_MANAGER_BASE_URL", "http://127.0.0.1:8000"),
-        help="Base URL for risk-manager /v1/portfolio/optimize.",
-    )
-    parser.add_argument(
-        "--risk-manager-risk-model-id",
-        default=env("RISK_MANAGER_RISK_MODEL_ID", "cn_a_basic_constraints_integer_lots"),
-        help="risk-manager risk_model_id for portfolio optimization.",
-    )
-    parser.add_argument(
-        "--risk-manager-mode",
-        default=env("RISK_MANAGER_MODE", "live"),
-        choices=["backtest", "simulation", "live"],
-        help="risk-manager request mode.",
-    )
-    parser.add_argument(
-        "--risk-manager-timeout-secs",
-        type=float,
-        default=float(env("RISK_MANAGER_TIMEOUT_SECS", "10")),
-        help="Timeout for risk-manager optimize requests.",
-    )
-    parser.add_argument(
-        "--stop-time",
-        default=env("MODEL_TARGET_STOP_TIME", "14:55"),
-        help="Exchange-local HH:MM time after which the target framework stops new convergence work.",
-    )
-    parser.add_argument(
-        "--full-tick-refresh-secs",
-        type=float,
-        default=float(env("MODEL_FULL_TICK_REFRESH_SECS", "1") or 1),
-        help=(
-            "Interval in seconds for refreshing the authoritative full-tick snapshot "
-            "(today's open, etc.) from the QMT proxy during the trading window. 0 disables."
-        ),
-    )
-    parser.add_argument(
-        "--full-tick-prefetch-time",
-        default=env("MODEL_FULL_TICK_PREFETCH_TIME", "09:27"),
-        help=(
-            "Exchange-local HH:MM time (pre-open) to fetch the full-tick snapshot "
-            "before the trading window opens. Empty disables the prefetch."
-        ),
-    )
-    parser.add_argument(
-        "--limit-stop-mode",
-        default=env("MODEL_LIMIT_STOP_MODE", "freeze_symbol"),
-        help="Target framework limit handling. Default freezes only the affected symbol.",
-    )
-    parser.add_argument(
-        "--order-slice-notional",
-        type=parse_decimal,
-        default=parse_decimal(env("MODEL_ORDER_SLICE_NOTIONAL", "300000")),
-        help="Target framework order split size in CNY notional. 0 disables splitting.",
-    )
-    parser.add_argument(
-        "--leave-non-targets",
-        action="store_true",
-        default=env_bool("MODEL_LEAVE_NON_TARGETS", False),
-        help="Do not sell holdings absent from the latest target weights.",
-    )
-    parser.add_argument(
         "--price-offset-ticks",
         type=int,
         default=int(env("MODEL_PRICE_OFFSET_TICKS", "1")),
         help="Limit-order offset in ticks past the touch: buy at ask+N*tick, sell at bid-N*tick.",
-    )
-    parser.add_argument(
-        "--trade-tick-log-sample-rate",
-        type=float,
-        default=float(env("MODEL_TRADE_TICK_LOG_SAMPLE_RATE", "0.0") or "0.0"),
-        help="Fraction (0.0-1.0) of trade ticks to log. 0 disables trade-tick logging.",
-    )
-    parser.add_argument(
-        "--order-book-depth-log-sample-rate",
-        type=float,
-        default=float(env("MODEL_ORDER_BOOK_DEPTH_LOG_SAMPLE_RATE", "0.0") or "0.0"),
-        help="Fraction (0.0-1.0) of order-book depth updates to log. 0 disables depth logging.",
     )
     parser.add_argument(
         "--metrics-port",
@@ -331,11 +210,6 @@ def parse_args() -> argparse.Namespace:
         "--status-addr",
         default=env("MODEL_STATUS_ADDR", "0.0.0.0"),
         help="Bind address for the health status HTTP server.",
-    )
-    parser.add_argument(
-        "--excluded-name-prefixes",
-        default=",".join(env_list("MODEL_EXCLUDED_NAME_PREFIXES", "*ST,ST,退市")),
-        help="Never buy stocks whose instrument name starts with any of these prefixes.",
     )
     parser.add_argument("--signal-warmup-days", type=int, default=int(env("MODEL_SIGNAL_WARMUP_DAYS", "7")))
     parser.add_argument("--max-universe", type=int, default=int(env("MODEL_MAX_UNIVERSE", "0")))
@@ -378,30 +252,7 @@ def parse_args() -> argparse.Namespace:
         default=float(env("CLICKHOUSE_TIMEOUT_SECS", "60")),
     )
     parser.add_argument("--exchange-timezone", default=env("QMT_EXCHANGE_TIMEZONE", "Asia/Shanghai"))
-    parser.add_argument(
-        "--trading-windows",
-        default=env("QMT_TRADING_WINDOWS", "09:29-11:30,13:00-14:55"),
-        help=(
-            "Live-only: comma-separated HH:MM-HH:MM order sessions (exchange tz). "
-            "Orders submit only inside these ranges; the lunch break is excluded. "
-            "Default '09:29-11:30,13:00-14:55'."
-        ),
-    )
-    parser.add_argument(
-        "--exchange-trading-windows",
-        default=env("QMT_EXCHANGE_TRADING_WINDOWS", "09:30-11:30,13:00-14:55"),
-        help=(
-            "Live-only: comma-separated HH:MM-HH:MM sessions checked against market "
-            "data ts_event. Orders submit only when both --trading-windows and this "
-            "window match. Default '09:30-11:30,13:00-14:55'."
-        ),
-    )
     parser.add_argument("--price-precision", type=int, default=int(env("QMT_PRICE_PRECISION", "2")))
-    parser.add_argument(
-        "--initial-cash",
-        type=parse_decimal,
-        default=parse_decimal(env("MODEL_LIVE_INITIAL_CASH", env("BACKTEST_INIT_CASH", "1000000"))),
-    )
     parser.add_argument("--account-id", default=env("QMT_ACCOUNT_ID"))
     parser.add_argument("--account-type", default=env("QMT_ACCOUNT_TYPE", "STOCK"))
     parser.add_argument("--base-url-http", default=env("QMT_BASE_URL_HTTP", QMT_DEFAULT_HTTP_URL))
@@ -409,7 +260,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-key", default=env("QMT_API_KEY"))
     parser.add_argument("--adjust-type", default=env("QMT_ADJUST_TYPE", "none"))
     parser.add_argument("--trader-id", default=env("QMT_TRADER_ID", "QMT-001"))
-    parser.add_argument("--order-id-tag", default=env("QMT_ORDER_ID_TAG", "001"))
     parser.add_argument("--strategy-name", default=env("QMT_STRATEGY_NAME", "nautilus_model_predictions"))
     parser.add_argument(
         "--poll-interval-secs",
@@ -525,6 +375,8 @@ def parse_args() -> argparse.Namespace:
         help="Build and dispose the node without connecting or running.",
     )
     args = parser.parse_args()
+    if not args.config:
+        parser.error("--config is required, or set STRATEGY_CONFIG_FILE (see configs/strategy.yaml)")
     if not args.base_url_ws:
         args.base_url_ws = derive_ws_url(args.base_url_http)
     if not args.account_id:
