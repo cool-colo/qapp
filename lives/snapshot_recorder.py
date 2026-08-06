@@ -60,6 +60,7 @@ SyncTaskCallback = Callable[[str, int, dict[str, Any]], None]
 class SnapshotRecorderConfig(ActorConfig, frozen=True):
     account_id: str
     trader_id: str
+    broker_name: str = "QMT"
     timezone_name: str = "Asia/Shanghai"
     before_time: str = "09:27"
     # After-trading snapshot fires shortly after market close (15:00). Note QMT may not
@@ -1302,11 +1303,11 @@ class SnapshotRecorder(Actor):
             except Exception as exc:
                 failed += 1
                 self.log.warning(f"backfilled order upsert failed: {exc}")
-        if count:
-            self.log.info(
-                f"backfilled {count} order(s) from QMT for {trading_date}",
-                color=LogColor.GREEN,
-            )
+        self.log.info(
+            f"backfilled {count} order(s) from {self.config.broker_name} for {trading_date} "
+            f"(source={len(rows)}, skipped={skipped}, failed={failed})",
+            color=LogColor.GREEN,
+        )
         return {
             "written_rows": count,
             "source_rows": len(rows),
@@ -1330,11 +1331,11 @@ class SnapshotRecorder(Actor):
             except Exception as exc:
                 failed += 1
                 self.log.warning(f"backfilled trade upsert failed: {exc}")
-        if count:
-            self.log.info(
-                f"backfilled {count} trade(s) from QMT for {trading_date}",
-                color=LogColor.GREEN,
-            )
+        self.log.info(
+            f"backfilled {count} trade(s) from {self.config.broker_name} for {trading_date} "
+            f"(source={len(rows)}, skipped={skipped}, failed={failed})",
+            color=LogColor.GREEN,
+        )
         return {
             "written_rows": count,
             "source_rows": len(rows),

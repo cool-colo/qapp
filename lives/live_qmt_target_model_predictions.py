@@ -57,6 +57,7 @@ def parse_args():
     except ValueError as exc:
         raise SystemExit(f"invalid configured HH:MM time: {exc}") from exc
     _apply_snapshot_args(args)
+    args.broker_name = "QMT"
     return args
 
 
@@ -198,6 +199,7 @@ def _add_snapshot_recorder(
         config=SnapshotRecorderConfig(
             account_id=str(args.account_id),
             trader_id=str(args.trader_id),
+            broker_name=args.broker_name,
             timezone_name=args.exchange_timezone,
             before_time=args.snapshot_before_time,
             after_time=args.snapshot_after_time,

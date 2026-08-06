@@ -94,6 +94,7 @@ def parse_args():
         raise SystemExit(f"invalid configured HH:MM time: {exc}") from exc
     _apply_snapshot_args(args)
     _apply_bigqmt_args(args)
+    args.broker_name = "BigQMT"
     return args
 
 

@@ -120,6 +120,31 @@ def enrich_broker_rows(rows: list[dict[str, Any]], venue: str) -> list[dict[str,
     return enriched
 
 
+def normalize_bigqmt_orders(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize BigQMT compatibility objects to the recorder order contract."""
+    normalized = enrich_broker_rows(rows, "BIGQMT")
+    for row in normalized:
+        # The Nautilus BigQMT client submits ClientOrderId as order_remark. The
+        # MiniQMT compatibility layer preserves it there rather than exposing the
+        # recorder's canonical client_order_id field.
+        if not row.get("client_order_id"):
+            row["client_order_id"] = row.get("order_remark")
+    return normalized
+
+
+def normalize_bigqmt_trades(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize BigQMT compatibility objects to the recorder trade contract."""
+    normalized = enrich_broker_rows(rows, "BIGQMT")
+    for row in normalized:
+        # BigQMT calls the execution identity trade_id; QMT's normalized broker
+        # contract (and SnapshotRecorder) calls it traded_id.
+        if not row.get("traded_id"):
+            row["traded_id"] = row.get("trade_id")
+        if not row.get("client_order_id"):
+            row["client_order_id"] = row.get("order_remark")
+    return normalized
+
+
 def normalize_broker_positions(
     rows: list[dict[str, Any]],
     venue: str,
@@ -397,11 +422,11 @@ class BigQmtBrokerDataSource:
 
     async def broker_order_snapshot(self) -> list[dict[str, Any]]:
         rows = await self._query("query_stock_orders")
-        return enrich_broker_rows(rows, self.venue)
+        return normalize_bigqmt_orders(rows)
 
     async def broker_trade_snapshot(self) -> list[dict[str, Any]]:
         rows = await self._query("query_stock_trades")
-        return enrich_broker_rows(rows, self.venue)
+        return normalize_bigqmt_trades(rows)
 
     async def _query(self, method: str) -> list[dict[str, Any]]:
         import asyncio
