@@ -55,7 +55,7 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         config: TargetModelPredictionsStrategyConfig,
         refresh_context: Any,
         refresh_interval_secs: float = 0.0,
-        refresh_time: str | None = "09:00",
+        refresh_time: str | None = "09:10",
         event_reporter: FixedTimeEventReporter | None = None,
     ) -> None:
         super().__init__(config)

@@ -648,15 +648,15 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             | {holding.instrument_id for holding in current_holdings},
         )
         total_asset = float(self._portfolio_value())
-        if self.config.risk_manager_mode == "backtest":
-            investable_asset = total_asset * (
-                1.0 - float(self.config.target_cash_buffer_percent)
-            )
-        else:
+        if self._account_id_equals(86904088):
             holdings_value = sum(
                 holding.quantity * holding.price for holding in current_holdings
             )
             investable_asset = float(holdings_value * 1.01)
+        else:
+            investable_asset = total_asset * (
+                1.0 - float(self.config.target_cash_buffer_percent)
+            )
         if investable_asset <= 0:
             investable_asset = float(self.config.initial_cash)
         return ModelTargetPlanningRequest(
@@ -671,6 +671,13 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             investable_asset=investable_asset,
             open_prices=open_prices,
         )
+
+    def _account_id_equals(self, account_number: int) -> bool:
+        for account in self._broker_accounts():
+            account_id = account.id
+            if str(account_id.get_id()) == str(account_number):
+                return True
+        return False
 
     def _build_candidates(
         self,
