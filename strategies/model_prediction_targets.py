@@ -643,6 +643,13 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         open_prices: dict[str, float] = {}
         candidates = self._build_candidates(trading_date, signal_date, open_prices)
         current_holdings = self._build_current_holdings(trading_date, signal_date, open_prices)
+        # TEMP: for account 86008933, force recent_holding_days=3 so these holdings are
+        # easy to drop/liquidate via the risk manager.
+        #if self._account_id_equals(86008933):
+        #    current_holdings = [
+        #        dataclasses.replace(holding, recent_holding_days=3)
+        #        for holding in current_holdings
+        #    ]
         active_ids = sorted(
             {candidate.instrument_id for candidate in candidates}
             | {holding.instrument_id for holding in current_holdings},

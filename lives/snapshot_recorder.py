@@ -1678,8 +1678,15 @@ class SnapshotRecorder(Actor):
         code = mapping.get(instrument_id_text) if isinstance(mapping, dict) else None
         if code:
             return code
-        text = instrument_id_text.upper()
-        return text[:-4] if text.endswith(".QMT") else text
+        # Strip the venue suffix (the segment after the final dot). The QMT venue
+        # is deployment-configured (e.g. QMT / BIGQMT), so parse the InstrumentId
+        # rather than assuming a fixed ".QMT" suffix.
+        text = instrument_id_text.strip()
+        try:
+            return InstrumentId.from_str(text).symbol.value.upper()
+        except (ValueError, TypeError):
+            head, _, _ = text.rpartition(".")
+            return (head or text).upper()
 
     def _strategy_last_close(self, instrument_id_text: str) -> float | None:
         closes = getattr(self._strategy, "_last_close", None)
