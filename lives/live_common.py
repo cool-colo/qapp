@@ -508,7 +508,9 @@ class LivePredictionDataLoader:
             start_date=min(bundle.trading_dates),
             end_date=now.date(),
         )
-        last_closes_by_stock = latest_closes(daily_stock_data, now.date())
+        prior_trading_dates = [value for value in bundle.trading_dates if value < now.date()]
+        close_as_of_date = max(prior_trading_dates) if prior_trading_dates else now.date()
+        last_closes_by_stock = latest_closes(daily_stock_data, close_as_of_date)
         return LivePredictionContext(
             bundle=bundle,
             stock_codes=stock_codes,

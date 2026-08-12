@@ -32,6 +32,7 @@ def test_live_loader_carries_daily_history_and_derives_latest_close() -> None:
     history = (
         DailyStockData("000001.SZ", date(2026, 7, 4), close=9.0),
         DailyStockData("000001.SZ", signal_date, close=10.0, pre_close=9.0, up_limit=10.0),
+        DailyStockData("000001.SZ", trading_date, close=99.0, pre_close=10.0),
     )
     loader = LivePredictionDataLoader.__new__(LivePredictionDataLoader)
     loader.args = SimpleNamespace(

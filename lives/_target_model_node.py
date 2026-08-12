@@ -345,6 +345,7 @@ def build_target_model_node(
             },
             daily_stock_data=context.daily_stock_data,
             consecutive_up_limit_days=params.consecutive_up_limit_days,
+            max_open_gap_up=params.max_open_gap_up,
             max_positions=args.max_positions,
             max_position_percent=params.max_position_percent,
             stop_loss=params.stop_loss,

@@ -41,6 +41,7 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     suspended_by_date: dict[str, list[str]]
     daily_stock_data: tuple[DailyStockData, ...] = ()
     consecutive_up_limit_days: int = 3
+    max_open_gap_up: float = 0.05
     max_positions: int = 50
     max_position_percent: float = 0.03
     holding_days: int = 10
@@ -77,6 +78,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         super().__init__(config)
         if int(config.consecutive_up_limit_days) < 0:
             raise ValueError("consecutive_up_limit_days must be non-negative")
+        if not 0.0 <= float(config.max_open_gap_up) <= 1.0:
+            raise ValueError("max_open_gap_up must be between 0 and 1")
         self._stock_by_instrument: dict[str, str] = {}
         self._instrument_by_stock: dict[str, InstrumentId] = {}
         self._update_instrument_stock_codes(config.instrument_stock_codes)
@@ -95,6 +98,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         }
         self._daily_stock_data = index_daily_stock_data(config.daily_stock_data)
         self._limit_history_warnings: set[tuple[date, str, str]] = set()
+        self._open_gap_warnings: set[tuple[date, str]] = set()
         self._active_positions = normalize_initial_active_positions(config.initial_active_positions)
         self._processed_dates: set[date] = set()
         self._target_planner = build_model_target_planner(config, self.log)
@@ -1135,9 +1139,36 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 listed_days = (pd.Timestamp(trading_date) - pd.Timestamp(listed_date)).days
                 if listed_days < int(self.config.min_listed_days):
                     return "new_stock"
+        if self._has_excessive_open_gap(stock_code, trading_date):
+            return "open_gap_up"
         if self._has_consecutive_up_limits(stock_code, trading_date):
             return "consecutive_up_limit"
         return None
+
+    def _has_excessive_open_gap(self, stock_code: str, trading_date: date) -> bool:
+        threshold = float(self.config.max_open_gap_up)
+        if threshold <= 0:
+            return False
+        instrument_id = self._instrument_by_stock.get(stock_code)
+        if instrument_id is None:
+            return False
+        instrument_id_text = str(instrument_id)
+        today_open = self._today_open_price(instrument_id_text)
+        if today_open is None:
+            return False
+        last_close = self._last_close.get(instrument_id_text)
+        if last_close is None or last_close <= 0:
+            warning_key = (trading_date, stock_code)
+            if warning_key not in self._open_gap_warnings:
+                self._open_gap_warnings.add(warning_key)
+                self.log.warning(
+                    "open-gap filter admitted candidate because previous close is missing: "
+                    f"date={trading_date} stock_code={stock_code} open={today_open}",
+                    color=LogColor.YELLOW,
+                )
+            return False
+        threshold_price = float(last_close) * (1.0 + threshold)
+        return today_open >= threshold_price - self._PRICE_COMPARISON_TOLERANCE
 
     def _has_consecutive_up_limits(self, stock_code: str, trading_date: date) -> bool:
         consecutive_days = int(self.config.consecutive_up_limit_days)

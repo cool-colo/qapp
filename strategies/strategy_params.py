@@ -56,6 +56,7 @@ class StrategyParams:
     trailing_take_profit_start: float = 0.0
     min_listed_days: int = 120
     consecutive_up_limit_days: int = 3
+    max_open_gap_up: float = 0.05
     holding_days: int = 10  # backtest rebalance cadence; unused by target-timer live path
     initial_cash: Decimal = Decimal("1000000")
 
@@ -99,6 +100,8 @@ class StrategyParams:
     def __post_init__(self) -> None:
         if int(self.consecutive_up_limit_days) < 0:
             raise ValueError("consecutive_up_limit_days must be non-negative")
+        if not 0.0 <= float(self.max_open_gap_up) <= 1.0:
+            raise ValueError("max_open_gap_up must be between 0 and 1")
 
     @property
     def exit_non_targets(self) -> bool:

@@ -477,6 +477,8 @@ class BuildCandidatesTest(unittest.TestCase):
         daily_stock_data: tuple[DailyStockData, ...] = (),
         trading_dates: list[date] | None = None,
         current_up_limit: float | None = None,
+        max_open_gap_up: float = 0.0,
+        last_close: float | None = 10.0,
     ):
         class CandidateStub:
             _PRICE_COMPARISON_TOLERANCE = (
@@ -485,6 +487,7 @@ class BuildCandidatesTest(unittest.TestCase):
             _build_candidates = TargetModelPredictionsStrategy._build_candidates
             _entry_skip_reason = TargetModelPredictionsStrategy._entry_skip_reason
             _has_consecutive_up_limits = TargetModelPredictionsStrategy._has_consecutive_up_limits
+            _has_excessive_open_gap = TargetModelPredictionsStrategy._has_excessive_open_gap
             _warn_incomplete_limit_history = (
                 TargetModelPredictionsStrategy._warn_incomplete_limit_history
             )
@@ -508,15 +511,21 @@ class BuildCandidatesTest(unittest.TestCase):
         strategy.config = SimpleNamespace(
             min_listed_days=0,
             consecutive_up_limit_days=consecutive_up_limit_days,
+            max_open_gap_up=max_open_gap_up,
         )
         strategy._signals_by_date = {signal_date: signals}
         strategy._instrument_by_stock = {"000001.SZ": instrument_id}
         strategy._stock_by_instrument = {str(instrument_id): "000001.SZ"}
         strategy._today_open = today_open
-        strategy._last_close = {str(instrument_id): 10.0}
+        strategy._last_close = (
+            {str(instrument_id): last_close}
+            if last_close is not None
+            else {}
+        )
         strategy._daily_stock_data = index_daily_stock_data(daily_stock_data)
         strategy._trading_dates = trading_dates or []
         strategy._limit_history_warnings = set()
+        strategy._open_gap_warnings = set()
         strategy._price_limits = MagicMock(return_value=(current_up_limit, None))
         strategy.signal_events = []
         return strategy, str(instrument_id), signal_date
@@ -592,6 +601,66 @@ class BuildCandidatesTest(unittest.TestCase):
         self.assertEqual(candidates, [])
         self.assertEqual(strategy.signal_events[0].signal_name, "entry_filtered")
         self.assertEqual(strategy.signal_events[0].extra["reason"], "consecutive_up_limit")
+
+    def test_open_gap_at_threshold_is_filtered(self) -> None:
+        signal = {
+            "date": date(2026, 7, 7),
+            "stock_code": "000001.SZ",
+            "score": 0.9,
+            "rank": 1,
+            "pred_return_live": 0.02,
+        }
+        strategy, _, signal_date = self._make_stub(
+            signals=[signal],
+            today_open={"000001.SZ.QMT": 10.5},
+            max_open_gap_up=0.05,
+            last_close=10.0,
+        )
+
+        candidates = strategy._build_candidates(date(2026, 7, 8), signal_date, {})
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(strategy.signal_events[0].extra["reason"], "open_gap_up")
+
+    def test_open_gap_below_threshold_is_admitted(self) -> None:
+        signal = {
+            "date": date(2026, 7, 7),
+            "stock_code": "000001.SZ",
+            "score": 0.9,
+            "rank": 1,
+            "pred_return_live": 0.02,
+        }
+        strategy, _, signal_date = self._make_stub(
+            signals=[signal],
+            today_open={"000001.SZ.QMT": 10.49},
+            max_open_gap_up=0.05,
+            last_close=10.0,
+        )
+
+        candidates = strategy._build_candidates(date(2026, 7, 8), signal_date, {})
+
+        self.assertEqual(len(candidates), 1)
+
+    def test_missing_last_close_warns_and_admits_open_gap_candidate(self) -> None:
+        signal = {
+            "date": date(2026, 7, 7),
+            "stock_code": "000001.SZ",
+            "score": 0.9,
+            "rank": 1,
+            "pred_return_live": 0.02,
+        }
+        strategy, _, signal_date = self._make_stub(
+            signals=[signal],
+            today_open={"000001.SZ.QMT": 11.0},
+            max_open_gap_up=0.05,
+            last_close=None,
+        )
+
+        candidates = strategy._build_candidates(date(2026, 7, 8), signal_date, {})
+
+        self.assertEqual(len(candidates), 1)
+        strategy.log.warning.assert_called_once()
+        self.assertIn("previous close is missing", strategy.log.warning.call_args.args[0])
 
     def test_current_open_below_limit_does_not_complete_streak(self) -> None:
         signal = {

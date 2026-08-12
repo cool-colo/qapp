@@ -60,6 +60,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
         self.assertEqual(config.max_position_percent, 0.03)
         self.assertEqual(config.consecutive_up_limit_days, 3)
+        self.assertEqual(config.max_open_gap_up, 0.05)
         self.assertTrue(config.local_exit_authoritative)
         self.assertFalse(config.process_targets_on_timer)
 
