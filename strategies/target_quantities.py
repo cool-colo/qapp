@@ -1263,7 +1263,8 @@ class TargetQuantityStrategy(Strategy):
         return f"[{shown}]"
 
     def _price_limit_reason(self, instrument_id_text: str, side: OrderSide) -> str | None:
-        price = self._last_close.get(instrument_id_text)
+        snapshot = self._market_status.get(instrument_id_text)
+        price = None if snapshot is None else snapshot.last_price
         if price is None or price <= 0:
             return None
         up_limit, down_limit = self._price_limits(instrument_id_text)
@@ -1940,6 +1941,11 @@ class TargetQuantityStrategy(Strategy):
         raw = pricer.compute(ctx)
         if raw is None or raw <= 0:
             return None
+        up_limit, down_limit = self._price_limits(str(instrument_id))
+        if side == OrderSide.BUY and up_limit is not None:
+            raw = min(raw, up_limit)
+        elif side == OrderSide.SELL and down_limit is not None:
+            raw = max(raw, down_limit)
         return instrument.make_price(raw)
 
     def _build_price_context(

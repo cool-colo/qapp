@@ -11,6 +11,7 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import PropertyMock
@@ -58,6 +59,8 @@ class TargetLiveConfigTest(unittest.TestCase):
             suspended_by_date={},
         )
         self.assertEqual(config.max_position_percent, 0.03)
+        self.assertEqual(config.consecutive_up_limit_days, 3)
+        self.assertTrue(config.local_exit_authoritative)
         self.assertFalse(config.process_targets_on_timer)
 
     def test_process_trading_day_prefers_live_target_portfolio(self) -> None:
@@ -197,9 +200,53 @@ class TargetLiveConfigTest(unittest.TestCase):
             "generated live target plan was not persisted; target not applied",
         )
 
+    def test_process_trading_day_applies_transient_plan_without_persisting(self) -> None:
+        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        trading_date = date(2026, 7, 8)
+        plan = ModelTargetPlan(
+            trading_date=trading_date,
+            signal_date=date(2026, 7, 7),
+            targets=[
+                TargetInfo(
+                    stock_code="000001.SZ",
+                    weight=None,
+                    quantity=0,
+                    target_context=TargetContext(current_qty=100),
+                    target_version=None,
+                    instrument_id="000001.SZ.QMT",
+                    is_locked=False,
+                ),
+            ],
+            reason="local_exit_missing_signal_data",
+            persistable=False,
+            degraded_reason="missing_signal_data",
+        )
+        strategy._live_target_portfolio_loader = MagicMock(return_value=[])
+        strategy._live_target_plan_persister = MagicMock()
+        strategy._trading_dates = [date(2026, 7, 7), trading_date]
+        strategy._resolve_signal_date = MagicMock(return_value=date(2026, 7, 7))
+        strategy.compute_daily_target_plan = MagicMock(return_value=plan)
+        strategy._plan_version = MagicMock(return_value="transient-ver")
+        strategy.update_target_quantities = MagicMock()
+
+        strategy._process_trading_day(trading_date)
+
+        strategy._live_target_plan_persister.assert_not_called()
+        strategy.update_target_quantities.assert_called_once_with(
+            quantities={"000001.SZ.QMT": 0},
+            target_date=trading_date,
+            reason="local_exit_missing_signal_data",
+            version="transient-ver",
+        )
+
     def test_recorder_persists_timer_plan_as_continuous_when_missing(self) -> None:
         trading_date = date(2026, 7, 8)
-        plan = SimpleNamespace(trading_date=trading_date, signal_date=date(2026, 7, 7))
+        plan = ModelTargetPlan(
+            trading_date=trading_date,
+            signal_date=date(2026, 7, 7),
+            targets=[],
+            reason="test",
+        )
         writer = SimpleNamespace(asset_snapshot_id=MagicMock(return_value=12))
         recorder = SimpleNamespace(
             config=SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER"),
@@ -993,6 +1040,65 @@ class TargetLiveConfigTest(unittest.TestCase):
             {"000001.SZ.QMT": 10000},
             "risk_manager_optimize",
             "ver-1",
+        )
+
+    def test_snapshot_recorder_applies_transient_plan_without_writing_rows(self) -> None:
+        trading_date = date(2026, 7, 10)
+        plan = ModelTargetPlan(
+            trading_date=trading_date,
+            signal_date=date(2026, 7, 9),
+            targets=[
+                TargetInfo(
+                    stock_code="000001.SZ",
+                    weight=None,
+                    quantity=0,
+                    target_context=TargetContext(current_qty=100),
+                    target_version=None,
+                    instrument_id="000001.SZ.QMT",
+                    is_locked=False,
+                ),
+            ],
+            reason="local_exit_risk_manager_failure",
+            persistable=False,
+            degraded_reason="risk_manager_failure",
+        )
+        callback = MagicMock()
+        recorder = SimpleNamespace(
+            _strategy=SimpleNamespace(
+                compute_daily_target_plan=MagicMock(return_value=plan),
+                plan_version=MagicMock(return_value="transient-ver"),
+            ),
+            _apply_target=MagicMock(),
+            _persist_target_plan=MagicMock(),
+            log=MagicMock(),
+        )
+
+        SnapshotRecorder._generate_and_persist_target(
+            recorder,
+            trading_date,
+            BEFORE_TRADING,
+            plan.signal_date,
+            asset_id=5,
+            on_complete=callback,
+        )
+
+        recorder._persist_target_plan.assert_not_called()
+        recorder._apply_target.assert_called_once_with(
+            trading_date,
+            {"000001.SZ.QMT": 0},
+            plan.reason,
+            "transient-ver",
+        )
+        callback.assert_called_once_with(
+            "failed",
+            0,
+            {
+                "error": (
+                    "applied transient daily target without persistence: "
+                    "degraded_reason=risk_manager_failure"
+                ),
+                "degraded_reason": "risk_manager_failure",
+            },
         )
 
     def test_writer_ensure_target_indexes_upgrades_uk_target_to_include_snapshot_type(self) -> None:

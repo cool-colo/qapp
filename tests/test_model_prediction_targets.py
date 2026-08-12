@@ -8,6 +8,8 @@ from unittest.mock import MagicMock
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.identifiers import InstrumentId
 
+from market_data import DailyStockData
+from market_data import index_daily_stock_data
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from strategies.model_target_planners import CurrentHolding
 from strategies.model_target_planners import ModelTargetCandidate
@@ -291,6 +293,21 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         self.assertFalse(holdings[0].can_sell)
         strategy._holding_exclusion.assert_not_called()
 
+    def test_triggered_holding_is_removed_and_collected_for_authority_decision(self) -> None:
+        strategy = self._make_stub()
+        strategy._holding_exclusion = MagicMock(return_value="stop_triggered")
+        forced_exits: dict[str, str] = {}
+
+        holdings = strategy._build_current_holdings(
+            date(2026, 7, 23),
+            date(2026, 7, 22),
+            {},
+            forced_exits=forced_exits,
+        )
+
+        self.assertEqual(holdings, [])
+        self.assertEqual(forced_exits, {"000157.SZ.QMT": "stop_triggered"})
+
     def test_recent_target_cutoff_window_defaults_to_90(self) -> None:
         strategy = self._make_stub()
         # 120 prior trading days: the default window (90) selects the 90th-prior day.
@@ -344,27 +361,44 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
         strategy.compute_daily_target_plan(date(2026, 7, 8))
 
         strategy._seed_active_positions_from_portfolio.assert_called_once_with(date(2026, 7, 8))
-        strategy._target_plan.assert_called_once_with(date(2026, 7, 8), signal_date)
+        strategy._target_plan.assert_called_once_with(
+            date(2026, 7, 8),
+            signal_date,
+            degraded_reason=None,
+        )
 
-    def test_skips_plan_and_reports_when_signal_date_is_not_previous_trading_date(self) -> None:
+    def test_builds_transient_plan_and_reports_when_previous_signal_data_is_missing(self) -> None:
         strategy = self._make_stub(signals=[])
         strategy._signals_by_date = {date(2026, 7, 6): []}
-        strategy._signal_date_alert_reporter = MagicMock(return_value=True)
+        strategy._target_alert_reporter = MagicMock(return_value=True)
 
-        result = strategy.compute_daily_target_plan(date(2026, 7, 8))
+        strategy.compute_daily_target_plan(date(2026, 7, 8))
 
-        self.assertIsNone(result)
-        strategy._seed_active_positions_from_portfolio.assert_not_called()
-        strategy._target_plan.assert_not_called()
+        strategy._seed_active_positions_from_portfolio.assert_called_once_with(date(2026, 7, 8))
+        strategy._target_plan.assert_called_once_with(
+            date(2026, 7, 8),
+            date(2026, 7, 7),
+            degraded_reason="missing_signal_data",
+        )
         strategy.log.error.assert_called_once()
-        strategy._signal_date_alert_reporter.assert_called_once_with(
-            "TARGET-MODEL-SIGNAL-DATE-MISMATCH",
+        strategy._target_alert_reporter.assert_called_once_with(
+            "TARGET-MODEL-SIGNAL-DATA-MISSING",
             "failed",
             {
                 "trading_date": date(2026, 7, 8),
                 "expected_signal_date": date(2026, 7, 7),
-                "resolved_signal_date": date(2026, 7, 6),
             },
+        )
+
+    def test_present_signal_date_with_no_candidates_is_not_degraded(self) -> None:
+        strategy = self._make_stub(signals=[])
+
+        strategy.compute_daily_target_plan(date(2026, 7, 8))
+
+        strategy._target_plan.assert_called_once_with(
+            date(2026, 7, 8),
+            date(2026, 7, 7),
+            degraded_reason=None,
         )
 
 
@@ -434,10 +468,26 @@ class AnnotatePlanTest(unittest.TestCase):
 
 
 class BuildCandidatesTest(unittest.TestCase):
-    def _make_stub(self, *, signals: list[dict], today_open: dict[str, float]):
+    def _make_stub(
+        self,
+        *,
+        signals: list[dict],
+        today_open: dict[str, float],
+        consecutive_up_limit_days: int = 0,
+        daily_stock_data: tuple[DailyStockData, ...] = (),
+        trading_dates: list[date] | None = None,
+        current_up_limit: float | None = None,
+    ):
         class CandidateStub:
+            _PRICE_COMPARISON_TOLERANCE = (
+                TargetModelPredictionsStrategy._PRICE_COMPARISON_TOLERANCE
+            )
             _build_candidates = TargetModelPredictionsStrategy._build_candidates
             _entry_skip_reason = TargetModelPredictionsStrategy._entry_skip_reason
+            _has_consecutive_up_limits = TargetModelPredictionsStrategy._has_consecutive_up_limits
+            _warn_incomplete_limit_history = (
+                TargetModelPredictionsStrategy._warn_incomplete_limit_history
+            )
             _name_skip_reason = MagicMock(return_value=None)
             _today_open_price = TargetModelPredictionsStrategy._today_open_price
             _open_price_with_source = TargetModelPredictionsStrategy._open_price_with_source
@@ -455,12 +505,19 @@ class BuildCandidatesTest(unittest.TestCase):
         strategy._suspended_by_date = {}
         strategy._st_by_date = {}
         strategy._listed_dates = {}
-        strategy.config = MagicMock(min_listed_days=0)
+        strategy.config = SimpleNamespace(
+            min_listed_days=0,
+            consecutive_up_limit_days=consecutive_up_limit_days,
+        )
         strategy._signals_by_date = {signal_date: signals}
         strategy._instrument_by_stock = {"000001.SZ": instrument_id}
         strategy._stock_by_instrument = {str(instrument_id): "000001.SZ"}
         strategy._today_open = today_open
         strategy._last_close = {str(instrument_id): 10.0}
+        strategy._daily_stock_data = index_daily_stock_data(daily_stock_data)
+        strategy._trading_dates = trading_dates or []
+        strategy._limit_history_warnings = set()
+        strategy._price_limits = MagicMock(return_value=(current_up_limit, None))
         strategy.signal_events = []
         return strategy, str(instrument_id), signal_date
 
@@ -508,7 +565,107 @@ class BuildCandidatesTest(unittest.TestCase):
         self.assertEqual(candidates, [])
         self.assertEqual(strategy.signal_events[0].signal_name, "entry_filtered")
         self.assertEqual(strategy.signal_events[0].extra["reason"], "missing_open_price")
+
+    def test_consecutive_limit_up_includes_current_open(self) -> None:
+        signal = {
+            "date": date(2026, 7, 7),
+            "stock_code": "000001.SZ",
+            "score": 0.9,
+            "rank": 1,
+            "pred_return_live": 0.02,
+        }
+        history = (
+            DailyStockData("000001.SZ", date(2026, 7, 6), close=10.0, up_limit=10.0),
+            DailyStockData("000001.SZ", date(2026, 7, 7), close=11.0, up_limit=11.0),
+        )
+        strategy, _, signal_date = self._make_stub(
+            signals=[signal],
+            today_open={"000001.SZ.QMT": 12.1},
+            consecutive_up_limit_days=3,
+            daily_stock_data=history,
+            trading_dates=[date(2026, 7, 6), date(2026, 7, 7), date(2026, 7, 8)],
+            current_up_limit=12.1,
+        )
+
+        candidates = strategy._build_candidates(date(2026, 7, 8), signal_date, {})
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(strategy.signal_events[0].signal_name, "entry_filtered")
+        self.assertEqual(strategy.signal_events[0].extra["reason"], "consecutive_up_limit")
+
+    def test_current_open_below_limit_does_not_complete_streak(self) -> None:
+        signal = {
+            "date": date(2026, 7, 7),
+            "stock_code": "000001.SZ",
+            "score": 0.9,
+            "rank": 1,
+            "pred_return_live": 0.02,
+        }
+        history = (
+            DailyStockData("000001.SZ", date(2026, 7, 6), close=10.0, up_limit=10.0),
+            DailyStockData("000001.SZ", date(2026, 7, 7), close=11.0, up_limit=11.0),
+        )
+        strategy, _, signal_date = self._make_stub(
+            signals=[signal],
+            today_open={"000001.SZ.QMT": 12.0},
+            consecutive_up_limit_days=3,
+            daily_stock_data=history,
+            trading_dates=[date(2026, 7, 6), date(2026, 7, 7), date(2026, 7, 8)],
+            current_up_limit=12.1,
+        )
+
+        candidates = strategy._build_candidates(date(2026, 7, 8), signal_date, {})
+
+        self.assertEqual(len(candidates), 1)
+
+    def test_current_historical_limit_supports_backtest_instrument(self) -> None:
+        signal = {
+            "date": date(2026, 7, 7),
+            "stock_code": "000001.SZ",
+            "score": 0.9,
+            "rank": 1,
+            "pred_return_live": 0.02,
+        }
+        strategy, _, signal_date = self._make_stub(
+            signals=[signal],
+            today_open={"000001.SZ.QMT": 12.1},
+            consecutive_up_limit_days=1,
+            daily_stock_data=(
+                DailyStockData("000001.SZ", date(2026, 7, 8), up_limit=12.1),
+            ),
+            trading_dates=[date(2026, 7, 8)],
+            current_up_limit=None,
+        )
+
+        candidates = strategy._build_candidates(date(2026, 7, 8), signal_date, {})
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(strategy.signal_events[0].extra["reason"], "consecutive_up_limit")
+
+    def test_missing_limit_history_warns_and_admits_candidate(self) -> None:
+        signal = {
+            "date": date(2026, 7, 7),
+            "stock_code": "000001.SZ",
+            "score": 0.9,
+            "rank": 1,
+            "pred_return_live": 0.02,
+        }
+        strategy, _, signal_date = self._make_stub(
+            signals=[signal],
+            today_open={"000001.SZ.QMT": 12.1},
+            consecutive_up_limit_days=3,
+            daily_stock_data=(
+                DailyStockData("000001.SZ", date(2026, 7, 7), close=11.0, up_limit=11.0),
+            ),
+            trading_dates=[date(2026, 7, 6), date(2026, 7, 7), date(2026, 7, 8)],
+            current_up_limit=12.1,
+        )
+
+        candidates = strategy._build_candidates(date(2026, 7, 8), signal_date, {})
+
+        self.assertEqual(len(candidates), 1)
         strategy.log.warning.assert_called_once()
+        self.assertIn("2026-07-06:missing_row", strategy.log.warning.call_args.args[0])
 
     def test_suspended_signal_is_filtered_out_of_candidates(self) -> None:
         strategy, instrument_id, signal_date = self._make_stub(
@@ -533,6 +690,177 @@ class BuildCandidatesTest(unittest.TestCase):
         self.assertEqual(candidates, [])
         self.assertEqual(strategy.signal_events[0].signal_name, "entry_filtered")
         self.assertEqual(strategy.signal_events[0].extra["reason"], "suspended")
+
+    def test_authoritative_local_exit_is_filtered_out_of_candidates(self) -> None:
+        strategy, instrument_id, signal_date = self._make_stub(
+            signals=[
+                {
+                    "date": date(2026, 7, 7),
+                    "stock_code": "000001.SZ",
+                    "score": 0.9,
+                    "rank": 1,
+                    "pred_return_live": 0.02,
+                },
+            ],
+            today_open={"000001.SZ.QMT": 10.1},
+        )
+        open_prices: dict[str, float] = {}
+
+        candidates = strategy._build_candidates(
+            date(2026, 7, 8),
+            signal_date,
+            open_prices,
+            excluded_instrument_ids={instrument_id},
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(strategy.signal_events[0].signal_name, "entry_filtered")
+        self.assertEqual(strategy.signal_events[0].extra["reason"], "local_exit")
+
+
+class TargetPlanAuthorityTest(unittest.TestCase):
+    def _make_stub(self, *, authoritative: bool):
+        class PlanStub:
+            _target_plan = TargetModelPredictionsStrategy._target_plan
+
+        request = ModelTargetPlanningRequest(
+            trading_date=date(2026, 7, 8),
+            signal_date=date(2026, 7, 7),
+            active_instrument_ids=[],
+            candidates=[],
+            current_holdings=[],
+            target_cash_buffer_percent=0.05,
+            max_position_percent=0.03,
+        )
+        plan = ModelTargetPlan(
+            trading_date=request.trading_date,
+            signal_date=request.signal_date,
+            targets=[],
+            reason="risk_manager_optimize",
+        )
+        strategy = PlanStub()
+        strategy.config = SimpleNamespace(local_exit_authoritative=authoritative)
+        strategy._target_planning_request = MagicMock(
+            return_value=(request, {"000001.SZ.QMT": "stop_triggered"}),
+        )
+        strategy._target_planner = SimpleNamespace(plan=MagicMock(return_value=plan))
+        strategy._annotate_plan = MagicMock(return_value=plan)
+        strategy._apply_forced_exit_overrides = MagicMock(return_value=plan)
+        strategy._local_safety_plan = MagicMock(return_value=plan)
+        strategy._report_risk_manager_failure = MagicMock()
+        return strategy
+
+    def test_enabled_authority_applies_explicit_overrides(self) -> None:
+        strategy = self._make_stub(authoritative=True)
+
+        strategy._target_plan(date(2026, 7, 8), date(2026, 7, 7))
+
+        strategy._apply_forced_exit_overrides.assert_called_once()
+
+    def test_authoritative_override_replaces_optimizer_quantity_with_zero(self) -> None:
+        class OverrideStub:
+            _apply_forced_exit_overrides = (
+                TargetModelPredictionsStrategy._apply_forced_exit_overrides
+            )
+
+        strategy = OverrideStub()
+        strategy._local_target_info = MagicMock(
+            return_value=TargetInfo(
+                stock_code="000001.SZ",
+                weight=None,
+                quantity=0,
+                target_context=TargetContext(current_qty=100),
+                target_version=None,
+                instrument_id="000001.SZ.QMT",
+                is_locked=False,
+            ),
+        )
+        optimizer_plan = ModelTargetPlan(
+            trading_date=date(2026, 7, 8),
+            signal_date=date(2026, 7, 7),
+            targets=[
+                TargetInfo(
+                    stock_code="000001.SZ",
+                    weight=None,
+                    quantity=100,
+                    target_context=TargetContext(),
+                    target_version=None,
+                    instrument_id="000001.SZ.QMT",
+                    is_locked=False,
+                ),
+            ],
+            reason="risk_manager_optimize",
+        )
+
+        plan = strategy._apply_forced_exit_overrides(
+            optimizer_plan,
+            {"000001.SZ.QMT": "stop_triggered"},
+        )
+
+        self.assertEqual(plan.targets[0].quantity, 0)
+
+    def test_disabled_authority_keeps_optimizer_plan_unchanged(self) -> None:
+        strategy = self._make_stub(authoritative=False)
+
+        strategy._target_plan(date(2026, 7, 8), date(2026, 7, 7))
+
+        strategy._apply_forced_exit_overrides.assert_not_called()
+
+    def test_risk_manager_failure_uses_transient_safety_plan(self) -> None:
+        strategy = self._make_stub(authoritative=False)
+        error = RuntimeError("unavailable")
+        strategy._target_planner.plan.side_effect = error
+
+        strategy._target_plan(date(2026, 7, 8), date(2026, 7, 7))
+
+        strategy._report_risk_manager_failure.assert_called_once_with(
+            date(2026, 7, 8),
+            date(2026, 7, 7),
+            error,
+        )
+        strategy._local_safety_plan.assert_called_once()
+
+    def test_local_safety_plan_preserves_holdings_and_zeros_only_forced_exits(self) -> None:
+        class SafetyStub:
+            _local_safety_plan = TargetModelPredictionsStrategy._local_safety_plan
+
+        strategy = SafetyStub()
+        strategy._held_quantities = MagicMock(
+            return_value={"000001.SZ.QMT": 100, "000002.SZ.QMT": 200},
+        )
+        strategy._local_target_info = MagicMock(
+            side_effect=lambda instrument_id, quantity: TargetInfo(
+                stock_code=instrument_id.split(".")[0],
+                weight=None,
+                quantity=quantity,
+                target_context=TargetContext(current_qty=100),
+                target_version=None,
+                instrument_id=instrument_id,
+                is_locked=False,
+            ),
+        )
+        request = ModelTargetPlanningRequest(
+            trading_date=date(2026, 7, 8),
+            signal_date=date(2026, 7, 7),
+            active_instrument_ids=[],
+            candidates=[],
+            current_holdings=[],
+            target_cash_buffer_percent=0.05,
+            max_position_percent=0.03,
+            total_asset=1_000_000,
+            investable_asset=950_000,
+        )
+
+        plan = strategy._local_safety_plan(
+            request,
+            {"000001.SZ.QMT": "stop_triggered"},
+            "missing_signal_data",
+        )
+
+        quantities = {target.instrument_id: target.quantity for target in plan.targets}
+        self.assertEqual(quantities, {"000001.SZ.QMT": 0, "000002.SZ.QMT": 200})
+        self.assertFalse(plan.persistable)
+        self.assertEqual(plan.degraded_reason, "missing_signal_data")
 
 
 if __name__ == "__main__":

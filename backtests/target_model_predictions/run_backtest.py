@@ -27,6 +27,7 @@ if NAUTILUS_TRADER_PATH.exists() and str(NAUTILUS_TRADER_PATH) not in sys.path:
 from backtests.data_providers import ClickHouseBarDataProvider  # noqa: E402
 from backtests.data_providers import ClickHouseBarSchema  # noqa: E402
 from backtests.data_providers import ClickHouseConnectionConfig  # noqa: E402
+from backtests.data_providers import ClickHouseDailyStockDataProvider  # noqa: E402
 from backtests.data_providers import ClickHouseModelPredictionDataProvider  # noqa: E402
 from backtests.data_providers import ModelPredictionDataRequest  # noqa: E402
 from backtests.data_providers import PredictionDataBundle  # noqa: E402
@@ -50,6 +51,7 @@ from backtests.result_writers.live_records import CONTINUOUS_TRADING  # noqa: E4
 from backtests.result_writers.live_writer import LiveSnapshotWriter  # noqa: E402
 from lives.snapshot_recorder import SnapshotRecorder  # noqa: E402
 from lives.snapshot_recorder import SnapshotRecorderConfig  # noqa: E402
+from market_data import DailyStockData  # noqa: E402
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy  # noqa: E402
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig  # noqa: E402
 from strategies.strategy_params import StrategyParams  # noqa: E402
@@ -224,7 +226,10 @@ def build_connection(args: argparse.Namespace) -> ClickHouseConnectionConfig:
     return REPORT_PROCESSOR.build_clickhouse_connection(args)
 
 
-def build_prediction_request(args: argparse.Namespace) -> ModelPredictionDataRequest:
+def build_prediction_request(
+    args: argparse.Namespace,
+    trading_history_days: int = 0,
+) -> ModelPredictionDataRequest:
     return ModelPredictionDataRequest(
         start_date=args.start,
         end_date=args.end,
@@ -236,6 +241,7 @@ def build_prediction_request(args: argparse.Namespace) -> ModelPredictionDataReq
         top_frac=args.top_frac,
         max_positions=args.max_positions,
         signal_warmup_days=args.signal_warmup_days,
+        trading_history_days=trading_history_days,
     )
 
 
@@ -438,6 +444,7 @@ def build_engine(
     bundle: PredictionDataBundle,
     bar_types: dict[str, Any],
     bars_by_stock: dict[str, list[Any]],
+    daily_stock_data: tuple[DailyStockData, ...],
 ) -> tuple[Any, BacktestTargetModelPredictionsStrategy, dict[str, list[Bar]]]:
     from nautilus_trader.adapters.qmt.common import parse_equity
     from nautilus_trader.adapters.qmt.common import qmt_symbol_to_instrument_id
@@ -531,6 +538,8 @@ def build_engine(
                 key.isoformat(): sorted(values)
                 for key, values in bundle.suspended_by_date.items()
             },
+            daily_stock_data=daily_stock_data,
+            consecutive_up_limit_days=params.consecutive_up_limit_days,
             max_positions=args.max_positions,
             max_position_percent=params.max_position_percent,
             holding_days=params.holding_days,
@@ -545,6 +554,7 @@ def build_engine(
             cash_buffer_percent=params.cash_buffer_percent,
             target_weight_planner=params.target_weight_planner,
             target_weight_planner_error_policy=params.target_weight_planner_error_policy,
+            local_exit_authoritative=params.local_exit_authoritative,
             risk_manager_base_url=params.risk_manager_base_url,
             risk_manager_risk_model_id=params.risk_manager_risk_model_id,
             risk_manager_mode=params.risk_manager_mode,
@@ -726,6 +736,7 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.top_frac": args.top_frac,
         "strategy.max_positions": args.max_positions,
         "strategy.max_position_percent": params.max_position_percent,
+        "strategy.consecutive_up_limit_days": params.consecutive_up_limit_days,
         "strategy.holding_days": params.holding_days,
         "strategy.stop_loss": params.stop_loss,
         "strategy.trailing_take_profit": params.trailing_take_profit,
@@ -734,6 +745,7 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.target_cash_buffer_percent": params.target_cash_buffer_percent,
         "strategy.target_weight_planner": params.target_weight_planner,
         "strategy.target_weight_planner_error_policy": params.target_weight_planner_error_policy,
+        "strategy.local_exit_authoritative": params.local_exit_authoritative,
         "strategy.risk_manager_base_url": params.risk_manager_base_url,
         "strategy.risk_manager_risk_model_id": params.risk_manager_risk_model_id,
         "strategy.risk_manager_mode": params.risk_manager_mode,
@@ -1155,9 +1167,11 @@ def side_text(value: Any) -> str:
 
 def main() -> None:
     args = parse_args()
+    params = StrategyParams.from_yaml(args.config)
     connection = build_connection(args)
     prediction_provider = ClickHouseModelPredictionDataProvider(connection)
-    request = build_prediction_request(args)
+    history_days = max(int(params.consecutive_up_limit_days) - 1, 0)
+    request = build_prediction_request(args, trading_history_days=history_days)
     bundle = prediction_provider.load(request)
     print(
         "Loaded prediction data: "
@@ -1177,6 +1191,11 @@ def main() -> None:
     )
     if not bars_by_stock:
         raise SystemExit("No valid bars loaded for the selected signal universe.")
+    daily_stock_data = ClickHouseDailyStockDataProvider(connection).load(
+        stock_codes=sorted(bars_by_stock),
+        start_date=min(bundle.trading_dates),
+        end_date=args.end,
+    )
     if args.load_only:
         return
 
@@ -1192,6 +1211,7 @@ def main() -> None:
         bundle,
         bar_types,
         bars_by_stock,
+        daily_stock_data,
     )
     target_plan_writer = configure_target_plan_persistence(
         args,

@@ -975,6 +975,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             prices={INST_A: 10.0, INST_B: 20.0},
             fields={INST_A: {"UpStopPrice": 10.0}},
         )
+        strategy._market_status[str(INST_A)] = TickSnapshot(last_price=10.0)
 
         strategy.update_target_quantities(
             {INST_A: 30000, INST_B: 15000},
@@ -1682,6 +1683,35 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         # buy price = open + max(open*offset_bps/1e4, tick); far above the stale 42.14.
         self.assertGreater(float(price), 53.0)
         self.assertLessEqual(float(price), 53.09 + 53.09 * strategy.config.buy_max_price_bps / 10_000.0)
+
+    def test_limit_reason_uses_full_tick_last_price_without_bar_updates(self) -> None:
+        strategy = self.make_strategy(
+            prices={INST_A: 27.37},
+            open_prices={INST_A: 32.84},
+            fields={INST_A: {"UpStopPrice": 32.84}},
+        )
+        strategy._market_status[str(INST_A)] = TickSnapshot(last_price=32.84)
+
+        self.assertEqual(
+            strategy._price_limit_reason(str(INST_A), OrderSide.BUY),
+            "up_limit",
+        )
+
+    def test_buy_limit_price_is_clamped_to_exchange_up_limit(self) -> None:
+        strategy = self.make_strategy(
+            prices={INST_A: 27.37},
+            open_prices={INST_A: 32.84},
+            fields={INST_A: {"UpStopPrice": 32.84}},
+        )
+
+        price = strategy._limit_price(
+            strategy.cache.instrument(INST_A),
+            INST_A,
+            OrderSide.BUY,
+            Decimal("400"),
+        )
+
+        self.assertEqual(price, Decimal("32.84"))
 
     def test_reconcile_increments_side_specific_cancel_count(self) -> None:
         trading_date = date(2026, 7, 2)

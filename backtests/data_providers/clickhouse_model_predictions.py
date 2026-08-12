@@ -36,6 +36,12 @@ class ClickHouseModelPredictionDataProvider(ModelPredictionDataProvider):
         start = pd.Timestamp(request.start_date).normalize()
         end = pd.Timestamp(request.end_date).normalize()
         query_start_hint = (start - pd.Timedelta(days=int(request.signal_warmup_days))).date()
+        history_start = self._trading_history_start(
+            start.date(),
+            int(request.trading_history_days),
+        )
+        if history_start is not None:
+            query_start_hint = min(query_start_hint, history_start)
         query_end = end.date()
         trading_dates = self._trading_dates(query_start_hint, query_end)
         if not trading_dates:
@@ -119,6 +125,22 @@ ORDER BY date
 """
         rows = self._fetch(ensure_json_each_row(sql))
         return [pd.Timestamp(row["date"]).normalize() for row in rows]
+
+    def _trading_history_start(self, start_date: date, history_days: int) -> date | None:
+        if history_days <= 0:
+            return None
+        sql = f"""
+SELECT cal_date AS date
+FROM dwd_trade_calendar
+WHERE exchange = 'SSE'
+  AND is_open = 1
+  AND cal_date < {quote_literal(str(start_date))}
+ORDER BY date DESC
+LIMIT {history_days:d}
+"""
+        rows = self._fetch(ensure_json_each_row(sql))
+        dates = [pd.Timestamp(row["date"]).date() for row in rows]
+        return min(dates) if dates else None
 
     def _predictions(
         self,

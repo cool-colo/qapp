@@ -245,7 +245,8 @@ class BacktestPlanningEventTest(unittest.TestCase):
             ],
         }
         args = SimpleNamespace(
-            start=signal_date.isoformat(),
+            config="configs/strategy.yaml",
+            start=first_trade_date.isoformat(),
             end=second_trade_date.isoformat(),
             exchange_timezone=self.timezone_name,
             trader_id="BACKTESTER-001",
@@ -285,7 +286,7 @@ class BacktestPlanningEventTest(unittest.TestCase):
                 "RISK_MANAGER_RISK_MODEL_ID": "test",
             },
         ):
-            engine, strategy, _ = build_engine(args, bundle, bar_types, bars_by_stock)
+            engine, strategy, _ = build_engine(args, bundle, bar_types, bars_by_stock, ())
 
         class CapturingPlanner:
             def __init__(self) -> None:

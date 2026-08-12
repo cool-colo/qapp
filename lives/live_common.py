@@ -2,15 +2,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import sys
-import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
-from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -32,18 +27,13 @@ if NAUTILUS_TRADER_PATH.exists() and str(NAUTILUS_TRADER_PATH) not in sys.path:
     sys.path.insert(0, str(NAUTILUS_TRADER_PATH))
 
 from backtests.data_providers import ClickHouseConnectionConfig  # noqa: E402
+from backtests.data_providers import ClickHouseDailyStockDataProvider  # noqa: E402
 from backtests.data_providers import ClickHouseModelPredictionDataProvider  # noqa: E402
 from backtests.data_providers import ModelPredictionDataRequest  # noqa: E402
 from backtests.data_providers import PredictionDataBundle  # noqa: E402
-from backtests.data_providers.clickhouse import ClickHouseBarDataProvider  # noqa: E402
-from backtests.data_providers.clickhouse import ClickHouseBarSchema  # noqa: E402
-from backtests.data_providers.clickhouse import ensure_json_each_row  # noqa: E402
-from backtests.data_providers.clickhouse import quote_identifier  # noqa: E402
-from backtests.data_providers.clickhouse import quote_literal  # noqa: E402
 from backtests.data_providers.clickhouse_model_predictions import normalize_stock_code  # noqa: E402
-from lives.monitoring import PrometheusExporter  # noqa: E402
-from lives.monitoring import PrometheusExporterConfig  # noqa: E402
-from nautilus_trader.common.enums import LogColor  # noqa: E402
+from market_data import DailyStockData  # noqa: E402
+from market_data import latest_closes  # noqa: E402
 
 
 
@@ -59,6 +49,7 @@ class LivePredictionContext:
     bar_types: dict[str, Any]
     instrument_stock_codes: dict[str, str]
     signals_by_date: dict[str, list[dict[str, Any]]]
+    daily_stock_data: tuple[DailyStockData, ...]
     last_closes: dict[str, float]
 
 
@@ -400,6 +391,7 @@ def build_prediction_request(
     args: argparse.Namespace,
     start: str,
     end: str,
+    trading_history_days: int = 0,
 ) -> ModelPredictionDataRequest:
     return ModelPredictionDataRequest(
         start_date=start,
@@ -412,6 +404,7 @@ def build_prediction_request(
         top_frac=args.top_frac,
         max_positions=args.max_positions,
         signal_warmup_days=args.signal_warmup_days,
+        trading_history_days=trading_history_days,
     )
 
 
@@ -479,15 +472,26 @@ class LivePredictionDataLoader:
         self.args = args
         self.connection = connection
         self.prediction_provider = ClickHouseModelPredictionDataProvider(connection)
-        self.bar_provider = ClickHouseBarDataProvider(connection=connection, schema=ClickHouseBarSchema())
+        self.daily_data_provider = ClickHouseDailyStockDataProvider(connection)
         # The broker source owns the venue-specific full-tick / broker snapshot calls
         # (QMT HTTP proxy vs Big QMT Redis RPC). Defaults to QMT for backward
         # compatibility with the existing QMT entrypoint.
         self._broker_source = broker_source or build_broker_data_source(args)
 
-    def load(self, extra_stock_codes: set[str] | None = None) -> LivePredictionContext:
+    def load(
+        self,
+        extra_stock_codes: set[str] | None = None,
+        trading_history_days: int = 0,
+    ) -> LivePredictionContext:
         start, end, now = rolling_request_dates(self.args)
-        bundle = self.prediction_provider.load(build_prediction_request(self.args, start, end))
+        bundle = self.prediction_provider.load(
+            build_prediction_request(
+                self.args,
+                start,
+                end,
+                trading_history_days=trading_history_days,
+            ),
+        )
         selected_codes = sorted(subscription_stock_codes(bundle, now.date()))
         if self.args.max_universe > 0:
             selected_codes = selected_codes[: self.args.max_universe]
@@ -499,7 +503,12 @@ class LivePredictionDataLoader:
             str(bar_types[stock_code].instrument_id): stock_code
             for stock_code in stock_codes
         }
-        last_closes = self.latest_closes(stock_codes, now.date())
+        daily_stock_data = self.daily_data_provider.load(
+            stock_codes=stock_codes,
+            start_date=min(bundle.trading_dates),
+            end_date=now.date(),
+        )
+        last_closes_by_stock = latest_closes(daily_stock_data, now.date())
         return LivePredictionContext(
             bundle=bundle,
             stock_codes=stock_codes,
@@ -507,41 +516,13 @@ class LivePredictionDataLoader:
             bar_types={str(bar_type.instrument_id): bar_type for bar_type in bar_types.values()},
             instrument_stock_codes=instrument_stock_codes,
             signals_by_date=signal_config(bundle, set(stock_codes)),
+            daily_stock_data=daily_stock_data,
             last_closes={
                 str(bar_types[stock_code].instrument_id): close
-                for stock_code, close in last_closes.items()
+                for stock_code, close in last_closes_by_stock.items()
                 if stock_code in bar_types
             },
         )
-
-    def latest_closes(self, stock_codes: list[str], as_of_date: pd.Timestamp | Any) -> dict[str, float]:
-        if not stock_codes:
-            return {}
-        results: dict[str, float] = {}
-        as_of = pd.Timestamp(as_of_date).date().isoformat()
-        for chunk in chunks(stock_codes, 500):
-            values = ", ".join(quote_literal(code) for code in chunk)
-            sql = f"""
-SELECT
-    source_code AS stock_code,
-    max(trade_date) AS date,
-    argMax(close, trade_date) AS close
-FROM {quote_identifier("dws_stock_factor_wide")}
-WHERE source_code IN ({values})
-  AND trade_date <= parseDateTimeBestEffort({quote_literal(as_of)})
-GROUP BY source_code
-"""
-            for row in self.bar_provider.fetch_json_each_row(ensure_json_each_row(sql)):
-                stock_code = normalize_stock_code(row.get("stock_code"))
-                if not stock_code:
-                    continue
-                try:
-                    close = float(row.get("close"))
-                except (TypeError, ValueError):
-                    continue
-                if close > 0:
-                    results[stock_code] = close
-        return results
 
     def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float]]:
         """
@@ -628,7 +609,3 @@ def subscription_signal_date(bundle: PredictionDataBundle, as_of_date: Any) -> A
     if candidates:
         return candidates[-1]
     return signal_dates[-1]
-
-
-def chunks(values: list[str], size: int) -> list[list[str]]:
-    return [values[index : index + size] for index in range(0, len(values), size)]

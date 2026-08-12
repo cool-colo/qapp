@@ -63,7 +63,7 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         self._refresh_interval_secs = float(refresh_interval_secs)
         self._refresh_time = self._parse_hh_mm(refresh_time)
         self._event_reporter = event_reporter
-        self.configure_signal_date_alert_reporter(
+        self.configure_target_alert_reporter(
             event_reporter.report if event_reporter is not None else None,
         )
         self._execution_reconciliation = LiveExecutionReconciliation(
@@ -135,6 +135,7 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
                     key.isoformat(): sorted(values)
                     for key, values in context.bundle.suspended_by_date.items()
                 },
+                daily_stock_data=context.daily_stock_data,
                 last_closes=context.last_closes,
                 subscribe_new_bars=True,
                 unsubscribe_removed_bars=True,
@@ -268,7 +269,11 @@ def build_target_model_node(
 
     params = StrategyParams.from_yaml(args.config)
     extra_stock_codes = legacy.normalized_stock_codes(legacy.env_list_from_value(args.extra_stock_codes))
-    context = loader.load(extra_stock_codes=extra_stock_codes)
+    history_days = max(int(params.consecutive_up_limit_days) - 1, 0)
+    context = loader.load(
+        extra_stock_codes=extra_stock_codes,
+        trading_history_days=history_days,
+    )
     venue_clients: VenueClients = make_venue_clients(args, context)
     print(
         "[build_node] loaded target context: "
@@ -278,6 +283,7 @@ def build_target_model_node(
         f"signal_dates={len(context.signals_by_date)} "
         f"signals_total={sum(len(v) for v in context.signals_by_date.values())} "
         f"last_closes={len(context.last_closes)} "
+        f"daily_stock_data={len(context.daily_stock_data)} "
         f"trading_dates={len(context.bundle.trading_dates)} "
         f"selected_rows={context.bundle.selected_rows} "
         f"universe={len(context.bundle.universe)}",
@@ -337,6 +343,8 @@ def build_target_model_node(
                 key.isoformat(): sorted(values)
                 for key, values in context.bundle.suspended_by_date.items()
             },
+            daily_stock_data=context.daily_stock_data,
+            consecutive_up_limit_days=params.consecutive_up_limit_days,
             max_positions=args.max_positions,
             max_position_percent=params.max_position_percent,
             stop_loss=params.stop_loss,
@@ -349,6 +357,7 @@ def build_target_model_node(
             excluded_name_prefixes=params.excluded_name_prefixes,
             target_weight_planner=params.target_weight_planner,
             target_weight_planner_error_policy=params.target_weight_planner_error_policy,
+            local_exit_authoritative=params.local_exit_authoritative,
             risk_manager_base_url=params.risk_manager_base_url,
             risk_manager_risk_model_id=params.risk_manager_risk_model_id,
             risk_manager_mode=params.risk_manager_mode,
@@ -378,6 +387,7 @@ def build_target_model_node(
         ),
         refresh_context=lambda active_stock_codes: loader.load(
             extra_stock_codes=extra_stock_codes.union(active_stock_codes),
+            trading_history_days=history_days,
         ),
         refresh_interval_secs=args.refresh_interval_secs,
         refresh_time=args.refresh_time,

@@ -55,6 +55,7 @@ class StrategyParams:
     trailing_take_profit: float = 0.0
     trailing_take_profit_start: float = 0.0
     min_listed_days: int = 120
+    consecutive_up_limit_days: int = 3
     holding_days: int = 10  # backtest rebalance cadence; unused by target-timer live path
     initial_cash: Decimal = Decimal("1000000")
 
@@ -71,6 +72,7 @@ class StrategyParams:
     # Target weight planning / risk manager
     target_weight_planner: str = "risk_manager"
     target_weight_planner_error_policy: str = "raise"
+    local_exit_authoritative: bool = True
     risk_manager_base_url: str = "http://127.0.0.1:8000"
     risk_manager_risk_model_id: str = "cn_a_basic_constraints_integer_lots"
     risk_manager_mode: str = "live"  # backtest configs set this to "backtest"
@@ -93,6 +95,10 @@ class StrategyParams:
     # Logging sample rates
     trade_tick_log_sample_rate: float = 0.0
     order_book_depth_log_sample_rate: float = 0.0
+
+    def __post_init__(self) -> None:
+        if int(self.consecutive_up_limit_days) < 0:
+            raise ValueError("consecutive_up_limit_days must be non-negative")
 
     @property
     def exit_non_targets(self) -> bool:

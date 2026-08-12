@@ -23,6 +23,7 @@ stop_loss: 0.1
 trailing_take_profit: 0.0
 trailing_take_profit_start: 0.0
 min_listed_days: 120
+consecutive_up_limit_days: 3  # includes today: today's open plus N-1 historical closes
 holding_days: 10           # backtest rebalance cadence (unused by live target-timer path)
 initial_cash: 1000000
 
@@ -39,6 +40,7 @@ stop_time: "14:55"
 # --- Target weight planning / risk manager ---
 target_weight_planner: risk_manager            # equal_weight | risk_manager
 target_weight_planner_error_policy: raise       # raise | equal_weight
+local_exit_authoritative: true                  # true => local exits override optimizer targets
 risk_manager_base_url: http://127.0.0.1:8000
 risk_manager_risk_model_id: cn_a_basic_constraints_integer_lots
 risk_manager_mode: live                          # backtest | simulation | live

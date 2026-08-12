@@ -3,6 +3,7 @@ from backtests.data_providers.base import PreparedBarData
 from backtests.data_providers.clickhouse import ClickHouseBarDataProvider
 from backtests.data_providers.clickhouse import ClickHouseBarSchema
 from backtests.data_providers.clickhouse import ClickHouseConnectionConfig
+from backtests.data_providers.clickhouse_daily_stock import ClickHouseDailyStockDataProvider
 from backtests.data_providers.clickhouse_model_predictions import ClickHouseModelPredictionDataProvider
 from backtests.data_providers.model_base import ModelPredictionDataProvider
 from backtests.data_providers.model_base import ModelPredictionDataRequest
@@ -14,19 +15,11 @@ __all__ = [
     "ClickHouseBarDataProvider",
     "ClickHouseBarSchema",
     "ClickHouseConnectionConfig",
+    "ClickHouseDailyStockDataProvider",
     "ClickHouseModelPredictionDataProvider",
     "ModelPredictionDataProvider",
     "ModelPredictionDataRequest",
     "PredictionDataBundle",
     "PredictionSignal",
     "PreparedBarData",
-]
-
-
-__all__ = [
-    "BarDataProvider",
-    "PreparedBarData",
-    "ClickHouseBarDataProvider",
-    "ClickHouseBarSchema",
-    "ClickHouseConnectionConfig",
 ]

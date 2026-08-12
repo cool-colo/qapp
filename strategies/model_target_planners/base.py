@@ -40,6 +40,8 @@ class ModelTargetPlan:
     request_id: str | None = None
     total_asset: float | None = None  # raw total asset
     investable_asset: float | None = None  # total asset net of trading buffer
+    persistable: bool = True
+    degraded_reason: str | None = None
 
 
 @dataclass(frozen=True)

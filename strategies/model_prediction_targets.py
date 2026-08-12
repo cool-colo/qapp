@@ -13,6 +13,8 @@ from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import InstrumentId
 
+from market_data import DailyStockData
+from market_data import index_daily_stock_data
 from strategies.model_common import ModelPredictionSignalEvent
 from strategies.model_common import normalize_initial_active_positions
 from strategies.model_common import normalize_signals
@@ -37,6 +39,8 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     listed_dates: dict[str, str]
     st_by_date: dict[str, list[str]]
     suspended_by_date: dict[str, list[str]]
+    daily_stock_data: tuple[DailyStockData, ...] = ()
+    consecutive_up_limit_days: int = 3
     max_positions: int = 50
     max_position_percent: float = 0.03
     holding_days: int = 10
@@ -48,6 +52,7 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     excluded_name_prefixes: tuple[str, ...] = ("*ST", "ST", "\u9000\u5e02")
     target_weight_planner: str = "equal_weight"
     target_weight_planner_error_policy: str = "raise"
+    local_exit_authoritative: bool = True
     risk_manager_base_url: str = ""
     risk_manager_risk_model_id: str = ""
     risk_manager_mode: str = "simulation"
@@ -66,9 +71,12 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
     """
 
     _PROCESS_TARGETS_TIMER = "TARGET-MODEL-PROCESS-TARGETS"
+    _PRICE_COMPARISON_TOLERANCE = 1e-6
 
     def __init__(self, config: TargetModelPredictionsStrategyConfig) -> None:
         super().__init__(config)
+        if int(config.consecutive_up_limit_days) < 0:
+            raise ValueError("consecutive_up_limit_days must be non-negative")
         self._stock_by_instrument: dict[str, str] = {}
         self._instrument_by_stock: dict[str, InstrumentId] = {}
         self._update_instrument_stock_codes(config.instrument_stock_codes)
@@ -85,13 +93,15 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             pd.Timestamp(key).date(): set(values)
             for key, values in config.suspended_by_date.items()
         }
+        self._daily_stock_data = index_daily_stock_data(config.daily_stock_data)
+        self._limit_history_warnings: set[tuple[date, str, str]] = set()
         self._active_positions = normalize_initial_active_positions(config.initial_active_positions)
         self._processed_dates: set[date] = set()
         self._target_planner = build_model_target_planner(config, self.log)
         self._live_target_portfolio_loader: Callable[[date, date | None], list[dict[str, Any]]] | None = None
         self._live_target_plan_persister: Callable[[ModelTargetPlan], bool] | None = None
         self._recent_target_loader: Callable[[date, date, list[str]], dict[str, date]] | None = None
-        self._signal_date_alert_reporter: Callable[[str, str, dict[str, Any]], bool | None] | None = None
+        self._target_alert_reporter: Callable[[str, str, dict[str, Any]], bool | None] | None = None
         self.signal_events: list[ModelPredictionSignalEvent] = []
 
     def configure_live_target_portfolio_loader(
@@ -129,12 +139,12 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         """
         self._recent_target_loader = loader
 
-    def configure_signal_date_alert_reporter(
+    def configure_target_alert_reporter(
         self,
         reporter: Callable[[str, str, dict[str, Any]], bool | None] | None,
     ) -> None:
-        """Inject the live monitoring reporter used for signal-date failures."""
-        self._signal_date_alert_reporter = reporter
+        """Inject live monitoring for target-input and planning failures."""
+        self._target_alert_reporter = reporter
 
     def _update_instrument_stock_codes(
         self,
@@ -172,6 +182,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         listed_dates: dict[str, str],
         st_by_date: dict[str, list[str]],
         suspended_by_date: dict[str, list[str]],
+        daily_stock_data: tuple[DailyStockData, ...],
         last_closes: dict[str, float] | None = None,
         subscribe_new_bars: bool = True,
         unsubscribe_removed_bars: bool = False,
@@ -198,6 +209,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             pd.Timestamp(key).date(): set(values)
             for key, values in suspended_by_date.items()
         }
+        self._daily_stock_data = index_daily_stock_data(daily_stock_data)
         try:
             today = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).date()
         except Exception:
@@ -241,8 +253,6 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         return True
 
     def _process_trading_day(self, trading_date: date) -> None:
-        if not self._has_expected_signal_date(trading_date):
-            return
         loaded_target = self._live_target_portfolio_target(trading_date)
         if loaded_target is not None:
             quantities, reason, version = loaded_target
@@ -254,10 +264,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             )
             return
         plan = self.compute_daily_target_plan(trading_date)
-        if plan is None:
-            return
         persister = self._live_target_plan_persister
-        if persister is not None:
+        if plan.persistable and persister is not None:
             try:
                 # Persist the newly generated plan before it becomes executable. The
                 # live wiring owns the MySQL implementation; the strategy stays DB-free.
@@ -340,61 +348,66 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             raise RuntimeError("live_target_portfolio rows contain no target_qty values")
         return quantities, reason, version
 
-    def compute_daily_target_plan(self, trading_date: date) -> ModelTargetPlan | None:
+    def compute_daily_target_plan(self, trading_date: date) -> ModelTargetPlan:
         """
-        Build the risk-manager request for the day and return the resulting plan
+        Build the day's target request and return the resulting plan
         **without submitting orders or accepting the target**.
 
         Two independent inputs are built and filtered separately (no merge):
 
         * **candidates** — the signal stocks, minus entry-ineligible ones (name
           prefixes, ST, suspension, minimum listed days, missing sizing price).
-        * **current_holdings** — the held positions, minus the untradable ones and the
-          ones a local hard-exit rule (stop-loss / trailing take-profit) fires on, so
-          the optimizer no longer sees them as current state and unwinds them.
+        * **current_holdings** — the held positions, minus the ones a local hard-exit
+          rule (ST / stop-loss / trailing take-profit) fires on. Suspended holdings
+          remain frozen in current state.
+
+        Missing signal data and risk-manager failures return a transient local safety
+        plan. Such plans are executable but deliberately not restart-persistent.
 
         The bar/timer path (_process_trading_day) uses this and then applies the plan
         via update_target_quantities. The snapshot recorder uses it before-trading to
         derive the day's frozen share counts. Both paths therefore run the same logic.
         """
-        if not self._has_expected_signal_date(trading_date):
-            return None
         self._seed_active_positions_from_portfolio(trading_date)
         signal_date = self._resolve_signal_date(trading_date)
+        has_signal_data = self._has_expected_signal_date(trading_date)
         today_signals = self._signals_by_date.get(signal_date, []) if signal_date else []
         self.log.info(
             f"model target day {trading_date}: signal_date={signal_date} "
             f"signals={len(today_signals)} active={len(self._active_positions)}",
             color=LogColor.BLUE,
         )
-        return self._target_plan(trading_date, signal_date)
+        return self._target_plan(
+            trading_date,
+            signal_date,
+            degraded_reason=None if has_signal_data else "missing_signal_data",
+        )
 
     def _has_expected_signal_date(self, trading_date: date) -> bool:
         expected_signal_date = previous_trading_date(self._trading_dates, trading_date)
-        resolved_signal_date = self._resolve_signal_date(trading_date)
-        if resolved_signal_date == expected_signal_date:
+        if expected_signal_date is None:
+            raise RuntimeError(f"no previous trading date available for {trading_date}")
+        if expected_signal_date in self._signals_by_date:
             return True
         message = (
-            "Refusing to process model targets because the resolved signal date does not match "
-            f"the previous trading date: trading_date={trading_date} "
-            f"expected_signal_date={expected_signal_date} resolved_signal_date={resolved_signal_date}"
+            "Previous-trading-date signal data is missing; applying a transient local safety plan: "
+            f"trading_date={trading_date} expected_signal_date={expected_signal_date}"
         )
         self.log.error(message)
-        reporter = self._signal_date_alert_reporter
+        reporter = self._target_alert_reporter
         if reporter is None:
             return False
         try:
             reporter(
-                "TARGET-MODEL-SIGNAL-DATE-MISMATCH",
+                "TARGET-MODEL-SIGNAL-DATA-MISSING",
                 "failed",
                 {
                     "trading_date": trading_date,
                     "expected_signal_date": expected_signal_date,
-                    "resolved_signal_date": resolved_signal_date,
                 },
             )
         except Exception as exc:
-            self.log.warning(f"Could not queue DingTalk signal-date mismatch alert: {exc}")
+            self.log.warning(f"Could not queue DingTalk missing-signal-data alert: {exc}")
         return False
 
     def plan_version(self, plan: ModelTargetPlan) -> str:
@@ -402,14 +415,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         return self._plan_version(plan)
 
     def _resolve_signal_date(self, trading_date: date) -> date | None:
-        prev_date = previous_trading_date(self._trading_dates, trading_date)
-        if prev_date is not None and prev_date in self._signals_by_date:
-            return prev_date
-        cutoff = prev_date or trading_date
-        candidates = [value for value in self._signals_by_date if value <= cutoff]
-        if candidates:
-            return max(candidates)
-        return prev_date
+        return previous_trading_date(self._trading_dates, trading_date)
 
     def _seed_active_positions_from_portfolio(self, trading_date: date) -> None:
         try:
@@ -583,10 +589,120 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             color=LogColor.YELLOW,
         )
 
-    def _target_plan(self, trading_date: date, signal_date: date | None) -> ModelTargetPlan:
-        request = self._target_planning_request(trading_date, signal_date)
-        plan = self._target_planner.plan(request)
-        return self._annotate_plan(plan, request)
+    def _target_plan(
+        self,
+        trading_date: date,
+        signal_date: date | None,
+        degraded_reason: str | None = None,
+    ) -> ModelTargetPlan:
+        request, forced_exits = self._target_planning_request(trading_date, signal_date)
+        if degraded_reason is not None:
+            return self._local_safety_plan(request, forced_exits, degraded_reason)
+        try:
+            plan = self._target_planner.plan(request)
+        except Exception as exc:
+            self._report_risk_manager_failure(trading_date, signal_date, exc)
+            return self._local_safety_plan(
+                request,
+                forced_exits,
+                "risk_manager_failure",
+            )
+        annotated = self._annotate_plan(plan, request)
+        if not bool(self.config.local_exit_authoritative):
+            return annotated
+        return self._apply_forced_exit_overrides(annotated, forced_exits)
+
+    def _report_risk_manager_failure(
+        self,
+        trading_date: date,
+        signal_date: date | None,
+        exc: Exception,
+    ) -> None:
+        message = (
+            f"risk-manager planning failed; applying a transient local safety plan: "
+            f"trading_date={trading_date} signal_date={signal_date} error={exc}"
+        )
+        self.log.error(message)
+        reporter = self._target_alert_reporter
+        if reporter is None:
+            return
+        try:
+            reporter(
+                "TARGET-MODEL-RISK-MANAGER-FAILURE",
+                "failed",
+                {
+                    "trading_date": trading_date,
+                    "signal_date": signal_date,
+                    "error": str(exc),
+                },
+            )
+        except Exception as report_exc:
+            self.log.warning(f"Could not queue DingTalk risk-manager failure alert: {report_exc}")
+
+    def _local_safety_plan(
+        self,
+        request: ModelTargetPlanningRequest,
+        forced_exits: dict[str, str],
+        degraded_reason: str,
+    ) -> ModelTargetPlan:
+        targets = [
+            self._local_target_info(
+                instrument_id,
+                0 if instrument_id in forced_exits else quantity,
+            )
+            for instrument_id, quantity in self._held_quantities().items()
+        ]
+        return ModelTargetPlan(
+            trading_date=request.trading_date,
+            signal_date=request.signal_date,
+            targets=targets,
+            reason=f"local_exit_{degraded_reason}",
+            total_asset=request.total_asset,
+            investable_asset=request.investable_asset,
+            persistable=False,
+            degraded_reason=degraded_reason,
+        )
+
+    def _apply_forced_exit_overrides(
+        self,
+        plan: ModelTargetPlan,
+        forced_exits: dict[str, str],
+    ) -> ModelTargetPlan:
+        if not forced_exits:
+            return plan
+        targets_by_instrument = {target.instrument_id: target for target in plan.targets}
+        for instrument_id in forced_exits:
+            targets_by_instrument[instrument_id] = self._local_target_info(instrument_id, 0)
+        return dataclasses.replace(
+            plan,
+            targets=[targets_by_instrument[key] for key in sorted(targets_by_instrument)],
+        )
+
+    def _held_quantities(self) -> dict[str, int]:
+        quantities: dict[str, int] = {}
+        for instrument_id in sorted(self._held_instrument_ids()):
+            quantity = int(self._current_quantity(InstrumentId.from_str(instrument_id)))
+            if quantity > 0:
+                quantities[instrument_id] = quantity
+        return quantities
+
+    def _local_target_info(self, instrument_id: str, quantity: int) -> TargetInfo:
+        price, price_source = self._open_price_with_source(instrument_id)
+        stock_code = self._stock_code_for_instrument(instrument_id)
+        return TargetInfo(
+            stock_code=stock_code,
+            weight=None,
+            quantity=int(quantity),
+            target_context=TargetContext(
+                price=price,
+                price_source=price_source,
+                current_qty=int(self._current_quantity(InstrumentId.from_str(instrument_id))),
+                market_status=self._market_status_for(instrument_id),
+            ),
+            target_version=None,
+            instrument_id=instrument_id,
+            is_locked=self._is_suspended_status(instrument_id),
+        )
 
     def _annotate_plan(
         self,
@@ -639,10 +755,32 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self,
         trading_date: date,
         signal_date: date | None,
-    ) -> ModelTargetPlanningRequest:
+    ) -> tuple[ModelTargetPlanningRequest, dict[str, str]]:
         open_prices: dict[str, float] = {}
-        candidates = self._build_candidates(trading_date, signal_date, open_prices)
-        current_holdings = self._build_current_holdings(trading_date, signal_date, open_prices)
+        forced_exits: dict[str, str] = {}
+        if bool(self.config.local_exit_authoritative):
+            current_holdings = self._build_current_holdings(
+                trading_date,
+                signal_date,
+                open_prices,
+                forced_exits=forced_exits,
+            )
+            candidates = self._build_candidates(
+                trading_date,
+                signal_date,
+                open_prices,
+                excluded_instrument_ids=set(forced_exits),
+            )
+        else:
+            # Preserve the pre-switch request path exactly: candidates are built
+            # normally, while triggered holdings are only removed from current state.
+            candidates = self._build_candidates(trading_date, signal_date, open_prices)
+            current_holdings = self._build_current_holdings(
+                trading_date,
+                signal_date,
+                open_prices,
+                forced_exits=forced_exits,
+            )
         # TEMP: for account 86008933, force recent_holding_days=3 so these holdings are
         # easy to drop/liquidate via the risk manager.
         #if self._account_id_equals(86008933):
@@ -666,7 +804,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             )
         if investable_asset <= 0:
             investable_asset = float(self.config.initial_cash)
-        return ModelTargetPlanningRequest(
+        request = ModelTargetPlanningRequest(
             trading_date=trading_date,
             signal_date=signal_date,
             active_instrument_ids=active_ids,
@@ -678,6 +816,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             investable_asset=investable_asset,
             open_prices=open_prices,
         )
+        return request, forced_exits
 
     def _account_id_equals(self, account_number: int) -> bool:
         for account in self._broker_accounts():
@@ -691,6 +830,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         trading_date: date,
         signal_date: date | None,
         open_prices: dict[str, float],
+        excluded_instrument_ids: set[str] | None = None,
     ) -> list[ModelTargetCandidate]:
         """
         Build the candidate list from the resolved signal date's signals only (not
@@ -712,7 +852,11 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             if instrument_id in seen:
                 continue
             seen.add(instrument_id)
-            skip_reason = self._entry_skip_reason(stock_code, trading_date)
+            skip_reason = (
+                "local_exit"
+                if instrument_id in (excluded_instrument_ids or set())
+                else self._entry_skip_reason(stock_code, trading_date)
+            )
             price = self._today_open_price(instrument_id)
             if skip_reason is None and price is None:
                 self._log_missing_new_entry_open_price(
@@ -763,6 +907,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         trading_date: date,
         signal_date: date | None,
         open_prices: dict[str, float],
+        forced_exits: dict[str, str] | None = None,
     ) -> list[CurrentHolding]:
         """
         Build the current-holdings list (the planner's ``current_weights``) from the
@@ -828,6 +973,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 continue
             exclusion = self._holding_exclusion(trading_date, signal_date, instrument_id, exit_rank)
             if exclusion is not None:
+                if forced_exits is not None:
+                    forced_exits[instrument_id] = exclusion
                 self.log.warning(f"Excluding holding from current_holdings: {instrument_id} reason={exclusion}")
                 continue
             price = self._today_open_price(instrument_id)
@@ -988,7 +1135,99 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 listed_days = (pd.Timestamp(trading_date) - pd.Timestamp(listed_date)).days
                 if listed_days < int(self.config.min_listed_days):
                     return "new_stock"
+        if self._has_consecutive_up_limits(stock_code, trading_date):
+            return "consecutive_up_limit"
         return None
+
+    def _has_consecutive_up_limits(self, stock_code: str, trading_date: date) -> bool:
+        consecutive_days = int(self.config.consecutive_up_limit_days)
+        if consecutive_days <= 0:
+            return False
+
+        instrument_id = self._instrument_by_stock.get(stock_code)
+        if instrument_id is None:
+            return False
+        instrument_id_text = str(instrument_id)
+        today_open = self._today_open_price(instrument_id_text)
+        if today_open is None:
+            # The existing candidate sizing path reports and filters this separately.
+            return False
+
+        today_up_limit, _ = self._price_limits(instrument_id_text)
+        if today_up_limit is None:
+            today_row = self._daily_stock_data.get((stock_code, trading_date))
+            if today_row is not None:
+                today_up_limit = today_row.up_limit
+        if today_up_limit is None or today_up_limit <= 0:
+            self._warn_incomplete_limit_history(
+                stock_code,
+                trading_date,
+                "missing current-day up_limit from instrument info and daily history",
+            )
+            return False
+        if today_open < today_up_limit - self._PRICE_COMPARISON_TOLERANCE:
+            return False
+
+        history_days = consecutive_days - 1
+        if history_days == 0:
+            return True
+        prior_trading_dates = sorted(
+            value for value in set(self._trading_dates) if value < trading_date
+        )
+        required_dates = prior_trading_dates[-history_days:]
+        if len(required_dates) != history_days:
+            self._warn_incomplete_limit_history(
+                stock_code,
+                trading_date,
+                f"need {history_days} prior trading dates, found {len(required_dates)}",
+            )
+            return False
+
+        incomplete: list[str] = []
+        rows: list[DailyStockData] = []
+        for required_date in required_dates:
+            row = self._daily_stock_data.get((stock_code, required_date))
+            if row is None:
+                incomplete.append(f"{required_date}:missing_row")
+                continue
+            missing_fields = []
+            if row.close is None or row.close <= 0:
+                missing_fields.append("close")
+            if row.up_limit is None or row.up_limit <= 0:
+                missing_fields.append("up_limit")
+            if missing_fields:
+                incomplete.append(f"{required_date}:missing_{'+'.join(missing_fields)}")
+                continue
+            rows.append(row)
+        if incomplete:
+            self._warn_incomplete_limit_history(
+                stock_code,
+                trading_date,
+                ",".join(incomplete),
+            )
+            return False
+
+        return all(
+            row.close >= row.up_limit - self._PRICE_COMPARISON_TOLERANCE
+            for row in rows
+            if row.close is not None and row.up_limit is not None
+        )
+
+    def _warn_incomplete_limit_history(
+        self,
+        stock_code: str,
+        trading_date: date,
+        detail: str,
+    ) -> None:
+        warning_key = (trading_date, stock_code, detail)
+        if warning_key in self._limit_history_warnings:
+            return
+        self._limit_history_warnings.add(warning_key)
+        self.log.warning(
+            "consecutive up-limit filter admitted candidate because reference data "
+            f"is incomplete: date={trading_date} stock_code={stock_code} detail={detail}",
+            color=LogColor.YELLOW,
+        )
 
     def _name_skip_reason(self, stock_code: str) -> str | None:
         instrument_id = self._instrument_by_stock.get(stock_code)

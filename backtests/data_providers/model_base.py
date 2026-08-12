@@ -21,6 +21,7 @@ class ModelPredictionDataRequest:
     top_frac: float = 0.10
     max_positions: int = 50
     signal_warmup_days: int = 7
+    trading_history_days: int = 0
 
 
 @dataclass(frozen=True)
