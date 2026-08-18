@@ -161,6 +161,8 @@ class LiveOrderRecord:
     open_price: Decimal | None = None
     book_snapshot: JsonMapping | None = None
     reason: str | None = None
+    # QMT-recorded委托时间 (order insert time from the venue), not the local receive clock.
+    order_time: datetime | None = None
     qmt_raw: JsonMapping | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None

@@ -225,6 +225,7 @@ CREATE TABLE IF NOT EXISTS `live_order` (
   `open_price`    DECIMAL(20,4) NULL,
   `book_snapshot` JSON         NULL,
   `reason`        VARCHAR(64)  NULL,
+  `order_time`    DATETIME     NULL,
   `qmt_raw`       JSON         NULL,
   `created_at`    DATETIME     NOT NULL,
   `updated_at`    DATETIME     NOT NULL,
@@ -497,6 +498,8 @@ class LiveSnapshotWriter:
             # Distinguishes QMT after-close backfilled rows (``fallback``) from live
             # msgbus rows (``live``).
             "source": "VARCHAR(16) NOT NULL DEFAULT 'live'",
+            # QMT-recorded委托时间.
+            "order_time": "DATETIME NULL",
         }
         try:
             existing = {
@@ -1084,6 +1087,7 @@ class LiveSnapshotWriter:
             "open_price": record.open_price,
             "book_snapshot": _json_dumps(record.book_snapshot),
             "reason": record.reason,
+            "order_time": record.order_time,
             "qmt_raw": _json_dumps(record.qmt_raw),
             "created_at": _timestamp(record.created_at),
             "updated_at": _timestamp(record.updated_at),

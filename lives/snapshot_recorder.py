@@ -967,6 +967,9 @@ class SnapshotRecorder(Actor):
             open_price=self._order_open_price(instrument_id_text),
             book_snapshot=self._order_book_snapshot(instrument_id, instrument_id_text),
             reason=self._bounded_order_reason(getattr(event, "reason", None)),
+            order_time=self._qmt_time_to_naive(
+                self._event_info(event), "order_at", "order_time_ms"
+            ),
             qmt_raw=self._order_event_payload(event),
             created_at=self._now_naive(),
             updated_at=self._now_naive(),
@@ -995,7 +998,9 @@ class SnapshotRecorder(Actor):
             quantity=self._int_or_none(last_qty),
             amount=amount,
             commission=self._commission(event),
-            trade_time=self._ns_to_naive(getattr(event, "ts_event", 0)),
+            trade_time=self._qmt_time_to_naive(
+                self._event_info(event), "traded_at", "traded_time_ms"
+            ),
             qmt_raw=self._event_info(event),
             created_at=self._now_naive(),
         )
@@ -1405,6 +1410,7 @@ class SnapshotRecorder(Actor):
             # target_version / book_snapshot stay null — strategy-only, unknown to QMT.
             open_price=open_prices.get(instrument_id_text),
             reason=self._bounded_order_reason(row.get("status_msg")),
+            order_time=self._qmt_time_to_naive(row, "order_at", "order_time_ms"),
             qmt_raw=self._jsonable(row),
             created_at=self._now_naive(),
             updated_at=self._now_naive(),
@@ -1473,7 +1479,7 @@ class SnapshotRecorder(Actor):
             quantity=self._int_or_none(row.get("traded_volume")),
             amount=self._decimal_or_none(row.get("traded_amount")),
             commission=self._decimal_or_none(row.get("commission")),
-            trade_time=self._epoch_ms_to_naive(row.get("traded_time_ms")),
+            trade_time=self._qmt_time_to_naive(row, "traded_at", "traded_time_ms"),
             qmt_raw=self._jsonable(row),
             created_at=self._now_naive(),
         )
@@ -1522,6 +1528,49 @@ class SnapshotRecorder(Actor):
             )
         except Exception:
             return None
+
+    def _qmt_datetime_str_to_naive(self, value: Any) -> datetime | None:
+        """Parse a QMT-recorded ``"YYYY-MM-DD HH:MM:SS"`` local-time string (BigQMT's
+        ``order_at`` / ``traded_at``) into a naive datetime.
+
+        BigQMT surfaces the venue time already in the exchange (Shanghai) timezone, so it
+        is parsed as local wall-clock time — no UTC conversion. Returns ``None`` when the
+        value is missing or unparseable.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            ts = pd.Timestamp(text)
+        except Exception:
+            return None
+        if ts is None or pd.isna(ts):
+            return None
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(self.config.timezone_name).tz_localize(None)
+        return ts.to_pydatetime()
+
+    def _qmt_time_to_naive(self, payload: Any, *keys: str) -> datetime | None:
+        """Resolve a QMT-recorded time from a raw order/trade payload dict.
+
+        Tries the given keys in order, accepting either a BigQMT datetime string
+        (``order_at`` / ``traded_at``) or a QMT epoch-milliseconds value
+        (``order_time_ms`` / ``traded_time_ms``). Returns ``None`` when no key yields a
+        parseable time.
+        """
+        if not isinstance(payload, dict):
+            return None
+        for key in keys:
+            value = payload.get(key)
+            if value is None or value == "":
+                continue
+            if key.endswith("_ms"):
+                resolved = self._epoch_ms_to_naive(value)
+            else:
+                resolved = self._qmt_datetime_str_to_naive(value)
+            if resolved is not None:
+                return resolved
+        return None
 
     def _apply_full_tick(
         self,

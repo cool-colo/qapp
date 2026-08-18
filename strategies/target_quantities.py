@@ -979,17 +979,24 @@ class TargetQuantityStrategy(Strategy):
     def on_order_filled(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
         instrument_id_text = str(getattr(event, "instrument_id", ""))
+        order_side = getattr(event, "order_side", None)
         self._forget_submitted_order(client_order_id)
         self._deferred_buys.pop(instrument_id_text, None)
         self._insufficient_funds.discard(instrument_id_text)
         # Reset the filled side's cancel count so the next convergence cycle for
         # this instrument starts pricing at the base offset again.
         if instrument_id_text:
-            order_side = getattr(event, "order_side", None)
             if order_side == OrderSide.BUY:
                 self._cancel_count_buy.pop(instrument_id_text, None)
             elif order_side == OrderSide.SELL:
                 self._cancel_count_sell.pop(instrument_id_text, None)
+        # A SELL fill frees cash. Re-converge immediately so deferred / cash-backed-off
+        # buys are retried now instead of waiting for the periodic timer (up to
+        # resubmit_check_interval_secs). BUY fills already reach target for their
+        # instrument, so they do not need to trigger convergence. The convergence path
+        # is guarded by a non-blocking lock and the trading-window gate.
+        if order_side == OrderSide.SELL:
+            self._converge_to_target(current_date=self._clock_date(), trigger="sell_fill")
 
     def on_order_canceled(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
