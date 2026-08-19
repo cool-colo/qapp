@@ -38,6 +38,7 @@ start_qapp.sh
 start_calculate_daily_returns.sh
 start_big_qmt_live_trading.sh
 start_big_qmt_live_trading_2.sh
+start_big_qmt_live_trading_3.sh
 start_bigqmt_full_tick_snapshot.sh
 .envs
 
