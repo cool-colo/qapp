@@ -28,6 +28,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         self,
         base_url: str,
         risk_model_id: str,
+        alpha_model_id: str,
         mode: str,
         *,
         log: Any,
@@ -35,6 +36,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
     ) -> None:
         self.base_url = str(base_url or "").rstrip("/")
         self.risk_model_id = str(risk_model_id or "").strip()
+        self.alpha_model_id = str(alpha_model_id or "").strip()
         self.mode = str(mode or "").strip()
         self.timeout_secs = float(timeout_secs)
         if log is None:
@@ -84,6 +86,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             "request_id": request_id,
             "mode": self.mode,
             "risk_model_id": self.risk_model_id,
+            "alpha_model_id": self.alpha_model_id,
             "asof_date": asof_date.isoformat(),
             "trade_date": request.trading_date.isoformat(),
             "candidates": [self._candidate_payload(candidate) for candidate in request.candidates],
@@ -109,9 +112,11 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
                 None if holding.recent_target_date is None else holding.recent_target_date.isoformat()
             ),
             "recent_holding_days": int(holding.recent_holding_days),
-            # "can_buy": bool(holding.can_buy),
-            # "can_sell": bool(holding.can_sell),
+            "can_buy": bool(holding.can_buy),
+            "can_sell": bool(holding.can_sell),
         }
+        if holding.rank is not None:
+            payload["rank"] = int(holding.rank)
         return payload
 
     @staticmethod
@@ -119,13 +124,16 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         # Candidates are built with a guaranteed open price and pred_return_live
         # (see TargetModelPredictionsStrategy._build_candidates), so both are sent
         # unconditionally here.
-        return {
+        payload: dict[str, Any] = {
             "stock_code": candidate.stock_code,
             "score": candidate.score,
             "is_tradable": True,
             "expected_return": float(candidate.expected_return),
             "price": float(candidate.open_price),
         }
+        if candidate.rank is not None:
+            payload["rank"] = int(candidate.rank)
+        return payload
 
     def _request_id(self, request: ModelTargetPlanningRequest) -> str:
         signal_text = "none" if request.signal_date is None else request.signal_date.isoformat()

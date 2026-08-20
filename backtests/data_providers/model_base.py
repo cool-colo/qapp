@@ -36,6 +36,7 @@ class PredictionSignal:
 @dataclass(frozen=True)
 class PredictionDataBundle:
     signals_by_date: dict[date, list[PredictionSignal]]
+    prediction_ranks_by_date: dict[date, dict[str, int]]
     universe: list[str]
     trading_dates: list[date]
     listed_dates: dict[str, date]

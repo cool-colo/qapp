@@ -35,6 +35,7 @@ from strategies.target_quantities import bar_date
 class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only=True, frozen=True):
     instrument_stock_codes: dict[str, str]
     signals_by_date: dict[str, list[dict[str, Any]]]
+    prediction_ranks_by_date: dict[str, dict[str, int]]
     trading_dates: list[str]
     listed_dates: dict[str, str]
     st_by_date: dict[str, list[str]]
@@ -56,6 +57,7 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     local_exit_authoritative: bool = True
     risk_manager_base_url: str = ""
     risk_manager_risk_model_id: str = ""
+    alpha_model_id: str = ""
     risk_manager_mode: str = "simulation"
     risk_manager_timeout_secs: float = 10.0
     process_targets_on_timer: bool = False
@@ -84,6 +86,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self._instrument_by_stock: dict[str, InstrumentId] = {}
         self._update_instrument_stock_codes(config.instrument_stock_codes)
         self._signals_by_date = normalize_signals(config.signals_by_date)
+        self._prediction_ranks_by_date = normalize_prediction_ranks(
+            config.prediction_ranks_by_date,
+        )
         self._latest_signal_by_stock_date = latest_signal_index(self._signals_by_date)
         self._trading_dates = [pd.Timestamp(value).date() for value in config.trading_dates]
         self._listed_dates = {
@@ -182,6 +187,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         bar_types: dict[str, BarType],
         instrument_stock_codes: dict[str, str],
         signals_by_date: dict[str, list[dict[str, Any]]],
+        prediction_ranks_by_date: dict[str, dict[str, int]],
         trading_dates: list[str],
         listed_dates: dict[str, str],
         st_by_date: dict[str, list[str]],
@@ -200,6 +206,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         )
         self._update_instrument_stock_codes(instrument_stock_codes)
         self._signals_by_date = normalize_signals(signals_by_date)
+        self._prediction_ranks_by_date = normalize_prediction_ranks(
+            prediction_ranks_by_date,
+        )
         self._latest_signal_by_stock_date = latest_signal_index(self._signals_by_date)
         refreshed_trading_dates = [pd.Timestamp(value).date() for value in trading_dates]
         self._trading_dates = sorted(set(self._trading_dates).union(refreshed_trading_dates))
@@ -892,6 +901,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     score=float(signal["score"]),
                     open_price=price,
                     expected_return=float(signal["pred_return_live"]),
+                    rank=int(signal["rank"]),
                 ),
             )
             self._record_signal(
@@ -925,6 +935,13 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         """
         held_ids = sorted(self._held_instrument_ids())
         recent_target_dates = self._recent_target_dates(trading_date, held_ids)
+        # Candidate signals are truncated by top_frac/max_positions. Holding ranks
+        # come from the separately retained, untruncated prediction universe.
+        rank_by_stock = (
+            self._prediction_ranks_by_date.get(signal_date, {})
+            if signal_date
+            else {}
+        )
         holdings: list[CurrentHolding] = []
         exit_rank = 0
         for instrument_id in held_ids:
@@ -972,6 +989,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                         recent_holding_days=0,
                         can_buy=False,
                         can_sell=False,
+                        rank=rank_by_stock.get(stock_code),
                     ),
                 )
                 continue
@@ -1001,6 +1019,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     price=price,
                     recent_target_date=recent_target_date,
                     recent_holding_days=recent_holding_days,
+                    rank=rank_by_stock.get(stock_code),
                 ),
             )
         self.log.info(
@@ -1356,4 +1375,25 @@ def latest_signal_index(
             result.setdefault(stock_code, []).append((signal_date, signal))
     for rows in result.values():
         rows.sort(key=lambda item: item[0])
+    return result
+
+
+def normalize_prediction_ranks(
+    ranks_by_date: dict[str, dict[str, int]],
+) -> dict[date, dict[str, int]]:
+    result: dict[date, dict[str, int]] = {}
+    for date_value, ranks in ranks_by_date.items():
+        signal_date = pd.Timestamp(date_value).date()
+        normalized_ranks: dict[str, int] = {}
+        for stock_code, rank in ranks.items():
+            normalized = normalize_stock_code(stock_code)
+            if not normalized:
+                raise ValueError(f"invalid stock code in prediction ranks: {stock_code!r}")
+            rank_value = int(rank)
+            if rank_value <= 0:
+                raise ValueError(
+                    f"prediction rank must be positive: {stock_code}={rank_value}",
+                )
+            normalized_ranks[normalized] = rank_value
+        result[signal_date] = normalized_ranks
     return result

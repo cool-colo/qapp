@@ -43,7 +43,7 @@ target_weight_planner: risk_manager            # equal_weight | risk_manager
 target_weight_planner_error_policy: raise       # raise | equal_weight
 local_exit_authoritative: true                  # true => local exits override optimizer targets
 risk_manager_base_url: http://127.0.0.1:8000
-risk_manager_risk_model_id: cn_a_basic_constraints_integer_lots
+risk_manager_risk_model_id: cn_a_basic_topn_holdings_integer_lots
 alpha_model_id: strict_all_gain_stable_top1200_20260802   # experiment ID; only supported value this period
 risk_manager_mode: live                          # backtest | simulation | live
 risk_manager_timeout_secs: 10.0

@@ -128,6 +128,10 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
                 bar_types=context.bar_types,
                 instrument_stock_codes=context.instrument_stock_codes,
                 signals_by_date=context.signals_by_date,
+                prediction_ranks_by_date={
+                    key.isoformat(): values
+                    for key, values in context.bundle.prediction_ranks_by_date.items()
+                },
                 trading_dates=[value.isoformat() for value in context.bundle.trading_dates],
                 listed_dates={key: value.isoformat() for key, value in context.bundle.listed_dates.items()},
                 st_by_date={key.isoformat(): sorted(values) for key, values in context.bundle.st_by_date.items()},
@@ -336,6 +340,10 @@ def build_target_model_node(
             bar_types=context.bar_types,
             instrument_stock_codes=context.instrument_stock_codes,
             signals_by_date=context.signals_by_date,
+            prediction_ranks_by_date={
+                key.isoformat(): values
+                for key, values in context.bundle.prediction_ranks_by_date.items()
+            },
             trading_dates=[value.isoformat() for value in context.bundle.trading_dates],
             listed_dates={key: value.isoformat() for key, value in context.bundle.listed_dates.items()},
             st_by_date={key.isoformat(): sorted(values) for key, values in context.bundle.st_by_date.items()},
@@ -361,6 +369,7 @@ def build_target_model_node(
             local_exit_authoritative=params.local_exit_authoritative,
             risk_manager_base_url=params.risk_manager_base_url,
             risk_manager_risk_model_id=params.risk_manager_risk_model_id,
+            alpha_model_id=params.alpha_model_id,
             risk_manager_mode=params.risk_manager_mode,
             risk_manager_timeout_secs=params.risk_manager_timeout_secs,
             unfilled_timeout_secs=params.unfilled_timeout_secs,

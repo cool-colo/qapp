@@ -12,6 +12,7 @@ def build_model_target_planner(config: Any, log: Any) -> ModelTargetPlanner:
         return RiskManagerModelTargetPlanner(
             base_url=config.risk_manager_base_url,
             risk_model_id=config.risk_manager_risk_model_id,
+            alpha_model_id=config.alpha_model_id,
             mode=config.risk_manager_mode,
             timeout_secs=config.risk_manager_timeout_secs,
             log=log,

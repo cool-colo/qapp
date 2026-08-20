@@ -68,8 +68,9 @@ class ClickHouseModelPredictionDataProvider(ModelPredictionDataProvider):
         if predictions.empty:
             raise RuntimeError("No predictions left after excluded stock code filtering")
 
+        ranked_predictions = rank_daily_predictions(predictions)
         selected = select_daily_signals(
-            predictions,
+            ranked_predictions,
             min_score=request.min_score,
             top_frac=request.top_frac,
             max_positions=request.max_positions,
@@ -85,6 +86,7 @@ class ClickHouseModelPredictionDataProvider(ModelPredictionDataProvider):
 
         return PredictionDataBundle(
             signals_by_date=signals_by_date,
+            prediction_ranks_by_date=build_prediction_rank_map(ranked_predictions),
             universe=universe,
             trading_dates=[pd.Timestamp(value).date() for value in trading_dates],
             listed_dates=listed_dates,
@@ -301,23 +303,45 @@ def select_daily_signals(
     top_frac: float,
     max_positions: int,
 ) -> pd.DataFrame:
-    frame = samples.copy()
+    frame = rank_daily_predictions(samples)
     if min_score is not None:
         frame = frame.loc[frame["score"] >= float(min_score)].copy()
     if frame.empty:
         return frame
     selected_parts = []
     for _, part in frame.groupby("date", sort=True):
-        part = part.sort_values("score", ascending=False)
+        part = part.sort_values("rank")
         top_count = max(1, int(math.ceil(len(part) * float(top_frac))))
         if max_positions > 0:
             top_count = min(top_count, int(max_positions))
-        selected = part.head(top_count).copy()
-        selected["rank"] = range(1, len(selected) + 1)
-        selected_parts.append(selected)
+        selected_parts.append(part.head(top_count).copy())
     if not selected_parts:
         return frame.iloc[0:0].copy()
     return pd.concat(selected_parts, ignore_index=True)
+
+
+def rank_daily_predictions(samples: pd.DataFrame) -> pd.DataFrame:
+    """Rank every loaded prediction before candidate-list truncation."""
+    frame = samples.drop(columns=["rank"], errors="ignore").copy()
+    if frame.empty:
+        frame["rank"] = pd.Series(dtype="int64")
+        return frame
+    frame = frame.sort_values(
+        ["date", "score", "stock_code"],
+        ascending=[True, False, True],
+    ).reset_index(drop=True)
+    frame["rank"] = frame.groupby("date", sort=False).cumcount() + 1
+    return frame
+
+
+def build_prediction_rank_map(ranked: pd.DataFrame) -> dict[date, dict[str, int]]:
+    result: dict[date, dict[str, int]] = {}
+    for value, part in ranked.groupby("date", sort=True):
+        result[pd.Timestamp(value).date()] = {
+            str(row.stock_code): int(row.rank)
+            for row in part.itertuples()
+        }
+    return result
 
 
 def build_signal_map(selected: pd.DataFrame) -> dict[date, list[PredictionSignal]]:

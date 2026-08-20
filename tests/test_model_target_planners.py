@@ -52,10 +52,10 @@ class ModelTargetPlannerTest(unittest.TestCase):
             active_instrument_ids=["000001.SZ.QMT", "000002.SZ.QMT"],
             candidates=[
                 ModelTargetCandidate(
-                    "000001.SZ.QMT", "000001.SZ", 0.12, open_price=10.0, expected_return=0.031,
+                    "000001.SZ.QMT", "000001.SZ", 0.12, open_price=10.0, expected_return=0.031, rank=1,
                 ),
                 ModelTargetCandidate(
-                    "000002.SZ.QMT", "000002.SZ", 0.08, open_price=20.0, expected_return=0.017,
+                    "000002.SZ.QMT", "000002.SZ", 0.08, open_price=20.0, expected_return=0.017, rank=2,
                 ),
             ],
             current_holdings=[
@@ -66,6 +66,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
                     price=10.0,
                     recent_target_date=date(2026, 6, 20),
                     recent_holding_days=8,
+                    rank=1,
                 ),
                 CurrentHolding(
                     "000004.SZ.QMT",
@@ -74,6 +75,8 @@ class ModelTargetPlannerTest(unittest.TestCase):
                     price=30.0,
                     recent_target_date=None,
                     recent_holding_days=0,
+                    can_buy=False,
+                    can_sell=False,
                 ),
             ],
             target_cash_buffer_percent=0.05,
@@ -123,6 +126,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
         planner = RiskManagerModelTargetPlanner(
             base_url="http://risk-manager.local/",
             risk_model_id="cn_a_basic_constraints_integer_lots",
+            alpha_model_id="strict_all_gain_stable_top1200_20260802",
             mode="live",
             timeout_secs=3.5,
             log=log,
@@ -134,6 +138,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
         self.assertEqual(captured["timeout"], 3.5)
         self.assertEqual(captured["payload"]["mode"], "live")
         self.assertEqual(captured["payload"]["risk_model_id"], "cn_a_basic_constraints_integer_lots")
+        self.assertEqual(captured["payload"]["alpha_model_id"], "strict_all_gain_stable_top1200_20260802")
         self.assertEqual(captured["payload"]["asof_date"], "2026-07-01")
         self.assertEqual(captured["payload"]["trade_date"], "2026-07-02")
         # Investable total (net of buffer) is sent so the service sizes share counts.
@@ -143,12 +148,14 @@ class ModelTargetPlannerTest(unittest.TestCase):
         self.assertEqual(
             captured["payload"]["candidates"],
             [
-                {"stock_code": "000001.SZ", "score": 0.12, "is_tradable": True, "expected_return": 0.031, "price": 10.0},
-                {"stock_code": "000002.SZ", "score": 0.08, "is_tradable": True, "expected_return": 0.017, "price": 20.0},
+                {"stock_code": "000001.SZ", "score": 0.12, "is_tradable": True, "expected_return": 0.031, "price": 10.0, "rank": 1},
+                {"stock_code": "000002.SZ", "score": 0.08, "is_tradable": True, "expected_return": 0.017, "price": 20.0, "rank": 2},
             ],
         )
         # current_weights come from holdings only, with the new item schema. The internal
-        # recent_target_date is serialized on the wire as recent_buy_date.
+        # recent_target_date is serialized on the wire as recent_buy_date. rank is present
+        # only when the held stock is ranked on the signal date; suspended/excluded holdings
+        # carry can_buy=can_sell=False.
         self.assertEqual(
             captured["payload"]["current_weights"],
             [
@@ -160,6 +167,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
                     "recent_holding_days": 8,
                     "can_buy": True,
                     "can_sell": True,
+                    "rank": 1,
                 },
                 {
                     "stock_code": "000004.SZ",
@@ -167,8 +175,8 @@ class ModelTargetPlannerTest(unittest.TestCase):
                     "price": 30.0,
                     "recent_buy_date": None,
                     "recent_holding_days": 0,
-                    "can_buy": True,
-                    "can_sell": True,
+                    "can_buy": False,
+                    "can_sell": False,
                 },
             ],
         )
@@ -248,6 +256,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
         planner = RiskManagerModelTargetPlanner(
             base_url="http://risk-manager.local",
             risk_model_id="cn_a_basic_constraints_integer_lots",
+            alpha_model_id="strict_all_gain_stable_top1200_20260802",
             mode="live",
             log=FakeLog(),
         )
@@ -277,6 +286,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
         planner = RiskManagerModelTargetPlanner(
             base_url="http://risk-manager.local",
             risk_model_id="cn_a_basic_constraints_integer_lots",
+            alpha_model_id="strict_all_gain_stable_top1200_20260802",
             mode="simulation",
             log=FakeLog(),
         )
@@ -304,6 +314,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
         planner = RiskManagerModelTargetPlanner(
             base_url="http://risk-manager.local",
             risk_model_id="cn_a_basic_constraints_integer_lots",
+            alpha_model_id="strict_all_gain_stable_top1200_20260802",
             mode="simulation",
             log=FakeLog(),
         )
@@ -320,6 +331,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
         planner = RiskManagerModelTargetPlanner(
             base_url="http://risk-manager.local",
             risk_model_id="cn_a_basic_constraints_integer_lots",
+            alpha_model_id="strict_all_gain_stable_top1200_20260802",
             mode="simulation",
             log=log,
         )
@@ -358,6 +370,7 @@ class ModelTargetPlannerTest(unittest.TestCase):
         planner = RiskManagerModelTargetPlanner(
             base_url="http://risk-manager.local",
             risk_model_id="cn_a_basic_constraints_integer_lots",
+            alpha_model_id="strict_all_gain_stable_top1200_20260802",
             mode="simulation",
             log=log,
         )

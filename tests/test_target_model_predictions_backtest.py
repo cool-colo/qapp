@@ -45,6 +45,7 @@ class BacktestPlanningEventTest(unittest.TestCase):
     ) -> PredictionDataBundle:
         return PredictionDataBundle(
             signals_by_date={},
+            prediction_ranks_by_date={},
             universe=["000001.SZ", "000002.SZ"],
             trading_dates=trading_dates,
             listed_dates={},
@@ -268,6 +269,10 @@ class BacktestPlanningEventTest(unittest.TestCase):
         }
         bundle = PredictionDataBundle(
             signals_by_date=signals,
+            prediction_ranks_by_date={
+                signal_date: {"000001.SZ": 1},
+                first_trade_date: {"000001.SZ": 1},
+            },
             universe=["000001.SZ"],
             trading_dates=[signal_date, first_trade_date, second_trade_date],
             listed_dates={},

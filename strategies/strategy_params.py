@@ -76,6 +76,7 @@ class StrategyParams:
     local_exit_authoritative: bool = True
     risk_manager_base_url: str = "http://127.0.0.1:8000"
     risk_manager_risk_model_id: str = "cn_a_basic_constraints_integer_lots"
+    alpha_model_id: str = ""  # experiment ID; required, set via strategy.yaml
     risk_manager_mode: str = "live"  # backtest configs set this to "backtest"
     risk_manager_timeout_secs: float = 10.0
 

@@ -7,10 +7,77 @@ from unittest.mock import patch
 
 import pandas as pd
 
+from backtests.data_providers import ClickHouseConnectionConfig
+from backtests.data_providers import ModelPredictionDataRequest
 from backtests.data_providers import PredictionDataBundle
 from backtests.data_providers import PredictionSignal
+from backtests.data_providers.clickhouse_model_predictions import ClickHouseModelPredictionDataProvider
+from backtests.data_providers.clickhouse_model_predictions import build_prediction_rank_map
+from backtests.data_providers.clickhouse_model_predictions import rank_daily_predictions
+from backtests.data_providers.clickhouse_model_predictions import select_daily_signals
 from lives.live_common import LivePredictionDataLoader
 from market_data import DailyStockData
+
+
+def test_daily_signal_selection_retains_full_prediction_ranks() -> None:
+    predictions = pd.DataFrame(
+        [
+            {"date": "2026-08-19", "stock_code": "000001.SZ", "score": 0.9},
+            {"date": "2026-08-19", "stock_code": "000002.SZ", "score": 0.8},
+            {"date": "2026-08-19", "stock_code": "000419.SZ", "score": 0.7},
+        ],
+    )
+
+    ranked = rank_daily_predictions(predictions)
+    selected = select_daily_signals(
+        ranked,
+        min_score=None,
+        top_frac=1.0,
+        max_positions=1,
+    )
+    ranks = build_prediction_rank_map(ranked)
+
+    assert selected[["stock_code", "rank"]].to_dict("records") == [
+        {"stock_code": "000001.SZ", "rank": 1},
+    ]
+    assert ranks[date(2026, 8, 19)]["000419.SZ"] == 3
+
+
+def test_prediction_bundle_keeps_rank_for_stock_outside_candidate_cutoff() -> None:
+    signal_date = date(2026, 8, 19)
+    predictions = pd.DataFrame(
+        [
+            {"date": signal_date, "stock_code": "000001.SZ", "score": 0.9},
+            {"date": signal_date, "stock_code": "000419.SZ", "score": 0.7},
+        ],
+    )
+    provider = ClickHouseModelPredictionDataProvider(
+        ClickHouseConnectionConfig(),
+    )
+    provider._trading_dates = MagicMock(
+        return_value=[pd.Timestamp(signal_date), pd.Timestamp("2026-08-20")],
+    )
+    provider._trading_history_start = MagicMock(return_value=None)
+    provider._requested_stock_codes = MagicMock(return_value=None)
+    provider._predictions = MagicMock(return_value=predictions)
+    provider._instrument_metadata = MagicMock(return_value=({}, {}))
+    provider._st_dates = MagicMock(return_value={})
+    provider._suspended_dates = MagicMock(return_value={})
+
+    bundle = provider.load(
+        ModelPredictionDataRequest(
+            start_date="2026-08-20",
+            end_date="2026-08-20",
+            all_stocks=True,
+            top_frac=1.0,
+            max_positions=1,
+        ),
+    )
+
+    assert [signal.stock_code for signal in bundle.signals_by_date[signal_date]] == [
+        "000001.SZ",
+    ]
+    assert bundle.prediction_ranks_by_date[signal_date]["000419.SZ"] == 2
 
 
 def test_live_loader_carries_daily_history_and_derives_latest_close() -> None:
@@ -20,6 +87,7 @@ def test_live_loader_carries_daily_history_and_derives_latest_close() -> None:
         signals_by_date={
             signal_date: [PredictionSignal(signal_date, "000001.SZ", 0.9, 1, 0.02)],
         },
+        prediction_ranks_by_date={signal_date: {"000001.SZ": 1}},
         universe=["000001.SZ"],
         trading_dates=[date(2026, 7, 4), signal_date, trading_date],
         listed_dates={},

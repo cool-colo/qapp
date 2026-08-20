@@ -32,4 +32,4 @@ exec python backtests/target_model_predictions/run_backtest.py \
 	--write-results \
 	--report-dir /tmp/qapp_model_report_check \
 	--benchmark-code 399300.SZ \
-        --config /data/flc/code/quant/qapp/configs/strategy.yaml
+        --config /data/flc/code/quant/qapp/configs/strategy_86008933.yaml

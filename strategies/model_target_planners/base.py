@@ -51,6 +51,7 @@ class ModelTargetCandidate:
     score: float
     open_price: float | None = None  # pre-market open (falls back to prev close upstream)
     expected_return: float | None = None  # daily_model_predictions.pred_return_live
+    rank: int | None = None  # original prediction rank (score-desc, 1-based)
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class CurrentHolding:
     recent_holding_days: int = 0
     can_buy: bool = True
     can_sell: bool = True
+    rank: int | None = None  # original prediction rank on signal_date; None if not ranked today
 
 
 @dataclass(frozen=False)

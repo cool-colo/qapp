@@ -190,6 +190,8 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         strategy.log = MagicMock()
         strategy._stock_by_instrument = {}
         strategy._instrument_by_stock = {}
+        strategy._signals_by_date = {}
+        strategy._prediction_ranks_by_date = {}
         strategy._recent_target_loader = None
         strategy._market_status = {}
         strategy._last_close = {}
@@ -222,6 +224,32 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         self.assertEqual(str(strategy._instrument_by_stock["000157.SZ"]), "000157.SZ.QMT")
         self.assertEqual(open_prices["000157.SZ.QMT"], 10.1)
         strategy.log.warning.assert_not_called()
+
+    def test_holding_rank_comes_from_untruncated_prediction_ranks(self) -> None:
+        strategy = self._make_stub()
+        signal_date = date(2026, 7, 22)
+        strategy._signals_by_date = {
+            signal_date: [
+                {
+                    "date": signal_date,
+                    "stock_code": "000001.SZ",
+                    "score": 0.9,
+                    "rank": 1,
+                    "pred_return_live": 0.02,
+                },
+            ],
+        }
+        strategy._prediction_ranks_by_date = {
+            signal_date: {"000001.SZ": 1, "000157.SZ": 427},
+        }
+
+        holdings = strategy._build_current_holdings(
+            date(2026, 7, 23),
+            signal_date,
+            {},
+        )
+
+        self.assertEqual(holdings[0].rank, 427)
 
     def test_suspended_holding_is_frozen_priced_at_last_close(self) -> None:
         strategy = self._make_stub()

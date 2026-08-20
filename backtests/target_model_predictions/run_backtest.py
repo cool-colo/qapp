@@ -531,6 +531,10 @@ def build_engine(
             bar_types=config_bar_types,
             instrument_stock_codes=instrument_stock_codes,
             signals_by_date=signals_config(bundle, set(loaded_stock_codes)),
+            prediction_ranks_by_date={
+                key.isoformat(): values
+                for key, values in bundle.prediction_ranks_by_date.items()
+            },
             trading_dates=[value.isoformat() for value in bundle.trading_dates],
             listed_dates={key: value.isoformat() for key, value in bundle.listed_dates.items()},
             st_by_date={key.isoformat(): sorted(values) for key, values in bundle.st_by_date.items()},
@@ -558,6 +562,7 @@ def build_engine(
             local_exit_authoritative=params.local_exit_authoritative,
             risk_manager_base_url=params.risk_manager_base_url,
             risk_manager_risk_model_id=params.risk_manager_risk_model_id,
+            alpha_model_id=params.alpha_model_id,
             risk_manager_mode=params.risk_manager_mode,
             risk_manager_timeout_secs=params.risk_manager_timeout_secs,
             order_slice_notional=params.order_slice_notional,
@@ -750,6 +755,7 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.local_exit_authoritative": params.local_exit_authoritative,
         "strategy.risk_manager_base_url": params.risk_manager_base_url,
         "strategy.risk_manager_risk_model_id": params.risk_manager_risk_model_id,
+        "strategy.alpha_model_id": params.alpha_model_id,
         "strategy.risk_manager_mode": params.risk_manager_mode,
         "strategy.risk_manager_timeout_secs": params.risk_manager_timeout_secs,
         "strategy.order_slice_notional": params.order_slice_notional,
