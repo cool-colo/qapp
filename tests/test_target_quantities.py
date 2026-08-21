@@ -1564,6 +1564,29 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(strategy._today_open[str(INST_A)], 10.0)
         self.assertEqual(strategy.submitted_orders, [])
 
+    def test_apply_full_tick_logs_complete_first_sorted_record(self) -> None:
+        strategy = self.make_strategy(open_prices={})
+        strategy._trading_day = date(2026, 7, 2)
+        first_fields = {"open": 10.0, "last_price": 10.1, "open_int": 13}
+        last_fields = {"open": 20.0, "last_price": 20.2, "open_int": 15}
+
+        strategy._apply_full_tick(
+            {
+                str(INST_B): last_fields,
+                str(INST_A): first_fields,
+            },
+            "refresh",
+        )
+
+        first_record_logs = [
+            args[0]
+            for args, _kwargs in strategy.log.infos
+            if "first full-tick snapshot record" in args[0]
+        ]
+        self.assertEqual(first_record_logs, [
+            f"first full-tick snapshot record (refresh): {(str(INST_A), first_fields)!r}",
+        ])
+
     def test_full_tick_async_source_runs_without_running_loop(self) -> None:
         strategy = self.make_strategy()
         strategy.clock.now = pd.Timestamp("2026-07-02 01:27:00", tz="UTC")

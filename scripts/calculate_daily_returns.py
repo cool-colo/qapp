@@ -4,7 +4,9 @@
 The calculation is intentionally an operations/reporting script.  It reads the
 live MySQL snapshots and trades, uses the tick snapshot's previous close, and
 writes one idempotent result table in MySQL.  It does not participate in any
-strategy or order-routing decision.
+strategy or order-routing decision.  Accounts are calculated and committed
+independently so corrupt data in one account does not prevent valid accounts
+from being persisted.
 
 For each account/trader/stock/day the generated rows are:
 
@@ -275,6 +277,46 @@ def calculate_records(
     return details + summaries
 
 
+def calculate_records_by_account(
+    trade_date: date | str,
+    trades: list[dict[str, Any]],
+    before_positions: list[dict[str, Any]],
+    after_positions: list[dict[str, Any]],
+    ticks: list[dict[str, Any]],
+) -> tuple[
+    dict[tuple[str, str], list[dict[str, Any]]],
+    dict[tuple[str, str], Exception],
+]:
+    """Calculate each account independently and retain account-local failures."""
+    trades_by_account: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    before_by_account: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    after_by_account: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for source, grouped in (
+        (trades, trades_by_account),
+        (before_positions, before_by_account),
+        (after_positions, after_by_account),
+    ):
+        for row in source:
+            key = (str(row["account_id"]), str(row["trader_id"]))
+            grouped[key].append(row)
+
+    account_keys = set(trades_by_account) | set(before_by_account) | set(after_by_account)
+    records: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    failures: dict[tuple[str, str], Exception] = {}
+    for key in sorted(account_keys):
+        try:
+            records[key] = calculate_records(
+                trade_date,
+                trades_by_account[key],
+                before_by_account[key],
+                after_by_account[key],
+                ticks,
+            )
+        except Exception as exc:
+            failures[key] = exc
+    return records, failures
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--env-file", default=_env("QAPP_ENV_FILE"))
@@ -430,18 +472,73 @@ def main(argv: list[str] | None = None) -> int:
     connection = _connect_mysql(args)
     try:
         trades, before, after, ticks = fetch_mysql_inputs(connection, args, trade_date)
-        rows = calculate_records(trade_date, trades, before, after, ticks)
-        LOGGER.info("calculated %d daily-return rows from %d trades, %d before positions, %d after positions", len(rows), len(trades), len(before), len(after))
-        if args.dry_run:
-            LOGGER.info("--dry-run: skipping MySQL result write")
-            for row in rows:
-                LOGGER.info("%s", json.dumps(row, ensure_ascii=False, default=str, sort_keys=True))
-            return 0
-        if not args.no_create_table:
+        if not args.dry_run and not args.no_create_table:
             create_table(connection, args.mysql_result_table)
-        upsert_records(connection, args.mysql_result_table, rows)
-        LOGGER.info("upserted %d rows into %s", len(rows), args.mysql_result_table)
-        return 0
+        records_by_account, failures = calculate_records_by_account(
+            trade_date,
+            trades,
+            before,
+            after,
+            ticks,
+        )
+        for (account_id, trader_id), exc in failures.items():
+            LOGGER.error(
+                "daily-return calculation failed for account_id=%s trader_id=%s: %s",
+                account_id,
+                trader_id,
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+        successful_accounts = 0
+        successful_rows = 0
+        for (account_id, trader_id), rows in records_by_account.items():
+            LOGGER.info(
+                "calculated %d daily-return rows for account_id=%s trader_id=%s",
+                len(rows),
+                account_id,
+                trader_id,
+            )
+            if args.dry_run:
+                for row in rows:
+                    LOGGER.info("%s", json.dumps(row, ensure_ascii=False, default=str, sort_keys=True))
+            else:
+                try:
+                    upsert_records(connection, args.mysql_result_table, rows)
+                except Exception as exc:
+                    connection.rollback()
+                    failures[(account_id, trader_id)] = exc
+                    LOGGER.error(
+                        "daily-return write failed for account_id=%s trader_id=%s: %s",
+                        account_id,
+                        trader_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    continue
+                LOGGER.info(
+                    "upserted %d rows for account_id=%s trader_id=%s into %s",
+                    len(rows),
+                    account_id,
+                    trader_id,
+                    args.mysql_result_table,
+                )
+            successful_accounts += 1
+            successful_rows += len(rows)
+
+        if args.dry_run:
+            LOGGER.info("--dry-run: skipped MySQL result writes")
+        LOGGER.info(
+            "daily-return run completed: %d successful accounts, %d rows, %d failed accounts "
+            "from %d trades, %d before positions, %d after positions",
+            successful_accounts,
+            successful_rows,
+            len(failures),
+            len(trades),
+            len(before),
+            len(after),
+        )
+        return 1 if failures else 0
     finally:
         connection.close()
 

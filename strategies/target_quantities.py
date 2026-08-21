@@ -551,9 +551,15 @@ class TargetQuantityStrategy(Strategy):
         if not isinstance(snapshot, dict) or not snapshot:
             self.log.warning(f"full-tick snapshot is invalid! ({trigger})")
             return
+        sorted_snapshot = sorted(snapshot.items(), key=lambda item: str(item[0]))
+        first_tick = sorted_snapshot[0]
+        self.log.info(
+            f"first full-tick snapshot record ({trigger}): {first_tick!r}",
+            color=LogColor.BLUE,
+        )
         trading_date = self._clock_date()
         updated = 0
-        for instrument_id, fields in snapshot.items():
+        for instrument_id, fields in sorted_snapshot:
             # Store the market status first: a suspended stock has open==0 and would
             # otherwise `continue` on the invalid-open path before status is recorded.
             self._roll_trading_day(trading_date)

@@ -1,7 +1,11 @@
 from decimal import Decimal
 import unittest
+from unittest.mock import MagicMock
+from unittest.mock import patch
 
 from scripts.calculate_daily_returns import calculate_records
+from scripts.calculate_daily_returns import calculate_records_by_account
+from scripts.calculate_daily_returns import main
 
 
 class DailyReturnCalculationTests(unittest.TestCase):
@@ -113,6 +117,80 @@ class DailyReturnCalculationTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_calculates_accounts_independently_when_one_is_corrupt(self) -> None:
+        positions = [
+            {
+                "account_id": account_id,
+                "trader_id": "trader",
+                "instrument_id": "000001.SZ",
+                "stock_code": "000001.SZ",
+                "volume": volume,
+            }
+            for account_id, volume in (("good", 100), ("corrupt", 200))
+        ]
+        records, failures = calculate_records_by_account(
+            "2026-07-27",
+            trades=[],
+            before_positions=positions,
+            after_positions=[
+                {**row, "volume": 100}
+                for row in positions
+            ],
+            ticks=[{
+                "instrument_id": "000001.SZ",
+                "stock_code": "000001.SZ",
+                "last_price": "10",
+                "last_close": "9",
+            }],
+        )
+
+        self.assertEqual(set(records), {("good", "trader")})
+        self.assertEqual(set(failures), {("corrupt", "trader")})
+        self.assertIn("position reconciliation failed", str(failures[("corrupt", "trader")]))
+        self.assertEqual(records[("good", "trader")][-1]["stock_code"], "summary")
+
+    @patch("scripts.calculate_daily_returns.load_env")
+    @patch("scripts.calculate_daily_returns.upsert_records")
+    @patch("scripts.calculate_daily_returns.fetch_mysql_inputs")
+    @patch("scripts.calculate_daily_returns._connect_mysql")
+    def test_main_persists_valid_account_when_another_account_is_corrupt(
+        self,
+        connect_mysql: MagicMock,
+        fetch_inputs: MagicMock,
+        upsert: MagicMock,
+        _load_env: MagicMock,
+    ) -> None:
+        connection = connect_mysql.return_value
+        positions = [
+            {
+                "account_id": account_id,
+                "trader_id": "trader",
+                "instrument_id": "000001.SZ",
+                "stock_code": "000001.SZ",
+                "volume": volume,
+            }
+            for account_id, volume in (("good", 100), ("corrupt", 200))
+        ]
+        fetch_inputs.return_value = (
+            [],
+            positions,
+            [{**row, "volume": 100} for row in positions],
+            [{
+                "instrument_id": "000001.SZ",
+                "stock_code": "000001.SZ",
+                "last_price": "10",
+                "last_close": "9",
+            }],
+        )
+
+        result = main(["--trade-date", "2026-07-27", "--no-create-table"])
+
+        self.assertEqual(result, 1)
+        upsert.assert_called_once()
+        written_rows = upsert.call_args.args[2]
+        self.assertEqual({row["account_id"] for row in written_rows}, {"good"})
+        connection.close.assert_called_once_with()
 
 
 if __name__ == "__main__":
