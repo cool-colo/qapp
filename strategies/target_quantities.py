@@ -553,10 +553,10 @@ class TargetQuantityStrategy(Strategy):
             return
         sorted_snapshot = sorted(snapshot.items(), key=lambda item: str(item[0]))
         first_tick = sorted_snapshot[0]
-        self.log.info(
-            f"first full-tick snapshot record ({trigger}): {first_tick!r}",
-            color=LogColor.BLUE,
-        )
+        # self.log.info(
+        #     f"first full-tick snapshot record ({trigger}): {first_tick!r}",
+        #     color=LogColor.BLUE,
+        # )
         trading_date = self._clock_date()
         updated = 0
         for instrument_id, fields in sorted_snapshot:
