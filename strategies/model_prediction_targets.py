@@ -999,7 +999,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     forced_exits[instrument_id] = exclusion
                 self.log.warning(f"Excluding holding from current_holdings: {instrument_id} reason={exclusion}")
                 continue
-            price = self._today_open_price(instrument_id)
+            price, _ = self._open_price_with_source(instrument_id)
             if price is None:
                 self._log_missing_new_entry_open_price(
                     trading_date=trading_date,

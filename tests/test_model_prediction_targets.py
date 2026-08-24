@@ -184,6 +184,7 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
             _recent_holding_days = TargetModelPredictionsStrategy._recent_holding_days
             _stock_code_for_instrument = TargetModelPredictionsStrategy._stock_code_for_instrument
             _today_open_price = TargetModelPredictionsStrategy._today_open_price
+            _open_price_with_source = TargetModelPredictionsStrategy._open_price_with_source
             _is_suspended_status = TargetModelPredictionsStrategy._is_suspended_status
 
         strategy = HoldingStub()
@@ -250,6 +251,23 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         )
 
         self.assertEqual(holdings[0].rank, 427)
+
+    def test_holding_without_open_price_falls_back_to_last_close(self) -> None:
+        strategy = self._make_stub()
+        strategy._today_open = {}
+        strategy._last_close = {"000157.SZ.QMT": 9.5}
+        open_prices: dict[str, float] = {}
+
+        holdings = strategy._build_current_holdings(
+            date(2026, 7, 23),
+            date(2026, 7, 22),
+            open_prices,
+        )
+
+        self.assertEqual(len(holdings), 1)
+        self.assertEqual(holdings[0].price, 9.5)
+        self.assertEqual(open_prices["000157.SZ.QMT"], 9.5)
+        strategy._log_missing_new_entry_open_price.assert_not_called()
 
     def test_suspended_holding_is_frozen_priced_at_last_close(self) -> None:
         strategy = self._make_stub()
