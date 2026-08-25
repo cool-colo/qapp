@@ -193,8 +193,22 @@ def _add_snapshot_recorder(
             stock_codes,
         )
 
+    def _load_position_span_start_dates(
+        trading_date: Any,
+        cutoff_trade_date: Any,
+        stock_codes: list[str],
+    ) -> dict[str, Any]:
+        return writer.load_position_span_start_dates(
+            str(args.account_id),
+            str(args.trader_id),
+            trading_date,
+            cutoff_trade_date,
+            stock_codes,
+        )
+
     strategy.configure_live_target_portfolio_loader(_load_live_target_portfolio)
     strategy.configure_recent_target_loader(_load_recent_target_dates)
+    strategy.configure_position_span_start_loader(_load_position_span_start_dates)
     recorder = SnapshotRecorder(
         config=SnapshotRecorderConfig(
             account_id=str(args.account_id),

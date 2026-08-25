@@ -65,6 +65,7 @@ SELECT
     factor.high AS high,
     factor.low AS low,
     factor.close AS close,
+    factor.adj_factor AS adj_factor,
     limits.pre_close AS pre_close,
     limits.up_limit AS up_limit,
     limits.down_limit AS down_limit
@@ -106,6 +107,7 @@ ORDER BY trade_date, stock_code
             pre_close=_optional_float(row.get("pre_close")),
             up_limit=_optional_float(row.get("up_limit")),
             down_limit=_optional_float(row.get("down_limit")),
+            adj_factor=_optional_float(row.get("adj_factor")),
         )
 
 

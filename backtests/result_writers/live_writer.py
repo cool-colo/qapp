@@ -876,6 +876,69 @@ class LiveSnapshotWriter:
             result[stock_code] = recent
         return result
 
+    def load_position_span_start_dates(
+        self,
+        account_id: str,
+        trader_id: str,
+        trade_date: date,
+        cutoff_trade_date: date,
+        stock_codes: Sequence[str],
+    ) -> dict[str, date]:
+        """
+        Resolve, per stock, the start of the **current holding span**: the most recent
+        ``trade_date`` in ``[cutoff_trade_date, trade_date]`` on which the position went
+        flat -> held — i.e. an ``after_trading`` snapshot with ``volume > 0`` exists and
+        there is **no** ``before_trading`` snapshot with ``volume > 0`` that same day.
+        Returns ``{stock_code: span_start_date}``; stocks with no qualifying entry day
+        are absent.
+
+        Used to bound the highest-close computation that seeds the trailing-take-profit
+        high-water mark for currently-held positions.
+        """
+        codes = [str(code) for code in stock_codes if code]
+        if not codes:
+            return {}
+        placeholders = ", ".join(["%s"] * len(codes))
+        # For each stock, take the latest after_trading (held) date that has no
+        # concurrent before_trading held row => the flat->held entry day. The absent
+        # before_trading row is detected via the anti-join (b.id IS NULL).
+        sql = (
+            "SELECT a.`stock_code`, MAX(a.`trade_date`) AS span_start_date "
+            "FROM `live_position_snapshot` a "
+            "LEFT JOIN `live_position_snapshot` b "
+            "  ON b.`account_id`=a.`account_id` AND b.`trader_id`=a.`trader_id` "
+            " AND b.`trade_date`=a.`trade_date` AND b.`stock_code`=a.`stock_code` "
+            f" AND b.`snapshot_type`=%s AND b.`volume` IS NOT NULL AND b.`volume` > 0 "
+            "WHERE a.`account_id`=%s AND a.`trader_id`=%s "
+            f"AND a.`snapshot_type`=%s AND a.`volume` IS NOT NULL AND a.`volume` > 0 "
+            "AND a.`trade_date` >= %s AND a.`trade_date` <= %s "
+            f"AND a.`stock_code` IN ({placeholders}) "
+            "AND b.`id` IS NULL "
+            "GROUP BY a.`stock_code`"
+        )
+        params: tuple[Any, ...] = (
+            BEFORE_TRADING,
+            account_id,
+            trader_id,
+            AFTER_TRADING,
+            cutoff_trade_date,
+            trade_date,
+            *codes,
+        )
+        rows = self._query(sql, params)
+        result: dict[str, date] = {}
+        for row in rows:
+            stock_code = str(row[0])
+            span_start = row[1]
+            if span_start is None:
+                continue
+            if isinstance(span_start, datetime):
+                span_start = span_start.date()
+            elif not isinstance(span_start, date):
+                span_start = datetime.strptime(str(span_start), "%Y-%m-%d").date()
+            result[stock_code] = span_start
+        return result
+
     def latest_asset_snapshot_value(
         self,
         account_id: str,

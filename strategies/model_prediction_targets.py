@@ -110,7 +110,10 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self._live_target_portfolio_loader: Callable[[date, date | None], list[dict[str, Any]]] | None = None
         self._live_target_plan_persister: Callable[[ModelTargetPlan], bool] | None = None
         self._recent_target_loader: Callable[[date, date, list[str]], dict[str, date]] | None = None
+        self._position_span_start_loader: Callable[[date, date, list[str]], dict[str, date]] | None = None
         self._target_alert_reporter: Callable[[str, str, dict[str, Any]], bool | None] | None = None
+        self._span_close_coverage_warnings: set[tuple[date, str]] = set()
+        self._entry_cost_adjust_warnings: set[tuple[date, str]] = set()
         self.signal_events: list[ModelPredictionSignalEvent] = []
 
     def configure_live_target_portfolio_loader(
@@ -147,6 +150,22 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         fall back to each position's entry date when no loader is configured.
         """
         self._recent_target_loader = loader
+
+    def configure_position_span_start_loader(
+        self,
+        loader: Callable[[date, date, list[str]], dict[str, date]] | None,
+    ) -> None:
+        """
+        Inject a loader for the start date of each held stock's current holding span.
+
+        Signature: ``loader(trading_date, cutoff_trade_date, stock_codes) ->
+        {stock_code: span_start_date}``. Live wiring queries ``live_position_snapshot``
+        for the most-recent flat->held transition (``after_trading`` held with no
+        concurrent ``before_trading`` held) within ``[cutoff_trade_date, trading_date]``.
+        Backtests leave this unset and fall back to each position's entry date. The span
+        bounds the highest-close computation that seeds the trailing high-water mark.
+        """
+        self._position_span_start_loader = loader
 
     def configure_target_alert_reporter(
         self,
@@ -457,10 +476,21 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 continue
             stock_code = self._stock_code_for_instrument(instrument_id_text)
             signal_state = self._latest_signal_state(stock_code, trading_date)
+            # Floor only; the authoritative high-water mark is the highest back-adjusted
+            # close over the holding span, injected each cycle by
+            # _raise_high_price_to_span_peak (which never lowers this value). Put the
+            # floor on the adjusted basis too so max(existing, span_peak) never mixes
+            # bases; fall back to the raw entry price when the entry-date factor is
+            # unavailable.
+            entry_row = self._daily_stock_data.get((stock_code, trading_date))
+            if entry_row is not None and entry_row.adj_factor is not None and entry_row.adj_factor > 0:
+                high_price_floor = float(entry_price) * float(entry_row.adj_factor)
+            else:
+                high_price_floor = float(entry_price)
             self._active_positions[instrument_id_text] = {
                 "entry_date": trading_date,
                 "entry_price": entry_price,
-                "high_price": max(entry_price, float(close_price or entry_price)),
+                "high_price": high_price_floor,
                 "last_signal_date": signal_state.get("last_signal_date", trading_date),
                 "score": signal_state.get("score", 0.0),
             }
@@ -512,9 +542,15 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 stock_code=self._stock_code_for_instrument(instrument_id),
                 fallback_price=exit_price,
             )
-        cost_price = float(state.get("entry_price") or exit_price or 0.0)
-        trailing = self._update_trailing_state(state, exit_price, cost_price)
         stock_code = self._stock_code_for_instrument(instrument_id)
+        cost_price = float(state.get("entry_price") or exit_price or 0.0)
+        # Trailing take-profit runs entirely on the back-adjusted basis: the peak
+        # (over [span_start, T-2]) and the T-1 comparison close are both adjusted, so
+        # the activation gate must compare against an adjusted entry cost too. Stop-loss
+        # keeps using the raw today's-open (exit_price) vs raw cost_price, unchanged.
+        trailing_price = self._prev_trading_close(stock_code, trading_date)
+        adjusted_cost = self._adjusted_entry_cost(state, stock_code, trading_date, cost_price)
+        trailing = self._update_trailing_state(state, trailing_price, adjusted_cost)
         untradable = self._untradable_reason(stock_code, trading_date)
         stop_triggered = (
             exit_price is not None
@@ -542,8 +578,12 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 "open_price": exit_price,
                 "price_source": price_source,
                 "entry_price": cost_price,
+                "trailing_price": trailing_price,
                 "high_price": trailing["high_price"],
                 "trailing_stop_price": trailing["stop_price"],
+                # open_price / entry_price are raw; trailing_price / high_price /
+                # trailing_stop_price are back-adjusted (close * adj_factor).
+                "trailing_basis": "adjusted",
             },
         )
         return signal_name
@@ -935,6 +975,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         """
         held_ids = sorted(self._held_instrument_ids())
         recent_target_dates = self._recent_target_dates(trading_date, held_ids)
+        span_start_dates = self._position_span_start_dates(trading_date, held_ids)
         # Candidate signals are truncated by top_frac/max_positions. Holding ranks
         # come from the separately retained, untruncated prediction universe.
         rank_by_stock = (
@@ -993,6 +1034,24 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     ),
                 )
                 continue
+            # Seed the trailing high-water mark from the highest close over the current
+            # holding span, ending at T-2, before the exit rule runs, so trailing
+            # take-profit measures against the true peak (not just the latest close /
+            # today's open). The T-1 close is the comparison price tested against the
+            # resulting stop, so it is excluded from the peak. Missing span coverage
+            # falls back to the existing mark (never regresses).
+            prev_trading_date = previous_trading_date(self._trading_dates, trading_date)
+            span_end_date = (
+                previous_trading_date(self._trading_dates, prev_trading_date)
+                if prev_trading_date is not None
+                else None
+            )
+            self._raise_high_price_to_span_peak(
+                instrument_id,
+                stock_code,
+                span_start_dates.get(instrument_id),
+                span_end_date,
+            )
             exclusion = self._holding_exclusion(trading_date, signal_date, instrument_id, exit_rank)
             if exclusion is not None:
                 if forced_exits is not None:
@@ -1108,6 +1167,196 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         if recent_index is None:
             return 1
         return max(1, today_index - recent_index)
+
+    def _position_span_start_dates(
+        self,
+        trading_date: date,
+        held_ids: list[str],
+    ) -> dict[str, date]:
+        """
+        Resolve the start date of each held instrument's current holding span, keyed by
+        instrument id.
+
+        Query the configured position-snapshot store (the most recent flat->held
+        transition within the trailing window, up to and including today) via the
+        injected loader. Without a loader (backtest), fall back to the position's entry
+        date from ``_active_positions``.
+        """
+        result: dict[str, date] = {}
+        loader = self._position_span_start_loader
+        if loader is not None:
+            cutoff = self._recent_target_cutoff_date(trading_date)
+            stock_codes = [
+                self._stock_code_for_instrument(instrument_id)
+                for instrument_id in held_ids
+            ]
+            stock_codes = [code for code in stock_codes if code]
+            try:
+                raw = loader(trading_date, cutoff, stock_codes)
+            except Exception as exc:
+                if self.log is not None:
+                    self.log.warning(
+                        f"position span-start loader failed: {exc}",
+                        color=LogColor.YELLOW,
+                    )
+                raw = {}
+            by_stock = {normalize_stock_code(code): value for code, value in (raw or {}).items()}
+            for instrument_id in held_ids:
+                stock_code = self._stock_code_for_instrument(instrument_id)
+                value = by_stock.get(stock_code)
+                if value is not None:
+                    result[instrument_id] = pd.Timestamp(value).date()
+            return result
+        # Backtest fallback: the position's entry date.
+        for instrument_id in held_ids:
+            state = self._active_positions.get(instrument_id)
+            if not isinstance(state, dict):
+                continue
+            entry_date = state.get("entry_date")
+            if entry_date is not None:
+                result[instrument_id] = pd.Timestamp(entry_date).date()
+        return result
+
+    def _adjusted_close(self, stock_code: str, day: date) -> float | None:
+        """
+        Back-adjusted daily close (``close * adj_factor``) for ``(stock_code, day)``.
+
+        ``adj_factor`` is a cumulative back-adjustment factor, so ``close * adj_factor``
+        is a continuous series across dividend/split ex-dates and is directly comparable
+        between any two dates. The trailing take-profit runs entirely on this basis so an
+        ex-event inside the window does not register as a phantom price move. Returns
+        ``None`` when the row, close, or factor is missing/non-positive.
+        """
+        row = self._daily_stock_data.get((stock_code, day))
+        if row is None:
+            return None
+        if row.close is None or row.close <= 0:
+            return None
+        if row.adj_factor is None or row.adj_factor <= 0:
+            return None
+        return float(row.close) * float(row.adj_factor)
+
+    def _highest_close_over_span(
+        self,
+        stock_code: str,
+        span_start_date: date | None,
+        span_end_date: date | None,
+    ) -> float | None:
+        """
+        Highest back-adjusted daily close in ``self._daily_stock_data`` over the holding
+        span ``[span_start_date, span_end_date]`` for ``stock_code``.
+
+        The span end is the second-to-last trading day (T-2), not today: the trailing
+        high-water mark is measured through T-2, and the T-1 close is then tested against
+        the resulting stop. Returns ``None`` when either bound is unknown or no covered
+        positive close is found; warns once per (span_end_date, stock_code) when the span
+        is only partially covered so under-coverage (rolling live window / suspension
+        gaps) is visible.
+        """
+        if span_start_date is None or span_end_date is None or not stock_code:
+            return None
+        span_dates = [
+            value
+            for value in self._trading_dates
+            if span_start_date <= value <= span_end_date
+        ]
+        if not span_dates:
+            return None
+        highest: float | None = None
+        covered = 0
+        for value in span_dates:
+            adjusted = self._adjusted_close(stock_code, value)
+            if adjusted is None:
+                continue
+            covered += 1
+            if highest is None or adjusted > highest:
+                highest = adjusted
+        if covered < len(span_dates):
+            warning_key = (span_end_date, stock_code)
+            if warning_key not in self._span_close_coverage_warnings:
+                self._span_close_coverage_warnings.add(warning_key)
+                self.log.warning(
+                    "trailing high-water span not fully covered by daily close data: "
+                    f"span_end={span_end_date} stock_code={stock_code} "
+                    f"span_start={span_start_date} covered={covered}/{len(span_dates)}",
+                    color=LogColor.YELLOW,
+                )
+        return highest
+
+    def _raise_high_price_to_span_peak(
+        self,
+        instrument_id: str,
+        stock_code: str,
+        span_start_date: date | None,
+        span_end_date: date | None,
+    ) -> None:
+        """
+        Raise a held position's tracked ``high_price`` to the highest close over its
+        current holding span ``[span_start_date, span_end_date]`` (end = T-2). Never
+        lowers the existing mark (missing-data safe): when the span is unknown or
+        uncovered, the previously-seeded value stands.
+        """
+        state = self._active_positions.get(instrument_id)
+        if not isinstance(state, dict):
+            return
+        span_peak = self._highest_close_over_span(stock_code, span_start_date, span_end_date)
+        if span_peak is None or span_peak <= 0:
+            return
+        previous_high = state.get("high_price")
+        if previous_high is None or span_peak > float(previous_high):
+            state["high_price"] = span_peak
+
+    def _prev_trading_close(self, stock_code: str, trading_date: date) -> float | None:
+        """
+        Back-adjusted close of the previous trading day (T-1) from
+        ``self._daily_stock_data``.
+
+        This is the comparison price for the trailing-take-profit check: the peak is
+        measured (adjusted) through T-2, then T-1's adjusted close is tested against the
+        resulting stop. Using the adjusted basis on both sides keeps a dividend/split
+        ex-date between T-2 and T-1 from registering as a phantom move. Returns ``None``
+        when T-1, its close, or its factor is unavailable.
+        """
+        if not stock_code:
+            return None
+        prev_date = previous_trading_date(self._trading_dates, trading_date)
+        if prev_date is None:
+            return None
+        return self._adjusted_close(stock_code, prev_date)
+
+    def _adjusted_entry_cost(
+        self,
+        state: dict[str, Any],
+        stock_code: str,
+        trading_date: date,
+        cost_price: float,
+    ) -> float:
+        """
+        Entry cost on the back-adjusted basis, for the trailing activation gate only.
+
+        The peak and T-1 comparison close are adjusted, so the activation gate
+        (``high_price >= cost*(1+activation)``) must compare against an adjusted cost:
+        ``entry_price * adj_factor(entry_date)``. When the entry-date factor is
+        unavailable (e.g. the rolling live window predates entry), fall back to the raw
+        cost (best-effort; only shifts the activation threshold slightly, never touches
+        stop-loss) and warn once per (trading_date, stock_code).
+        """
+        if cost_price <= 0:
+            return cost_price
+        entry_date = state.get("entry_date")
+        if entry_date is not None and stock_code:
+            row = self._daily_stock_data.get((stock_code, pd.Timestamp(entry_date).date()))
+            if row is not None and row.adj_factor is not None and row.adj_factor > 0:
+                return cost_price * float(row.adj_factor)
+        warning_key = (trading_date, stock_code)
+        if warning_key not in self._entry_cost_adjust_warnings:
+            self._entry_cost_adjust_warnings.add(warning_key)
+            self.log.warning(
+                "trailing activation using raw entry cost: adj_factor unavailable on "
+                f"entry date={trading_date} stock_code={stock_code} entry_date={entry_date}",
+                color=LogColor.YELLOW,
+            )
+        return cost_price
 
     def _open_price_with_source(self, instrument_id_text: str) -> tuple[float | None, str | None]:
         """
@@ -1312,12 +1561,17 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         cost_price: float,
     ) -> dict[str, Any]:
         result = {"triggered": False, "high_price": state.get("high_price"), "stop_price": None}
+        # The high-water mark is the highest close over [span_start, T-2], injected by
+        # _raise_high_price_to_span_peak before this runs. close_price here is the T-1
+        # close used only to test the stop -- it must NOT ratchet the mark (the peak
+        # excludes T-1 by construction).
+        high_price = state.get("high_price")
+        if high_price is None or float(high_price) <= 0:
+            return result
+        high_price = float(high_price)
+        result["high_price"] = high_price
         if close_price is None or close_price <= 0:
             return result
-        previous_high = state.get("high_price")
-        high_price = max(close_price, float(previous_high or close_price))
-        state["high_price"] = high_price
-        result["high_price"] = high_price
         trailing_pct = float(self.config.trailing_take_profit)
         if trailing_pct <= 0 or cost_price <= 0:
             state["trailing_stop_price"] = None

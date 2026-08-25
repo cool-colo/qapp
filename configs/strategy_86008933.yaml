@@ -20,8 +20,8 @@
 # --- Position sizing / rotation ---
 max_position_percent: 0.03
 stop_loss: 0.1
-trailing_take_profit: 0.0
-trailing_take_profit_start: 0.0
+trailing_take_profit: 0.06
+trailing_take_profit_start: 0.15
 min_listed_days: 120
 consecutive_up_limit_days: 3  # includes today: today's open plus N-1 historical closes
 max_open_gap_up: 0.05          # skip entries opening >= 5% above the previous close; 0 disables

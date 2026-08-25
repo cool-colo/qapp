@@ -18,6 +18,7 @@ class DailyStockData:
     pre_close: float | None = None
     up_limit: float | None = None
     down_limit: float | None = None
+    adj_factor: float | None = None
 
 
 def index_daily_stock_data(
