@@ -537,6 +537,22 @@ class LivePredictionDataLoader:
         """
         return self._broker_source.full_tick_snapshot(stock_codes)
 
+    def divid_events(
+        self,
+        stock_codes: list[str],
+        end_time: str = "",
+    ) -> dict[str, list[tuple[Any, float]]]:
+        """
+        Dividend/split ex-events per stock from the broker gateway.
+
+        Infrastructure plumbing (Big QMT ``get_divid_factors``) used to restate a
+        holding's entry cost onto today's post-ex basis for the stop-loss check.
+        Returns ``{stock_code: [(ex_date, per_event_coef), ...]}``; empty on venues
+        without the capability (the strategy then falls back to ClickHouse
+        ``adj_factor``). Delegated to the venue broker source.
+        """
+        return self._broker_source.divid_events(stock_codes, end_time)
+
     async def broker_position_snapshot(self) -> dict[str, dict[str, Any]]:
         """
         Broker-reported position snapshot keyed by Nautilus instrument id.

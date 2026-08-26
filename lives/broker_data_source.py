@@ -179,6 +179,12 @@ class BrokerDataSource(Protocol):
 
     def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float]]: ...
 
+    def divid_events(
+        self,
+        stock_codes: list[str],
+        end_time: str = "",
+    ) -> dict[str, list[tuple[Any, float]]]: ...
+
     async def broker_position_snapshot(self) -> dict[str, dict[str, Any]]: ...
 
     async def broker_order_snapshot(self) -> list[dict[str, Any]]: ...
@@ -233,6 +239,19 @@ class QmtBrokerDataSource:
             build_instrument_id(stock_code, self.venue): tick
             for stock_code, tick in by_stock.items()
         }
+
+    def divid_events(
+        self,
+        stock_codes: list[str],
+        end_time: str = "",
+    ) -> dict[str, list[tuple[Any, float]]]:
+        """
+        Dividend/split ex-events per stock. Not available on the QMT proxy path.
+
+        Returns an empty mapping so the strategy falls back to the ClickHouse
+        ``adj_factor`` for cost-basis restatement (identical to backtest behavior).
+        """
+        return {}
 
     async def broker_position_snapshot(self) -> dict[str, dict[str, Any]]:
         rows = await self._with_broker_session(
@@ -415,6 +434,67 @@ class BigQmtBrokerDataSource:
             if isinstance(prices, (list, tuple)) and prices:
                 renamed[f"{side}_price"] = prices[0]
         return coerce_tick_fields(renamed)
+
+    def divid_events(
+        self,
+        stock_codes: list[str],
+        end_time: str = "",
+    ) -> dict[str, list[tuple[Any, float]]]:
+        """
+        Dividend/split ex-events per stock via Big QMT ``get_divid_factors``.
+
+        Returns ``{stock_code: [(ex_date, per_event_coef), ...]}`` — the raw
+        ex-event list (all events up to ``end_time`` if given), leaving the
+        ``(entry_date, today]`` windowing and cumulative product to the strategy.
+
+        ``get_divid_factors`` returns a dict keyed by ms-epoch ex-date whose value
+        is ``[div/share, songzhuan, zhuanzeng, allot, allot_price, is_gugai,
+        复权系数]``; index 6 is the per-event adjust coefficient.
+        """
+        if not stock_codes:
+            return {}
+        account_id = str(self.args.account_id or "").strip()
+        if not account_id:
+            _LOGGER.error("divid events requested without account_id")
+            return {}
+        self._ensure_client()
+        import pandas as pd
+
+        result: dict[str, list[tuple[Any, float]]] = {}
+        for stock_code in stock_codes:
+            code = str(stock_code).strip()
+            if not code:
+                continue
+            try:
+                factors = self._xtdata.get_divid_factors(code, "", end_time) or {}
+            except Exception as exc:  # noqa: BLE001 - RPC failures degrade to no data
+                _LOGGER.warning("get_divid_factors failed for %s: %s", code, exc)
+                continue
+            events: list[tuple[Any, float]] = []
+            for ms_ts, row in factors.items():
+                if not isinstance(row, (list, tuple)) or len(row) < 7:
+                    _LOGGER.warning(
+                        "get_divid_factors returned unusable row for %s @ %s: %s",
+                        code,
+                        ms_ts,
+                        row,
+                    )
+                    continue
+                try:
+                    ex_date = pd.Timestamp(int(ms_ts), unit="ms", tz="Asia/Shanghai").date()
+                    coef = float(row[6])
+                except (TypeError, ValueError) as exc:
+                    _LOGGER.warning(
+                        "get_divid_factors bad ex-date/coef for %s @ %s: %s",
+                        code,
+                        ms_ts,
+                        exc,
+                    )
+                    continue
+                events.append((ex_date, coef))
+            events.sort(key=lambda item: item[0])
+            result[code] = events
+        return result
 
     async def broker_position_snapshot(self) -> dict[str, dict[str, Any]]:
         rows = await self._query("query_stock_positions")

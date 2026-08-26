@@ -111,9 +111,11 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self._live_target_plan_persister: Callable[[ModelTargetPlan], bool] | None = None
         self._recent_target_loader: Callable[[date, date, list[str]], dict[str, date]] | None = None
         self._position_span_start_loader: Callable[[date, date, list[str]], dict[str, date]] | None = None
+        self._divid_events_loader: Callable[[list[str]], dict[str, list[tuple[date, float]]]] | None = None
         self._target_alert_reporter: Callable[[str, str, dict[str, Any]], bool | None] | None = None
         self._span_close_coverage_warnings: set[tuple[date, str]] = set()
         self._entry_cost_adjust_warnings: set[tuple[date, str]] = set()
+        self._stop_cost_adjust_warnings: set[tuple[date, str]] = set()
         self.signal_events: list[ModelPredictionSignalEvent] = []
 
     def configure_live_target_portfolio_loader(
@@ -166,6 +168,23 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         bounds the highest-close computation that seeds the trailing high-water mark.
         """
         self._position_span_start_loader = loader
+
+    def configure_divid_events_loader(
+        self,
+        loader: Callable[[list[str]], dict[str, list[tuple[date, float]]]] | None,
+    ) -> None:
+        """
+        Inject a loader for per-stock dividend/split ex-events.
+
+        Signature: ``loader(stock_codes) -> {stock_code: [(ex_date, coef), ...]}``, where
+        ``coef`` is the per-event back-adjustment coefficient (复权系数). Live wiring
+        queries the QMT ``get_divid_factors`` adapter after the daily full-tick snapshot.
+        The strategy filters events to each position's ``(entry_date, trading_date]``
+        window and takes their product to restate the entry cost onto today's basis for
+        the stop-loss check. Backtests leave this unset and derive the same ratio from
+        ClickHouse ``adj_factor`` in ``_daily_stock_data``.
+        """
+        self._divid_events_loader = loader
 
     def configure_target_alert_reporter(
         self,
@@ -516,6 +535,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         signal_date: date | None,
         instrument_id: str,
         exit_rank: int,
+        span_start_date: date | None = None,
     ) -> str | None:
         """
         Decide whether a currently-held position must be **excluded** from the
@@ -544,18 +564,48 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             )
         stock_code = self._stock_code_for_instrument(instrument_id)
         cost_price = float(state.get("entry_price") or exit_price or 0.0)
+        # Authoritative entry date for the dividend-adjustment logic: the holding
+        # span-start date (real flat->held transition from live_position_snapshot).
+        # NOT state["entry_date"] — the latter is set to `trading_date` at seed time
+        # (restart-safe seeding has no memory of the true open date), so in live it
+        # reads as today for every held position. None => no adjustment (ratio 1.0).
+        entry_date = span_start_date
         # Trailing take-profit runs entirely on the back-adjusted basis: the peak
         # (over [span_start, T-2]) and the T-1 comparison close are both adjusted, so
-        # the activation gate must compare against an adjusted entry cost too. Stop-loss
-        # keeps using the raw today's-open (exit_price) vs raw cost_price, unchanged.
+        # the activation gate must compare against an adjusted entry cost too.
         trailing_price = self._prev_trading_close(stock_code, trading_date)
-        adjusted_cost = self._adjusted_entry_cost(state, stock_code, trading_date, cost_price)
+        adjusted_cost = self._adjusted_entry_cost(
+            entry_date, stock_code, trading_date, cost_price,
+        )
         trailing = self._update_trailing_state(state, trailing_price, adjusted_cost)
         untradable = self._untradable_reason(stock_code, trading_date)
+        # Stop-loss: APPLIED decision is still the original raw-cost comparison
+        # (today's open vs raw entry cost). The dividend/split-adjusted variant below
+        # is computed for SHADOW logging only (not applied) so it can be validated
+        # against the running log before switching over.
         stop_triggered = (
             exit_price is not None
             and cost_price > 0
             and exit_price <= cost_price * (1.0 - self.config.stop_loss)
+        )
+        # Shadow: restate the entry cost onto today's post-ex basis. No ex-event in
+        # (entry_date, today] => ratio 1.0 => identical to the raw decision.
+        stop_cost_ratio = self._stop_cost_ratio(entry_date, stock_code, trading_date)
+        cost_today = cost_price * stop_cost_ratio
+        stop_triggered_adjusted = (
+            exit_price is not None
+            and cost_today > 0
+            and exit_price <= cost_today * (1.0 - self.config.stop_loss)
+        )
+        self._log_stop_loss_shadow(
+            stock_code=stock_code,
+            trading_date=trading_date,
+            exit_price=exit_price,
+            cost_price=cost_price,
+            cost_today=cost_today,
+            stop_cost_ratio=stop_cost_ratio,
+            stop_triggered=stop_triggered,
+            stop_triggered_adjusted=stop_triggered_adjusted,
         )
         trailing_triggered = bool(trailing["triggered"])
         if untradable:
@@ -582,11 +632,62 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 "high_price": trailing["high_price"],
                 "trailing_stop_price": trailing["stop_price"],
                 # open_price / entry_price are raw; trailing_price / high_price /
-                # trailing_stop_price are back-adjusted (close * adj_factor).
+                # trailing_stop_price are back-adjusted (close * adj_factor). The
+                # APPLIED stop-loss compares raw open against raw entry_price.
+                # stop_cost_ratio / stop_cost_today / stop_triggered_adjusted are the
+                # SHADOW dividend-adjusted variant (not applied), recorded for
+                # validation before switching over.
                 "trailing_basis": "adjusted",
+                "stop_cost_ratio": stop_cost_ratio,
+                "stop_cost_today": cost_today,
+                "stop_triggered_adjusted": stop_triggered_adjusted,
             },
         )
         return signal_name
+
+    def _log_stop_loss_shadow(
+        self,
+        *,
+        stock_code: str,
+        trading_date: date,
+        exit_price: float | None,
+        cost_price: float,
+        cost_today: float,
+        stop_cost_ratio: float,
+        stop_triggered: bool,
+        stop_triggered_adjusted: bool,
+    ) -> None:
+        """
+        Shadow-log the dividend-adjusted stop-loss variant WITHOUT applying it.
+
+        The applied stop-loss still uses the raw entry cost. This records what the
+        adjusted-cost variant (cost_today = entry_price * factor_entry/factor_today)
+        would have decided, so it can be validated against the running log before the
+        adjusted logic is switched on. Divergence between the two decisions is logged
+        at WARNING so it is easy to grep; a non-trivial ratio with matching decisions
+        is logged at INFO.
+        """
+        if self.log is None:
+            return
+        threshold = 1.0 - self.config.stop_loss
+        diverged = stop_triggered != stop_triggered_adjusted
+        # Only worth logging when a corporate action actually shifts the basis, or the
+        # two decisions disagree.
+        if not diverged and abs(stop_cost_ratio - 1.0) < 1e-9:
+            return
+        message = (
+            "[stop-loss shadow] "
+            f"date={trading_date} stock_code={stock_code} "
+            f"open={exit_price} entry_raw={cost_price} "
+            f"ratio={stop_cost_ratio:.6f} cost_today={cost_today:.6f} "
+            f"threshold={threshold:.4f} "
+            f"applied(raw)={stop_triggered} shadow(adjusted)={stop_triggered_adjusted} "
+            f"diverged={diverged}"
+        )
+        if diverged:
+            self.log.warning(message, color=LogColor.YELLOW)
+        else:
+            self.log.info(message, color=LogColor.BLUE)
 
     def _untradable_reason(self, stock_code: str, trading_date: date) -> str | None:
         if stock_code in self._suspended_by_date.get(trading_date, set()):
@@ -1052,7 +1153,13 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 span_start_dates.get(instrument_id),
                 span_end_date,
             )
-            exclusion = self._holding_exclusion(trading_date, signal_date, instrument_id, exit_rank)
+            exclusion = self._holding_exclusion(
+                trading_date,
+                signal_date,
+                instrument_id,
+                exit_rank,
+                span_start_dates.get(instrument_id),
+            )
             if exclusion is not None:
                 if forced_exits is not None:
                     forced_exits[instrument_id] = exclusion
@@ -1236,6 +1343,81 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             return None
         return float(row.close) * float(row.adj_factor)
 
+    def _adj_factor(self, stock_code: str, day: date) -> float | None:
+        """
+        Cumulative back-adjustment factor for ``(stock_code, day)`` from
+        ``_daily_stock_data``. Returns ``None`` when the row or factor is
+        missing/non-positive. Used by the backtest path of ``_stop_cost_ratio``.
+        """
+        row = self._daily_stock_data.get((stock_code, day))
+        if row is None or row.adj_factor is None or row.adj_factor <= 0:
+            return None
+        return float(row.adj_factor)
+
+    def _stop_cost_ratio(
+        self,
+        entry_date: date | None,
+        stock_code: str,
+        trading_date: date,
+    ) -> float:
+        """
+        ``factor_entry / factor_today`` used to restate the raw entry cost onto today's
+        post-ex basis for the stop-loss check, so a dividend/split between entry and today
+        does not trip a phantom stop. ``1.0`` (no adjustment) when there is no ex-event in
+        ``(entry_date, trading_date]`` or the required data is missing.
+
+        ``entry_date`` is the authoritative holding span-start date (from
+        ``live_position_snapshot`` in live), NOT the seed-time ``state["entry_date"]``.
+
+        Live (events loader set): product of per-event coefficients for ex-events in
+        ``(entry_date, trading_date]``. Backtest (no loader): ``adj_factor(entry_date) /
+        adj_factor(trading_date)`` from ClickHouse, which equals that product because
+        ``adj_factor`` is the cumulative coefficient.
+        """
+        if entry_date is None or not stock_code:
+            return 1.0
+        entry_date = pd.Timestamp(entry_date).date()
+        if entry_date >= trading_date:
+            return 1.0
+        loader = self._divid_events_loader
+        if loader is not None:
+            try:
+                events_by_stock = loader([stock_code]) or {}
+            except Exception as exc:
+                if self.log is not None:
+                    self.log.warning(
+                        f"dividend events loader failed: {exc}",
+                        color=LogColor.YELLOW,
+                    )
+                events_by_stock = {}
+            events = events_by_stock.get(stock_code)
+            if events is None:
+                return self._warn_stop_cost_unadjusted(trading_date, stock_code)
+            ratio = 1.0
+            for ex_date, coef in events:
+                ex_date = pd.Timestamp(ex_date).date()
+                if entry_date < ex_date <= trading_date and coef and coef > 0:
+                    ratio *= float(coef)
+            return ratio
+        # Backtest fallback: cumulative adj_factor ratio.
+        factor_entry = self._adj_factor(stock_code, entry_date)
+        factor_today = self._adj_factor(stock_code, trading_date)
+        if factor_entry is None or factor_today is None or factor_today <= 0:
+            return self._warn_stop_cost_unadjusted(trading_date, stock_code)
+        return factor_entry / factor_today
+
+    def _warn_stop_cost_unadjusted(self, trading_date: date, stock_code: str) -> float:
+        warning_key = (trading_date, stock_code)
+        if warning_key not in self._stop_cost_adjust_warnings:
+            self._stop_cost_adjust_warnings.add(warning_key)
+            if self.log is not None:
+                self.log.warning(
+                    "stop-loss using raw entry cost: dividend factor unavailable "
+                    f"date={trading_date} stock_code={stock_code}",
+                    color=LogColor.YELLOW,
+                )
+        return 1.0
+
     def _highest_close_over_span(
         self,
         stock_code: str,
@@ -1326,37 +1508,49 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
 
     def _adjusted_entry_cost(
         self,
-        state: dict[str, Any],
+        entry_date: date | None,
         stock_code: str,
         trading_date: date,
         cost_price: float,
-    ) -> float:
+    ) -> float | None:
         """
         Entry cost on the back-adjusted basis, for the trailing activation gate only.
 
         The peak and T-1 comparison close are adjusted, so the activation gate
         (``high_price >= cost*(1+activation)``) must compare against an adjusted cost:
-        ``entry_price * adj_factor(entry_date)``. When the entry-date factor is
-        unavailable (e.g. the rolling live window predates entry), fall back to the raw
-        cost (best-effort; only shifts the activation threshold slightly, never touches
-        stop-loss) and warn once per (trading_date, stock_code).
+        ``entry_price * adj_factor(entry_date)``. ``entry_date`` is the authoritative
+        holding span-start date (not the seed-time ``state["entry_date"]``).
+
+        Returns ``None`` when the entry-date factor cannot be resolved (unknown entry
+        date, or the entry-date ``adj_factor`` row is absent — e.g. the rolling live
+        window predates entry). ``None`` means the gate has no comparable cost and
+        trailing MUST NOT arm: comparing the adjusted peak against a raw cost would be a
+        basis mismatch that spuriously arms (for a back-adjust factor > 1, always in the
+        arming direction) and fires a phantom take-profit. Warns once per
+        (trading_date, stock_code) so the missing coverage is visible.
         """
         if cost_price <= 0:
-            return cost_price
-        entry_date = state.get("entry_date")
+            return None
         if entry_date is not None and stock_code:
-            row = self._daily_stock_data.get((stock_code, pd.Timestamp(entry_date).date()))
+            entry_day = pd.Timestamp(entry_date).date()
+            # Same-day (or future) entry: no trading day has elapsed since entry, so no
+            # ex-event can sit between entry and now — raw cost IS the adjusted cost on
+            # this basis (factor ratio 1). Return it directly (no warning; it would
+            # otherwise fire for every fresh position).
+            if entry_day >= trading_date:
+                return cost_price
+            row = self._daily_stock_data.get((stock_code, entry_day))
             if row is not None and row.adj_factor is not None and row.adj_factor > 0:
                 return cost_price * float(row.adj_factor)
         warning_key = (trading_date, stock_code)
         if warning_key not in self._entry_cost_adjust_warnings:
             self._entry_cost_adjust_warnings.add(warning_key)
             self.log.warning(
-                "trailing activation using raw entry cost: adj_factor unavailable on "
-                f"entry date={trading_date} stock_code={stock_code} entry_date={entry_date}",
+                "trailing activation disabled: adj_factor unavailable on entry date "
+                f"trading_date={trading_date} stock_code={stock_code} entry_date={entry_date}",
                 color=LogColor.YELLOW,
             )
-        return cost_price
+        return None
 
     def _open_price_with_source(self, instrument_id_text: str) -> tuple[float | None, str | None]:
         """
@@ -1558,7 +1752,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self,
         state: dict[str, Any],
         close_price: float | None,
-        cost_price: float,
+        cost_price: float | None,
     ) -> dict[str, Any]:
         result = {"triggered": False, "high_price": state.get("high_price"), "stop_price": None}
         # The high-water mark is the highest close over [span_start, T-2], injected by
@@ -1573,7 +1767,13 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         if close_price is None or close_price <= 0:
             return result
         trailing_pct = float(self.config.trailing_take_profit)
-        if trailing_pct <= 0 or cost_price <= 0:
+        # cost_price is the adjusted entry cost; None means the entry-date factor was
+        # unavailable (see _adjusted_entry_cost). Both the peak and the T-1 close are on
+        # the adjusted basis, so without a comparable adjusted cost the activation gate
+        # cannot be evaluated -- do NOT arm (comparing against a raw cost would be a
+        # basis mismatch that spuriously fires). Leaving the stop unset here does not
+        # touch stop-loss, which runs independently on the raw basis.
+        if trailing_pct <= 0 or cost_price is None or cost_price <= 0:
             state["trailing_stop_price"] = None
             return result
         activation_pct = max(0.0, float(self.config.trailing_take_profit_start))

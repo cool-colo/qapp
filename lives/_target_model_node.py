@@ -448,6 +448,28 @@ def build_target_model_node(
         return loader.full_tick_snapshot(codes)
 
     strategy.configure_full_tick_source(fetch_full_tick=_fetch_full_tick)
+
+    _divid_events_cache: dict[tuple[str, str], list[tuple[Any, float]]] = {}
+
+    def _load_divid_events(
+        stock_codes: list[str],
+    ) -> dict[str, list[tuple[Any, float]]]:
+        # Dividend/split ex-events per held stock, from the broker gateway
+        # (Big QMT ``get_divid_factors``; empty on the QMT proxy path). Used by the
+        # strategy to restate a holding's entry cost onto today's post-ex basis for
+        # the stop-loss check. Cached per (trading-date, stock) so repeated stop-loss
+        # evaluations within a day do not re-RPC; the daily cadence matches the
+        # full-tick refresh. end_time bounds the query to today's ex-events.
+        end_time = pd.Timestamp.now(tz=args.exchange_timezone).strftime("%Y%m%d")
+        wanted = [str(code).strip() for code in stock_codes if str(code or "").strip()]
+        missing = [code for code in wanted if (end_time, code) not in _divid_events_cache]
+        if missing:
+            fetched = loader.divid_events(missing, end_time)
+            for code in missing:
+                _divid_events_cache[(end_time, code)] = fetched.get(code, [])
+        return {code: _divid_events_cache[(end_time, code)] for code in wanted}
+
+    strategy.configure_divid_events_loader(_load_divid_events)
     node.trader.add_strategy(strategy)
     add_snapshot_recorder(
         args,
