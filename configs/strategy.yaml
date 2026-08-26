@@ -29,8 +29,8 @@ holding_days: 10           # backtest rebalance cadence (unused by live target-t
 initial_cash: 1000000
 
 # --- Order lifecycle / cash gating ---
-unfilled_timeout_secs: 20.0
-resubmit_interval_secs: 10.0     # feeds resubmit_check_interval_secs AND process_targets_interval_secs
+unfilled_timeout_secs: 10.0
+resubmit_interval_secs: 5.0     # feeds resubmit_check_interval_secs AND process_targets_interval_secs
 cash_buffer_percent: 0.0
 target_cash_buffer_percent: 0.05
 order_slice_notional: 300000     # CNY notional per order slice; 0 disables splitting

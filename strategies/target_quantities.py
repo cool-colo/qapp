@@ -240,7 +240,7 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     buy_offset_bps: float = 5.0
     sell_offset_bps: float = 5.0
     buy_max_price_bps: float = 100.0
-    buy_cancel_threshold: int = 2
+    buy_cancel_threshold: int = 1
     sell_cancel_threshold: int = 1
     exit_non_targets: bool = True
     limit_stop_mode: str = "freeze_symbol"

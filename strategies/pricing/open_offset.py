@@ -78,7 +78,7 @@ class OpenOffsetBuyPriceStrategy(BuyPriceStrategy):
         self,
         offset_bps: float = 5.0,
         max_price_bps: float = 100.0,
-        cancel_threshold: int = 2,
+        cancel_threshold: int = 1,
         *,
         logger: PriceStrategyLogger,
     ) -> None:
