@@ -25,11 +25,12 @@ export MODEL_SNAPSHOTS_ENABLED=on
 # 其它变量全部写这里
 
 exec python backtests/target_model_predictions/run_backtest.py \
-	--start 2026-07-01 \
-	--end 2026-07-30 \
+	--start 2026-08-10 \
+	--end 2026-08-26 \
 	--all-stocks \
 	--log-level INFO \
 	--write-results \
 	--report-dir /tmp/qapp_model_report_check \
 	--benchmark-code 399300.SZ \
+	 --predictions-table daily_model_predictions_training_strict_all_gain_stable_top1200_20260802 \
         --config /data/flc/code/quant/qapp/configs/strategy_86008933.yaml

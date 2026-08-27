@@ -739,7 +739,11 @@ class SnapshotRecorder(Actor):
         for target in plan.targets:
             target_context = target.target_context
             row_version = target.target_version or version
-            extra: dict[str, Any] = {"target_version": row_version}
+            extra: dict[str, Any] = {
+                "target_version": row_version,
+                "risk_model_id": self._strategy.config.risk_manager_risk_model_id,
+                "alpha_model_id": self._strategy.config.alpha_model_id,
+            }
             if target_context.recent_target_date is not None:
                 extra["recent_buy_date"] = target_context.recent_target_date.isoformat()
             if target_context.recent_holding_days is not None:
