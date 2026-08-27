@@ -136,11 +136,8 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         return payload
 
     def _request_id(self, request: ModelTargetPlanningRequest) -> str:
-        signal_text = "none" if request.signal_date is None else request.signal_date.isoformat()
-        return (
-            f"qapp-model-target-{request.trading_date.isoformat()}-{signal_text}"
-            f"-{len(request.candidates)}-{uuid4().hex}"
-        )
+        trading_text = request.trading_date.strftime("%Y%m%d")
+        return f"qapp-{trading_text}-{uuid4().hex}"
 
     def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         endpoint = f"{self.base_url}/v1/portfolio/optimize"

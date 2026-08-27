@@ -32,7 +32,7 @@ initial_cash: 1000000
 unfilled_timeout_secs: 10.0
 resubmit_interval_secs: 5.0     # feeds resubmit_check_interval_secs AND process_targets_interval_secs
 cash_buffer_percent: 0.0
-target_cash_buffer_percent: 0.05
+target_cash_buffer_percent: 0.01
 order_slice_notional: 300000     # CNY notional per order slice; 0 disables splitting
 limit_stop_mode: freeze_symbol
 leave_non_targets: false         # false => exit holdings absent from latest targets
@@ -44,7 +44,6 @@ target_weight_planner_error_policy: raise       # raise | equal_weight
 local_exit_authoritative: true                  # true => local exits override optimizer targets
 risk_manager_base_url: http://127.0.0.1:8000
 risk_manager_risk_model_id: cn_a_basic_constraints_integer_lots
-alpha_model_id: strict_all_gain_stable_top1200_20260802   # experiment ID; only supported value this period
 risk_manager_mode: live                          # backtest | simulation | live
 risk_manager_timeout_secs: 10.0
 

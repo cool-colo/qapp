@@ -947,10 +947,10 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             | {holding.instrument_id for holding in current_holdings},
         )
         total_asset = float(self._portfolio_value())
+        holdings_value = sum(
+            holding.quantity * holding.price for holding in current_holdings
+        )
         if self._account_id_equals(86904088):
-            holdings_value = sum(
-                holding.quantity * holding.price for holding in current_holdings
-            )
             investable_asset = float(holdings_value * 1.01)
         else:
             investable_asset = total_asset * (
@@ -958,6 +958,11 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             )
         if investable_asset <= 0:
             investable_asset = float(self.config.initial_cash)
+        if investable_asset <= holdings_value:
+            self.log.warning(
+                f"investable_asset <= holdings_value: investable_asset={investable_asset} "
+                f"holdings_value={holdings_value} total_asset={total_asset} ")
+            investable_asset = float(holdings_value) * 1.005
         request = ModelTargetPlanningRequest(
             trading_date=trading_date,
             signal_date=signal_date,
