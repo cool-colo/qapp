@@ -743,6 +743,23 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             color=LogColor.YELLOW,
         )
 
+    def _log_missing_holding_open_price(
+        self,
+        trading_date: date,
+        instrument_id: str,
+        stock_code: str,
+        quantity: int,
+    ) -> None:
+        if self.log is None:
+            return
+        self.log.warning(
+            f"dropping held position from current_holdings: no sizing price "
+            f"(open and last_close both unavailable) date={trading_date} "
+            f"instrument_id={instrument_id} stock_code={stock_code} quantity={quantity}; "
+            f"holding will not be sent to the planner and may be liquidated as a non-target",
+            color=LogColor.YELLOW,
+        )
+
     def _target_plan(
         self,
         trading_date: date,
@@ -1172,11 +1189,11 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 continue
             price, _ = self._open_price_with_source(instrument_id)
             if price is None:
-                self._log_missing_new_entry_open_price(
+                self._log_missing_holding_open_price(
                     trading_date=trading_date,
-                    signal_date=signal_date or trading_date,
                     instrument_id=instrument_id,
                     stock_code=stock_code,
+                    quantity=quantity,
                 )
                 continue
             open_prices.setdefault(instrument_id, price)

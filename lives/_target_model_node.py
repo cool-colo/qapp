@@ -250,6 +250,59 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         return stock_codes
 
 
+def _held_stock_codes_for_seeding(args: Any) -> set[str]:
+    """
+    Read currently-held stock codes from the ``live_position_snapshot`` MySQL table
+    so they can be folded into the initial universe.
+
+    Prefers today's ``before_trading`` snapshot; falls back to the most recent prior
+    trading date's ``after_trading`` snapshot (see
+    ``LiveSnapshotWriter.load_held_stock_codes_for_seeding``). Failures are non-fatal:
+    seeding is best-effort, so any error is logged and an empty set returned.
+    """
+    from backtests.result_writers.live_writer import LiveSnapshotWriter
+
+    trade_date = pd.Timestamp.now(tz=args.exchange_timezone).date()
+    writer: Any = None
+    try:
+        writer = LiveSnapshotWriter.from_pymysql_kwargs(
+            logger=None,
+            create_tables=False,
+            host=args.mysql_host,
+            port=int(args.mysql_port),
+            user=args.mysql_user,
+            password=args.mysql_password,
+            database=args.mysql_database,
+            charset="utf8mb4",
+            autocommit=False,
+        )
+        codes = writer.load_held_stock_codes_for_seeding(
+            str(args.account_id),
+            str(args.trader_id),
+            trade_date,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort seeding, never fatal
+        print(
+            f"[build_node] held-position seeding skipped (live_position_snapshot read failed): {exc}",
+            flush=True,
+        )
+        codes = []
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+    normalized = legacy.normalized_stock_codes(codes)
+    if normalized:
+        print(
+            f"[build_node] seeding {len(normalized)} held stock code(s) into initial universe "
+            f"from live_position_snapshot (trade_date={trade_date})",
+            flush=True,
+        )
+    return normalized
+
+
 def build_target_model_node(
     args: Any,
     loader: legacy.LivePredictionDataLoader,
@@ -273,6 +326,13 @@ def build_target_model_node(
 
     params = StrategyParams.from_yaml(args.config)
     extra_stock_codes = legacy.normalized_stock_codes(legacy.env_list_from_value(args.extra_stock_codes))
+    # Fold currently-held stock codes into the initial universe so their last_close
+    # gets seeded from ClickHouse even when they dropped out of today's prediction
+    # universe. Without this a held-but-unpredicted name has no price source and gets
+    # dropped from the risk-manager holdings / cannot be priced for a forced exit.
+    held_stock_codes = _held_stock_codes_for_seeding(args)
+    if held_stock_codes:
+        extra_stock_codes = extra_stock_codes.union(held_stock_codes)
     history_days = max(int(params.consecutive_up_limit_days) - 1, 0)
     context = loader.load(
         extra_stock_codes=extra_stock_codes,

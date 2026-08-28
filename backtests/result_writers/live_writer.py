@@ -755,6 +755,61 @@ class LiveSnapshotWriter:
         rows = self._query(sql, (account_id, trader_id, trade_date))
         return sorted({str(row[0]).strip() for row in rows if row and str(row[0]).strip()})
 
+    def load_held_stock_codes_for_seeding(
+        self,
+        account_id: str,
+        trader_id: str,
+        trade_date: date,
+    ) -> list[str]:
+        """
+        Return held stock codes to fold into the initial universe so their
+        ``last_close`` gets seeded from ClickHouse.
+
+        Prefers today's ``before_trading`` snapshot; when that snapshot has not
+        been written yet (e.g. an early-session start), falls back to the most
+        recent prior trading date's ``after_trading`` snapshot. Only held rows
+        (``volume > 0``) are considered so flat/closed positions are excluded.
+        """
+        before = self._query(
+            "SELECT DISTINCT `stock_code` FROM `live_position_snapshot` "
+            "WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s "
+            "AND `snapshot_type`=%s "
+            "AND `volume` IS NOT NULL AND `volume` > 0 "
+            "AND `stock_code` IS NOT NULL AND `stock_code` <> ''",
+            (account_id, trader_id, trade_date, BEFORE_TRADING),
+        )
+        codes = self._distinct_codes(before)
+        if codes:
+            return codes
+        # Fall back to the latest prior-date after_trading snapshot.
+        prior = self._query(
+            "SELECT `stock_code` FROM `live_position_snapshot` "
+            "WHERE `account_id`=%s AND `trader_id`=%s "
+            "AND `snapshot_type`=%s AND `trade_date` < %s "
+            "AND `volume` IS NOT NULL AND `volume` > 0 "
+            "AND `stock_code` IS NOT NULL AND `stock_code` <> '' "
+            "AND `trade_date` = ("
+            "  SELECT MAX(`trade_date`) FROM `live_position_snapshot` "
+            "  WHERE `account_id`=%s AND `trader_id`=%s "
+            "  AND `snapshot_type`=%s AND `trade_date` < %s"
+            ")",
+            (
+                account_id,
+                trader_id,
+                AFTER_TRADING,
+                trade_date,
+                account_id,
+                trader_id,
+                AFTER_TRADING,
+                trade_date,
+            ),
+        )
+        return self._distinct_codes(prior)
+
+    @staticmethod
+    def _distinct_codes(rows: Sequence[Any]) -> list[str]:
+        return sorted({str(row[0]).strip() for row in rows if row and str(row[0]).strip()})
+
     def load_target_portfolios(
         self,
         account_id: str,

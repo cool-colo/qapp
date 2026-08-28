@@ -563,7 +563,16 @@ class TargetQuantityStrategy(Strategy):
             # Store the market status first: a suspended stock has open==0 and would
             # otherwise `continue` on the invalid-open path before status is recorded.
             self._roll_trading_day(trading_date)
-            self._market_status[str(instrument_id)] = TickSnapshot.from_fields(fields)
+            tick = TickSnapshot.from_fields(fields)
+            self._market_status[str(instrument_id)] = tick
+            # Record the snapshot's last_close (previous session close) before the
+            # invalid-open gate: a held name outside today's subscription universe has
+            # neither an initial_last_closes seed nor a bar to feed _last_close, so the
+            # full tick is its only price source. Storing last_close here lets such a
+            # holding still be priced (and thus kept, not dropped) even when today's open
+            # is invalid.
+            if tick.last_close is not None and tick.last_close > 0:
+                self._last_close[str(instrument_id)] = float(tick.last_close)
             open_price = self._full_tick_open(fields)
             if open_price is None:
                 self.log.warning(f"full-tick snapshot contains invalid open price for {instrument_id} ({trigger})")

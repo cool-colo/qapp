@@ -343,6 +343,8 @@ class QmtBrokerDataSource:
 
 # Big QMT get_full_tick returns camelCase fields; normalize to the same snake_case
 # tick keys the QMT proxy tick carries (open/last_price/high/low/last_close/...).
+# ``openInt`` is QMT's real-time market-status code (1=停牌); the strategy reads it
+# via ``open_int`` to freeze suspended holdings, so it must be carried through.
 _BIG_QMT_TICK_FIELD_MAP = {
     "open": "open",
     "lastPrice": "last_price",
@@ -352,6 +354,7 @@ _BIG_QMT_TICK_FIELD_MAP = {
     "amount": "amount",
     "volume": "volume",
     "pvolume": "pvolume",
+    "openInt": "open_int",
 }
 
 
