@@ -326,6 +326,12 @@ def build_target_model_node(
 
     params = StrategyParams.from_yaml(args.config)
     extra_stock_codes = legacy.normalized_stock_codes(legacy.env_list_from_value(args.extra_stock_codes))
+    # Benchmark index codes recorded in the after-trading live_stock_tick_snapshot.
+    # They are reference-only (never traded, never in the universe), so keep them out
+    # of extra_stock_codes/loader universe and add them only to the full-tick fetch.
+    index_tick_codes = legacy.normalized_stock_codes(
+        legacy.env_list_from_value(args.index_tick_codes),
+    )
     # Fold currently-held stock codes into the initial universe so their last_close
     # gets seeded from ClickHouse even when they dropped out of today's prediction
     # universe. Without this a held-but-unpredicted name has no price source and gets
@@ -488,6 +494,11 @@ def build_target_model_node(
             stock_code = legacy.stock_code_from_instrument_id(instrument_id)
             if stock_code:
                 stock_codes.add(stock_code)
+        # Benchmark indices (e.g. 399852.SZ 中证1000): reference-only, priced from the
+        # same broker full-tick so the after-trading live_stock_tick_snapshot carries an
+        # index row. They are never traded; applying their tick to the strategy only
+        # seeds inert price state for a non-universe instrument id.
+        stock_codes.update(index_tick_codes)
         if not stock_codes:
             return {}
         return loader.full_tick_snapshot(sorted(stock_codes))

@@ -209,6 +209,16 @@ def parse_args() -> argparse.Namespace:
         default=",".join(env_list("MODEL_LIVE_EXTRA_STOCK_CODES", "")),
         help="Additional stock codes to load/manage at startup, for example current holdings.",
     )
+    parser.add_argument(
+        "--index-tick-codes",
+        default=",".join(env_list("MODEL_INDEX_TICK_CODES", "399852.SZ")),
+        help=(
+            "Comma-separated index codes to include in the after-trading "
+            "live_stock_tick_snapshot (benchmark reference; not traded). "
+            "Default 399852.SZ (中证1000). QMT does not serve 000985.CSI (中证全指). "
+            "Empty string disables."
+        ),
+    )
     parser.add_argument("--history-days", type=int, default=int(env("MODEL_LIVE_HISTORY_DAYS", "45")))
     parser.add_argument(
         "--calendar-lookahead-days",

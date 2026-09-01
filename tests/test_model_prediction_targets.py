@@ -621,7 +621,7 @@ class BuildCandidatesTest(unittest.TestCase):
         self.assertEqual(strategy.signal_events[0].signal_name, "entry_filtered")
         self.assertEqual(strategy.signal_events[0].extra["reason"], "missing_open_price")
 
-    def test_consecutive_limit_up_includes_current_open(self) -> None:
+    def test_consecutive_limit_up_from_prior_closes(self) -> None:
         signal = {
             "date": date(2026, 7, 7),
             "stock_code": "000001.SZ",
@@ -636,7 +636,7 @@ class BuildCandidatesTest(unittest.TestCase):
         strategy, _, signal_date = self._make_stub(
             signals=[signal],
             today_open={"000001.SZ.QMT": 12.1},
-            consecutive_up_limit_days=3,
+            consecutive_up_limit_days=2,
             daily_stock_data=history,
             trading_dates=[date(2026, 7, 6), date(2026, 7, 7), date(2026, 7, 8)],
             current_up_limit=12.1,
@@ -708,7 +708,7 @@ class BuildCandidatesTest(unittest.TestCase):
         strategy.log.warning.assert_called_once()
         self.assertIn("previous close is missing", strategy.log.warning.call_args.args[0])
 
-    def test_current_open_below_limit_does_not_complete_streak(self) -> None:
+    def test_prior_close_below_limit_does_not_complete_streak(self) -> None:
         signal = {
             "date": date(2026, 7, 7),
             "stock_code": "000001.SZ",
@@ -718,12 +718,12 @@ class BuildCandidatesTest(unittest.TestCase):
         }
         history = (
             DailyStockData("000001.SZ", date(2026, 7, 6), close=10.0, up_limit=10.0),
-            DailyStockData("000001.SZ", date(2026, 7, 7), close=11.0, up_limit=11.0),
+            DailyStockData("000001.SZ", date(2026, 7, 7), close=10.5, up_limit=11.0),
         )
         strategy, _, signal_date = self._make_stub(
             signals=[signal],
             today_open={"000001.SZ.QMT": 12.0},
-            consecutive_up_limit_days=3,
+            consecutive_up_limit_days=2,
             daily_stock_data=history,
             trading_dates=[date(2026, 7, 6), date(2026, 7, 7), date(2026, 7, 8)],
             current_up_limit=12.1,
@@ -746,9 +746,9 @@ class BuildCandidatesTest(unittest.TestCase):
             today_open={"000001.SZ.QMT": 12.1},
             consecutive_up_limit_days=1,
             daily_stock_data=(
-                DailyStockData("000001.SZ", date(2026, 7, 8), up_limit=12.1),
+                DailyStockData("000001.SZ", date(2026, 7, 7), close=11.0, up_limit=11.0),
             ),
-            trading_dates=[date(2026, 7, 8)],
+            trading_dates=[date(2026, 7, 7), date(2026, 7, 8)],
             current_up_limit=None,
         )
 
@@ -768,11 +768,16 @@ class BuildCandidatesTest(unittest.TestCase):
         strategy, _, signal_date = self._make_stub(
             signals=[signal],
             today_open={"000001.SZ.QMT": 12.1},
-            consecutive_up_limit_days=3,
+            consecutive_up_limit_days=2,
             daily_stock_data=(
                 DailyStockData("000001.SZ", date(2026, 7, 7), close=11.0, up_limit=11.0),
             ),
-            trading_dates=[date(2026, 7, 6), date(2026, 7, 7), date(2026, 7, 8)],
+            trading_dates=[
+                date(2026, 7, 5),
+                date(2026, 7, 6),
+                date(2026, 7, 7),
+                date(2026, 7, 8),
+            ],
             current_up_limit=12.1,
         )
 

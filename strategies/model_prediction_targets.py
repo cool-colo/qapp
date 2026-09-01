@@ -1659,33 +1659,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         if consecutive_days <= 0:
             return False
 
-        instrument_id = self._instrument_by_stock.get(stock_code)
-        if instrument_id is None:
-            return False
-        instrument_id_text = str(instrument_id)
-        today_open = self._today_open_price(instrument_id_text)
-        if today_open is None:
-            # The existing candidate sizing path reports and filters this separately.
-            return False
-
-        today_up_limit, _ = self._price_limits(instrument_id_text)
-        if today_up_limit is None:
-            today_row = self._daily_stock_data.get((stock_code, trading_date))
-            if today_row is not None:
-                today_up_limit = today_row.up_limit
-        if today_up_limit is None or today_up_limit <= 0:
-            self._warn_incomplete_limit_history(
-                stock_code,
-                trading_date,
-                "missing current-day up_limit from instrument info and daily history",
-            )
-            return False
-        if today_open < today_up_limit - self._PRICE_COMPARISON_TOLERANCE:
-            return False
-
-        history_days = consecutive_days - 1
-        if history_days == 0:
-            return True
+        history_days = consecutive_days
         prior_trading_dates = sorted(
             value for value in set(self._trading_dates) if value < trading_date
         )
