@@ -13,6 +13,10 @@ Designed to run standalone under crontab. On each run it:
    not, sends a DingTalk **alert**; on success it sends a normal DingTalk
    message. Any sync failure also sends an alert.
 
+The ClickHouse read, MySQL upsert, and shared argparse groups live in
+``scripts._ch_mysql_sync``; this script only supplies the calendar-specific
+columns, WHERE clause, table DDL, and messaging.
+
 DingTalk credentials (``DINGTALK_ACCESS_TOKEN`` / ``DINGTALK_SECRET``) and the
 ClickHouse/MySQL connection settings are read from the environment. A ``.env``
 file is loaded first, resolved as: ``--env-file`` → ``<script dir>/.env`` →
@@ -39,12 +43,9 @@ import json
 import logging
 import os
 import sys
-import urllib.error
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -59,30 +60,40 @@ if NAUTILUS_TRADER_PATH.exists() and str(NAUTILUS_TRADER_PATH) not in sys.path:
 
 from monitoring.dingtalk_alert import DingTalkAlerter  # noqa: E402
 from monitoring.dingtalk_alert import load_env  # noqa: E402
+from scripts._ch_mysql_sync import CURRENT_VERSION_SYS_TO  # noqa: E402
+from scripts._ch_mysql_sync import ClickHouseConn  # noqa: E402
+from scripts._ch_mysql_sync import SyncColumn  # noqa: E402
+from scripts._ch_mysql_sync import add_behavior_args  # noqa: E402
+from scripts._ch_mysql_sync import add_clickhouse_args  # noqa: E402
+from scripts._ch_mysql_sync import add_dingtalk_args  # noqa: E402
+from scripts._ch_mysql_sync import add_env_file_arg  # noqa: E402
+from scripts._ch_mysql_sync import add_mysql_connection_args  # noqa: E402
+from scripts._ch_mysql_sync import clickhouse_select_json_each_row  # noqa: E402
+from scripts._ch_mysql_sync import connect_mysql  # noqa: E402
+from scripts._ch_mysql_sync import preparse_env_file  # noqa: E402
+from scripts._ch_mysql_sync import quote_ch_literal  # noqa: E402
+from scripts._ch_mysql_sync import upsert_rows  # noqa: E402
+from scripts._ch_mysql_sync import _env  # noqa: E402
 
 _LOGGER = logging.getLogger("sync_trade_calendar")
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
-# The current-version marker in the SCD-2 ClickHouse calendar table.
-CURRENT_VERSION_SYS_TO = "2299-12-31 00:00:00.000"
-
 # MySQL target table. Core calendar columns + a write-time stamp.
 MYSQL_TABLE = "trade_calendar"
 
-
-def _env(name: str, default: str | None = None) -> str | None:
-    value = os.environ.get(name)
-    return value if value not in (None, "") else default
+# MySQL column <- ClickHouse field mapping. exchange + cal_date form the PK.
+COLUMNS = [
+    SyncColumn("exchange", is_pk=True, transform=lambda v: str(v) if v is not None else ""),
+    SyncColumn("cal_date", is_pk=True),
+    SyncColumn("is_open", transform=lambda v: int(v) if v not in (None, "") else 0),
+    SyncColumn("pretrade_date"),
+]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--env-file",
-        default=_env("QAPP_ENV_FILE"),
-        help="Explicit .env path (else <script dir>/.env, else <cwd>/.env).",
-    )
+    add_env_file_arg(parser)
     # Calendar selection
     parser.add_argument(
         "--exchange",
@@ -95,25 +106,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only sync cal_date >= this YYYY-MM-DD.",
     )
     # ClickHouse (source)
-    parser.add_argument("--clickhouse-url", default=_env("CLICKHOUSE_URL", "http://127.0.0.1:8123"))
-    parser.add_argument("--clickhouse-database", default=_env("CLICKHOUSE_DATABASE"))
-    parser.add_argument("--clickhouse-user", default=_env("CLICKHOUSE_USER", "default"))
-    parser.add_argument("--clickhouse-password", default=_env("CLICKHOUSE_PASSWORD"))
-    parser.add_argument(
-        "--clickhouse-timeout-secs",
-        type=float,
-        default=float(_env("CLICKHOUSE_TIMEOUT_SECS", "60") or "60"),
-    )
+    add_clickhouse_args(parser)
     parser.add_argument(
         "--clickhouse-table",
         default=_env("TRADE_CALENDAR_CH_TABLE", "dwd_trade_calendar"),
     )
     # MySQL (target)
-    parser.add_argument("--mysql-host", default=_env("MYSQL_HOST", "localhost"))
-    parser.add_argument("--mysql-port", type=int, default=int(_env("MYSQL_PORT", "3306") or "3306"))
-    parser.add_argument("--mysql-user", default=_env("MYSQL_USER", "root"))
-    parser.add_argument("--mysql-password", default=_env("MYSQL_PASSWORD", ""))
-    parser.add_argument("--mysql-database", default=_env("MYSQL_DATABASE", "backtest"))
+    add_mysql_connection_args(parser)
     parser.add_argument("--mysql-table", default=_env("TRADE_CALENDAR_MYSQL_TABLE", MYSQL_TABLE))
     parser.add_argument(
         "--batch-size",
@@ -122,42 +121,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rows per MySQL upsert executemany batch.",
     )
     # DingTalk
-    parser.add_argument("--access-token", default=_env("DINGTALK_ACCESS_TOKEN"))
-    parser.add_argument("--secret", default=_env("DINGTALK_SECRET"))
-    parser.add_argument(
-        "--dingtalk-timeout-secs",
-        type=float,
-        default=float(_env("DINGTALK_TIMEOUT_SECS", "5") or "5"),
-    )
+    add_dingtalk_args(parser)
     # Behavior
-    parser.add_argument(
-        "--no-create-table",
-        action="store_true",
-        help="Skip CREATE TABLE IF NOT EXISTS for the MySQL table.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Fetch + log counts but do not write MySQL or send DingTalk.",
-    )
-    parser.add_argument("--log-level", default=_env("QMT_LOG_LEVEL", "INFO"))
+    add_behavior_args(parser)
     return parser
 
 
 # ---------------------------------------------------------------------------
 # ClickHouse read
 # ---------------------------------------------------------------------------
-def _quote_ch_literal(value: str) -> str:
-    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-
 def fetch_calendar(args: argparse.Namespace) -> list[dict[str, Any]]:
     """Read current-version calendar rows from ClickHouse over HTTP."""
-    where = [f"sys_to = {_quote_ch_literal(CURRENT_VERSION_SYS_TO)}"]
+    where = [f"sys_to = {quote_ch_literal(CURRENT_VERSION_SYS_TO)}"]
     if args.exchange:
-        where.append(f"exchange = {_quote_ch_literal(args.exchange)}")
+        where.append(f"exchange = {quote_ch_literal(args.exchange)}")
     if args.start:
-        where.append(f"cal_date >= {_quote_ch_literal(args.start)}")
+        where.append(f"cal_date >= {quote_ch_literal(args.start)}")
     sql = (
         "SELECT exchange, cal_date, is_open, pretrade_date\n"
         f"FROM `{args.clickhouse_table}`\n"
@@ -165,54 +144,12 @@ def fetch_calendar(args: argparse.Namespace) -> list[dict[str, Any]]:
         "ORDER BY exchange, cal_date\n"
         "FORMAT JSONEachRow"
     )
-
-    params: dict[str, str] = {"query": sql}
-    if args.clickhouse_database:
-        params["database"] = args.clickhouse_database
-    url = f"{str(args.clickhouse_url).rstrip('/')}/?{urlencode(params)}"
-    headers = {"Accept": "application/json"}
-    if args.clickhouse_user:
-        headers["X-ClickHouse-User"] = args.clickhouse_user
-    if args.clickhouse_password:
-        headers["X-ClickHouse-Key"] = args.clickhouse_password
-
-    request = urllib.request.Request(url=url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(request, timeout=args.clickhouse_timeout_secs) as response:
-            text = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"ClickHouse HTTP {exc.code}: {detail[:1000]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"ClickHouse request failed: {exc}") from exc
-
-    rows: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            rows.append(json.loads(line))
-    return rows
+    return clickhouse_select_json_each_row(ClickHouseConn.from_args(args), sql)
 
 
 # ---------------------------------------------------------------------------
 # MySQL write
 # ---------------------------------------------------------------------------
-def _connect_mysql(args: argparse.Namespace):
-    try:
-        import pymysql
-    except ImportError as exc:  # pragma: no cover - deployment dependency
-        raise ImportError("pymysql is required to sync the trade calendar to MySQL") from exc
-    return pymysql.connect(
-        host=args.mysql_host,
-        port=args.mysql_port,
-        user=args.mysql_user,
-        password=args.mysql_password,
-        database=args.mysql_database,
-        charset="utf8mb4",
-        autocommit=False,
-    )
-
-
 def _create_table_sql(table: str) -> str:
     return (
         f"CREATE TABLE IF NOT EXISTS `{table}` (\n"
@@ -224,52 +161,6 @@ def _create_table_sql(table: str) -> str:
         "  PRIMARY KEY (`exchange`, `cal_date`)\n"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
-
-
-def _empty_to_none(value: Any) -> Any:
-    # ClickHouse can emit '0000-00-00' / '' for a null Date; treat as NULL.
-    if value in (None, "", "0000-00-00"):
-        return None
-    return value
-
-
-def upsert_calendar(
-    connection,
-    table: str,
-    rows: list[dict[str, Any]],
-    synced_at: datetime,
-    batch_size: int,
-) -> int:
-    """Upsert rows by primary key (exchange, cal_date). Returns rows sent."""
-    if not rows:
-        return 0
-    sql = (
-        f"INSERT INTO `{table}` (`exchange`, `cal_date`, `is_open`, `pretrade_date`, `synced_at`)\n"
-        "VALUES (%s, %s, %s, %s, %s)\n"
-        "ON DUPLICATE KEY UPDATE\n"
-        "  `is_open` = VALUES(`is_open`),\n"
-        "  `pretrade_date` = VALUES(`pretrade_date`),\n"
-        "  `synced_at` = VALUES(`synced_at`)"
-    )
-    stamp = synced_at.strftime("%Y-%m-%d %H:%M:%S")
-    params = [
-        (
-            str(row.get("exchange", "")),
-            _empty_to_none(row.get("cal_date")),
-            int(row.get("is_open", 0)),
-            _empty_to_none(row.get("pretrade_date")),
-            stamp,
-        )
-        for row in rows
-    ]
-    sent = 0
-    with connection.cursor() as cursor:
-        for start in range(0, len(params), max(1, batch_size)):
-            batch = params[start:start + max(1, batch_size)]
-            cursor.executemany(sql, batch)
-            sent += len(batch)
-    connection.commit()
-    return sent
 
 
 def count_today(connection, table: str, exchange: str, today: str) -> int:
@@ -285,18 +176,10 @@ def count_today(connection, table: str, exchange: str, today: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-def _preparse_env_file(argv: list[str] | None) -> str | None:
-    """Pull out only --env-file before the full parser reads env-var defaults."""
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--env-file", default=_env("QAPP_ENV_FILE"))
-    known, _ = pre.parse_known_args(argv)
-    return known.env_file
-
-
 def main(argv: list[str] | None = None) -> int:
     # Load .env FIRST so every _env(...) default in build_parser() sees it
     # (host/user/password/etc. are resolved at parser-construction time).
-    load_env(_preparse_env_file(argv), script_dir=Path(__file__).resolve().parent)
+    load_env(preparse_env_file(argv), script_dir=Path(__file__).resolve().parent)
 
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -326,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             _LOGGER.info("today %s present in fetched rows: %s", today, has_today)
             return 0
 
-        connection = _connect_mysql(args)
+        connection = connect_mysql(args)
         try:
             if not args.no_create_table:
                 with connection.cursor() as cursor:
@@ -334,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
                 connection.commit()
                 _LOGGER.info("ensured MySQL table %s exists", args.mysql_table)
 
-            sent = upsert_calendar(connection, args.mysql_table, rows, now, args.batch_size)
+            sent = upsert_rows(connection, args.mysql_table, COLUMNS, rows, now, args.batch_size)
             _LOGGER.info("upserted %d rows into %s", sent, args.mysql_table)
 
             today_count = count_today(connection, args.mysql_table, args.exchange, today)

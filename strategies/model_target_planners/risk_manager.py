@@ -88,6 +88,7 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             "risk_model_id": self.risk_model_id,
             "alpha_model_id": self.alpha_model_id,
             "asof_date": asof_date.isoformat(),
+            #"asof_date": "2026-08-26",
             "trade_date": request.trading_date.isoformat(),
             "candidates": [self._candidate_payload(candidate) for candidate in request.candidates],
             "current_weights": current_weights,
