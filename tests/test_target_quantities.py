@@ -279,9 +279,11 @@ class TestableTargetQuantityStrategy:
     on_order_book_depth = TargetQuantityStrategy.on_order_book_depth
     on_trade_tick = TargetQuantityStrategy.on_trade_tick
     on_order_filled = TargetQuantityStrategy.on_order_filled
+    on_order_canceled = TargetQuantityStrategy.on_order_canceled
     on_order_denied = TargetQuantityStrategy.on_order_denied
     on_order_rejected = TargetQuantityStrategy.on_order_rejected
     _handle_order_not_accepted = TargetQuantityStrategy._handle_order_not_accepted
+    _is_transient_sellable_denial = TargetQuantityStrategy._is_transient_sellable_denial
     _converge_to_target = TargetQuantityStrategy._converge_to_target
     _converge_to_target_locked = TargetQuantityStrategy._converge_to_target_locked
     _order_book_depth_logging_enabled = TargetQuantityStrategy._order_book_depth_logging_enabled
@@ -520,6 +522,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             timeout_secs=30.0,
         )
         strategy._sellable_exhausted = {}
+        strategy._recent_sell_cancel_ts = {}
         strategy._last_account_sizing_snapshot = None
         strategy.target_events = []
         strategy.order_events = []
@@ -1376,6 +1379,65 @@ class TargetQuantityStrategyTest(unittest.TestCase):
                 "client_order_id": "O-1",
                 "instrument_id": INST_A,
                 "reason": "QMT sellable volume is 400, requested SELL volume is 28300",
+            },
+        )()
+
+        strategy.on_order_denied(event)
+
+        self.assertEqual(strategy._sellable_exhausted, {str(INST_A): date(2026, 7, 2)})
+
+    def test_sellable_denial_after_own_sell_cancel_is_transient_not_latched(self) -> None:
+        # A sellable-position denial that lands shortly after this strategy
+        # cancels its own SELL for the same instrument is the broker
+        # freeze-release race: do NOT latch the instrument out for the day.
+        strategy = self.make_strategy()
+        canceled = FakeOrder(
+            client_order_id="O-cancel",
+            instrument_id=INST_A,
+            side=OrderSide.SELL,
+            quantity=Decimal("1800"),
+        )
+        strategy.cache.all_orders.append(canceled)
+        cancel_event = type(
+            "CanceledEvent",
+            (),
+            {"client_order_id": "O-cancel", "instrument_id": INST_A},
+        )()
+
+        strategy.on_order_canceled(cancel_event)
+        self.assertIn(str(INST_A), strategy._recent_sell_cancel_ts)
+
+        denied = type(
+            "DeniedEvent",
+            (),
+            {
+                "client_order_id": "O-resubmit",
+                "instrument_id": INST_A,
+                "reason": "BigQMT sellable volume is 0, requested SELL volume is 1800",
+            },
+        )()
+        strategy.on_order_denied(denied)
+
+        # Not latched — the periodic convergence is free to retry.
+        self.assertEqual(strategy._sellable_exhausted, {})
+
+    def test_sellable_denial_after_cancel_window_still_latches(self) -> None:
+        strategy = self.make_strategy()
+        # A self-cancel that is older than the retry window must not mask a
+        # genuine sellable exhaustion.
+        window_ns = int(
+            float(strategy.config.sellable_denial_retry_window_secs) * 1_000_000_000
+        )
+        strategy._recent_sell_cancel_ts[str(INST_A)] = (
+            strategy.clock.timestamp_ns() - window_ns - 1_000_000_000
+        )
+        event = type(
+            "DeniedEvent",
+            (),
+            {
+                "client_order_id": "O-1",
+                "instrument_id": INST_A,
+                "reason": "BigQMT sellable volume is 0, requested SELL volume is 1800",
             },
         )()
 

@@ -235,6 +235,12 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     initial_last_closes: dict[str, float] | None = None
     unfilled_timeout_secs: float = 60.0
     resubmit_check_interval_secs: float = 10.0
+    # A broker sellable-position denial that lands shortly after this strategy
+    # cancels its own sell for the same instrument is treated as a transient
+    # freeze-release race (the broker has not yet released the shares frozen by
+    # the just-canceled order) rather than day-long sellable exhaustion, so the
+    # periodic convergence retries instead of latching the instrument out.
+    sellable_denial_retry_window_secs: float = 30.0
     cash_buffer_percent: float = 0.01
     target_cash_buffer_percent: float = 0.05
     buy_offset_bps: float = 5.0
@@ -360,6 +366,11 @@ class TargetQuantityStrategy(Strategy):
         )
         self._full_tick_task: asyncio.Future[Any] | ConcurrentFuture[Any] | None = None
         self._sellable_exhausted: dict[str, date] = {}
+        # ts_event (ns) of this strategy's most recent SELL cancel, per instrument.
+        # Used to recognise a broker sellable-position denial that races the
+        # broker's freeze-release for the just-canceled order (see
+        # `_handle_order_not_accepted`).
+        self._recent_sell_cancel_ts: dict[str, int] = {}
         self._last_account_sizing_snapshot: str | None = None
         self.target_events: list[TargetQuantityTargetEvent] = []
         self.order_events: list[TargetQuantityOrderEvent] = []
@@ -897,6 +908,7 @@ class TargetQuantityStrategy(Strategy):
         self._depth_converged_today = False
         self._cancel_count_buy = {}
         self._cancel_count_sell = {}
+        self._recent_sell_cancel_ts = {}
         # New trading day: stale quote timestamps must not satisfy the exchange
         # window gate.
         if self._event_trading_date(self._last_quote_tick_ts_event) != trading_date:
@@ -1016,6 +1028,13 @@ class TargetQuantityStrategy(Strategy):
     def on_order_canceled(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
         self._forget_submitted_order(client_order_id)
+        # Record when we cancel our own SELL so a sellable-position denial that
+        # races the broker's freeze-release can be recognised as transient.
+        instrument_id_text = str(getattr(event, "instrument_id", ""))
+        if instrument_id_text:
+            order = self.cache.order(event.client_order_id)
+            if order is not None and order.side == OrderSide.SELL:
+                self._recent_sell_cancel_ts[instrument_id_text] = self.clock.timestamp_ns()
         self._converge_to_target(current_date=self._clock_date(), trigger="cancel")
 
     def on_order_denied(self, event: Any) -> None:
@@ -1043,6 +1062,17 @@ class TargetQuantityStrategy(Strategy):
             )
             return
         if _is_sellable_position_denial(reason):
+            if instrument_id_text and self._is_transient_sellable_denial(instrument_id_text):
+                # The shares are still frozen by our just-canceled sell; the broker
+                # has not released them yet. Do NOT latch `_sellable_exhausted`
+                # (which would block this instrument for the rest of the day) — let
+                # the periodic convergence retry once the freeze clears.
+                self.log.warning(
+                    f"Order {client_order_id} {instrument_id_text} denied for sellable-position "
+                    f"exhaustion shortly after our own sell cancel; treating as transient "
+                    f"freeze-release race and will retry. reason={reason}",
+                )
+                return
             if instrument_id_text:
                 self._sellable_exhausted[instrument_id_text] = self._clock_date()
             self.log.warning(
@@ -1052,6 +1082,23 @@ class TargetQuantityStrategy(Strategy):
             return
         if instrument_id_text:
             self._deferred_buys.pop(instrument_id_text, None)
+
+    def _is_transient_sellable_denial(self, instrument_id_text: str) -> bool:
+        """
+        True when a sellable-position denial for this instrument arrives within
+        `sellable_denial_retry_window_secs` of this strategy canceling its own
+        SELL for the same instrument — i.e. the broker's `can_use_volume` is
+        transiently 0 because the freeze from the just-canceled order has not
+        been released yet, not because the position is genuinely exhausted.
+        """
+        window_secs = float(self.config.sellable_denial_retry_window_secs)
+        if window_secs <= 0:
+            return False
+        cancel_ts = self._recent_sell_cancel_ts.get(instrument_id_text)
+        if cancel_ts is None:
+            return False
+        elapsed_ns = self.clock.timestamp_ns() - cancel_ts
+        return 0 <= elapsed_ns <= int(window_secs * 1_000_000_000)
 
     def _on_converge_timer(self, _event: Any) -> None:
         try:
