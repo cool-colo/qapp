@@ -1,0 +1,51 @@
+# Dashboard configuration — copy to web/config.yaml and fill in / point at env vars.
+#
+# web/config.yaml is gitignored. Values may be literals or ${ENV} / ${ENV:-default}
+# placeholders expanded from the process environment (a .env file at the repo root
+# is loaded automatically if present).
+#
+# `sources` is the list of named MySQL databases the UI can switch between. Each is a
+# separate deployment (e.g. 实盘 real-money vs 模拟盘 simulation) living in its own
+# database. Accounts (account_id, trader_id) within a source are auto-discovered from
+# the live_* tables — you do NOT list them here.
+
+sources:
+  - name: 模拟盘
+    mysql:
+      host: ${SIM_MYSQL_HOST:-127.0.0.1}
+      port: ${SIM_MYSQL_PORT:-3306}
+      user: ${SIM_MYSQL_USER:-root}
+      password: ${SIM_MYSQL_PASSWORD:-}
+      database: ${SIM_MYSQL_DATABASE:-quant_routine_test}
+
+  # Add the real-money deployment once its database exists. Delete this block if you
+  # only have one source.
+  - name: 实盘
+    mysql:
+      host: ${PROD_MYSQL_HOST:-127.0.0.1}
+      port: ${PROD_MYSQL_PORT:-3306}
+      user: ${PROD_MYSQL_USER:-root}
+      password: ${PROD_MYSQL_PASSWORD:-}
+      database: ${PROD_MYSQL_DATABASE:-quant_prod}
+
+# ClickHouse is shared across all sources (market data, not per-account). Reached over
+# its HTTP interface (port 8123) with stdlib urllib.
+clickhouse:
+  url: ${CLICKHOUSE_URL:-http://127.0.0.1:8123}
+  database: ${CLICKHOUSE_DATABASE:-}
+  user: ${CLICKHOUSE_USER:-default}
+  password: ${CLICKHOUSE_PASSWORD:-}
+  timeout_secs: 30
+
+# Optional: per-account start date for the 收益报表 (return report). The report's end
+# date is always today; its start date defaults to one month ago unless overridden here.
+# Key is "account_id/trader_id"; value is an ISO date.
+return_report_start:
+  # "66623901/BIGQMT-002": "2026-08-14"
+  # "86008933/BIGQMT-001": "2026-07-01"
+
+# Optional: accounts to hide from the UI. Each entry is "account_id/trader_id";
+# blocked accounts do not appear in the account drop-down.
+account_blacklist:
+  # - "86904088/BIGQMT-001"
+  # - "86904088/QMT-001"

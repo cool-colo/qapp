@@ -42,3 +42,7 @@ start_big_qmt_live_trading_3.sh
 start_bigqmt_full_tick_snapshot.sh
 .envs
 
+# Dashboard local config (real credentials) — use web/config.example.yaml as a template
+web/config.yaml
+web/compare_presets.json
+

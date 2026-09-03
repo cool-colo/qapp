@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>实盘监控 · Live Trading Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="layout">
+    <!-- ============ Sidebar ============ -->
+    <aside class="sidebar">
+      <div class="brand-row">
+        <div class="brand">实盘监控</div>
+        <button id="sidebar-toggle" class="side-toggle" title="收缩/展开">«</button>
+      </div>
+      <div class="side-selectors">
+        <label>数据源 <select id="sel-source"></select></label>
+        <label>账户 <select id="sel-account"></select></label>
+      </div>
+      <nav class="side-nav">
+        <button class="nav-item active" data-tab="snapshot">按日快照</button>
+        <button class="nav-item" data-tab="report">收益报表</button>
+        <button class="nav-item" data-tab="series">随时间</button>
+        <button class="nav-item" data-tab="compare">对比</button>
+        <button class="nav-item" data-tab="kline">个股 K 线</button>
+      </nav>
+    </aside>
+
+    <div class="content">
+      <!-- ============ Snapshot tab (with sub-tabs) ============ -->
+      <section id="tab-snapshot" class="tab-panel active">
+        <div class="subbar">
+          <div class="subtabs">
+            <button class="subtab active" data-sub="positions">持仓</button>
+            <button class="subtab" data-sub="asset">资产</button>
+            <button class="subtab" data-sub="target">目标组合</button>
+            <button class="subtab" data-sub="orders">委托</button>
+            <button class="subtab" data-sub="trades">成交</button>
+          </div>
+          <div class="subbar-controls">
+            <label>日期 <select id="snap-date"></select></label>
+            <label>阶段
+              <select id="snap-phase">
+                <option value="after_trading">after_trading</option>
+                <option value="before_trading">before_trading</option>
+                <option value="continuous_trading">continuous_trading</option>
+                <option value="">(全部)</option>
+              </select>
+            </label>
+            <button id="snap-refresh">刷新</button>
+            <label class="inline"><input type="checkbox" id="snap-auto" /> 自动刷新(15s)</label>
+          </div>
+        </div>
+        <div id="snap-positions" class="sub-panel active table-wrap"></div>
+        <div id="snap-asset" class="sub-panel table-wrap"></div>
+        <div id="snap-target" class="sub-panel table-wrap"></div>
+        <div id="snap-orders" class="sub-panel table-wrap"></div>
+        <div id="snap-trades" class="sub-panel table-wrap"></div>
+      </section>
+
+      <!-- ============ Return report tab ============ -->
+      <section id="tab-report" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <label>起 <input type="date" id="report-start" /></label>
+            <label>止 <input type="date" id="report-end" /></label>
+            <button id="report-refresh">刷新</button>
+            <span class="hint">默认止=今天，起=账户配置值或一个月前</span>
+          </div>
+        </div>
+        <div id="report-table" class="table-wrap"></div>
+      </section>
+
+      <!-- ============ Time series tab ============ -->
+      <section id="tab-series" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <label>数据类型
+              <select id="series-dataset">
+                <option value="asset">资产快照</option>
+                <option value="returns">收益/滑点报表</option>
+              </select>
+            </label>
+            <label>指标 <select id="series-metric"></select></label>
+            <label>起 <input type="date" id="series-start" /></label>
+            <label>止 <input type="date" id="series-end" /></label>
+            <button id="series-plot">绘制</button>
+          </div>
+        </div>
+        <div id="series-chart" class="chart"></div>
+      </section>
+
+      <!-- ============ Comparison tab ============ -->
+      <section id="tab-compare" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <label>起 <input type="date" id="cmp-start" /></label>
+            <label>止 <input type="date" id="cmp-end" /></label>
+            <button id="cmp-plot">绘制</button>
+          </div>
+        </div>
+
+        <div class="cmp-body">
+          <div class="cmp-left">
+            <h4>已保存对比</h4>
+            <ul id="cmp-saved" class="saved-list"></ul>
+          </div>
+          <div class="cmp-right">
+            <div class="series-builder">
+              <div class="builder-row">
+                <select class="cmp-source"></select>
+                <select class="cmp-account"></select>
+                <select class="cmp-dataset">
+                  <option value="asset">资产</option>
+                  <option value="returns">收益报表</option>
+                </select>
+                <select class="cmp-metric"></select>
+                <button class="cmp-add">+ 添加序列</button>
+              </div>
+              <ul id="cmp-list"></ul>
+              <div class="save-row">
+                <input type="text" id="cmp-name" placeholder="对比名称" />
+                <button id="cmp-save">保存当前对比</button>
+              </div>
+            </div>
+            <div id="cmp-chart" class="chart"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ K-line tab ============ -->
+      <section id="tab-kline" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <label>股票代码 <input type="text" id="kline-code" placeholder="000001.SZ" /></label>
+            <label>起 <input type="date" id="kline-start" /></label>
+            <label>止 <input type="date" id="kline-end" /></label>
+            <label class="inline"><input type="checkbox" id="kline-marks" checked /> 显示买卖点</label>
+            <button id="kline-plot">绘制</button>
+          </div>
+        </div>
+        <div id="kline-chart" class="chart chart-tall"></div>
+      </section>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

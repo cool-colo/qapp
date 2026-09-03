@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS `live_stock_tick_snapshot` (
   `snapshot_type`         VARCHAR(24)   NOT NULL,
   `instrument_id`         VARCHAR(32)   NOT NULL,
   `stock_code`            VARCHAR(16)   NOT NULL,
+  `name`                  VARCHAR(64)   NULL,
   `market_status`         VARCHAR(24)   NULL,
   `last_price`            DECIMAL(20,4) NULL,
   `open`                  DECIMAL(20,4) NULL,
@@ -406,6 +407,7 @@ class LiveSnapshotWriter:
         self._ensure_position_columns()
         self._ensure_order_columns()
         self._ensure_trade_columns()
+        self._ensure_stock_tick_columns()
         self._ensure_target_indexes()
 
     def create_target_table(self) -> None:
@@ -480,6 +482,33 @@ class LiveSnapshotWriter:
             try:
                 self._execute(
                     f"ALTER TABLE `live_position_snapshot` ADD COLUMN `{column}` {ddl}",
+                    (),
+                )
+            except Exception:
+                # Concurrent add or insufficient privilege — leave as-is.
+                pass
+
+    def _ensure_stock_tick_columns(self) -> None:
+        """
+        Add tick-snapshot columns introduced after the initial
+        live_stock_tick_snapshot deployment. Best-effort only.
+        """
+        additions = {
+            "name": "VARCHAR(64) NULL",
+        }
+        try:
+            existing = {
+                str(row[0])
+                for row in self._query("SHOW COLUMNS FROM `live_stock_tick_snapshot`", ())
+            }
+        except Exception:
+            return
+        for column, ddl in additions.items():
+            if column in existing:
+                continue
+            try:
+                self._execute(
+                    f"ALTER TABLE `live_stock_tick_snapshot` ADD COLUMN `{column}` {ddl}",
                     (),
                 )
             except Exception:
@@ -1134,6 +1163,7 @@ class LiveSnapshotWriter:
             "snapshot_type": record.snapshot_type,
             "instrument_id": record.instrument_id,
             "stock_code": record.stock_code,
+            "name": record.name,
             "market_status": record.market_status,
             "last_price": record.last_price,
             "open": record.open,

@@ -57,6 +57,16 @@ from backtests.result_writers.live_records import LiveTradeRecord
 SyncTaskCallback = Callable[[str, int, dict[str, Any]], None]
 
 
+# Benchmark index codes are included in the after-trading tick snapshot for
+# reference but are not `沪深京A股` members, so the QMT InstrumentProvider never
+# loads them into the cache. Supply their names here so the `name` column is
+# populated for index rows. Keyed by the stock_code form stored in the snapshot.
+_INDEX_NAME_BY_STOCK_CODE: dict[str, str] = {
+    "399852.SZ": "中证1000",
+    "000985.CSI": "中证全指",
+}
+
+
 class SnapshotRecorderConfig(ActorConfig, frozen=True):
     account_id: str
     trader_id: str
@@ -1626,6 +1636,10 @@ class SnapshotRecorder(Actor):
                     snapshot_type=AFTER_TRADING,
                     instrument_id=instrument_id_text,
                     stock_code=self._stock_code(instrument_id_text),
+                    name=self._instrument_name(
+                        instrument_id_text,
+                        self._stock_code(instrument_id_text),
+                    ),
                     market_status=(
                         None if tick.market_status is None else tick.market_status.name
                     ),
@@ -1764,6 +1778,31 @@ class SnapshotRecorder(Actor):
         except (ValueError, TypeError):
             head, _, _ = text.rpartition(".")
             return (head or text).upper()
+
+    def _instrument_name(
+        self,
+        instrument_id_text: str,
+        stock_code: str,
+    ) -> str | None:
+        # Primary source: the Nautilus instrument cache, populated by the QMT
+        # InstrumentProvider from `InstrumentName` (info["name"] never null for a
+        # loaded instrument — degrades to the symbol). Covers every tradable
+        # A-share under the default load_all=True.
+        try:
+            instrument = self.cache.instrument(InstrumentId.from_str(instrument_id_text))
+        except (ValueError, TypeError):
+            instrument = None
+        if instrument is not None:
+            info = instrument.info
+            if isinstance(info, dict):
+                name = info.get("name")
+                if name:
+                    return str(name)
+        # Fallback: benchmark index rows are not in the cache.
+        index_name = _INDEX_NAME_BY_STOCK_CODE.get(stock_code)
+        if index_name:
+            return index_name
+        return None
 
     def _strategy_last_close(self, instrument_id_text: str) -> float | None:
         closes = getattr(self._strategy, "_last_close", None)

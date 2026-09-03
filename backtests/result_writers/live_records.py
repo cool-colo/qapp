@@ -89,6 +89,7 @@ class LiveStockTickSnapshotRecord:
     snapshot_type: str
     instrument_id: str
     stock_code: str
+    name: str | None = None
     market_status: str | None = None
     last_price: Decimal | None = None
     open: Decimal | None = None
