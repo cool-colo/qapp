@@ -12,13 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from web import compare_presets
 from web.config import AppConfig, load_config
-from web.db import DataAccess, MySqlSource, jsonable_rows, quote_literal
+from web.db import DataAccess, MySqlSource, NodeApiClient, jsonable_rows, quote_literal
 from web.returns_report import (
     RETURN_COLUMNS,
     derive_instrument_suffix,
@@ -29,6 +29,14 @@ from web.returns_report import (
 class ComparePreset(BaseModel):
     name: str
     series: list[dict[str, Any]]
+
+
+class SellRequest(BaseModel):
+    account: str
+    trader: str
+    stock_code: str | None = None
+    instrument_id: str | None = None
+
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SNAPSHOT_TYPES = {"before_trading", "continuous_trading", "after_trading"}
@@ -59,6 +67,16 @@ def _mysql(data: DataAccess, source: str) -> MySqlSource:
         return data.mysql(source)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"unknown source: {source!r}") from None
+
+
+def _node_api(data: DataAccess, account: str, trader: str) -> NodeApiClient:
+    client = data.node_api(account, trader)
+    if client is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"account {account}/{trader} has no node_api configured",
+        )
+    return client
 
 
 def _check_snapshot_type(snapshot_type: str | None) -> None:
@@ -107,6 +125,9 @@ def list_accounts(
                 "instrument_suffix": derive_instrument_suffix(mysql, account_id, trader_id),
                 "report_start": report_start,
                 "report_end": today,
+                # Whether this account has a live-node control API configured — the
+                # frontend uses it to enable/disable the realtime/control tabs.
+                "has_node_api": cfg.node_api_for(account_id, trader_id) is not None,
             },
         )
     return {"accounts": accounts}
@@ -471,12 +492,115 @@ def delete_compare_preset(name: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+# ---- live-node realtime + control proxy ------------------------------------
+# These proxy to the per-account live node's control API (one node per account).
+# The node's token (if any) stays server-side; the browser only ever talks to this
+# dashboard. Endpoints key on account_id/trader_id, not source, because each account
+# runs its own node.
+
+
+@app.get("/api/realtime/positions")
+def realtime_positions(
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    client = _node_api(data, account, trader)
+    try:
+        payload = client.get("/realtime/positions")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    positions = payload.get("positions") or []
+    # Fill 证券名称 from ClickHouse when the node could not resolve a name.
+    positions = data.attach_names(positions)
+    for row in positions:
+        if not row.get("name"):
+            row["name"] = row.get("stock_name") or ""
+    return {"positions": positions, "asset": payload.get("asset") or {}}
+
+
+@app.get("/api/control/state")
+def control_state(
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    client = _node_api(data, account, trader)
+    try:
+        return client.get("/control/state")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/control/suspend")
+def control_suspend(
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    return _control_post(data, account, trader, "/control/suspend")
+
+
+@app.post("/api/control/resume")
+def control_resume(
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    return _control_post(data, account, trader, "/control/resume")
+
+
+@app.post("/api/control/sell_all")
+def control_sell_all(
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    return _control_post(data, account, trader, "/control/sell_all")
+
+
+@app.post("/api/control/sell")
+def control_sell(
+    body: SellRequest,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    node_body: dict[str, Any] = {}
+    if body.instrument_id:
+        node_body["instrument_id"] = body.instrument_id
+    if body.stock_code:
+        node_body["stock_code"] = body.stock_code
+    return _control_post(data, body.account, body.trader, "/control/sell", node_body)
+
+
+def _control_post(
+    data: DataAccess,
+    account: str,
+    trader: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    client = _node_api(data, account, trader)
+    try:
+        return client.post(path, body)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 # ---- static frontend -------------------------------------------------------
 
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+def index() -> HTMLResponse:
+    # Inject a cache-busting ?v=<mtime> onto the local JS/CSS so a browser never
+    # serves a stale bundle after a deploy (index.html itself is returned no-store).
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    for asset in ("app.js", "style.css"):
+        try:
+            ver = int((STATIC_DIR / asset).stat().st_mtime)
+        except OSError:
+            continue
+        html = html.replace(f'"/{asset}"', f'"/{asset}?v={ver}"')
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
 app.mount("/", StaticFiles(directory=str(STATIC_DIR)), name="static")

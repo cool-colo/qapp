@@ -202,6 +202,23 @@ def parse_args() -> argparse.Namespace:
         default=env("MODEL_STATUS_ADDR", "0.0.0.0"),
         help="Bind address for the health status HTTP server.",
     )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=int(env("MODEL_CONTROL_PORT", "9300")),
+        help="In-process trading-control HTTP port (lives.control_server). Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--control-addr",
+        default=env("MODEL_CONTROL_ADDR", "0.0.0.0"),
+        help="Bind address for the trading-control HTTP server.",
+    )
+    parser.add_argument(
+        "--control-token",
+        default=env("MODEL_CONTROL_TOKEN", None),
+        help="Shared token required in the X-Control-Token header for control writes. "
+        "If unset, all control writes are rejected (fail-safe).",
+    )
     parser.add_argument("--signal-warmup-days", type=int, default=int(env("MODEL_SIGNAL_WARMUP_DAYS", "7")))
     parser.add_argument("--max-universe", type=int, default=int(env("MODEL_MAX_UNIVERSE", "0")))
     parser.add_argument(

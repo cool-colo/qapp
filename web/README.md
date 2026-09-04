@@ -68,6 +68,20 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/returns` | `source, account, trader, start, end, instrument_suffix?` |
 | `GET /api/kline` | `stock_code, start, end` |
 | `GET /api/kline_with_trades` | `source, account, trader, stock_code, start, end` |
+| `GET /api/realtime/positions` | `account, trader` |
+| `GET /api/control/state` | `account, trader` |
+| `POST /api/control/suspend` | `account, trader` |
+| `POST /api/control/resume` | `account, trader` |
+| `POST /api/control/sell_all` | `account, trader` |
+| `POST /api/control/sell` | body: `{account, trader, stock_code}` |
+
+The `realtime/*` and `control/*` endpoints proxy to the **per-account** live-node
+control API. Each account (`account_id/trader_id`) runs its own live node (qapp) with
+its own `--control-port`, so the node URL is configured under the top-level `node_api:`
+map keyed by `"account_id/trader_id"` (**not** per source) — see `config.example.yaml`.
+The node's `X-Control-Token` stays server-side. `GET /api/accounts` returns a
+`has_node_api` flag per account so the UI enables the 实时信息 / 交易管理 tabs only for
+accounts that have a node configured.
 
 ## Security note
 

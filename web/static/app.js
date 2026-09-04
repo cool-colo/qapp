@@ -14,6 +14,33 @@ function toast(msg) {
   toast._t = setTimeout(() => el.classList.remove("show"), 4000);
 }
 
+// A styled modal confirm — resolves true (confirm) / false (cancel/backdrop/Esc).
+// Replaces window.confirm for a cleaner look. Supports HTML body + danger style.
+function confirmDialog({ title = "请确认", bodyHtml = "", okText = "确定", cancelText = "取消", danger = false } = {}) {
+  return new Promise((resolve) => {
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.innerHTML =
+      `<div class="modal" role="dialog" aria-modal="true">
+         <div class="modal-title">${title}</div>
+         <div class="modal-body">${bodyHtml}</div>
+         <div class="modal-actions">
+           <button class="ghost modal-cancel">${cancelText}</button>
+           <button class="${danger ? "danger" : ""} modal-ok">${okText}</button>
+         </div>
+       </div>`;
+    document.body.appendChild(back);
+    const done = (val) => { window.removeEventListener("keydown", onKey); back.remove(); resolve(val); };
+    const onKey = (e) => { if (e.key === "Escape") done(false); if (e.key === "Enter") done(true); };
+    back.querySelector(".modal-ok").addEventListener("click", () => done(true));
+    back.querySelector(".modal-cancel").addEventListener("click", () => done(false));
+    back.addEventListener("mousedown", (e) => { if (e.target === back) done(false); });
+    window.addEventListener("keydown", onKey);
+    requestAnimationFrame(() => back.classList.add("show"));
+    back.querySelector(".modal-ok").focus();
+  });
+}
+
 async function api(path, params, opts = {}) {
   const url = new URL(path, window.location.origin);
   Object.entries(params || {}).forEach(([k, v]) => {
@@ -38,6 +65,7 @@ function fmt(v) {
 }
 function pct(v) {
   if (v === null || v === undefined || v === "") return "";
+  if (typeof v !== "number") return String(v);  // sentinel like "-"
   return (v * 100).toFixed(2) + "%";
 }
 function todayISO() { return new Date().toISOString().slice(0, 10); }
@@ -114,6 +142,8 @@ function refreshActiveTab() {
   else if (tab === "series") { if ($("#series-start").value && $("#series-end").value) $("#series-plot").click(); }
   else if (tab === "compare") { if (cmpSeries.length) plotCompare(); }
   else if (tab === "kline") { if ($("#kline-code").value.trim()) plotKline(); }
+  else if (tab === "realtime") loadRealtime();
+  else if (tab === "control") loadControl();
 }
 
 // ---------------------------------------------------------------------------
@@ -121,11 +151,16 @@ function refreshActiveTab() {
 // ---------------------------------------------------------------------------
 $$(".nav-item").forEach((btn) => {
   btn.addEventListener("click", () => {
+    // Fold every group, then open only the one this item belongs to (if any).
+    const group = btn.closest(".nav-group");
+    $$(".nav-group").forEach((g) => g.classList.toggle("open", g === group));
     $$(".nav-item").forEach((b) => b.classList.remove("active"));
     $$(".tab-panel").forEach((p) => p.classList.remove("active"));
     btn.classList.add("active");
     $(`#tab-${btn.dataset.tab}`).classList.add("active");
     if (btn.dataset.tab === "report") loadReport();
+    else if (btn.dataset.tab === "realtime") loadRealtime();
+    else if (btn.dataset.tab === "control") loadControl();
     setTimeout(resizeCharts, 0);
   });
 });
@@ -147,9 +182,69 @@ $("#sidebar-toggle").addEventListener("click", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Table renderer
+// Table renderer — with per-column click-to-sort + a per-column filter row.
 // ---------------------------------------------------------------------------
-// opts: { columns, linkStock, signCols, headers, intCols, weekBandCol, footerRow, footerRowClass }
+// opts: { columns, linkStock, signCols, headers, intCols, rateCols, weekBandCol,
+//         footerRow, footerFn, footerRowClass, cellFn, noSort, noFilter, onRender }
+//   footerFn(visibleRows) -> rowObject|null   dynamic footer recomputed per view
+//   cellFn(col, value, row) -> tdHtml|undefined   per-cell override (undefined = default)
+//   rateCols: Set of columns formatted as percentages
+//   noSort / noFilter: Sets of columns excluded from sort / filter
+//   onRender(el): called after every (re)draw so callers can (re)bind handlers
+function isNumericColFor(c, opts) {
+  return isNumericCol(c)
+    || (opts.intCols && opts.intCols.has(c))
+    || (opts.rateCols && opts.rateCols.has(c))
+    || RATE_COLS.has(c);
+}
+
+// The string a cell displays — shared by the cell renderer and the filter so
+// what you type against matches what you see.
+function cellDisplay(c, v, opts) {
+  if (RATE_COLS.has(c) || (opts.rateCols && opts.rateCols.has(c))) return pct(v);
+  if (opts.intCols && opts.intCols.has(c) && typeof v === "number") return Math.round(v).toLocaleString();
+  return fmt(v);
+}
+
+// A column's filter is an object { text, values }:
+//   text   — substring / numeric-comparator query ("" = no text filter)
+//   values — Set of chosen displayed-string keys, or null for "all values"
+// A column is "active" when it has text or a value-set.
+function filterActive(f) {
+  return !!f && ((f.text && f.text.trim()) || f.values !== null && f.values !== undefined);
+}
+
+// Match the free-text part. Numeric columns honor >,>=,<,<=,= prefixes;
+// everything else is a case-insensitive substring on the displayed string.
+function passesText(c, v, text, opts) {
+  const q = (text || "").trim();
+  if (!q) return true;
+  if (isNumericColFor(c, opts) && typeof v === "number") {
+    const m = q.match(/^(>=|<=|>|<|=)\s*(-?\d[\d,]*\.?\d*)$/);
+    if (m) {
+      const n = parseFloat(m[2].replace(/,/g, ""));
+      if (!isNaN(n)) {
+        switch (m[1]) {
+          case ">": return v > n;
+          case ">=": return v >= n;
+          case "<": return v < n;
+          case "<=": return v <= n;
+          case "=": return v === n;
+        }
+      }
+    }
+  }
+  return cellDisplay(c, v, opts).toLowerCase().includes(q.toLowerCase());
+}
+
+// Row passes a column filter iff it's within the chosen value-set (or all) AND
+// matches the free-text query.
+function passesFilter(c, v, f, opts) {
+  if (!filterActive(f)) return true;
+  if (f.values !== null && f.values !== undefined && !f.values.has(cellDisplay(c, v, opts))) return false;
+  return passesText(c, v, f.text, opts);
+}
+
 function renderTable(container, rows, opts = {}) {
   const el = $(container);
   if (!rows || rows.length === 0) { el.innerHTML = '<div class="empty">无数据</div>'; return; }
@@ -157,20 +252,32 @@ function renderTable(container, rows, opts = {}) {
   const linkStock = opts.linkStock;
   const signCols = opts.signCols;
   const headers = opts.headers || {};
-  const intCols = opts.intCols;
   const weekBandCol = opts.weekBandCol;
+  const noSort = opts.noSort || new Set();
+  const noFilter = opts.noFilter || new Set();
 
-  const head = cols.map((c) =>
-    `<th class="${isNumericCol(c) ? "" : "text"}">${headers[c] || c}</th>`).join("");
+  // Persist sort/filter state across redraws so re-sorting keeps prior filters
+  // and vice-versa. Re-render (new data) resets neither col choice nor filters.
+  const prev = el._tableState || {};
+  // Default sort applies only on first render (no prior user choice persisted).
+  const ds = opts.defaultSort || {};
+  const state = {
+    rows, opts, cols,
+    sortCol: prev.sortCol || ds.col || null,
+    sortDir: prev.sortDir || ds.dir || null,
+    filters: prev.filters || {},
+  };
+  el._tableState = state;
 
-  // Build one <td> for column `c` with value `v`, reusing the shared formatting
-  // rules. `allowLink` gates the K-line link (footer/summary cells never link).
+  // Build one <td> for column `c`. `allowLink` gates the K-line link (footer
+  // cells never link). `cellFn` may fully override a cell (e.g. action button).
   function cellHtml(c, v, row, allowLink) {
-    let cls = isNumericCol(c) ? "" : "text";
-    let disp;
-    if (RATE_COLS.has(c)) disp = pct(v);
-    else if (intCols && intCols.has(c) && typeof v === "number") disp = Math.round(v).toLocaleString();
-    else disp = fmt(v);
+    if (opts.cellFn) {
+      const custom = opts.cellFn(c, v, row);
+      if (custom !== undefined) return custom;
+    }
+    let cls = isNumericColFor(c, opts) ? "" : "text";
+    let disp = cellDisplay(c, v, opts);
     const wantSign = signCols ? signCols.has(c)
       : (c.includes("pnl") || c.includes("rate") || c.includes("excess"));
     if (wantSign) cls += signClass(v);
@@ -181,29 +288,228 @@ function renderTable(container, rows, opts = {}) {
     return `<td class="${cls}">${disp}</td>`;
   }
 
-  // Alternating background per adjacent week group (band 0 / band 1).
-  let band = 0, prevWeek = null;
-  const body = rows.map((row) => {
-    let rowCls = "";
-    if (weekBandCol) {
-      const w = row[weekBandCol];
-      if (prevWeek !== null && w !== prevWeek) band ^= 1;
-      prevWeek = w;
-      rowCls = band ? " wk-band" : "";
-    }
-    const tds = cols.map((c) => cellHtml(c, row[c], row, true));
-    return `<tr class="${rowCls}">${tds.join("")}</tr>`;
+  // ---- header row: label + sort caret + a hover/active filter funnel icon ----
+  const FUNNEL = '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path fill="currentColor" d="M1.5 2h13l-5 6v5l-3 1.5V8z"/></svg>';
+  const headCells = cols.map((c) => {
+    const numeric = isNumericColFor(c, opts);
+    const sortable = !noSort.has(c);
+    const label = headers[c] || c;
+    const caret = sortable ? '<span class="sort-caret"></span>' : "";
+    const funnel = !noFilter.has(c)
+      ? `<button class="filter-btn" data-filter-col="${c}" title="筛选">${FUNNEL}</button>` : "";
+    const dataCol = sortable ? ` data-col="${c}"` : "";
+    const role = sortable ? ' role="button"' : "";
+    return `<th class="${numeric ? "" : "text"}"${dataCol}${role}><span class="th-label">${label}${caret}</span>${funnel}</th>`;
   }).join("");
+  el.innerHTML =
+    `<table><thead><tr class="head-row">${headCells}</tr></thead>` +
+    `<tbody></tbody><tfoot></tfoot></table>`;
+  const table = el.querySelector("table");
 
-  let foot = "";
-  if (opts.footerRow) {
+  function draw() {
+    // 1. filter
+    let view = state.rows.filter((row) =>
+      cols.every((c) => (state.filters[c] ? passesFilter(c, row[c], state.filters[c], opts) : true)));
+    // 2. sort (nulls/blanks always to the bottom)
+    if (state.sortCol) {
+      const c = state.sortCol, dir = state.sortDir === "desc" ? -1 : 1;
+      const numeric = isNumericColFor(c, opts);
+      const isEmpty = (x) => x === null || x === undefined || x === "" || (numeric && x === "-");
+      view = view.slice().sort((ra, rb) => {
+        const a = ra[c], b = rb[c];
+        if (isEmpty(a) && isEmpty(b)) return 0;
+        if (isEmpty(a)) return 1;
+        if (isEmpty(b)) return -1;
+        if (numeric) return (Number(a) - Number(b)) * dir;
+        return String(a).localeCompare(String(b)) * dir;
+      });
+    }
+    // 3. body (+ week bands over the visible rows)
+    let band = 0, prevWeek = null;
+    table.querySelector("tbody").innerHTML = view.map((row) => {
+      let rowCls = "";
+      if (weekBandCol) {
+        const w = row[weekBandCol];
+        if (prevWeek !== null && w !== prevWeek) band ^= 1;
+        prevWeek = w;
+        rowCls = band ? " wk-band" : "";
+      }
+      if (opts.rowClass) {
+        const extra = opts.rowClass(row);
+        if (extra) rowCls += " " + extra;
+      }
+      return `<tr class="${rowCls}">${cols.map((c) => cellHtml(c, row[c], row, true)).join("")}</tr>`;
+    }).join("");
+    // 4. footer (recomputed from the visible rows when a footerFn is given)
+    const footerRow = opts.footerFn ? opts.footerFn(view) : opts.footerRow;
     const fcls = opts.footerRowClass || "sum-row";
-    const ftds = cols.map((c) => cellHtml(c, opts.footerRow[c], opts.footerRow, false));
-    foot = `<tfoot><tr class="${fcls}">${ftds.join("")}</tr></tfoot>`;
+    table.querySelector("tfoot").innerHTML = footerRow
+      ? `<tr class="${fcls}">${cols.map((c) => cellHtml(c, footerRow[c], footerRow, false)).join("")}</tr>`
+      : "";
+    // 5. sort carets
+    table.querySelectorAll("th[data-col]").forEach((th) => {
+      const caret = th.querySelector(".sort-caret");
+      if (!caret) return;
+      const active = th.dataset.col === state.sortCol;
+      th.classList.toggle("sorted", active);
+      caret.textContent = active ? (state.sortDir === "desc" ? " ▼" : " ▲") : "";
+    });
+    // 5b. keep the funnel lit on columns that have an active filter
+    table.querySelectorAll("th .filter-btn").forEach((btn) => {
+      btn.parentElement.classList.toggle("has-filter", filterActive(state.filters[btn.dataset.filterCol]));
+    });
+    // 6. rebind row-level handlers (klinks always; caller extras via onRender)
+    el.querySelectorAll("a.klink").forEach((a) => a.addEventListener("click", () => openKline(a.dataset.code)));
+    if (opts.onRender) opts.onRender(el);
   }
 
-  el.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody>${foot}</table>`;
-  el.querySelectorAll("a.klink").forEach((a) => a.addEventListener("click", () => openKline(a.dataset.code)));
+  // Header click → asc → desc → clear. Clicks on the funnel are excluded so
+  // opening the filter dialog never re-sorts the column.
+  table.querySelectorAll("th[data-col]").forEach((th) => {
+    th.addEventListener("click", (e) => {
+      if (e.target.closest(".filter-btn")) return;
+      const c = th.dataset.col;
+      if (state.sortCol !== c) { state.sortCol = c; state.sortDir = "asc"; }
+      else if (state.sortDir === "asc") state.sortDir = "desc";
+      else { state.sortCol = null; state.sortDir = null; }
+      draw();
+    });
+  });
+  // Funnel icon → filter dialog for that column.
+  table.querySelectorAll(".filter-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openFilterPopup(btn.closest("th"), btn.dataset.filterCol, state, opts, draw);
+    });
+  });
+
+  draw();
+}
+
+// ---------------------------------------------------------------------------
+// Column filter dialog — a single reusable floating popup (Excel-style):
+// a distinct-value checklist plus a free-text / comparator box.
+// ---------------------------------------------------------------------------
+let _fpEl = null;      // the shared popup element
+let _fpClose = null;   // active close handler (outside-click / esc / scroll)
+
+function closeFilterPopup() {
+  if (_fpEl) _fpEl.style.display = "none";
+  if (_fpClose) {
+    document.removeEventListener("mousedown", _fpClose, true);
+    document.removeEventListener("keydown", _fpClose, true);
+    window.removeEventListener("scroll", _fpClose, true);
+    window.removeEventListener("resize", _fpClose, true);
+    _fpClose = null;
+  }
+}
+
+function openFilterPopup(th, col, state, opts, draw) {
+  closeFilterPopup();
+  if (!_fpEl) {
+    _fpEl = document.createElement("div");
+    _fpEl.className = "filter-popup";
+    document.body.appendChild(_fpEl);
+  }
+  const cur = state.filters[col] || { text: "", values: null };
+
+  // Distinct displayed values from the full (unfiltered) row set.
+  const seen = new Set();
+  const distinct = [];
+  for (const r of state.rows) {
+    const disp = cellDisplay(col, r[col], opts);
+    if (disp === "" || seen.has(disp)) continue;
+    seen.add(disp);
+    distinct.push({ key: disp, raw: r[col] });
+  }
+  const numeric = isNumericColFor(col, opts);
+  distinct.sort((a, b) =>
+    numeric && typeof a.raw === "number" && typeof b.raw === "number"
+      ? a.raw - b.raw : a.key.localeCompare(b.key));
+
+  const checked = cur.values; // Set or null(=all)
+  _fpEl.innerHTML =
+    `<input class="fp-text" placeholder="如 >1000 或 文字" value="${(cur.text || "").replace(/"/g, "&quot;")}">` +
+    `<input class="fp-search" placeholder="搜索选项">` +
+    `<label class="fp-all"><input type="checkbox" class="fp-all-cb"> (全选)</label>` +
+    `<div class="fp-list">` +
+    distinct.map((d, i) =>
+      `<label data-key="${encodeURIComponent(d.key)}"><input type="checkbox" class="fp-cb" data-i="${i}"` +
+      `${checked === null || checked.has(d.key) ? " checked" : ""}> ${d.key}</label>`).join("") +
+    `</div>` +
+    `<div class="fp-actions">` +
+    `<button class="fp-clear">清除</button>` +
+    `<button class="fp-cancel">取消</button>` +
+    `<button class="fp-ok">确定</button>` +
+    `</div>`;
+
+  // Position under the header, clamped to the viewport.
+  _fpEl.style.display = "block";
+  const r = th.getBoundingClientRect();
+  const w = _fpEl.offsetWidth, h = _fpEl.offsetHeight;
+  let left = Math.min(r.left, window.innerWidth - w - 8);
+  let top = r.bottom + 2;
+  if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 2);
+  _fpEl.style.left = Math.max(8, left) + "px";
+  _fpEl.style.top = top + "px";
+
+  const boxes = () => Array.from(_fpEl.querySelectorAll(".fp-cb"));
+  const allCb = _fpEl.querySelector(".fp-all-cb");
+  const syncAll = () => {
+    const vis = boxes().filter((b) => b.closest("label").style.display !== "none");
+    const on = vis.filter((b) => b.checked).length;
+    allCb.checked = on === vis.length && vis.length > 0;
+    allCb.indeterminate = on > 0 && on < vis.length;
+  };
+  syncAll();
+
+  allCb.addEventListener("change", () => {
+    boxes().forEach((b) => { if (b.closest("label").style.display !== "none") b.checked = allCb.checked; });
+  });
+  boxes().forEach((b) => b.addEventListener("change", syncAll));
+
+  // In-popup search narrows the checklist (not the table).
+  _fpEl.querySelector(".fp-search").addEventListener("input", (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    _fpEl.querySelectorAll(".fp-list label").forEach((lab) => {
+      const key = decodeURIComponent(lab.dataset.key).toLowerCase();
+      lab.style.display = key.includes(q) ? "" : "none";
+    });
+    syncAll();
+  });
+
+  const apply = () => {
+    const text = _fpEl.querySelector(".fp-text").value;
+    const on = boxes().filter((b) => b.checked).map((b) => distinct[Number(b.dataset.i)].key);
+    // All checked → "all" (null) so we don't carry a redundant full set.
+    const values = on.length === distinct.length ? null : new Set(on);
+    state.filters[col] = { text, values };
+    closeFilterPopup();
+    draw();
+  };
+  _fpEl.querySelector(".fp-ok").addEventListener("click", apply);
+  _fpEl.querySelector(".fp-text").addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
+  _fpEl.querySelector(".fp-clear").addEventListener("click", () => {
+    state.filters[col] = { text: "", values: null };
+    closeFilterPopup();
+    draw();
+  });
+  _fpEl.querySelector(".fp-cancel").addEventListener("click", closeFilterPopup);
+
+  _fpEl.querySelector(".fp-text").focus();
+
+  // Dismiss on outside-click, Esc, or scroll/resize (position would drift).
+  _fpClose = (e) => {
+    if (e.type === "keydown" && e.key !== "Escape") return;
+    if (e.type === "mousedown" && _fpEl.contains(e.target)) return;
+    closeFilterPopup();
+  };
+  setTimeout(() => {
+    document.addEventListener("mousedown", _fpClose, true);
+    document.addEventListener("keydown", _fpClose, true);
+    window.addEventListener("scroll", _fpClose, true);
+    window.addEventListener("resize", _fpClose, true);
+  }, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -310,16 +616,15 @@ async function loadReport() {
   if (!start) { toast("请设置起始日期"); return; }
   try {
     const { columns, rows } = await api("/api/returns", { ...accountParams(), start, end });
-    // Drop rows lacking both盘前/盘后 market values.
-    const kept = rows.filter((r) =>
-      r.before_market_value != null && r.after_market_value != null);
-    renderTable("#report-table", kept, {
+    // Row filtering (drop dates lacking both 盘前/盘后 market values) is done in
+    // SQL so the weekly cumulative columns stay consistent with the visible rows.
+    renderTable("#report-table", rows, {
       columns,
       headers: REPORT_HEADERS,
       signCols: REPORT_SIGN_COLS,
       intCols: REPORT_INT_COLS,
       weekBandCol: "week_label",
-      footerRow: buildReportSummary(kept),
+      footerFn: buildReportSummary,
     });
   } catch (e) { toast(e.message); }
 }
@@ -556,6 +861,7 @@ function openKline(stockCode) {
   } else {
     defaultKlineRange();
   }
+  $$(".nav-group").forEach((g) => g.classList.remove("open"));
   $$(".nav-item").forEach((b) => b.classList.remove("active"));
   $$(".tab-panel").forEach((p) => p.classList.remove("active"));
   document.querySelector('.nav-item[data-tab="kline"]').classList.add("active");
@@ -706,6 +1012,163 @@ async function plotKline() {
   } catch (e) { toast(e.message); }
 }
 $("#kline-plot").addEventListener("click", plotKline);
+
+// ---------------------------------------------------------------------------
+// Realtime info tab (实时信息) — live positions from the node's control API
+// ---------------------------------------------------------------------------
+// Column order + Chinese headers mirror the broker 持仓 screen.
+const RT_COLS = [
+  "account", "stock_code", "stock_name", "volume", "can_use_volume", "frozen",
+  "avg_price", "last_price", "unrealized_pnl", "pnl_ratio", "day_change",
+  "day_pnl", "market_value", "position_cost", "action",
+];
+const RT_HEADERS = {
+  account: "资金账号", stock_code: "证券代码", stock_name: "证券名称",
+  volume: "当前拥股", can_use_volume: "可用数量", frozen: "冻结数量",
+  avg_price: "成本价", last_price: "最新价", unrealized_pnl: "持仓盈亏",
+  pnl_ratio: "盈亏比例", day_change: "当日涨幅", day_pnl: "当日盈亏",
+  market_value: "市值", position_cost: "持仓成本", action: "操作",
+};
+const RT_SIGN_COLS = new Set(["unrealized_pnl", "pnl_ratio", "day_change", "day_pnl"]);
+// Ratios rendered as percentages.
+const RT_RATE_COLS = new Set(["pnl_ratio", "day_change"]);
+const RT_INT_COLS = new Set(["volume", "can_use_volume", "frozen"]);
+
+// The per-row 卖出 button cell (the only custom cell in the realtime table).
+function rtActionCell(row) {
+  // No sell button when there is nothing available to sell (可用数量 == 0),
+  // which also covers sold-out (closed-today) rows.
+  if (!row || !row.stock_code || !row.can_use_volume) return "<td></td>";
+  return `<td class="text"><button class="rt-sell" data-code="${row.stock_code}" data-name="${row.name || ""}" data-qty="${row.can_use_volume}">卖出</button></td>`;
+}
+
+// 合计 (total) row over the *visible* positions (blank cells count as 0). 市值
+// prefers the account's broker market_value when the node reports one AND no
+// filter is narrowing the view; otherwise it sums what's shown.
+function buildRtFooter(rows, asset, filtered) {
+  if (!rows || rows.length === 0) return null;
+  const a = asset || {};
+  const sumCol = (c) => rows.reduce((acc, r) => acc + (typeof r[c] === "number" ? r[c] : 0), 0);
+  return {
+    account: "合计",
+    market_value: (!filtered && typeof a.market_value === "number") ? a.market_value : sumCol("market_value"),
+    position_cost: sumCol("position_cost"),
+    unrealized_pnl: sumCol("unrealized_pnl"),
+    day_pnl: sumCol("day_pnl"),
+  };
+}
+
+function renderRealtime(positions, asset) {
+  const el = $("#rt-positions");
+  if (!positions || positions.length === 0) { el.innerHTML = '<div class="empty">无持仓</div>'; return; }
+  // The node payload uses `name` for 证券名称; the table column is `stock_name`.
+  positions.forEach((p) => { if (p.stock_name === undefined) p.stock_name = p.name; });
+  const total = positions.length;
+  renderTable("#rt-positions", positions, {
+    columns: RT_COLS,
+    headers: RT_HEADERS,
+    linkStock: true,       // 证券代码 / 证券名称 → K 线图
+    signCols: RT_SIGN_COLS,
+    rateCols: RT_RATE_COLS,
+    intCols: RT_INT_COLS,
+    noSort: new Set(["action"]),
+    noFilter: new Set(["action"]),
+    cellFn: (c, v, row) => (c === "action" ? rtActionCell(row) : undefined),
+    rowClass: (row) => (row.closed_today ? "closed-today" : ""),
+    defaultSort: { col: "volume", dir: "desc" },
+    footerFn: (view) => buildRtFooter(view, asset, view.length !== total),
+    onRender: (root) => root.querySelectorAll("button.rt-sell")
+      .forEach((b) => b.addEventListener("click", () => sellStock(b.dataset.code, b.dataset.name, b.dataset.qty))),
+  });
+}
+
+async function sellStock(code, name, qty) {
+  const title = "确认卖出";
+  const body = `即将市价卖出<br><b>${name ? name + " " : ""}${code}</b>`
+    + (qty ? `<br>可用数量 <b>${Number(qty).toLocaleString()}</b> 股` : "");
+  const ok = await confirmDialog({ title, bodyHtml: body, okText: "卖出", danger: true });
+  if (!ok) return;
+  try {
+    const r = await api("/api/control/sell", {}, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account: state.account.account_id, trader: state.account.trader_id, stock_code: code }),
+    });
+    toast(r && r.ok ? `已提交卖出 ${code}` : "已提交");
+    loadRealtime();
+  } catch (e) { toast(e.message); }
+}
+
+// The realtime/control tabs need a live-node control API for the selected account.
+function hasNodeApi() { return !!(state.account && state.account.has_node_api); }
+function nodeApiHint(container) {
+  $(container).innerHTML = '<div class="empty">该账户未配置实盘节点 API（node_api）</div>';
+}
+
+async function loadRealtime() {
+  if (!state.account) return;
+  if (!hasNodeApi()) { nodeApiHint("#rt-positions"); $("#rt-updated").textContent = ""; return; }
+  try {
+    const { positions, asset } = await api("/api/realtime/positions",
+      { account: state.account.account_id, trader: state.account.trader_id });
+    renderRealtime(positions, asset);
+    $("#rt-updated").textContent = "更新于 " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("#rt-positions").innerHTML = '<div class="empty">获取失败</div>';
+    toast(e.message);
+  }
+}
+$("#rt-refresh").addEventListener("click", loadRealtime);
+let rtTimer = null;
+$("#rt-auto").addEventListener("change", (e) => {
+  clearInterval(rtTimer);
+  if (e.target.checked) rtTimer = setInterval(loadRealtime, 15000);
+});
+
+// ---------------------------------------------------------------------------
+// Trading control tab (交易管理) — suspend / resume / sell-all + audit log
+// ---------------------------------------------------------------------------
+const CTRL_LOG_COLS = ["ts", "action", "detail_json", "result"];
+const CTRL_LOG_HEADERS = { ts: "时间", action: "操作", detail_json: "详情", result: "结果" };
+
+async function loadControl() {
+  if (!state.account) return;
+  if (!hasNodeApi()) {
+    $("#ctrl-state").textContent = "未配置节点";
+    $("#ctrl-state").className = "";
+    $("#ctrl-suspend").disabled = $("#ctrl-resume").disabled = true;
+    nodeApiHint("#ctrl-log");
+    return;
+  }
+  try {
+    const st = await api("/api/control/state",
+      { account: state.account.account_id, trader: state.account.trader_id });
+    const paused = !!st.trading_paused;
+    const b = $("#ctrl-state");
+    b.textContent = paused ? "已暂停" : "运行中";
+    b.className = paused ? "neg" : "pos";
+    $("#ctrl-suspend").disabled = paused;
+    $("#ctrl-resume").disabled = !paused;
+    renderTable("#ctrl-log", st.recent_actions || [], {
+      columns: CTRL_LOG_COLS, headers: CTRL_LOG_HEADERS,
+    });
+  } catch (e) {
+    $("#ctrl-log").innerHTML = '<div class="empty">获取失败</div>';
+    toast(e.message);
+  }
+}
+
+async function controlPost(path, confirmMsg) {
+  if (!hasNodeApi()) { toast("该账户未配置实盘节点 API"); return; }
+  if (confirmMsg && !window.confirm(confirmMsg)) return;
+  try {
+    await api(path, { account: state.account.account_id, trader: state.account.trader_id }, { method: "POST" });
+    loadControl();
+  } catch (e) { toast(e.message); }
+}
+$("#ctrl-suspend").addEventListener("click", () => controlPost("/api/control/suspend"));
+$("#ctrl-resume").addEventListener("click", () => controlPost("/api/control/resume"));
+$("#ctrl-sell-all").addEventListener("click", () => controlPost("/api/control/sell_all", "确认卖出全部可卖持仓？此操作不可撤销。"));
+$("#ctrl-refresh").addEventListener("click", loadControl);
 
 // ---------------------------------------------------------------------------
 // Init

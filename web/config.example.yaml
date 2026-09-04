@@ -28,6 +28,21 @@ sources:
       password: ${PROD_MYSQL_PASSWORD:-}
       database: ${PROD_MYSQL_DATABASE:-quant_prod}
 
+# Live-node control APIs, keyed by "account_id/trader_id". Each account runs its own
+# live node (qapp) with its own --control-port, so the URL is per-account, NOT per
+# source. An account with an entry here gets the 实时信息 (real-time positions) and
+# 交易管理 (suspend/resume/sell) tabs; accounts without one have those tabs disabled.
+# `token` (if the node requires --control-token) is sent as the X-Control-Token header
+# on control writes and stays server-side — the browser never sees it. A blank url
+# (e.g. an unfilled ${ENV:-} default) simply drops the entry.
+node_api:
+  # "86904088/QMT-002":
+  #   url: ${NODE_API_86904088_QMT002:-http://127.0.0.1:9300}
+  #   token: ${NODE_TOKEN_86904088_QMT002:-}
+  # "86008933/BIGQMT-001":
+  #   url: http://10.0.0.5:9300
+  #   token: ${NODE_TOKEN_86008933_BIGQMT001:-}
+
 # ClickHouse is shared across all sources (market data, not per-account). Reached over
 # its HTTP interface (port 8123) with stdlib urllib.
 clickhouse:

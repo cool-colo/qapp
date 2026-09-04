@@ -34,6 +34,16 @@ class SourceConfig:
 
 
 @dataclass(frozen=True)
+class NodeApiConfig:
+    """A single live node's control API (one node per account/trader)."""
+
+    # Base URL, e.g. "http://127.0.0.1:9300".
+    url: str
+    # Shared token sent as X-Control-Token on control writes. Stays server-side.
+    token: str | None = None
+
+
+@dataclass(frozen=True)
 class ClickHouseConfig:
     url: str = "http://127.0.0.1:8123"
     database: str | None = None
@@ -51,6 +61,9 @@ class AppConfig:
     return_report_start: dict[str, str]
     # Accounts hidden from the UI, each key "account_id/trader_id".
     account_blacklist: frozenset[str]
+    # Live-node control APIs keyed by "account_id/trader_id" (one node per account).
+    # Absent = the realtime/control tabs are disabled for that account.
+    node_api: dict[str, NodeApiConfig]
 
     def source(self, name: str) -> SourceConfig:
         for src in self.sources:
@@ -63,6 +76,9 @@ class AppConfig:
 
     def is_blocked(self, account_id: str, trader_id: str) -> bool:
         return f"{account_id}/{trader_id}" in self.account_blacklist
+
+    def node_api_for(self, account_id: str, trader_id: str) -> NodeApiConfig | None:
+        return self.node_api.get(f"{account_id}/{trader_id}")
 
 
 def _load_dotenv(path: Path) -> None:
@@ -139,7 +155,12 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         if name in seen:
             raise ValueError(f"duplicate source name: {name!r}")
         seen.add(name)
-        sources.append(SourceConfig(name=name, mysql=_build_mysql(entry["mysql"], name)))
+        sources.append(
+            SourceConfig(
+                name=name,
+                mysql=_build_mysql(entry["mysql"], name),
+            )
+        )
 
     ch_raw = raw.get("clickhouse") or {}
     clickhouse = ClickHouseConfig(
@@ -160,9 +181,37 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         raise ValueError("account_blacklist must be a list of 'account_id/trader_id' strings")
     account_blacklist = frozenset(str(k) for k in blacklist_raw)
 
+    node_api = _build_node_api(raw.get("node_api") or {})
+
     return AppConfig(
         sources=sources,
         clickhouse=clickhouse,
         return_report_start=return_report_start,
         account_blacklist=account_blacklist,
+        node_api=node_api,
     )
+
+
+def _build_node_api(raw: Any) -> dict[str, NodeApiConfig]:
+    """Parse the top-level ``node_api`` map: "account_id/trader_id" -> {url, token}.
+
+    A blank/absent url drops the entry (the account's realtime/control tabs stay
+    disabled), so an unfilled ``${ENV:-}`` default is a no-op rather than an error.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "node_api must be a mapping of 'account_id/trader_id' -> {url, token}",
+        )
+    result: dict[str, NodeApiConfig] = {}
+    for key, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"node_api[{key!r}] must be a mapping with a 'url' key")
+        url = entry.get("url")
+        if not url:
+            continue
+        token = entry.get("token")
+        result[str(key)] = NodeApiConfig(
+            url=str(url),
+            token=(str(token) if token else None),
+        )
+    return result

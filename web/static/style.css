@@ -60,6 +60,18 @@ body.sidebar-collapsed .brand-row { justify-content: center; }
 }
 .nav-item:hover { background: var(--panel-2); color: var(--text); }
 .nav-item.active { background: var(--accent); color: #fff; }
+/* Collapsible nav group: sub-items fold away until the group is opened. */
+.nav-group { display: flex; flex-direction: column; gap: 4px; }
+.nav-item.nav-sub { padding-left: 26px; font-size: 13px; display: none; }
+.nav-item.nav-sub::before { content: "└ "; color: var(--muted); }
+.nav-group.open .nav-item.nav-sub { display: block; }
+/* Caret on a parent that has sub-items, rotating when open. */
+.nav-item.nav-parent::after {
+  content: "▸"; float: right; color: var(--muted);
+  transition: transform .15s; transform-origin: center;
+}
+.nav-group.open .nav-item.nav-parent::after { content: "▾"; }
+.nav-item.nav-parent.active::after { color: #fff; }
 
 .content { flex: 1; min-width: 0; padding: 0 0 24px; }
 
@@ -104,9 +116,46 @@ th, td { padding: 5px 9px; text-align: right; border-bottom: 1px solid var(--bor
 th { background: var(--panel-2); color: var(--muted); position: sticky; top: 0; text-align: right; }
 td.text, th.text { text-align: left; }
 tr:hover td { background: rgba(76, 141, 255, 0.07); }
+
+/* Click-to-sort headers + a per-column filter funnel (hover / active). */
+tr.head-row th[role="button"] { cursor: pointer; user-select: none; white-space: nowrap; }
+tr.head-row th[role="button"]:hover { color: var(--text); }
+tr.head-row th.sorted { color: var(--accent); }
+.sort-caret { font-size: 10px; color: var(--accent); }
+.filter-btn {
+  visibility: hidden; margin-left: 4px; cursor: pointer; border: none;
+  background: none; color: var(--muted); padding: 0 2px; vertical-align: middle;
+  line-height: 1;
+}
+tr.head-row th:hover .filter-btn, th.has-filter .filter-btn { visibility: visible; }
+.filter-btn:hover { color: var(--text); }
+th.has-filter .filter-btn { color: var(--accent); }
+
+/* Floating per-column filter dialog. */
+.filter-popup {
+  position: fixed; z-index: 50; display: none; width: 220px; padding: 8px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, .5); font-size: 12px; text-align: left;
+}
+.filter-popup .fp-text, .filter-popup .fp-search {
+  width: 100%; box-sizing: border-box; margin-bottom: 6px; padding: 3px 6px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  font-size: 12px; border-radius: 3px;
+}
+.filter-popup .fp-text:focus, .filter-popup .fp-search:focus { outline: none; border-color: var(--accent); }
+.filter-popup .fp-all { display: flex; gap: 6px; align-items: center; padding: 2px 0; color: var(--muted); }
+.filter-popup .fp-list { max-height: 220px; overflow-y: auto; margin: 4px 0 8px; border-top: 1px solid var(--border); }
+.filter-popup .fp-list label { display: flex; gap: 6px; align-items: center; padding: 2px 0; cursor: pointer; color: var(--text); }
+.filter-popup .fp-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.filter-popup .fp-actions button {
+  cursor: pointer; padding: 3px 10px; font-size: 12px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+}
+.filter-popup .fp-actions .fp-ok { background: var(--accent); border-color: var(--accent); color: #fff; }
+.filter-popup .fp-actions button:hover { filter: brightness(1.15); }
 .pos { color: var(--up); }
 .neg { color: var(--down); }
-.zero { color: #000; }
+.zero { color: var(--muted); }
 .empty { padding: 14px; color: var(--muted); }
 
 a.klink { color: var(--accent); cursor: pointer; text-decoration: none; }
@@ -164,9 +213,53 @@ a.klink:hover { text-decoration: underline; }
 .builder-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .save-row { display: flex; gap: 8px; margin-top: 10px; }
 
+/* ---- Realtime info (实时信息) + trading control (交易管理) ---- */
+#tab-realtime .table-wrap, #tab-control .table-wrap { margin: 16px 20px; }
+
+/* Per-row 卖出 button in the realtime positions table. */
+.rt-sell {
+  background: var(--down); color: #fff; padding: 3px 10px; font-size: 12px;
+}
+
+/* 合计 total row for the realtime table (same treatment as the report footer). */
+#rt-positions tfoot tr.sum-row td {
+  position: sticky; bottom: 0; background: var(--panel-2);
+  font-weight: 700; border-top: 2px solid var(--accent); border-bottom: none;
+}
+#rt-positions tfoot tr.sum-row td.text { color: var(--text); }
+#rt-positions tfoot tr.sum-row:hover td { background: var(--panel-2); }
+
+/* Sold-out today (当前拥股 0): dimmed + italic, but realized day result still shown. */
+#rt-positions tr.closed-today td { opacity: .6; font-style: italic; }
+
+/* Destructive control buttons (全部卖出). */
+button.danger { background: var(--down); }
+
+#tab-control .ctrl-heading { margin: 18px 20px 6px; color: var(--muted); font-size: 12px; }
+
 #toast {
   position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
   background: #b23b3b; color: #fff; padding: 10px 18px; border-radius: 6px;
   opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 80vw;
 }
 #toast.show { opacity: 1; }
+
+/* ---- Modal confirm dialog ---- */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 100; display: flex;
+  align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .55); opacity: 0; transition: opacity .15s;
+}
+.modal-backdrop.show { opacity: 1; }
+.modal {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  width: 320px; max-width: 88vw; padding: 18px 20px 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .55);
+  transform: translateY(6px) scale(.98); transition: transform .15s;
+}
+.modal-backdrop.show .modal { transform: none; }
+.modal-title { font-size: 15px; font-weight: 600; margin-bottom: 10px; }
+.modal-body { color: var(--text); font-size: 13px; line-height: 1.6; margin-bottom: 18px; }
+.modal-body b { color: var(--accent); font-weight: 600; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.modal-actions button { padding: 7px 16px; font-size: 13px; border-radius: 5px; }

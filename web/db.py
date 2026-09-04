@@ -176,6 +176,47 @@ ORDER BY {ts} ASC{limit_clause}
 """
 
 
+class NodeApiClient:
+    """Minimal client for a live node's control API (stdlib urllib, like ClickHouse).
+
+    The token, if configured, is sent as the ``X-Control-Token`` header on writes and
+    stays entirely server-side (the browser talks only to the dashboard, which
+    proxies here).
+    """
+
+    def __init__(self, base_url: str, token: str | None = None, timeout_secs: float = 15.0) -> None:
+        self._base = base_url.rstrip("/")
+        self._token = token
+        self._timeout = timeout_secs
+
+    def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        url = f"{self._base}/{path.lstrip('/')}"
+        if params:
+            url = f"{url}?{urlencode(params)}"
+        return self._request(Request(url=url, method="GET"))
+
+    def post(self, path: str, body: dict[str, Any] | None = None) -> Any:
+        url = f"{self._base}/{path.lstrip('/')}"
+        data = json.dumps(body or {}).encode("utf-8")
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        if self._token:
+            headers["X-Control-Token"] = self._token
+        return self._request(Request(url=url, data=data, headers=headers, method="POST"))
+
+    def _request(self, request: Request) -> Any:
+        try:
+            with urlopen(request, timeout=self._timeout) as response:
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"node API HTTP {exc.code}: {body[:1000]}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"node API request failed: {exc}") from exc
+        if not raw.strip():
+            return {}
+        return json.loads(raw)
+
+
 class DataAccess:
     """Bundles per-source MySQL readers plus the shared ClickHouse client."""
 
@@ -183,6 +224,12 @@ class DataAccess:
         self._config = config
         self._mysql = {src.name: MySqlSource(src.mysql) for src in config.sources}
         self.clickhouse = ClickHouseClient(config.clickhouse)
+        # One control-API client per account (account_id/trader_id) — each account
+        # runs its own live node, so the node URL is keyed by account, not source.
+        self._node_api = {
+            key: NodeApiClient(cfg.url, cfg.token)
+            for key, cfg in config.node_api.items()
+        }
         self._name_cache: dict[str, str] = {}
 
     @property
@@ -215,3 +262,7 @@ class DataAccess:
             return self._mysql[source]
         except KeyError:
             raise KeyError(f"unknown source: {source!r}") from None
+
+    def node_api(self, account_id: str, trader_id: str) -> "NodeApiClient | None":
+        """The live-node control-API client for an account, or None if not configured."""
+        return self._node_api.get(f"{account_id}/{trader_id}")

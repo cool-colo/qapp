@@ -8,9 +8,16 @@ changes are:
     (@start_date, @end_date, @trader_id, @instrument_suffix, @account_id) become
     pymysql named parameters (%(start_date)s ...);
   * the final SELECT emits raw NUMERIC columns with english names instead of the
-    Chinese percent-string presentation columns, so the values can be charted.
+    Chinese percent-string presentation columns, so the values can be charted;
+  * the ``combined`` CTE has a WHERE that drops a date when it has NEITHER a 盘前
+    nor a 盘后 market value, OR has no daily return (return_amount). This is a
+    web-only divergence from the .sql: the filter runs before the windowed
+    cumulatives so the displayed week_cum_* values stay consistent with the rows
+    actually shown. (Previously this filter lived in the frontend, applied AFTER
+    the query, which desynced the weekly totals.)
 
-IF YOU CHANGE THE REPORT LOGIC, UPDATE BOTH THIS FILE AND THE .sql IN LOCKSTEP.
+IF YOU CHANGE THE REPORT LOGIC, UPDATE BOTH THIS FILE AND THE .sql IN LOCKSTEP
+(except the ``combined`` WHERE filter noted above, which is web-only).
 """
 
 from __future__ import annotations
@@ -169,6 +176,13 @@ combined AS (
     LEFT JOIN daily_slippage s ON d.trade_date = s.trade_date
     LEFT JOIN csi_all       ca ON d.trade_date = ca.trade_date
     LEFT JOIN csi1000       ck ON d.trade_date = ck.trade_date
+    -- Drop a date when it has NEITHER a 盘前 nor a 盘后 market value, and also
+    -- drop dates that have no daily return (return_amount). Applied here (before
+    -- the windowed cumulatives) so week_cum_* stays consistent with the rows
+    -- actually returned.
+    WHERE (bm.before_market_value IS NOT NULL
+           OR am.after_market_value IS NOT NULL)
+      AND r.return_amount IS NOT NULL
 ),
 windowed AS (
     SELECT

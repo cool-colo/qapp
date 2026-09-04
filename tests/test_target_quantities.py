@@ -283,6 +283,7 @@ class TestableTargetQuantityStrategy:
     on_order_denied = TargetQuantityStrategy.on_order_denied
     on_order_rejected = TargetQuantityStrategy.on_order_rejected
     _handle_order_not_accepted = TargetQuantityStrategy._handle_order_not_accepted
+    _is_historical_event = TargetQuantityStrategy._is_historical_event
     _is_transient_sellable_denial = TargetQuantityStrategy._is_transient_sellable_denial
     _converge_to_target = TargetQuantityStrategy._converge_to_target
     _converge_to_target_locked = TargetQuantityStrategy._converge_to_target_locked
@@ -506,6 +507,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         # convergence behavior, not the trading-window gate.
         strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 10:00:00")
         strategy._convergence_suspended = False
+        strategy._trading_paused = False
         strategy._converge_lock = threading.Lock()
         strategy._async_scheduler = AsyncAwaitableScheduler()
         strategy._execution_state_reconciler = ExecutionStateReconciler(
@@ -523,6 +525,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         )
         strategy._sellable_exhausted = {}
         strategy._recent_sell_cancel_ts = {}
+        strategy._startup_ts_ns = -1
         strategy._last_account_sizing_snapshot = None
         strategy.target_events = []
         strategy.order_events = []
@@ -1337,13 +1340,35 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(strategy._target_quantities, {str(INST_A): Decimal("500")})
 
     def test_order_fill_releases_only_filled_symbol_insufficient_funds_backoff(self) -> None:
+        # A BUY fill (no cash freed) releases only the filled instrument's backoff.
         strategy = self.make_strategy()
         strategy._insufficient_funds = {str(INST_A), str(INST_B)}
-        event = type("FillEvent", (), {"client_order_id": "O-1", "instrument_id": INST_A})()
+        event = type(
+            "FillEvent",
+            (),
+            {"client_order_id": "O-1", "instrument_id": INST_A, "order_side": OrderSide.BUY},
+        )()
 
         strategy.on_order_filled(event)
 
         self.assertEqual(strategy._insufficient_funds, {str(INST_B)})
+
+    def test_sell_fill_clears_all_insufficient_funds_backoff(self) -> None:
+        # A SELL fill injects cash, invalidating every prior insufficient-funds
+        # rejection — not just the filled instrument's — so the whole set clears.
+        # The event that frees cash is a sell of a *different* instrument than the
+        # rejected buys, so per-symbol discard alone would deadlock the book.
+        strategy = self.make_strategy()
+        strategy._insufficient_funds = {str(INST_A), str(INST_B)}
+        event = type(
+            "FillEvent",
+            (),
+            {"client_order_id": "O-1", "instrument_id": INST_A, "order_side": OrderSide.SELL},
+        )()
+
+        strategy.on_order_filled(event)
+
+        self.assertEqual(strategy._insufficient_funds, set())
 
     def test_missing_account_cash_defers_buys_without_using_equity_as_cash(self) -> None:
         strategy = self.make_strategy(require_account_cash=True)
@@ -1483,6 +1508,64 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         )()
 
         strategy.on_order_denied(event)
+
+        self.assertEqual(strategy._insufficient_funds, {str(INST_A)})
+        self.assertEqual(strategy._deferred_buys, {str(INST_A): Decimal("30000")})
+
+    def test_reconciliation_replayed_insufficient_funds_rejection_is_ignored(self) -> None:
+        # A rejection replayed by reconciliation on restart carries a pre-startup
+        # ts_event. It must NOT latch the live cash-backoff, or the book deadlocks
+        # with stale history (esp. when there is no sell today to clear the latch).
+        strategy = self.make_strategy()
+        strategy._startup_ts_ns = 10_000_000_000
+        strategy.cache.all_orders.append(
+            FakeOrder(
+                client_order_id="O-old",
+                instrument_id=INST_A,
+                side=OrderSide.BUY,
+                quantity=Decimal("30000"),
+            ),
+        )
+        event = type(
+            "RejectedEvent",
+            (),
+            {
+                "client_order_id": "O-old",
+                "instrument_id": INST_A,
+                "reason": "[COUNTER] [260200][可用资金不足][fund_account=1]",
+                "ts_event": 9_000_000_000,  # before startup
+            },
+        )()
+
+        strategy.on_order_rejected(event)
+
+        self.assertEqual(strategy._insufficient_funds, set())
+        self.assertNotIn(str(INST_A), strategy._deferred_buys)
+
+    def test_live_insufficient_funds_rejection_after_startup_still_latches(self) -> None:
+        # A rejection stamped after startup is a genuine live event and must latch.
+        strategy = self.make_strategy()
+        strategy._startup_ts_ns = 10_000_000_000
+        strategy.cache.all_orders.append(
+            FakeOrder(
+                client_order_id="O-live",
+                instrument_id=INST_A,
+                side=OrderSide.BUY,
+                quantity=Decimal("30000"),
+            ),
+        )
+        event = type(
+            "RejectedEvent",
+            (),
+            {
+                "client_order_id": "O-live",
+                "instrument_id": INST_A,
+                "reason": "[COUNTER] [260200][可用资金不足][fund_account=1]",
+                "ts_event": 11_000_000_000,  # after startup
+            },
+        )()
+
+        strategy.on_order_rejected(event)
 
         self.assertEqual(strategy._insufficient_funds, {str(INST_A)})
         self.assertEqual(strategy._deferred_buys, {str(INST_A): Decimal("30000")})

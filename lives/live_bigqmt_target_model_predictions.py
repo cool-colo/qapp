@@ -162,8 +162,10 @@ def main() -> None:
     connection = legacy.build_connection(args)
     broker_source = BigQmtBrokerDataSource(args)
     loader = legacy.LivePredictionDataLoader(args, connection, broker_source=broker_source)
-    node, status_server = build_node(args, loader)
+    node, status_server, control_server = build_node(args, loader)
     if args.build_only:
+        if control_server is not None:
+            control_server.stop()
         if status_server is not None:
             status_server.stop()
         node.dispose()
@@ -171,6 +173,8 @@ def main() -> None:
     try:
         node.run()
     finally:
+        if control_server is not None:
+            control_server.stop()
         if status_server is not None:
             status_server.stop()
         node.dispose()

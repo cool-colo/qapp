@@ -20,17 +20,22 @@
         <label>账户 <select id="sel-account"></select></label>
       </div>
       <nav class="side-nav">
-        <button class="nav-item active" data-tab="snapshot">按日快照</button>
+        <div class="nav-group open" data-group="realtime">
+          <button class="nav-item nav-parent active" data-tab="realtime">实时信息</button>
+          <button class="nav-item nav-sub" data-tab="realtime" data-sub="positions">持仓</button>
+        </div>
+        <button class="nav-item" data-tab="snapshot">按日快照</button>
         <button class="nav-item" data-tab="report">收益报表</button>
         <button class="nav-item" data-tab="series">随时间</button>
         <button class="nav-item" data-tab="compare">对比</button>
         <button class="nav-item" data-tab="kline">个股 K 线</button>
+        <button class="nav-item" data-tab="control">交易管理</button>
       </nav>
     </aside>
 
     <div class="content">
       <!-- ============ Snapshot tab (with sub-tabs) ============ -->
-      <section id="tab-snapshot" class="tab-panel active">
+      <section id="tab-snapshot" class="tab-panel">
         <div class="subbar">
           <div class="subtabs">
             <button class="subtab active" data-sub="positions">持仓</button>
@@ -142,6 +147,33 @@
           </div>
         </div>
         <div id="kline-chart" class="chart chart-tall"></div>
+      </section>
+
+      <!-- ============ Realtime info tab (实时信息) ============ -->
+      <section id="tab-realtime" class="tab-panel active">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <button id="rt-refresh">刷新</button>
+            <label class="inline"><input type="checkbox" id="rt-auto" /> 自动刷新(15s)</label>
+            <span id="rt-updated" class="hint"></span>
+          </div>
+        </div>
+        <div id="rt-positions" class="table-wrap"></div>
+      </section>
+
+      <!-- ============ Trading control tab (交易管理) ============ -->
+      <section id="tab-control" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <span>交易状态：<b id="ctrl-state">—</b></span>
+            <button id="ctrl-suspend">暂停交易</button>
+            <button id="ctrl-resume">恢复交易</button>
+            <button id="ctrl-sell-all" class="danger">全部卖出</button>
+            <button id="ctrl-refresh">刷新</button>
+          </div>
+        </div>
+        <h4 class="ctrl-heading">操作记录</h4>
+        <div id="ctrl-log" class="table-wrap"></div>
       </section>
     </div>
   </div>

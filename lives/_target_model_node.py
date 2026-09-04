@@ -21,6 +21,8 @@ from lives import live_common as legacy
 from lives.live_reconciliation import LiveExecutionReconciliation
 from lives.monitoring import PrometheusExporter
 from lives.monitoring import PrometheusExporterConfig
+from lives.control_server import ControlServerConfig
+from lives.control_server import LiveControlServer
 from lives.status_server import LiveStatusServer
 from lives.status_server import StatusServerConfig
 from monitoring.dingtalk_alert import DingTalkAlerter
@@ -310,7 +312,7 @@ def build_target_model_node(
     add_snapshot_recorder: Any,
 ):
     """
-    Build the trading node, strategy, recorder, exporter and status server.
+    Build the trading node, strategy, recorder, exporter, status + control servers.
 
     ``make_venue_clients(args, context) -> VenueClients`` builds the venue-specific
     client configs + factories from the loaded prediction context (the instrument
@@ -583,4 +585,77 @@ def build_target_model_node(
             f"Live status server on http://{args.status_addr}:{args.status_port}/health",
             color=LogColor.GREEN,
         )
-    return node, status_server
+
+    # Trading-control state + audit-log writer (best-effort: a MySQL outage must not
+    # block trading, so we degrade to in-memory paused=False on any failure).
+    control_writer: Any = None
+    try:
+        from backtests.result_writers.live_control_writer import LiveControlWriter
+
+        control_writer = LiveControlWriter.from_pymysql_kwargs(
+            logger=None,
+            create_tables=True,
+            host=args.mysql_host,
+            port=int(args.mysql_port),
+            user=args.mysql_user,
+            password=args.mysql_password,
+            database=args.mysql_database,
+            charset="utf8mb4",
+            autocommit=False,
+        )
+        paused = control_writer.load_trading_paused(str(args.account_id), str(args.trader_id))
+        # Safe to apply directly here: this runs before node.run(), so it is
+        # uncontended by the trading thread.
+        strategy.trading_controller.set_paused(bool(paused))
+        node.get_logger().info(
+            f"Loaded trading_paused={paused} from live_control_state",
+            color=LogColor.GREEN,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort, never fatal
+        node.get_logger().warning(
+            f"Trading-control state load skipped (MySQL unavailable): {exc}",
+        )
+        if control_writer is not None:
+            try:
+                control_writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            control_writer = None
+
+    control_server: LiveControlServer | None = None
+    if args.control_port and int(args.control_port) > 0:
+        control_server = LiveControlServer(
+            node=node,
+            strategy_ref=strategy,
+            control_writer=control_writer,
+            account_id=str(args.account_id),
+            trader_id=str(args.trader_id),
+            config=ControlServerConfig(
+                port=int(args.control_port),
+                addr=args.control_addr,
+                token=args.control_token,
+            ),
+        )
+        # Best-effort: a taken port (e.g. a stale node still listening) must not kill
+        # trading. Warn and continue without the control server; stop() closes the
+        # writer it owned so it does not leak.
+        try:
+            control_server.start()
+            node.get_logger().info(
+                f"Live control server on http://{args.control_addr}:{args.control_port}/realtime/positions",
+                color=LogColor.GREEN,
+            )
+        except OSError as exc:
+            node.get_logger().warning(
+                f"Live control server not started (port {args.control_port} unavailable): {exc}",
+            )
+            control_server.stop()  # closes control_writer; safe on a never-started server
+            control_server = None
+    elif control_writer is not None:
+        # Control server disabled but the writer is open — nothing owns it, so close.
+        try:
+            control_writer.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    return node, status_server, control_server

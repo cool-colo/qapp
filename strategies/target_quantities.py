@@ -39,6 +39,7 @@ from strategies.pricing import OpenOffsetBuyPriceStrategy
 from strategies.pricing import OpenOffsetSellPriceStrategy
 from strategies.pricing import PriceContext
 from strategies.order_splitter import NotionalOrderSplitter
+from strategies.trading_control import TradingController
 
 # QMT repurposes the full-tick ``open_int`` field as a real-time market-status code
 # (the ISO-10383-style trading-phase state machine). Map each known code to a
@@ -311,6 +312,10 @@ class TargetQuantityStrategy(Strategy):
         self._converge_lock = threading.Lock()
         self._rejected_order_ids: set[str] = set()
         self._insufficient_funds: set[str] = set()
+        # Set in on_start; guards against reconciliation-replayed historical events
+        # latching live cash-backoff state. -1 means "not yet started" (treat all
+        # events as live) so behaviour is unchanged before on_start runs.
+        self._startup_ts_ns: int = -1
         self._order_target_versions: dict[str, str] = {}
         self._order_intent_contexts: dict[str, IntentContext] = {}
         self._order_splitter = NotionalOrderSplitter(config.order_slice_notional)
@@ -355,6 +360,14 @@ class TargetQuantityStrategy(Strategy):
         }
         self._subscribed_quote_tick_probe_instruments: set[str] = set()
         self._convergence_suspended = False
+        # Persistent manual-pause flag, controlled via the live-node control API.
+        # When set, ordinary convergence is skipped, but a manual SELL still runs
+        # (it forces convergence for that one action without clearing the flag).
+        # Loaded from MySQL at node startup; mutated only by set_trading_paused.
+        self._trading_paused = False
+        # Standalone manual trading-control state/logic (pause flag + manual sell),
+        # driven from the live-node control-server thread via the host primitives.
+        self._trading_controller = TradingController(self)
         self._async_scheduler = AsyncAwaitableScheduler()
         self._execution_state_reconciler = ExecutionStateReconciler(
             timezone_name=config.timezone_name,
@@ -405,6 +418,11 @@ class TargetQuantityStrategy(Strategy):
 
     def on_start(self) -> None:
         self._async_scheduler.capture_running_loop()
+        # Startup wall-clock. Order rejection/denial events replayed by execution
+        # reconciliation on restart carry their original (historical) ts_event; we
+        # use this to distinguish them from live rejections so stale insufficient-
+        # funds rejections do not latch the live cash-backoff state.
+        self._startup_ts_ns = self.clock.timestamp_ns()
         self._execution_state_reconciler.bind_runtime(
             clock=self.clock,
             log=self.log,
@@ -685,6 +703,78 @@ class TargetQuantityStrategy(Strategy):
         """Return the latest broker-reconciled sellable quantity for an instrument."""
         return self._execution_state_reconciler.venue_sellable_quantity(instrument_id)
 
+    # ------------------------------------------------------------------
+    # Manual trading control host primitives
+    # ------------------------------------------------------------------
+    # These implement the ``TradingControlHost`` protocol so the standalone
+    # ``TradingController`` (which owns the pause flag and the manual-sell logic) can
+    # drive convergence without reaching into strategy internals. The control server
+    # calls the controller, never these directly.
+    @property
+    def trading_controller(self) -> TradingController:
+        """The manual trading-control state/logic for this strategy."""
+        return self._trading_controller
+
+    @property
+    def control_converge_lock(self) -> threading.Lock:
+        return self._converge_lock
+
+    def control_set_paused_flag(self, paused: bool) -> None:
+        self._trading_paused = bool(paused)
+        # Keep the suspend guard consistent so update_target_quantities' early-return
+        # matches the pause state outside the on_bar window handling.
+        self._convergence_suspended = self._trading_paused
+
+    def control_current_targets(self) -> dict[str, Decimal]:
+        return dict(self._target_quantities)
+
+    def control_open_long_quantities(self) -> dict[str, Decimal]:
+        held: dict[str, Decimal] = {}
+        try:
+            open_positions = self.cache.positions_open()
+        except Exception:
+            open_positions = []
+        for position in open_positions:
+            try:
+                if not position.is_long:
+                    continue
+                iid_text = str(position.instrument_id)
+                qty = Decimal(str(position.quantity))
+            except Exception:
+                continue
+            if qty > 0:
+                held[iid_text] = qty
+        return held
+
+    def control_sellable_quantity(self, instrument_id: str) -> Decimal | None:
+        return self.venue_sellable_quantity(instrument_id)
+
+    def control_clock_date(self) -> date:
+        return self._clock_date()
+
+    def control_event_date(self, ts_event: int) -> date | None:
+        """Exchange-local date for a nanosecond event timestamp (control host)."""
+        return self._event_trading_date(ts_event)
+
+    def control_apply_targets(
+        self,
+        targets: dict[str, Decimal],
+        target_date: date,
+        reason: str,
+    ) -> None:
+        self.update_target_quantities(
+            targets,
+            target_date=target_date,
+            reason=reason,
+            version=target_version(target_date, targets, reason),
+        )
+
+    def control_force_converge(self, current_date: date, trigger: str) -> None:
+        self._converge_to_target(current_date=current_date, trigger=trigger, force=True)
+
+    def control_log(self, message: str) -> None:
+        self.log.info(message, color=LogColor.YELLOW)
+
     def refresh_target_instruments(
         self,
         instrument_ids: list[InstrumentId],
@@ -881,9 +971,12 @@ class TargetQuantityStrategy(Strategy):
             )
             self._set_authoritative_open(instrument_id, trading_date, float(bar.open))
         within_window = self._within_trading_window()
-        self._convergence_suspended = not within_window
+        # Suspend during on_target_bar if outside the window OR manually paused, so
+        # update_target_quantities' early-return stays consistent. Restore to the
+        # persistent pause flag (not False) so a paused strategy keeps its guard.
+        self._convergence_suspended = (not within_window) or self._trading_paused
         self.on_target_bar(bar)
-        self._convergence_suspended = False
+        self._convergence_suspended = self._trading_paused
         self._converge_to_target(current_date=trading_date, trigger="bar")
 
     def on_target_bar(self, bar: Bar) -> None:
@@ -1023,6 +1116,17 @@ class TargetQuantityStrategy(Strategy):
         # instrument, so they do not need to trigger convergence. The convergence path
         # is guarded by a non-blocking lock and the trading-window gate.
         if order_side == OrderSide.SELL:
+            # A SELL fill injects cash, which invalidates every prior
+            # insufficient-funds rejection — not just this instrument's. An
+            # instrument is latched in `_insufficient_funds` because a BUY was
+            # rejected for lack of cash; the event that frees that cash is a SELL of
+            # a *different* instrument, so per-instrument discard never releases the
+            # latched buys and the book deadlocks (buys skipped before the cash gate).
+            # Clearing the whole set here lets those buys be re-evaluated against the
+            # new cash on this convergence. If the broker still rejects a re-probed
+            # buy, `_handle_order_not_accepted` re-latches it until the next SELL fill,
+            # so this does not hammer a broker whose cash is genuinely short.
+            self._insufficient_funds.clear()
             self._converge_to_target(current_date=self._clock_date(), trigger="sell_fill")
 
     def on_order_canceled(self, event: Any) -> None:
@@ -1050,6 +1154,18 @@ class TargetQuantityStrategy(Strategy):
         self._forget_submitted_order(client_order_id)
         self._rejected_order_ids.add(client_order_id)
         if _is_insufficient_funds(reason):
+            # A rejection replayed by execution reconciliation on restart carries its
+            # original (pre-startup) ts_event. Its cash situation no longer applies —
+            # free cash has since changed and there may be no sell today to clear the
+            # latch — so latching it would deadlock the book with stale history. Skip
+            # the cash-backoff for such events; the next convergence re-probes the buy
+            # against current cash and re-latches only if the broker rejects it now.
+            if self._is_historical_event(event):
+                self.log.info(
+                    f"Ignoring reconciliation-replayed insufficient-funds rejection for "
+                    f"{client_order_id} {instrument_id_text}; predates startup. reason={reason}",
+                )
+                return
             order = self.cache.order(event.client_order_id)
             order_qty = self._decimal_quantity(order.quantity)
             if instrument_id_text:
@@ -1106,10 +1222,19 @@ class TargetQuantityStrategy(Strategy):
         except Exception as exc:
             self.log.warning(f"target convergence failed: {exc}")
 
-    def _converge_to_target(self, current_date: date, trigger: str) -> None:
-        if not self._within_trading_window():
+    def _converge_to_target(self, current_date: date, trigger: str, force: bool = False) -> None:
+        # ``force`` (set only by a manual SELL) bypasses the manual-pause flag so a
+        # requested liquidation still runs while trading is paused. It does NOT
+        # bypass the trading-window gate.
+        if (self._trading_paused and not force) or not self._within_trading_window():
             return
-        acquired = self._converge_lock.acquire(blocking=False)
+        # A forced (manual-sell) convergence must not be silently dropped when the
+        # trading thread holds the lock, so it waits (bounded); ordinary triggers
+        # skip when already converging.
+        if force:
+            acquired = self._converge_lock.acquire(timeout=5.0)
+        else:
+            acquired = self._converge_lock.acquire(blocking=False)
         if not acquired:
             return
         try:
@@ -1915,6 +2040,23 @@ class TargetQuantityStrategy(Strategy):
     def _is_reconciliation_order(order: Any) -> bool:
         tags = getattr(order, "tags", []) or []
         return "RECONCILIATION" in {str(tag) for tag in tags}
+
+    def _is_historical_event(self, event: Any) -> bool:
+        """
+        True when an order event predates this strategy's startup — i.e. it was
+        replayed by execution reconciliation rather than produced by a live order.
+
+        Reconciliation republishes today's terminal venue events (rejected /
+        canceled) on restart with their original ts_event, so comparing against the
+        startup timestamp is the reliable discriminator. Before on_start runs
+        (_startup_ts_ns == -1) every event is treated as live.
+        """
+        if self._startup_ts_ns < 0:
+            return False
+        ts_event = getattr(event, "ts_event", None)
+        if ts_event is None:
+            return False
+        return int(ts_event) < self._startup_ts_ns
 
     def _open_sell_quantity(self, instrument_id: InstrumentId) -> Decimal:
         total = Decimal("0")
