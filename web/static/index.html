@@ -23,6 +23,7 @@
         <div class="nav-group open" data-group="realtime">
           <button class="nav-item nav-parent active" data-tab="realtime">实时信息</button>
           <button class="nav-item nav-sub" data-tab="realtime" data-sub="positions">持仓</button>
+          <button class="nav-item nav-sub" data-tab="realtime" data-sub="asset">资产</button>
         </div>
         <button class="nav-item" data-tab="snapshot">按日快照</button>
         <button class="nav-item" data-tab="report">收益报表</button>
@@ -163,7 +164,8 @@
             <span id="rt-updated" class="hint"></span>
           </div>
         </div>
-        <div id="rt-positions" class="table-wrap"></div>
+        <div id="rt-positions" class="rt-sub-panel active table-wrap"></div>
+        <div id="rt-asset" class="rt-sub-panel table-wrap"></div>
       </section>
 
       <!-- ============ Trading control tab (交易管理) ============ -->

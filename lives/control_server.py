@@ -384,20 +384,30 @@ class LiveControlServer:
 
     def _closed_row(self, position: Any, iid_text: str) -> dict:
         # Sold out today: nothing held now, so 当前拥股/可用/市值/持仓成本 are 0.
-        # 最新价 shows the average close (清仓均价 — what it went out at).
-        # NOTE: under QMT snapshot reconciliation avg_px_open == avg_px_close and
-        # realized_pnl is basically just fees, so the position's own realized figure
-        # is NOT the day's result. We show "-" for 盈亏比例, and compute 当日盈亏 as
-        # (清仓均价 − 昨收) × 卖出股数, which is the meaningful day move on the shares.
+        #
+        # 当日涨幅 and 当日盈亏 are DIFFERENT things and use DIFFERENT prices:
+        #   - 最新价 / 当日涨幅 are properties of the *stock*: the current live quote
+        #     and its move off 昨收. A sold-out row still tracks the live quote, so we
+        #     show the current market price (matching the broker screen), NOT the exit
+        #     price. Using avg_px_close as 最新价 was the bug — under QMT snapshot
+        #     reconciliation avg_px_open == avg_px_close, so it is just the cost price,
+        #     neither a live price nor a reliable exit price.
+        #   - 当日盈亏 is *our* day result on the shares we sold: (卖出均价 − 昨收) ×
+        #     卖出股数, using the actual exit price (avg_px_close), independent of where
+        #     the stock trades now.
+        # realized_pnl is basically fees under reconciliation, so 盈亏比例 stays "-".
         avg_price = _float_or_none(position.avg_px_open)  # 成本价
-        avg_close = _float_or_none(position.avg_px_close)  # 最新价 (清仓均价)
+        avg_close = _float_or_none(position.avg_px_close)  # 卖出均价 (清仓均价)
+        last_price = self._last_price(iid_text)  # 最新价 (current live quote)
         prev_close = self._prev_close(iid_text)
         sold_qty = _decimal_or_none(position.peak_qty) or Decimal(0)
 
-        day_change = None
-        day_pnl = None
+        day_change = None  # 当日涨幅: stock's move off 昨收, from the live quote
+        if last_price is not None and prev_close is not None and prev_close > 0:
+            day_change = (last_price - prev_close) / prev_close
+
+        day_pnl = None  # 当日盈亏: our result on sold shares, from the exit price
         if avg_close is not None and prev_close is not None and prev_close > 0:
-            day_change = (avg_close - prev_close) / prev_close
             day_pnl = (avg_close - prev_close) * float(sold_qty)
 
         row = self._base_row(iid_text)
@@ -407,11 +417,11 @@ class LiveControlServer:
                 "can_use_volume": 0,  # 可用数量
                 "frozen": 0,  # 冻结数量
                 "avg_price": avg_price,  # 成本价
-                "last_price": avg_close,  # 最新价 (清仓均价)
+                "last_price": last_price,  # 最新价 (current live quote)
                 "unrealized_pnl": None,  # 持仓盈亏 (已清仓 → 留空)
                 "pnl_ratio": "-",  # 盈亏比例 (无法从对账数据可靠计算)
-                "day_change": day_change,  # 当日涨幅
-                "day_pnl": day_pnl,  # 当日盈亏 = (清仓均价 − 昨收) × 卖出股数
+                "day_change": day_change,  # 当日涨幅 = (最新价 − 昨收) / 昨收
+                "day_pnl": day_pnl,  # 当日盈亏 = (卖出均价 − 昨收) × 卖出股数
                 "market_value": 0.0,  # 市值
                 "position_cost": 0.0,  # 持仓成本
                 "closed_today": True,
@@ -419,7 +429,19 @@ class LiveControlServer:
         )
         return row
 
-    def _asset_payload(self) -> dict:
+    @staticmethod
+    def _positions_market_value(positions: list[dict] | None) -> float:
+        """Sum the (Nautilus-priced) 市值 across the open-position rows."""
+        if not positions:
+            return 0.0
+        total = 0.0
+        for row in positions:
+            value = row.get("market_value")
+            if isinstance(value, (int, float)):
+                total += float(value)
+        return total
+
+    def _asset_payload(self, positions: list[dict] | None = None) -> dict:
         cache = self._cache
         try:
             accounts = cache.accounts()
@@ -446,6 +468,23 @@ class LiveControlServer:
         info = self._account_info(account)
         for key in ("total_asset", "market_value", "cash", "available_cash", "frozen_cash"):
             payload[key] = _float_or_none(info.get(key))
+
+        # 持仓市值 / 总资产: the broker's `market_value` field can arrive as ~0 for this
+        # account (the RPC backend does not always populate m_dInstrumentValue), which
+        # collapses total_asset (= cash + frozen_cash + market_value) down to just cash.
+        # Prefer the market value we already computed per position from Nautilus + live
+        # prices (repo convention: business reads go through Nautilus first), and rebuild
+        # total_asset from the settled invariant so the two agree with the 持仓 view.
+        nt_market_value = self._positions_market_value(positions)
+        broker_mv = payload["market_value"]
+        if positions is not None and (broker_mv is None or abs(broker_mv) < 1.0):
+            payload["market_value"] = nt_market_value
+            cash = payload["cash"]
+            if cash is None:
+                cash = payload["available_cash"]
+            frozen = payload["frozen_cash"] or 0.0
+            if cash is not None:
+                payload["total_asset"] = float(cash) + float(frozen) + nt_market_value
         return payload
 
     @staticmethod
@@ -589,11 +628,12 @@ class LiveControlServer:
                     if path == "/health/live":
                         self._send(200, {"status": "alive"})
                     elif path == "/realtime/positions":
+                        positions = server._positions_payload()
                         self._send(
                             200,
                             {
-                                "positions": server._positions_payload(),
-                                "asset": server._asset_payload(),
+                                "positions": positions,
+                                "asset": server._asset_payload(positions),
                                 "server_time": datetime.now(timezone.utc).isoformat(),
                             },
                         )

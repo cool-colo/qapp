@@ -168,12 +168,22 @@ $$(".nav-item").forEach((btn) => {
     $$(".tab-panel").forEach((p) => p.classList.remove("active"));
     btn.classList.add("active");
     $(`#tab-${btn.dataset.tab}`).classList.add("active");
+    // 实时信息 has 持仓 / 资产 sub-panels; a nav-sub click selects which one shows.
+    // A click on the parent (no data-sub) defaults to 持仓.
+    if (btn.dataset.tab === "realtime") showRealtimeSub(btn.dataset.sub || "positions");
     if (btn.dataset.tab === "report") loadReport();
     else if (btn.dataset.tab === "realtime") loadRealtime();
     else if (btn.dataset.tab === "control") loadControl();
     setTimeout(resizeCharts, 0);
   });
 });
+
+// Toggle between the 持仓 (#rt-positions) and 资产 (#rt-asset) sub-panels.
+function showRealtimeSub(sub) {
+  $$(".rt-sub-panel").forEach((p) => p.classList.remove("active"));
+  const target = $(`#rt-${sub}`);
+  if (target) target.classList.add("active");
+}
 
 $$(".subtab").forEach((btn) => {
   btn.addEventListener("click", () => {
@@ -1207,6 +1217,29 @@ function renderRealtime(positions, asset) {
   });
 }
 
+// 资产 sub-panel — account-level assets from the same /realtime/positions payload
+// (the node's control server returns `asset` alongside `positions`). Rendered as a
+// labeled key/value card mirroring the broker 资金 screen.
+const RT_ASSET_ROWS = [
+  ["total_asset", "总资产"],
+  ["market_value", "持仓市值"],
+  ["cash", "资金余额"],
+  ["available_cash", "可用资金"],
+  ["frozen_cash", "冻结资金"],
+];
+function renderRealtimeAsset(asset) {
+  const el = $("#rt-asset");
+  if (!asset) { el.innerHTML = '<div class="empty">无资产数据</div>'; return; }
+  const rows = RT_ASSET_ROWS
+    .filter(([k]) => asset[k] !== null && asset[k] !== undefined)
+    .map(([k, label]) => `<tr><th class="text">${label}</th><td>${fmt(asset[k])}</td></tr>`)
+    .join("");
+  const acct = asset.account ? `<caption class="text">资金账号 ${asset.account}</caption>` : "";
+  el.innerHTML = rows
+    ? `<table class="kv-asset">${acct}<tbody>${rows}</tbody></table>`
+    : '<div class="empty">无资产数据</div>';
+}
+
 async function sellStock(code, name, qty) {
   const title = "确认卖出";
   const body = `即将市价卖出<br><b>${name ? name + " " : ""}${code}</b>`
@@ -1231,14 +1264,16 @@ function nodeApiHint(container) {
 
 async function loadRealtime() {
   if (!state.account) return;
-  if (!hasNodeApi()) { nodeApiHint("#rt-positions"); $("#rt-updated").textContent = ""; return; }
+  if (!hasNodeApi()) { nodeApiHint("#rt-positions"); nodeApiHint("#rt-asset"); $("#rt-updated").textContent = ""; return; }
   try {
     const { positions, asset } = await api("/api/realtime/positions",
       { account: state.account.account_id, trader: state.account.trader_id });
     renderRealtime(positions, asset);
+    renderRealtimeAsset(asset);
     $("#rt-updated").textContent = "更新于 " + new Date().toLocaleTimeString();
   } catch (e) {
     $("#rt-positions").innerHTML = '<div class="empty">获取失败</div>';
+    $("#rt-asset").innerHTML = '<div class="empty">获取失败</div>';
     toast(e.message);
   }
 }

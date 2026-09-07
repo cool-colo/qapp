@@ -148,6 +148,10 @@ button:disabled:hover { filter: none; }
 .tab-panel.active { display: block; }
 .sub-panel { display: none; margin: 16px 20px; }
 .sub-panel.active { display: block; }
+/* Sub-panels inside the 实时信息 tab (持仓 / 资产) — no extra margin; they sit
+   directly under the tab's subbar like the original single positions panel did. */
+.rt-sub-panel { display: none; }
+.rt-sub-panel.active { display: block; }
 
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
 table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
@@ -155,6 +159,13 @@ th, td { padding: 5px 9px; text-align: right; border-bottom: 1px solid var(--bor
 th { background: var(--panel-2); color: var(--muted); position: sticky; top: 0; text-align: right; }
 td.text, th.text { text-align: left; }
 tr:hover td { background: rgba(76, 141, 255, 0.07); }
+
+/* 资产 key/value card (实时信息 → 资产): a compact label→value table, not the
+   full-width sortable grid. Row headers (labels) sit left, values right. */
+table.kv-asset { width: auto; min-width: 280px; }
+table.kv-asset caption { padding: 6px 9px; color: var(--muted); font-size: 12px; caption-side: top; }
+table.kv-asset th { position: static; }
+table.kv-asset td { min-width: 140px; }
 
 /* Click-to-sort headers + a per-column filter funnel (hover / active). */
 tr.head-row th[role="button"] { cursor: pointer; user-select: none; white-space: nowrap; }
