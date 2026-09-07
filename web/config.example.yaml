@@ -9,6 +9,12 @@
 # database. Accounts (account_id, trader_id) within a source are auto-discovered from
 # the live_* tables — you do NOT list them here.
 
+# Sell actions (the per-row 卖出 button and 交易管理's 全部卖出). While false, both are
+# rendered grayed-out and the backend answers 403 for /api/control/sell and
+# /api/control/sell_all. Turn it on here, or with WEB_SELL_ENABLED=true; the default
+# is off.
+sell_enabled: ${WEB_SELL_ENABLED:-false}
+
 sources:
   - name: 模拟盘
     mysql:

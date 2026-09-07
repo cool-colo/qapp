@@ -48,7 +48,7 @@ def _timestamp(value: datetime | None) -> datetime:
 
 CREATE_TABLES_SQL = (
     """
-CREATE TABLE IF NOT EXISTS `bt_experiment` (
+CREATE TABLE IF NOT EXISTS `backtest_experiment` (
   `experiment_id`      VARCHAR(128)  NOT NULL,
   `experiment_name`    VARCHAR(255)  NOT NULL,
   `strategy_id`        VARCHAR(128)  NOT NULL,
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS `bt_experiment` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
-CREATE TABLE IF NOT EXISTS `bt_experiment_param` (
+CREATE TABLE IF NOT EXISTS `backtest_experiment_param` (
   `id`             BIGINT       NOT NULL AUTO_INCREMENT,
   `experiment_id`  VARCHAR(128) NOT NULL,
   `param_group`    VARCHAR(128) NOT NULL DEFAULT '',
@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS `bt_experiment_param` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
-CREATE TABLE IF NOT EXISTS `bt_signal` (
+CREATE TABLE IF NOT EXISTS `backtest_signal` (
   `id`             BIGINT        NOT NULL AUTO_INCREMENT,
   `experiment_id`  VARCHAR(128)  NOT NULL,
   `signal_date`    DATE          NOT NULL,
@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS `bt_signal` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
-CREATE TABLE IF NOT EXISTS `bt_target_portfolio` (
+CREATE TABLE IF NOT EXISTS `backtest_target_portfolio` (
   `id`                 BIGINT        NOT NULL AUTO_INCREMENT,
   `experiment_id`      VARCHAR(128)  NOT NULL,
   `target_id`          VARCHAR(128)  NOT NULL,
@@ -136,7 +136,7 @@ CREATE TABLE IF NOT EXISTS `bt_target_portfolio` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
-CREATE TABLE IF NOT EXISTS `bt_order` (
+CREATE TABLE IF NOT EXISTS `backtest_order` (
   `id`                BIGINT        NOT NULL AUTO_INCREMENT,
   `experiment_id`     VARCHAR(128)  NOT NULL,
   `order_id`          VARCHAR(128)  NOT NULL,
@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS `bt_order` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
-CREATE TABLE IF NOT EXISTS `bt_trade` (
+CREATE TABLE IF NOT EXISTS `backtest_trade` (
   `id`             BIGINT        NOT NULL AUTO_INCREMENT,
   `experiment_id`  VARCHAR(128)  NOT NULL,
   `trade_id`       VARCHAR(128)  NOT NULL,
@@ -190,7 +190,7 @@ CREATE TABLE IF NOT EXISTS `bt_trade` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
-CREATE TABLE IF NOT EXISTS `bt_daily_position` (
+CREATE TABLE IF NOT EXISTS `backtest_daily_position` (
   `id`                BIGINT        NOT NULL AUTO_INCREMENT,
   `experiment_id`     VARCHAR(128)  NOT NULL,
   `trading_date`      DATE          NOT NULL,
@@ -211,7 +211,7 @@ CREATE TABLE IF NOT EXISTS `bt_daily_position` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
-CREATE TABLE IF NOT EXISTS `bt_daily_account` (
+CREATE TABLE IF NOT EXISTS `backtest_daily_account` (
   `id`             BIGINT        NOT NULL AUTO_INCREMENT,
   `experiment_id`  VARCHAR(128)  NOT NULL,
   `trading_date`   DATE          NOT NULL,
@@ -234,7 +234,7 @@ CREATE TABLE IF NOT EXISTS `bt_daily_account` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
-CREATE TABLE IF NOT EXISTS `bt_daily_performance` (
+CREATE TABLE IF NOT EXISTS `backtest_daily_performance` (
   `id`                       BIGINT        NOT NULL AUTO_INCREMENT,
   `experiment_id`            VARCHAR(128)  NOT NULL,
   `trading_date`             DATE          NOT NULL,
@@ -259,7 +259,7 @@ CREATE TABLE IF NOT EXISTS `bt_daily_performance` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
-CREATE TABLE IF NOT EXISTS `bt_summary_metric` (
+CREATE TABLE IF NOT EXISTS `backtest_summary_metric` (
   `id`                BIGINT        NOT NULL AUTO_INCREMENT,
   `experiment_id`     VARCHAR(128)  NOT NULL,
   `metric_group`      VARCHAR(128)  NOT NULL,
@@ -278,7 +278,7 @@ CREATE TABLE IF NOT EXISTS `bt_summary_metric` (
 
 
 class MySQLResultWriter(ResultWriter):
-    """Persist Nautilus backtest records into an idempotently-created bt_* schema."""
+    """Persist Nautilus backtest records into an idempotently-created backtest_* schema."""
 
     def __init__(
         self,
@@ -318,14 +318,14 @@ class MySQLResultWriter(ResultWriter):
         for statement in CREATE_TABLES_SQL:
             self._execute(statement, ())
         self._ensure_columns(
-            "bt_target_portfolio",
+            "backtest_target_portfolio",
             {
                 "target_qty": "BIGINT NULL",
                 "current_qty": "BIGINT NULL",
                 "delta_qty": "BIGINT NULL",
             },
         )
-        self._ensure_columns("bt_order", {"target_qty": "BIGINT NULL"})
+        self._ensure_columns("backtest_order", {"target_qty": "BIGINT NULL"})
 
     def _ensure_columns(self, table: str, additions: Mapping[str, str]) -> None:
         table_sql = self._quote_identifier(table)
@@ -344,7 +344,7 @@ class MySQLResultWriter(ResultWriter):
 
     def create_experiment(self, experiment: ExperimentRecord) -> None:
         self._upsert_one(
-            "bt_experiment",
+            "backtest_experiment",
             {
                 "experiment_id": experiment.experiment_id,
                 "experiment_name": experiment.experiment_name,
@@ -394,13 +394,13 @@ class MySQLResultWriter(ResultWriter):
             params.append(finished_at)
         params.append(experiment_id)
         self._execute(
-            f"UPDATE bt_experiment SET {', '.join(assignments)} WHERE experiment_id = %s",
+            f"UPDATE backtest_experiment SET {', '.join(assignments)} WHERE experiment_id = %s",
             tuple(params),
         )
 
     def write_experiment_params(self, records: Sequence[ExperimentParamRecord]) -> None:
         self._upsert_many(
-            "bt_experiment_param",
+            "backtest_experiment_param",
             [
                 {
                     "experiment_id": record.experiment_id,
@@ -419,7 +419,7 @@ class MySQLResultWriter(ResultWriter):
 
     def write_signals(self, records: Sequence[SignalRecord]) -> None:
         self._upsert_many(
-            "bt_signal",
+            "backtest_signal",
             [
                 {
                     "experiment_id": record.experiment_id,
@@ -444,7 +444,7 @@ class MySQLResultWriter(ResultWriter):
 
     def write_target_portfolios(self, records: Sequence[TargetPortfolioRecord]) -> None:
         self._upsert_many(
-            "bt_target_portfolio",
+            "backtest_target_portfolio",
             [
                 {
                     "experiment_id": record.experiment_id,
@@ -473,7 +473,7 @@ class MySQLResultWriter(ResultWriter):
 
     def write_orders(self, records: Sequence[OrderRecord]) -> None:
         self._upsert_many(
-            "bt_order",
+            "backtest_order",
             [
                 {
                     "experiment_id": record.experiment_id,
@@ -509,7 +509,7 @@ class MySQLResultWriter(ResultWriter):
 
     def write_trades(self, records: Sequence[TradeRecord]) -> None:
         self._upsert_many(
-            "bt_trade",
+            "backtest_trade",
             [
                 {
                     "experiment_id": record.experiment_id,
@@ -537,7 +537,7 @@ class MySQLResultWriter(ResultWriter):
 
     def write_daily_positions(self, records: Sequence[DailyPositionRecord]) -> None:
         self._upsert_many(
-            "bt_daily_position",
+            "backtest_daily_position",
             [
                 {
                     "experiment_id": record.experiment_id,
@@ -563,7 +563,7 @@ class MySQLResultWriter(ResultWriter):
 
     def write_daily_accounts(self, records: Sequence[DailyAccountRecord]) -> None:
         self._upsert_many(
-            "bt_daily_account",
+            "backtest_daily_account",
             [
                 {
                     "experiment_id": record.experiment_id,
@@ -591,7 +591,7 @@ class MySQLResultWriter(ResultWriter):
 
     def write_daily_performance(self, records: Sequence[DailyPerformanceRecord]) -> None:
         self._upsert_many(
-            "bt_daily_performance",
+            "backtest_daily_performance",
             [
                 {
                     "experiment_id": record.experiment_id,
@@ -621,7 +621,7 @@ class MySQLResultWriter(ResultWriter):
 
     def write_summary_metrics(self, records: Sequence[SummaryMetricRecord]) -> None:
         self._upsert_many(
-            "bt_summary_metric",
+            "backtest_summary_metric",
             [
                 {
                     "experiment_id": record.experiment_id,

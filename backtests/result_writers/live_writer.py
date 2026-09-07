@@ -270,7 +270,7 @@ class LiveSnapshotWriter:
     portfolio targets, and order/trade lifecycle events into the ``live_*`` MySQL
     schema.
 
-    Kept independent of the backtest ``bt_*`` writer: the live tables carry a
+    Kept independent of the backtest ``backtest_*`` writer: the live tables carry a
     snapshot_type and account/trader identity rather than an experiment id, and hold
     both QMT authoritative fields (unprefixed) and Nautilus comparison fields (nt_).
     All writes use ``ON DUPLICATE KEY UPDATE`` so re-running before/after-trading is

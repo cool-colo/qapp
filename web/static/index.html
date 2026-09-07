@@ -88,10 +88,15 @@
                 <option value="returns">收益/滑点报表</option>
               </select>
             </label>
-            <label>指标 <select id="series-metric"></select></label>
+            <div class="multi-select" id="series-metric-ms">
+              <span class="ms-caption">指标</span>
+              <button type="button" class="ms-toggle" id="series-metric-toggle">选择指标</button>
+              <div class="ms-panel" id="series-metric-panel"></div>
+            </div>
             <label>起 <input type="date" id="series-start" /></label>
             <label>止 <input type="date" id="series-end" /></label>
             <button id="series-plot">绘制</button>
+            <span class="hint">默认止=今天，起=一个月前；收益率类指标用右轴</span>
           </div>
         </div>
         <div id="series-chart" class="chart"></div>

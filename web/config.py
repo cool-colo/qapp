@@ -64,6 +64,9 @@ class AppConfig:
     # Live-node control APIs keyed by "account_id/trader_id" (one node per account).
     # Absent = the realtime/control tabs are disabled for that account.
     node_api: dict[str, NodeApiConfig]
+    # Master switch for every sell action in the UI (卖出 / 全部卖出). Off by default:
+    # the sell endpoints answer 403 and the buttons render grayed out.
+    sell_enabled: bool = False
 
     def source(self, name: str) -> SourceConfig:
         for src in self.sources:
@@ -116,6 +119,29 @@ def _expand(value: Any) -> Any:
         )
 
     return _PLACEHOLDER_RE.sub(repl, value)
+
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off", ""}
+
+
+def _parse_bool(value: Any, key: str) -> bool:
+    """Parse a boolean config value.
+
+    ``${ENV}`` placeholders expand to strings, so ``"false"`` (and the empty default
+    of an unfilled ``${ENV:-}``) has to read as a boolean rather than truthiness.
+    Anything unrecognized raises rather than silently defaulting.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in _TRUTHY:
+        return True
+    if text in _FALSY:
+        return False
+    raise ValueError(f"{key} must be a boolean, got {value!r}")
 
 
 def _build_mysql(raw: dict[str, Any], source_name: str) -> MySqlConfig:
@@ -182,6 +208,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
     account_blacklist = frozenset(str(k) for k in blacklist_raw)
 
     node_api = _build_node_api(raw.get("node_api") or {})
+    sell_enabled = _parse_bool(raw.get("sell_enabled", False), "sell_enabled")
 
     return AppConfig(
         sources=sources,
@@ -189,6 +216,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         return_report_start=return_report_start,
         account_blacklist=account_blacklist,
         node_api=node_api,
+        sell_enabled=sell_enabled,
     )
 
 

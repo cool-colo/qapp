@@ -4,12 +4,18 @@ A local, read-only dashboard for the live trading data this repo persists:
 
 - **按日快照** — asset / positions / target portfolio / orders / trades for a chosen
   date + phase. Each stock row links to its **个股 K 线** view.
-- **随时间** — time series: pick a metric (asset columns or return-report columns) and
-  a date range; x = date, y = the selected column.
+- **随时间** — time series: pick one or more metrics from a checkbox list (asset
+  columns or return-report columns) and a date range; x = date, one line per selected
+  column. Rate columns move to a right-hand % axis when mixed with magnitude columns,
+  so both stay readable. Default range = one month ago → today. Checking/unchecking a
+  metric, switching 数据类型, or changing either date redraws immediately; **绘制** stays
+  as an explicit re-fetch of the same parameters.
 - **对比** — overlay multiple series on one chart, each = (source, account, metric).
   A preset plots 策略周累计收益率 vs 中证1000周累计收益率 for the current account.
 - **个股 K 线** — daily candlestick from ClickHouse `dws_stock_factor_wide`, with this
-  account's **buy (red ↑) / sell (green ↓)** fills overlaid as markers.
+  account's **buy (red ↑) / sell (green ↓)** fills overlaid as markers. Changing a date
+  or the 显示买卖点 option redraws right away (as it does in **对比**, where a date change
+  re-plots whenever at least one series is added).
 
 It is a self-contained consumer — nothing here is imported by the strategy / backtest
 / live trading code.
@@ -58,6 +64,7 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | Endpoint | Params |
 |---|---|
 | `GET /api/sources` | — |
+| `GET /api/config` | — |
 | `GET /api/accounts` | `source` |
 | `GET /api/dates` | `source, account, trader, table` |
 | `GET /api/asset` | `source, account, trader, start, end, snapshot_type` |
@@ -82,6 +89,12 @@ map keyed by `"account_id/trader_id"` (**not** per source) — see `config.examp
 The node's `X-Control-Token` stays server-side. `GET /api/accounts` returns a
 `has_node_api` flag per account so the UI enables the 实时信息 / 交易管理 tabs only for
 accounts that have a node configured.
+
+**Selling is opt-in.** `sell_enabled` in the config (**default false**, also settable as
+`WEB_SELL_ENABLED=true`) gates every sell action: `GET /api/config` exposes the flag so
+the UI renders the per-row **卖出** and 交易管理's **全部卖出** buttons grayed-out, and
+`POST /api/control/sell` / `POST /api/control/sell_all` answer **403** while it is off —
+the grayed buttons are courtesy, the 403 is the gate. Suspend / resume are unaffected.
 
 ## Security note
 

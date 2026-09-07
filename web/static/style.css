@@ -89,6 +89,14 @@ button {
 }
 button:hover { filter: brightness(1.1); }
 button.ghost { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+/* Unusable actions — e.g. 卖出 / 全部卖出 while sell_enabled is off. The compound
+   selectors are what keep this ahead of the red .danger / .rt-sell backgrounds. */
+button:disabled,
+button.danger:disabled,
+button.rt-sell:disabled {
+  background: var(--panel-2); color: var(--muted); cursor: not-allowed; opacity: .65;
+}
+button:disabled:hover { filter: none; }
 
 /* ---- Sub-bar (top of each tab, holds sub-tabs + controls) ---- */
 .subbar {
@@ -104,6 +112,37 @@ button.ghost { background: var(--panel-2); border: 1px solid var(--border); colo
 .subtab.active { color: var(--text); border-bottom-color: var(--accent); }
 .subbar-controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
 .hint { color: var(--muted); font-size: 11px; align-self: center; }
+
+/* ---- Checkbox dropdown picker (指标 multi-select) ---- */
+.multi-select { display: inline-flex; flex-direction: column; gap: 3px; position: relative; }
+.ms-caption { color: var(--muted); font-size: 12px; }
+.ms-toggle {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 5px 8px; font-size: 13px; text-align: left;
+  min-width: 180px; max-width: 260px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.ms-toggle::after { content: " ▾"; color: var(--muted); }
+.ms-panel {
+  display: none; position: absolute; top: 100%; left: 0; z-index: 20; margin-top: 4px;
+  min-width: 220px; padding: 6px; background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 6px 24px rgba(0, 0, 0, .5);
+}
+.multi-select.open .ms-panel { display: block; }
+.ms-list { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; }
+.ms-opt {
+  display: flex; flex-direction: row; align-items: center; gap: 7px;
+  padding: 4px 6px; border-radius: 4px; font-size: 13px; color: var(--text); cursor: pointer;
+}
+.ms-opt:hover { background: rgba(76, 141, 255, 0.12); }
+.ms-actions {
+  display: flex; gap: 6px; margin-top: 6px; padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+.ms-actions button {
+  background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+  padding: 3px 10px; font-size: 12px;
+}
+.ms-actions button:hover { color: var(--text); }
 
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }

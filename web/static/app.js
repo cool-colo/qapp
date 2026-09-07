@@ -89,7 +89,15 @@ function signClass(v) {
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-const state = { source: null, accounts: [], account: null };
+const state = { source: null, accounts: [], account: null, sellEnabled: false };
+// Sell gating is a backend decision (web/config.yaml: sell_enabled). It starts off so
+// the UI never offers a sell action before /api/config has answered.
+const SELL_OFF_HINT = "卖出功能未启用（web/config.yaml: sell_enabled）";
+function setSellAllEnabled(on, hint = SELL_OFF_HINT) {
+  const btn = $("#ctrl-sell-all");
+  btn.disabled = !on;
+  btn.title = on ? "" : hint;
+}
 function accountLabel(a) { return `${a.account_id} / ${a.trader_id}`; }
 function accountKey(a) { return `${a.account_id}|${a.trader_id}`; }
 function accountParams() {
@@ -100,7 +108,9 @@ function accountParams() {
 // Bootstrapping
 // ---------------------------------------------------------------------------
 async function initSources() {
-  const { sources } = await api("/api/sources");
+  const [{ sources }, cfg] = await Promise.all([api("/api/sources"), api("/api/config")]);
+  state.sellEnabled = !!cfg.sell_enabled;
+  setSellAllEnabled(state.sellEnabled);
   const sel = $("#sel-source");
   sel.innerHTML = sources.map((s) => `<option>${s}</option>`).join("");
   state.source = sources[0];
@@ -671,30 +681,133 @@ const RETURN_METRICS = [
   "return_amount", "week_cum_return_amount", "before_market_value", "after_market_value",
   "buy_slippage_bps", "sell_slippage_bps", "total_slippage_bps",
 ];
+const metricList = (dataset) => (dataset === "returns" ? RETURN_METRICS : ASSET_METRICS);
+// Single-select picker, used by the 对比 series builder.
 function fillMetricSelect(sel, dataset) {
-  const metrics = dataset === "returns" ? RETURN_METRICS : ASSET_METRICS;
-  sel.innerHTML = metrics.map((m) => `<option>${m}</option>`).join("");
+  sel.innerHTML = metricList(dataset).map((m) => `<option>${m}</option>`).join("");
 }
-$("#series-dataset").addEventListener("change", (e) => fillMetricSelect($("#series-metric"), e.target.value));
+
+// ---- 指标 multi-select (checkbox dropdown) ----
+// Several metrics on one chart is the normal case here (strategy vs benchmark vs
+// excess rate, or equity against its pnl components), so the 随时间 picker is a
+// checkbox panel rather than a single <select>.
+function renderMetricPanel(metrics) {
+  $("#series-metric-panel").innerHTML =
+    `<div class="ms-list">${metrics.map((m) =>
+      `<label class="ms-opt"><input type="checkbox" value="${m}" /><span>${m}</span></label>`).join("")}</div>
+     <div class="ms-actions">
+       <button type="button" data-act="all">全选</button>
+       <button type="button" data-act="none">清空</button>
+     </div>`;
+}
+function selectedMetrics() {
+  return $$("#series-metric-panel input:checked").map((i) => i.value);
+}
+function updateMetricLabel() {
+  const sel = selectedMetrics();
+  $("#series-metric-toggle").textContent =
+    sel.length === 0 ? "选择指标" : sel.length === 1 ? sel[0] : `${sel.length} 个指标`;
+}
+function setAllMetrics(checked) {
+  $$("#series-metric-panel input").forEach((i) => { i.checked = checked; });
+  updateMetricLabel();
+}
+// Each dataset has its own column set, so switching resets the list + selection.
+function resetMetricSelection(metrics) {
+  renderMetricPanel(metrics);
+  const first = $("#series-metric-panel input");
+  if (first) first.checked = true;
+  updateMetricLabel();
+}
+// Selecting/deselecting an indicator (or switching 数据类型, which resets the list)
+// redraws right away — 绘制 stays only as an explicit re-fetch.
+$("#series-dataset").addEventListener("change", (e) => {
+  resetMetricSelection(metricList(e.target.value));
+  plotSeries(true);
+});
+$("#series-metric-toggle").addEventListener("click", (e) => {
+  e.stopPropagation();
+  $("#series-metric-ms").classList.toggle("open");
+});
+$("#series-metric-panel").addEventListener("click", (e) => {
+  const act = e.target.dataset.act;
+  if (act) { e.preventDefault(); setAllMetrics(act === "all"); plotSeries(true); }
+});
+$("#series-metric-panel").addEventListener("change", (e) => {
+  updateMetricLabel();
+  if (e.target.type === "checkbox") plotSeries(true);
+});
+document.addEventListener("click", (e) => {
+  const owner = e.target.closest && e.target.closest("#series-metric-ms");
+  if (!owner) $("#series-metric-ms").classList.remove("open");
+});
+
+// Rate columns (~0.0x) and magnitude columns (~1e6) cannot share one linear axis
+// without one of them going flat, so when both kinds are selected the rates move
+// to a right-hand % axis. Returns metric -> yAxisIndex.
+function applyMetricAxes(opt, metrics) {
+  const pctFmt = (v) => (v * 100).toFixed(1) + "%";
+  const hasRate = metrics.some((m) => RATE_COLS.has(m));
+  const hasMag = metrics.some((m) => !RATE_COLS.has(m));
+  if (!hasRate || !hasMag) {
+    if (hasRate) opt.yAxis.axisLabel.formatter = pctFmt;
+    return () => 0;
+  }
+  opt.grid.right = 78;  // room for the right-hand axis labels
+  opt.yAxis = [
+    { type: "value", axisLabel: { color: "#8a94a8" }, splitLine: { lineStyle: { color: "#2a3346" } } },
+    { type: "value", position: "right", axisLabel: { color: "#8a94a8", formatter: pctFmt }, splitLine: { show: false } },
+  ];
+  return (m) => (RATE_COLS.has(m) ? 1 : 0);
+}
+const tipNum = (v) => (v === null || v === undefined ? "-"
+  : Number(v).toLocaleString(undefined, { maximumFractionDigits: 4 }));
+const tipPct = (v) => (v === null || v === undefined ? "-" : (v * 100).toFixed(4) + "%");
 
 async function fetchSeriesData(dataset, base, start, end) {
   if (dataset === "returns") return (await api("/api/returns", { ...base, start, end })).rows;
   return (await api("/api/asset", { ...base, start, end, snapshot_type: "after_trading" })).rows;
 }
 
-$("#series-plot").addEventListener("click", async () => {
+// Default window: end = today, start = one month ago (only when blank).
+function defaultSeriesRange() {
+  if (!$("#series-end").value) $("#series-end").value = todayISO();
+  if (!$("#series-start").value) $("#series-start").value = monthsBefore(null, 1);
+}
+
+// auto=true is the change-driven path: a half-filled form is skipped quietly
+// instead of toasting on every pick. Draw requests are sequenced because several
+// can be in flight once a control redraws on change — only the newest may paint.
+let seriesDraw = 0;
+async function plotSeries(auto = false) {
+  const draw = ++seriesDraw;
   const dataset = $("#series-dataset").value;
-  const metric = $("#series-metric").value;
+  const metrics = selectedMetrics();
   const start = $("#series-start").value, end = $("#series-end").value;
-  if (!start || !end) { toast("请选择起止日期"); return; }
+  if (!start || !end) { if (!auto) toast("请选择起止日期"); return; }
+  if (!metrics.length) { if (!auto) toast("请至少选择一个指标"); return; }
   try {
     const rows = await fetchSeriesData(dataset, accountParams(), start, end);
-    const opt = baseLineOption(`${accountLabel(state.account)} · ${metric}`);
+    if (draw !== seriesDraw) return;
+    const opt = baseLineOption(`${accountLabel(state.account)} · ${metrics.join(" / ")}`);
     opt.xAxis.data = rows.map((r) => r.trade_date);
-    if (RATE_COLS.has(metric)) opt.yAxis.axisLabel.formatter = (v) => (v * 100).toFixed(1) + "%";
-    opt.series = [{ name: metric, type: "line", showSymbol: false, connectNulls: true, data: rows.map((r) => r[metric]) }];
+    const axisFor = applyMetricAxes(opt, metrics);
+    if (metrics.length > 1) {
+      // Scrollable single-row legend keeps the header from crowding the plot.
+      opt.legend = { type: "scroll", top: 28, left: 10, right: 10, textStyle: { color: "#8a94a8" } };
+    }
+    opt.series = metrics.map((m) => ({
+      name: m, type: "line", showSymbol: false, connectNulls: true,
+      yAxisIndex: axisFor(m),
+      tooltip: { valueFormatter: RATE_COLS.has(m) ? tipPct : tipNum },
+      data: rows.map((r) => r[m]),
+    }));
     getChart("series-chart").setOption(opt, true);
-  } catch (e) { toast(e.message); }
+  } catch (e) { if (draw === seriesDraw) toast(e.message); }
+}
+$("#series-plot").addEventListener("click", () => plotSeries());
+["#series-start", "#series-end"].forEach((sel) => {
+  $(sel).addEventListener("change", () => plotSeries(true));
 });
 
 // ---------------------------------------------------------------------------
@@ -868,11 +981,15 @@ function openKline(stockCode) {
   $("#tab-kline").classList.add("active");
   setTimeout(plotKline, 0);
 }
-async function plotKline() {
+// Change-driven redraws follow the same rule as plotSeries: quiet on incomplete
+// input, and only the newest in-flight request may paint.
+let klineDraw = 0;
+async function plotKline(auto = false) {
+  const draw = ++klineDraw;
   const code = $("#kline-code").value.trim();
   const start = $("#kline-start").value, end = $("#kline-end").value;
   const withMarks = $("#kline-marks").checked;
-  if (!code || !start || !end) { toast("请填写代码与起止日期"); return; }
+  if (!code || !start || !end) { if (!auto) toast("请填写代码与起止日期"); return; }
   try {
     let bars, trades = [], name = "";
     if (withMarks && state.account) {
@@ -882,6 +999,7 @@ async function plotKline() {
       const d = await api("/api/kline", { stock_code: code, start, end, source: state.source });
       bars = d.rows; name = d.stock_name;
     }
+    if (draw !== klineDraw) return;
     if (!bars || bars.length === 0) { toast("ClickHouse 无该股票行情"); return; }
 
     const dates = bars.map((b) => String(b.ts).slice(0, 10));
@@ -1009,9 +1127,14 @@ async function plotKline() {
       ],
     };
     getChart("kline-chart").setOption(opt, true);
-  } catch (e) { toast(e.message); }
+  } catch (e) { if (draw === klineDraw) toast(e.message); }
 }
-$("#kline-plot").addEventListener("click", plotKline);
+$("#kline-plot").addEventListener("click", () => plotKline());
+// Same as the 随时间 tab: a date or 显示买卖点 change redraws without 绘制.
+["#kline-start", "#kline-end"].forEach((sel) => {
+  $(sel).addEventListener("change", () => plotKline(true));
+});
+$("#kline-marks").addEventListener("change", () => plotKline(true));
 
 // ---------------------------------------------------------------------------
 // Realtime info tab (实时信息) — live positions from the node's control API
@@ -1039,7 +1162,9 @@ function rtActionCell(row) {
   // No sell button when there is nothing available to sell (可用数量 == 0),
   // which also covers sold-out (closed-today) rows.
   if (!row || !row.stock_code || !row.can_use_volume) return "<td></td>";
-  return `<td class="text"><button class="rt-sell" data-code="${row.stock_code}" data-name="${row.name || ""}" data-qty="${row.can_use_volume}">卖出</button></td>`;
+  // sell_enabled=false → grayed out, and a disabled button never fires the click.
+  const gate = state.sellEnabled ? "" : `disabled title="${SELL_OFF_HINT}"`;
+  return `<td class="text"><button class="rt-sell" ${gate} data-code="${row.stock_code}" data-name="${row.name || ""}" data-qty="${row.can_use_volume}">卖出</button></td>`;
 }
 
 // 合计 (total) row over the *visible* positions (blank cells count as 0). 市值
@@ -1136,6 +1261,7 @@ async function loadControl() {
     $("#ctrl-state").textContent = "未配置节点";
     $("#ctrl-state").className = "";
     $("#ctrl-suspend").disabled = $("#ctrl-resume").disabled = true;
+    setSellAllEnabled(false, "该账户未配置实盘节点 API（node_api）");
     nodeApiHint("#ctrl-log");
     return;
   }
@@ -1148,6 +1274,7 @@ async function loadControl() {
     b.className = paused ? "neg" : "pos";
     $("#ctrl-suspend").disabled = paused;
     $("#ctrl-resume").disabled = !paused;
+    setSellAllEnabled(state.sellEnabled);
     renderTable("#ctrl-log", st.recent_actions || [], {
       columns: CTRL_LOG_COLS, headers: CTRL_LOG_HEADERS,
     });
@@ -1173,5 +1300,6 @@ $("#ctrl-refresh").addEventListener("click", loadControl);
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
-fillMetricSelect($("#series-metric"), "asset");
+resetMetricSelection(ASSET_METRICS);
+defaultSeriesRange();
 initSources().catch((e) => toast("初始化失败: " + e.message));

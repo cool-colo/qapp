@@ -95,6 +95,12 @@ def list_sources(data: DataAccess = Depends(get_data)) -> dict[str, list[str]]:
     return {"sources": data.source_names}
 
 
+@app.get("/api/config")
+def ui_config() -> dict[str, bool]:
+    """Server-side switches the UI reads to decide what it may offer. Add new knobs here."""
+    return {"sell_enabled": _config().sell_enabled}
+
+
 @app.get("/api/accounts")
 def list_accounts(
     source: str,
@@ -550,12 +556,23 @@ def control_resume(
     return _control_post(data, account, trader, "/control/resume")
 
 
+def _require_sell_enabled() -> None:
+    """Sells are opt-in through ``sell_enabled`` in the dashboard config. The UI grays
+    the buttons out; this is what actually keeps them from doing anything."""
+    if not _config().sell_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="卖出功能未启用：请在 web/config.yaml 设置 sell_enabled: true",
+        )
+
+
 @app.post("/api/control/sell_all")
 def control_sell_all(
     account: str,
     trader: str,
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
+    _require_sell_enabled()
     return _control_post(data, account, trader, "/control/sell_all")
 
 
@@ -564,6 +581,7 @@ def control_sell(
     body: SellRequest,
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
+    _require_sell_enabled()
     node_body: dict[str, Any] = {}
     if body.instrument_id:
         node_body["instrument_id"] = body.instrument_id
