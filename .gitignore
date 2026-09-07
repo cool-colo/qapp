@@ -32,6 +32,7 @@ Thumbs.db
 .claude
 .gitignore
 .pyc
+*.pyc
 .gitignore
 logs
 start_qapp.sh
