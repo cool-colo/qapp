@@ -160,12 +160,30 @@ th { background: var(--panel-2); color: var(--muted); position: sticky; top: 0; 
 td.text, th.text { text-align: left; }
 tr:hover td { background: rgba(76, 141, 255, 0.07); }
 
+/* Leading 序号 row-number column: narrow, muted, pinned to the left edge so it stays
+   readable while a wide table scrolls sideways. A sticky cell needs an opaque
+   background — the translucent row tints would let the cells scrolled underneath
+   show through — hence the solid equivalents of those tints further down. */
+th.idx-col, td.idx-col {
+  position: sticky; left: 0; width: 46px; min-width: 46px; padding: 5px 4px;
+  text-align: center; color: var(--muted); border-right: 1px solid var(--border);
+}
+td.idx-col { z-index: 1; background: var(--bg); }
+th.idx-col { z-index: 4; background: var(--panel-2); }
+tr:hover td.idx-col { background: #131c30; }
+
 /* 资产 key/value card (实时信息 → 资产): a compact label→value table, not the
    full-width sortable grid. Row headers (labels) sit left, values right. */
 table.kv-asset { width: auto; min-width: 280px; }
 table.kv-asset caption { padding: 6px 9px; color: var(--muted); font-size: 12px; caption-side: top; }
 table.kv-asset th { position: static; }
 table.kv-asset td { min-width: 140px; }
+
+/* 资产 sub-panel: the key/value card beside the 资产构成 pie (持仓市值 / 可用资金 /
+   冻结资金). Wraps to two rows when the content column is narrow. */
+.asset-split { display: flex; flex-wrap: wrap; align-items: stretch; gap: 16px; padding: 12px; }
+.asset-split table.kv-asset { flex: 0 0 auto; align-self: flex-start; }
+.asset-pie { flex: 1 1 340px; min-width: 300px; min-height: 280px; }
 
 /* Click-to-sort headers + a per-column filter funnel (hover / active). */
 tr.head-row th[role="button"] { cursor: pointer; user-select: none; white-space: nowrap; }
@@ -220,10 +238,15 @@ a.klink:hover { text-decoration: underline; }
 /* Alternating background for adjacent weeks so week groups are distinguishable */
 #report-table tr.wk-band td { background: rgba(76, 141, 255, 0.10); }
 #report-table tr.wk-band:hover td { background: rgba(76, 141, 255, 0.16); }
+/* Same two tints flattened onto --bg for the sticky 序号 cell (see above). */
+#report-table tr.wk-band td.idx-col { background: #152036; }
+#report-table tr.wk-band:hover td.idx-col { background: #192744; }
 /* Bottom summary/total row — stands out from normal + week-band rows */
 #report-table tfoot tr.sum-row td {
   position: sticky;
   bottom: 0;
+  /* above the sticky 序号 column (z-index 1) so the pinned corner never loses */
+  z-index: 2;
   background: var(--panel-2);
   font-weight: 700;
   border-top: 2px solid var(--accent);
@@ -273,7 +296,7 @@ a.klink:hover { text-decoration: underline; }
 
 /* 合计 total row for the realtime table (same treatment as the report footer). */
 #rt-positions tfoot tr.sum-row td {
-  position: sticky; bottom: 0; background: var(--panel-2);
+  position: sticky; bottom: 0; z-index: 2; background: var(--panel-2);
   font-weight: 700; border-top: 2px solid var(--accent); border-bottom: none;
 }
 #rt-positions tfoot tr.sum-row td.text { color: var(--text); }

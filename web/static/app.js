@@ -202,8 +202,14 @@ $("#sidebar-toggle").addEventListener("click", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Table renderer — with per-column click-to-sort + a per-column filter row.
+// Table renderer — with a leading 序号 column, per-column click-to-sort + a
+// per-column filter row.
 // ---------------------------------------------------------------------------
+// The 序号 column is positional, not data: it numbers the *visible* rows, so it
+// renumbers after every sort/filter and carries no value into the footer row.
+const IDX_HEAD = '<th class="idx-col">序号</th>';
+const IDX_FOOT = '<td class="idx-col"></td>';
+
 // opts: { columns, linkStock, signCols, headers, intCols, rateCols, weekBandCol,
 //         footerRow, footerFn, footerRowClass, cellFn, noSort, noFilter, onRender }
 //   footerFn(visibleRows) -> rowObject|null   dynamic footer recomputed per view
@@ -322,7 +328,7 @@ function renderTable(container, rows, opts = {}) {
     return `<th class="${numeric ? "" : "text"}"${dataCol}${role}><span class="th-label">${label}${caret}</span>${funnel}</th>`;
   }).join("");
   el.innerHTML =
-    `<table><thead><tr class="head-row">${headCells}</tr></thead>` +
+    `<table><thead><tr class="head-row">${IDX_HEAD}${headCells}</tr></thead>` +
     `<tbody></tbody><tfoot></tfoot></table>`;
   const table = el.querySelector("table");
 
@@ -346,7 +352,7 @@ function renderTable(container, rows, opts = {}) {
     }
     // 3. body (+ week bands over the visible rows)
     let band = 0, prevWeek = null;
-    table.querySelector("tbody").innerHTML = view.map((row) => {
+    table.querySelector("tbody").innerHTML = view.map((row, i) => {
       let rowCls = "";
       if (weekBandCol) {
         const w = row[weekBandCol];
@@ -358,13 +364,14 @@ function renderTable(container, rows, opts = {}) {
         const extra = opts.rowClass(row);
         if (extra) rowCls += " " + extra;
       }
-      return `<tr class="${rowCls}">${cols.map((c) => cellHtml(c, row[c], row, true)).join("")}</tr>`;
+      return `<tr class="${rowCls}"><td class="idx-col">${i + 1}</td>` +
+        `${cols.map((c) => cellHtml(c, row[c], row, true)).join("")}</tr>`;
     }).join("");
     // 4. footer (recomputed from the visible rows when a footerFn is given)
     const footerRow = opts.footerFn ? opts.footerFn(view) : opts.footerRow;
     const fcls = opts.footerRowClass || "sum-row";
     table.querySelector("tfoot").innerHTML = footerRow
-      ? `<tr class="${fcls}">${cols.map((c) => cellHtml(c, footerRow[c], footerRow, false)).join("")}</tr>`
+      ? `<tr class="${fcls}">${IDX_FOOT}${cols.map((c) => cellHtml(c, footerRow[c], footerRow, false)).join("")}</tr>`
       : "";
     // 5. sort carets
     table.querySelectorAll("th[data-col]").forEach((th) => {
@@ -662,6 +669,14 @@ function getChart(id) {
   return charts[id];
 }
 function resizeCharts() { Object.values(charts).forEach((c) => c.resize()); }
+// A container that is rebuilt from innerHTML detaches its chart canvas; dispose the
+// cached instance first so ECharts never keeps a dead DOM node.
+function disposeChart(id) {
+  if (charts[id]) {
+    charts[id].dispose();
+    delete charts[id];
+  }
+}
 window.addEventListener("resize", resizeCharts);
 
 function baseLineOption(title) {
@@ -1219,7 +1234,8 @@ function renderRealtime(positions, asset) {
 
 // 资产 sub-panel — account-level assets from the same /realtime/positions payload
 // (the node's control server returns `asset` alongside `positions`). Rendered as a
-// labeled key/value card mirroring the broker 资金 screen.
+// labeled key/value card mirroring the broker 资金 screen, plus a 资产构成 pie of
+// 持仓市值 / 可用资金 / 冻结资金 — the three parts that make up 总资产.
 const RT_ASSET_ROWS = [
   ["total_asset", "总资产"],
   ["market_value", "持仓市值"],
@@ -1227,17 +1243,50 @@ const RT_ASSET_ROWS = [
   ["available_cash", "可用资金"],
   ["frozen_cash", "冻结资金"],
 ];
-function renderRealtimeAsset(asset) {
+const RT_ASSET_PIE_ID = "rt-asset-pie";
+// The pie's three slices, by asset key — labels come from RT_ASSET_ROWS so the two
+// views of the same numbers can't drift apart.
+const RT_ASSET_PIE_KEYS = ["market_value", "available_cash", "frozen_cash"];
+
+function renderRealtimeAssetPie(asset) {
+  const labels = new Map(RT_ASSET_ROWS);
+  const el = $("#" + RT_ASSET_PIE_ID);
+  const data = RT_ASSET_PIE_KEYS
+    .map((k) => ({ name: labels.get(k), value: Number(asset[k]) || 0 }))
+    .filter((d) => d.value > 0);
+  if (!data.length) { el.innerHTML = '<div class="empty">无资产构成</div>'; return; }
+  getChart(RT_ASSET_PIE_ID).setOption({
+    backgroundColor: "transparent",
+    title: { text: "资产构成", left: "center", textStyle: { color: "#d7dce6", fontSize: 14 } },
+    tooltip: { trigger: "item", formatter: (p) => `${p.name}&nbsp;&nbsp;${fmt(p.value)}（${p.percent}%）` },
+    legend: { bottom: 0, textStyle: { color: "#8a94a8" } },
+    series: [{
+      type: "pie",
+      radius: ["40%", "64%"],
+      center: ["50%", "52%"],
+      label: { color: "#d7dce6", formatter: "{b}\n{d}%" },
+      labelLine: { length: 8, length2: 10 },
+      itemStyle: { borderColor: "#171d2b", borderWidth: 2 },
+      data,
+    }],
+  }, true);
+}
+
+function renderRealtimeAsset(asset, emptyText = "无资产数据") {
   const el = $("#rt-asset");
-  if (!asset) { el.innerHTML = '<div class="empty">无资产数据</div>'; return; }
-  const rows = RT_ASSET_ROWS
-    .filter(([k]) => asset[k] !== null && asset[k] !== undefined)
-    .map(([k, label]) => `<tr><th class="text">${label}</th><td>${fmt(asset[k])}</td></tr>`)
-    .join("");
+  disposeChart(RT_ASSET_PIE_ID);
+  const rows = asset
+    ? RT_ASSET_ROWS
+      .filter(([k]) => asset[k] !== null && asset[k] !== undefined)
+      .map(([k, label]) => `<tr><th class="text">${label}</th><td>${fmt(asset[k])}</td></tr>`)
+      .join("")
+    : "";
+  if (!rows) { el.innerHTML = `<div class="empty">${emptyText}</div>`; return; }
   const acct = asset.account ? `<caption class="text">资金账号 ${asset.account}</caption>` : "";
-  el.innerHTML = rows
-    ? `<table class="kv-asset">${acct}<tbody>${rows}</tbody></table>`
-    : '<div class="empty">无资产数据</div>';
+  el.innerHTML =
+    `<div class="asset-split"><table class="kv-asset">${acct}<tbody>${rows}</tbody></table>` +
+    `<div id="${RT_ASSET_PIE_ID}" class="asset-pie"></div></div>`;
+  renderRealtimeAssetPie(asset);
 }
 
 async function sellStock(code, name, qty) {
@@ -1264,7 +1313,12 @@ function nodeApiHint(container) {
 
 async function loadRealtime() {
   if (!state.account) return;
-  if (!hasNodeApi()) { nodeApiHint("#rt-positions"); nodeApiHint("#rt-asset"); $("#rt-updated").textContent = ""; return; }
+  if (!hasNodeApi()) {
+    nodeApiHint("#rt-positions");
+    renderRealtimeAsset(null, "该账户未配置实盘节点 API（node_api）");
+    $("#rt-updated").textContent = "";
+    return;
+  }
   try {
     const { positions, asset } = await api("/api/realtime/positions",
       { account: state.account.account_id, trader: state.account.trader_id });
@@ -1273,7 +1327,7 @@ async function loadRealtime() {
     $("#rt-updated").textContent = "更新于 " + new Date().toLocaleTimeString();
   } catch (e) {
     $("#rt-positions").innerHTML = '<div class="empty">获取失败</div>';
-    $("#rt-asset").innerHTML = '<div class="empty">获取失败</div>';
+    renderRealtimeAsset(null, "获取失败");
     toast(e.message);
   }
 }

@@ -34,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 
 from strategies.trading_control import SELL_ALL_REASON
@@ -278,6 +279,46 @@ class LiveControlServer:
                 total += leaves
         return total
 
+    def _today_sells(self, instrument_id_text: str) -> dict[str, float]:
+        """Aggregate today's SELL fills for an instrument from the Nautilus cache.
+
+        Returns today's sold quantity and notional (Σ qty×price). Only the SELL side
+        is trustworthy: reconciliation reseeds each open long as a single synthetic
+        BUY @ cost (so today's buys can't be read from fills — see ``_open_row``),
+        but it never fabricates a SELL, so any SELL fill here is a genuine intraday
+        sell. Used for the realized leg of 当日盈亏 on a partially-sold position.
+        Intra-session this is exact; after a restart reconciliation drops the sell
+        fills entirely, so this returns 0 and the realized leg simply vanishes.
+        """
+        sell_qty = sell_notional = 0.0
+        try:
+            orders = self._cache.orders(
+                instrument_id=InstrumentId.from_str(instrument_id_text),
+                side=OrderSide.SELL,
+            )
+        except Exception:
+            return {"sell_qty": 0.0, "sell_notional": 0.0}
+        today = self._strategy.control_clock_date()
+        for order in orders:
+            try:
+                events = order.events
+            except Exception:
+                continue
+            for event in events:
+                if not isinstance(event, OrderFilled):
+                    continue
+                if event.order_side != OrderSide.SELL:
+                    continue
+                if self._strategy.control_event_date(int(event.ts_event)) != today:
+                    continue
+                qty = _float_or_none(event.last_qty)
+                px = _float_or_none(event.last_px)
+                if qty is None or px is None or qty <= 0:
+                    continue
+                sell_qty += qty
+                sell_notional += qty * px
+        return {"sell_qty": sell_qty, "sell_notional": sell_notional}
+
     # ---- payload assembly ----------------------------------------------------
 
     def _positions_payload(self) -> list[dict]:
@@ -328,6 +369,71 @@ class LiveControlServer:
                 out.append({"error": repr(exc)})
         return {"today": today, "closed_count": len(positions), "positions": out}
 
+    def _fills_debug_payload(self) -> dict:
+        """Diagnostic: dump every cached fill per open long position with its raw
+        ts_event and the date control_event_date maps it to, so we can see whether
+        reconciliation is mislabelling prior-day fills as 'today' (which would
+        inflate 当日盈亏 after a restart)."""
+        today = str(self._strategy.control_clock_date())
+        out = []
+        try:
+            positions = self._open_long_positions()
+        except Exception as exc:
+            return {"today": today, "error": repr(exc), "positions": []}
+        for position in positions:
+            iid_text = str(position.instrument_id)
+            fill_dump = []
+            try:
+                orders = self._cache.orders(
+                    instrument_id=InstrumentId.from_str(iid_text),
+                )
+            except Exception as exc:
+                out.append({"instrument_id": iid_text, "error": repr(exc)})
+                continue
+            for order in orders:
+                try:
+                    events = order.events
+                except Exception:
+                    continue
+                for event in events:
+                    if not isinstance(event, OrderFilled):
+                        continue
+                    ts_event = int(event.ts_event)
+                    event_date = self._strategy.control_event_date(ts_event)
+                    fill_dump.append(
+                        {
+                            "side": str(event.order_side),
+                            "last_qty": _float_or_none(event.last_qty),
+                            "last_px": _float_or_none(event.last_px),
+                            "ts_event": ts_event,
+                            "event_date": None if event_date is None else str(event_date),
+                            "is_today": (event_date is not None and str(event_date) == today),
+                        }
+                    )
+            agg = self._today_sells(iid_text)
+            volume_f = float(_decimal_or_none(getattr(position, "quantity", None)) or Decimal(0))
+            can_use = self._sellable(iid_text)
+            frozen = self._frozen_by_pending_sell(iid_text)
+            opening_qty = (float(can_use) if can_use is not None else 0.0) + float(frozen)
+            opening_qty = max(0.0, min(opening_qty, volume_f))
+            out.append(
+                {
+                    "instrument_id": iid_text,
+                    "stock_code": self._stock_code(iid_text),
+                    "current_volume": volume_f,
+                    "can_use_volume": None if can_use is None else float(can_use),
+                    "frozen_pending_sell": float(frozen),
+                    "last_price": self._last_price(iid_text),
+                    "prev_close": self._prev_close(iid_text),
+                    "avg_px_open": _float_or_none(getattr(position, "avg_px_open", None)),
+                    "today_sells": agg,
+                    "opening_qty": opening_qty,
+                    "today_buy_qty": volume_f - opening_qty,
+                    "fills": fill_dump,
+                }
+            )
+        return {"today": today, "open_count": len(positions), "positions": out}
+
     def _base_row(self, iid_text: str) -> dict:
         return {
             "account": self._account_id,  # 资金账号
@@ -360,8 +466,41 @@ class LiveControlServer:
         day_change = None
         day_pnl = None
         if last_price is not None and prev_close is not None and prev_close > 0:
+            # 当日涨幅 is a property of the stock: its move off 昨收.
             day_change = (last_price - prev_close) / prev_close
-            day_pnl = (last_price - prev_close) * volume_f
+            # 当日盈亏 must account for shares bought TODAY, which were not held at 昨收
+            # and so must be marked off their 买入均价, not 昨收. Reconciliation-rebuilt
+            # fills can't be trusted for this (a restart seeds each carried position as
+            # a single synthetic BUY @ cost stamped with today's timestamp — which would
+            # make a purely carried holding look entirely bought-today). Instead use the
+            # broker's T+1 ground truth: shares carried from before today are sellable
+            # today (可用数量 can_use_volume) or locked in a pending sell (冻结); shares
+            # bought today are neither. So:
+            #     opening_qty (carried) = 可用数量 + 冻结
+            #     today_buy_qty         = 当前拥股 − opening_qty
+            #   day_pnl = (最新价 − 昨收) × opening_qty      # carried, off 昨收
+            #           + (最新价 − 买入均价) × today_buy_qty # today's buys, off cost
+            # A purely carried holding reduces to (最新价 − 昨收) × 当前拥股; a name
+            # bought entirely today reduces to (最新价 − 买入均价) × 当前拥股.
+            opening_qty = (float(can_use) if can_use is not None else 0.0) + float(frozen)
+            opening_qty = max(0.0, min(opening_qty, volume_f))
+            today_buy_qty = volume_f - opening_qty
+            day_pnl = (last_price - prev_close) * opening_qty
+            if today_buy_qty > 0 and avg_price is not None:
+                # avg_price (成本价) is the today buy price when the holding is entirely
+                # new; for a mixed carried+today name it is a blended cost — the best
+                # broker-grounded proxy for the today portion absent a separate today VWAP.
+                day_pnl += (last_price - avg_price) * today_buy_qty
+            # Realized leg: shares SOLD today are gone from 当前拥股 (disjoint from the
+            # held legs above), so add their realized result. Today's sells can only be
+            # of carried shares (today's buys are T+1-locked, unsellable same day), so
+            # the reference is always 昨收: (卖出金额 − 昨收 × 今卖量). Sell fills are
+            # genuine and reliable intra-session; after a restart reconciliation drops
+            # them (it reseeds open longs as a single net-BUY, keeping no SELL fill), so
+            # sell_qty degrades to 0 and this leg vanishes — the held legs stay correct.
+            sells = self._today_sells(iid_text)
+            if sells["sell_qty"] > 0:
+                day_pnl += sells["sell_notional"] - prev_close * sells["sell_qty"]
 
         row = self._base_row(iid_text)
         row.update(
@@ -641,6 +780,8 @@ class LiveControlServer:
                         self._send(200, server._control_state())
                     elif path == "/realtime/closed_debug":
                         self._send(200, server._closed_debug_payload())
+                    elif path == "/realtime/fills_debug":
+                        self._send(200, server._fills_debug_payload())
                     else:
                         self._send(404, {"error": "not found", "path": self.path})
                 except Exception as exc:  # never let a handler crash the thread

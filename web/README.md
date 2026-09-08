@@ -2,6 +2,8 @@
 
 A local, read-only dashboard for the live trading data this repo persists:
 
+- **实时信息** — the live node's 持仓 table plus a 资产 sub-page: the broker 资金
+  key/value card next to a **资产构成** pie of 持仓市值 / 可用资金 / 冻结资金.
 - **按日快照** — asset / positions / target portfolio / orders / trades for a chosen
   date + phase. Each stock row links to its **个股 K 线** view.
 - **随时间** — time series: pick one or more metrics from a checkbox list (asset
@@ -16,6 +18,10 @@ A local, read-only dashboard for the live trading data this repo persists:
   account's **buy (red ↑) / sell (green ↓)** fills overlaid as markers. Changing a date
   or the 显示买卖点 option redraws right away (as it does in **对比**, where a date change
   re-plots whenever at least one series is added).
+
+Every table goes through one shared renderer, which prefixes a leading **序号**
+row-number column: it numbers the *visible* rows, so it follows the current sort/filter
+and stays pinned to the left edge while a wide table scrolls sideways.
 
 It is a self-contained consumer — nothing here is imported by the strategy / backtest
 / live trading code.
