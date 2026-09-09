@@ -46,7 +46,7 @@ risk_manager_base_url: http://127.0.0.1:8000
 risk_manager_risk_model_id: cn_a_basic_topn_holdings_integer_lots
 alpha_model_id: strict_all_gain_stable_top1200_20260802   # experiment ID; only supported value this period
 risk_manager_mode: live                          # backtest | simulation | live
-risk_manager_timeout_secs: 10.0
+risk_manager_timeout_secs: 60.0
 
 # --- Universe name filtering ---
 excluded_name_prefixes:

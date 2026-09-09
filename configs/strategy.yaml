@@ -45,7 +45,7 @@ local_exit_authoritative: true                  # true => local exits override o
 risk_manager_base_url: http://127.0.0.1:8000
 risk_manager_risk_model_id: cn_a_basic_constraints_integer_lots
 risk_manager_mode: live                          # backtest | simulation | live
-risk_manager_timeout_secs: 10.0
+risk_manager_timeout_secs: 60.0
 
 # --- Universe name filtering ---
 excluded_name_prefixes:
