@@ -153,6 +153,7 @@ function refreshActiveTab() {
   else if (tab === "compare") { if (cmpSeries.length) plotCompare(); }
   else if (tab === "kline") { if ($("#kline-code").value.trim()) plotKline(); }
   else if (tab === "realtime") loadRealtime();
+  else if (tab === "stratinfo") loadStratInfo();
   else if (tab === "control") loadControl();
 }
 
@@ -171,8 +172,10 @@ $$(".nav-item").forEach((btn) => {
     // 实时信息 has 持仓 / 资产 sub-panels; a nav-sub click selects which one shows.
     // A click on the parent (no data-sub) defaults to 持仓.
     if (btn.dataset.tab === "realtime") showRealtimeSub(btn.dataset.sub || "positions");
+    if (btn.dataset.tab === "stratinfo") showStratInfoSub(btn.dataset.sub || "signals");
     if (btn.dataset.tab === "report") loadReport();
     else if (btn.dataset.tab === "realtime") loadRealtime();
+    else if (btn.dataset.tab === "stratinfo") loadStratInfo();
     else if (btn.dataset.tab === "control") loadControl();
     setTimeout(resizeCharts, 0);
   });
@@ -1337,6 +1340,68 @@ $("#rt-auto").addEventListener("change", (e) => {
   clearInterval(rtTimer);
   if (e.target.checked) rtTimer = setInterval(loadRealtime, 15000);
 });
+
+// ---------------------------------------------------------------------------
+// Strategy info tab (策略信息) — 信号 (top-50 origin signals) + 策略 (key config).
+// Both read the live node's in-memory strategy state via the control API, so
+// the views reflect exactly what this node is trading on. Data-driven so new
+// node-side fields render without frontend changes (extendable by design).
+// ---------------------------------------------------------------------------
+const SI_SIGNAL_COLS = ["rank", "stock_code", "name", "score", "pred_return_live", "selected"];
+const SI_SIGNAL_HEADERS = {
+  rank: "排名", stock_code: "证券代码", name: "证券名称",
+  score: "评分", pred_return_live: "预测收益", selected: "已持仓",
+};
+const SI_INFO_LABELS = {
+  risk_model_id: "风险模型 ID", alpha_model_id: "Alpha 模型 ID",
+  risk_manager_mode: "风控模式", predictions_table: "预测表",
+  max_positions: "最大持仓数",
+};
+
+function showStratInfoSub(sub) {
+  $$(".si-sub-panel").forEach((p) => p.classList.remove("active"));
+  const target = $(`#si-${sub}`);
+  if (target) target.classList.add("active");
+}
+
+async function loadStratInfo() {
+  if (!state.account) return;
+  if (!hasNodeApi()) {
+    nodeApiHint("#si-signals");
+    nodeApiHint("#si-strategy");
+    $("#si-meta").textContent = "";
+    return;
+  }
+  const params = { account: state.account.account_id, trader: state.account.trader_id };
+  try {
+    const sig = await api("/api/strategy/signals", params);
+    $("#si-meta").textContent =
+      `预测表：${sig.predictions_table || "—"} · 信号日期：${sig.signal_date || "—"} · 共 ${sig.count || 0} 条`;
+    renderTable("#si-signals", sig.signals || [], {
+      columns: SI_SIGNAL_COLS, headers: SI_SIGNAL_HEADERS,
+      intCols: new Set(["rank"]), rateCols: new Set(["pred_return_live"]),
+      linkStock: true,
+      cellFn: (c, v) => (c === "selected" ? `<td>${v ? "✓" : ""}</td>` : undefined),
+    });
+  } catch (e) {
+    $("#si-signals").innerHTML = '<div class="empty">获取失败</div>';
+    $("#si-meta").textContent = "";
+    toast(e.message);
+  }
+  try {
+    const info = await api("/api/strategy/info", params);
+    const rows = Object.entries(info).map(([k, v]) => ({
+      项: SI_INFO_LABELS[k] || k, 值: v === null || v === undefined ? "" : v,
+    }));
+    renderTable("#si-strategy", rows, {
+      columns: ["项", "值"], noSort: new Set(["项", "值"]), noFilter: new Set(["项", "值"]),
+    });
+  } catch (e) {
+    $("#si-strategy").innerHTML = '<div class="empty">获取失败</div>';
+    toast(e.message);
+  }
+}
+$("#si-refresh").addEventListener("click", loadStratInfo);
 
 // ---------------------------------------------------------------------------
 // Trading control tab (交易管理) — suspend / resume / sell-all + audit log

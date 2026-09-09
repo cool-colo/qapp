@@ -652,6 +652,66 @@ class LiveControlServer:
                     continue
         return total
 
+    # ---- strategy-info reads (from node memory) ------------------------------
+    # These read the running strategy's in-memory state directly (config + loaded
+    # signals) — never a DB or QMT poll — so the dashboard's 策略信息 views reflect
+    # exactly what this node is trading on. Shaped as flat, key-appendable payloads
+    # so new fields can be added without reshaping the frontend.
+
+    def _strategy_info_payload(self) -> dict:
+        """Key strategy config for the 策略 view (risk-model / alpha-model ids, …)."""
+        config = self._strategy.config
+        return {
+            "risk_model_id": config.risk_manager_risk_model_id,
+            "alpha_model_id": config.alpha_model_id,
+            "risk_manager_mode": config.risk_manager_mode,
+            "predictions_table": config.predictions_table,
+            "max_positions": config.max_positions,
+        }
+
+    def _signal_name(self, stock_code: str) -> str | None:
+        """证券名称 for a stock code, via the strategy's code→instrument mapping."""
+        mapping = self._strategy._instrument_by_stock
+        instrument_id = mapping.get(stock_code) if isinstance(mapping, dict) else None
+        if instrument_id is None:
+            return None
+        return self._instrument_name(str(instrument_id))
+
+    def _strategy_signals_payload(self) -> dict:
+        """The top-50 origin signals (with detail) for the latest signal date in memory."""
+        signals_by_date = self._strategy._signals_by_date
+        signal_date = max(signals_by_date) if signals_by_date else None
+        rows: list[dict] = []
+        if signal_date is not None:
+            day_signals = signals_by_date[signal_date]
+            ordered = sorted(
+                day_signals,
+                key=lambda s: (s.get("rank") if s.get("rank") is not None else 1_000_000),
+            )
+            active = self._strategy._active_positions
+            active_codes = {
+                self._stock_code(iid_text).upper()
+                for iid_text in active
+            } if isinstance(active, dict) else set()
+            for signal in ordered[:50]:
+                stock_code = str(signal.get("stock_code"))
+                rows.append(
+                    {
+                        "rank": signal.get("rank"),
+                        "stock_code": stock_code,
+                        "name": self._signal_name(stock_code),
+                        "score": _float_or_none(signal.get("score")),
+                        "pred_return_live": _float_or_none(signal.get("pred_return_live")),
+                        "selected": stock_code.upper() in active_codes,
+                    },
+                )
+        return {
+            "predictions_table": self._strategy.config.predictions_table,
+            "signal_date": None if signal_date is None else str(signal_date),
+            "count": len(rows),
+            "signals": rows,
+        }
+
     # ---- control actions -----------------------------------------------------
 
     def _set_paused(self, paused: bool) -> dict:
@@ -778,6 +838,10 @@ class LiveControlServer:
                         )
                     elif path == "/control/state":
                         self._send(200, server._control_state())
+                    elif path == "/strategy/info":
+                        self._send(200, server._strategy_info_payload())
+                    elif path == "/strategy/signals":
+                        self._send(200, server._strategy_signals_payload())
                     elif path == "/realtime/closed_debug":
                         self._send(200, server._closed_debug_payload())
                     elif path == "/realtime/fills_debug":

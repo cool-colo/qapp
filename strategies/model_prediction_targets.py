@@ -55,6 +55,7 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     target_weight_planner: str = "equal_weight"
     target_weight_planner_error_policy: str = "raise"
     local_exit_authoritative: bool = True
+    predictions_table: str = ""
     risk_manager_base_url: str = ""
     risk_manager_risk_model_id: str = ""
     alpha_model_id: str = ""

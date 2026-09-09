@@ -152,6 +152,8 @@ button:disabled:hover { filter: none; }
    directly under the tab's subbar like the original single positions panel did. */
 .rt-sub-panel { display: none; }
 .rt-sub-panel.active { display: block; }
+.si-sub-panel { display: none; }
+.si-sub-panel.active { display: block; }
 
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
 table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }

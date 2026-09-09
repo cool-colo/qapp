@@ -525,6 +525,42 @@ def realtime_positions(
     return {"positions": positions, "asset": payload.get("asset") or {}}
 
 
+@app.get("/api/strategy/info")
+def strategy_info(
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Key strategy config read from the live node's memory (策略 view)."""
+    client = _node_api(data, account, trader)
+    try:
+        return client.get("/strategy/info")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/strategy/signals")
+def strategy_signals(
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Top-50 origin signals held in the live node's memory (信号 view)."""
+    client = _node_api(data, account, trader)
+    try:
+        payload = client.get("/strategy/signals")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # Fill 证券名称 from ClickHouse when the node could not resolve a name (mirrors
+    # realtime_positions), keeping the node's own name if it set one.
+    signals = data.attach_names(payload.get("signals") or [])
+    for row in signals:
+        if not row.get("name"):
+            row["name"] = row.get("stock_name") or ""
+    payload["signals"] = signals
+    return payload
+
+
 @app.get("/api/control/state")
 def control_state(
     account: str,

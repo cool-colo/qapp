@@ -25,6 +25,11 @@
           <button class="nav-item nav-sub" data-tab="realtime" data-sub="positions">持仓</button>
           <button class="nav-item nav-sub" data-tab="realtime" data-sub="asset">资产</button>
         </div>
+        <div class="nav-group" data-group="stratinfo">
+          <button class="nav-item nav-parent" data-tab="stratinfo">策略信息</button>
+          <button class="nav-item nav-sub" data-tab="stratinfo" data-sub="signals">信号</button>
+          <button class="nav-item nav-sub" data-tab="stratinfo" data-sub="strategy">策略</button>
+        </div>
         <button class="nav-item" data-tab="snapshot">按日快照</button>
         <button class="nav-item" data-tab="report">收益报表</button>
         <button class="nav-item" data-tab="series">随时间</button>
@@ -166,6 +171,18 @@
         </div>
         <div id="rt-positions" class="rt-sub-panel active table-wrap"></div>
         <div id="rt-asset" class="rt-sub-panel table-wrap"></div>
+      </section>
+
+      <!-- ============ Strategy info tab (策略信息) ============ -->
+      <section id="tab-stratinfo" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <button id="si-refresh">刷新</button>
+            <span id="si-meta" class="hint"></span>
+          </div>
+        </div>
+        <div id="si-signals" class="si-sub-panel active table-wrap"></div>
+        <div id="si-strategy" class="si-sub-panel table-wrap"></div>
       </section>
 
       <!-- ============ Trading control tab (交易管理) ============ -->

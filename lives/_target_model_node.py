@@ -435,6 +435,7 @@ def build_target_model_node(
             target_weight_planner=params.target_weight_planner,
             target_weight_planner_error_policy=params.target_weight_planner_error_policy,
             local_exit_authoritative=params.local_exit_authoritative,
+            predictions_table=args.predictions_table,
             risk_manager_base_url=params.risk_manager_base_url,
             risk_manager_risk_model_id=params.risk_manager_risk_model_id,
             alpha_model_id=params.alpha_model_id,
