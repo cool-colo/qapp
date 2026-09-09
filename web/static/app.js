@@ -1347,10 +1347,10 @@ $("#rt-auto").addEventListener("change", (e) => {
 // the views reflect exactly what this node is trading on. Data-driven so new
 // node-side fields render without frontend changes (extendable by design).
 // ---------------------------------------------------------------------------
-const SI_SIGNAL_COLS = ["rank", "stock_code", "name", "score", "pred_return_live", "selected"];
+const SI_SIGNAL_COLS = ["rank", "stock_code", "name", "score", "pred_return_live", "day_change", "held"];
 const SI_SIGNAL_HEADERS = {
   rank: "排名", stock_code: "证券代码", name: "证券名称",
-  score: "评分", pred_return_live: "预测收益", selected: "已持仓",
+  score: "评分", pred_return_live: "预测收益", day_change: "当日涨幅", held: "已持仓",
 };
 const SI_INFO_LABELS = {
   risk_model_id: "风险模型 ID", alpha_model_id: "Alpha 模型 ID",
@@ -1362,6 +1362,34 @@ function showStratInfoSub(sub) {
   $$(".si-sub-panel").forEach((p) => p.classList.remove("active"));
   const target = $(`#si-${sub}`);
   if (target) target.classList.add("active");
+  // The signal summary belongs to the 信号 view only.
+  $("#si-summary").style.display = sub === "signals" ? "" : "none";
+}
+
+// A UI-only rollup of the loaded signal rows — no backend involvement. Counts how
+// many names are up / down / flat (by 当日涨幅) and how many are currently held.
+function renderSignalSummary(signals) {
+  const el = $("#si-summary");
+  const rows = signals || [];
+  if (!rows.length) { el.innerHTML = ""; return; }
+  let up = 0, down = 0, flat = 0, unknown = 0, held = 0;
+  for (const r of rows) {
+    if (r.held) held += 1;
+    const c = r.day_change;
+    if (typeof c !== "number") unknown += 1;
+    else if (c > 0) up += 1;
+    else if (c < 0) down += 1;
+    else flat += 1;
+  }
+  const chip = (label, value, cls = "") =>
+    `<span class="si-chip ${cls}">${label} <b>${value}</b></span>`;
+  el.innerHTML =
+    chip("共", rows.length) +
+    chip("上涨", up, "pos") +
+    chip("下跌", down, "neg") +
+    chip("平", flat) +
+    (unknown ? chip("无价", unknown) : "") +
+    chip("已持仓", held, "held");
 }
 
 async function loadStratInfo() {
@@ -1377,15 +1405,20 @@ async function loadStratInfo() {
     const sig = await api("/api/strategy/signals", params);
     $("#si-meta").textContent =
       `预测表：${sig.predictions_table || "—"} · 信号日期：${sig.signal_date || "—"} · 共 ${sig.count || 0} 条`;
+    renderSignalSummary(sig.signals || []);
     renderTable("#si-signals", sig.signals || [], {
       columns: SI_SIGNAL_COLS, headers: SI_SIGNAL_HEADERS,
-      intCols: new Set(["rank"]), rateCols: new Set(["pred_return_live"]),
+      intCols: new Set(["rank"]),
+      rateCols: new Set(["pred_return_live", "day_change"]),
+      signCols: new Set(["pred_return_live", "day_change"]),
       linkStock: true,
-      cellFn: (c, v) => (c === "selected" ? `<td>${v ? "✓" : ""}</td>` : undefined),
+      rowClass: (row) => (row.held ? "held-row" : ""),
+      cellFn: (c, v) => (c === "held" ? `<td>${v ? "✓" : ""}</td>` : undefined),
     });
   } catch (e) {
     $("#si-signals").innerHTML = '<div class="empty">获取失败</div>';
     $("#si-meta").textContent = "";
+    $("#si-summary").innerHTML = "";
     toast(e.message);
   }
   try {
@@ -1402,6 +1435,11 @@ async function loadStratInfo() {
   }
 }
 $("#si-refresh").addEventListener("click", loadStratInfo);
+let siTimer = null;
+$("#si-auto").addEventListener("change", (e) => {
+  clearInterval(siTimer);
+  if (e.target.checked) siTimer = setInterval(loadStratInfo, 15000);
+});
 
 // ---------------------------------------------------------------------------
 // Trading control tab (交易管理) — suspend / resume / sell-all + audit log

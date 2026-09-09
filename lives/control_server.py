@@ -669,13 +669,28 @@ class LiveControlServer:
             "max_positions": config.max_positions,
         }
 
-    def _signal_name(self, stock_code: str) -> str | None:
-        """证券名称 for a stock code, via the strategy's code→instrument mapping."""
-        mapping = self._strategy._instrument_by_stock
-        instrument_id = mapping.get(stock_code) if isinstance(mapping, dict) else None
-        if instrument_id is None:
+    def _day_change(self, instrument_id_text: str) -> float | None:
+        """当日涨幅: the stock's live move off 昨收 — same prices the 持仓 view uses."""
+        last_price = self._last_price(instrument_id_text)
+        prev_close = self._prev_close(instrument_id_text)
+        if last_price is None or prev_close is None or prev_close <= 0:
             return None
-        return self._instrument_name(str(instrument_id))
+        return (last_price - prev_close) / prev_close
+
+    def _held_stock_codes(self) -> set[str]:
+        """Stock codes currently held (open long positions in the Nautilus cache).
+
+        This is the authoritative in-position set the 持仓 view shows — a name in
+        ``_active_positions`` may be a planned/rotating book entry that is not yet (or
+        no longer) actually held, so we key the highlight off real open longs.
+        """
+        held: set[str] = set()
+        for position in self._open_long_positions():
+            try:
+                held.add(self._stock_code(str(position.instrument_id)).upper())
+            except Exception:
+                continue
+        return held
 
     def _strategy_signals_payload(self) -> dict:
         """The top-50 origin signals (with detail) for the latest signal date in memory."""
@@ -688,21 +703,21 @@ class LiveControlServer:
                 day_signals,
                 key=lambda s: (s.get("rank") if s.get("rank") is not None else 1_000_000),
             )
-            active = self._strategy._active_positions
-            active_codes = {
-                self._stock_code(iid_text).upper()
-                for iid_text in active
-            } if isinstance(active, dict) else set()
+            held_codes = self._held_stock_codes()
+            mapping = self._strategy._instrument_by_stock
             for signal in ordered[:50]:
                 stock_code = str(signal.get("stock_code"))
+                instrument_id = mapping.get(stock_code) if isinstance(mapping, dict) else None
+                iid_text = None if instrument_id is None else str(instrument_id)
                 rows.append(
                     {
                         "rank": signal.get("rank"),
                         "stock_code": stock_code,
-                        "name": self._signal_name(stock_code),
+                        "name": (None if iid_text is None else self._instrument_name(iid_text)),
                         "score": _float_or_none(signal.get("score")),
                         "pred_return_live": _float_or_none(signal.get("pred_return_live")),
-                        "selected": stock_code.upper() in active_codes,
+                        "day_change": (None if iid_text is None else self._day_change(iid_text)),
+                        "held": stock_code.upper() in held_codes,
                     },
                 )
         return {

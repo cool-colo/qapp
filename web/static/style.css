@@ -154,6 +154,22 @@ button:disabled:hover { filter: none; }
 .rt-sub-panel.active { display: block; }
 .si-sub-panel { display: none; }
 .si-sub-panel.active { display: block; }
+/* Signals held in the current book get a strongly highlighted row. */
+#si-signals tr.held-row td { background: rgba(76, 141, 255, 0.28); font-weight: 600; }
+#si-signals tr.held-row:hover td { background: rgba(76, 141, 255, 0.38); }
+
+/* UI-only signal rollup (counts of up/down/flat/held), rendered as chips. */
+.si-summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 10px; }
+.si-summary:empty { display: none; }
+.si-chip {
+  background: #152036; border: 1px solid #24314c; border-radius: 12px;
+  padding: 3px 12px; font-size: 13px; color: #aeb6c4;
+}
+.si-chip b { color: #e6ebf2; margin-left: 2px; }
+.si-chip.pos b { color: var(--up); }
+.si-chip.neg b { color: var(--down); }
+.si-chip.held { border-color: rgba(76, 141, 255, 0.6); }
+.si-chip.held b { color: #4c8dff; }
 
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
 table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
