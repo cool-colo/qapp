@@ -171,6 +171,8 @@ button:disabled:hover { filter: none; }
 .si-chip.neg b { color: var(--down); }
 .si-chip.held { border-color: rgba(76, 141, 255, 0.6); }
 .si-chip.held b { color: #4c8dff; }
+/* Divider between the up/down counts and the live signal-quality chips. */
+.si-chip-sep { width: 1px; align-self: stretch; background: #24314c; margin: 2px 2px; }
 
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
 table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }

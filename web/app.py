@@ -24,6 +24,11 @@ from web.returns_report import (
     derive_instrument_suffix,
     query_returns,
 )
+from web.signal_quality_report import (
+    ALLOWED_HOLDING_DAYS,
+    SIGNAL_QUALITY_COLUMNS,
+    query_signal_quality,
+)
 
 
 class ComparePreset(BaseModel):
@@ -359,6 +364,58 @@ def get_returns(
     except Exception as exc:  # noqa: BLE001 — surface DB errors as 500 with a message
         raise HTTPException(status_code=500, detail=f"returns query failed: {exc}") from exc
     return {"columns": RETURN_COLUMNS, "rows": jsonable_rows(rows)}
+
+
+@app.get("/api/signal_quality")
+def get_signal_quality(
+    account: str,
+    trader: str,
+    start: str,
+    end: str,
+    holding_days: int = Query(3),
+    predictions_table: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Per-day signal-quality metrics for an account's predictions table (ClickHouse).
+
+    The predictions table is per-account: unless overridden via ``predictions_table``,
+    it is read from the account's live node (``/strategy/info`` → ``predictions_table``),
+    the same source the 策略信息/策略 view uses.
+    """
+    if holding_days not in ALLOWED_HOLDING_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"holding_days must be one of {list(ALLOWED_HOLDING_DAYS)}",
+        )
+    table = predictions_table
+    if not table:
+        client = _node_api(data, account, trader)
+        try:
+            info = client.get("/strategy/info")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        table = info.get("predictions_table")
+        if not table:
+            raise HTTPException(
+                status_code=502,
+                detail="live node did not report a predictions_table",
+            )
+    try:
+        rows = query_signal_quality(
+            data.clickhouse,
+            table=table,
+            start_date=start,
+            end_date=end,
+            holding_days=holding_days,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface DB errors as 500 with a message
+        raise HTTPException(status_code=500, detail=f"signal_quality query failed: {exc}") from exc
+    return {
+        "columns": SIGNAL_QUALITY_COLUMNS,
+        "rows": rows,
+        "predictions_table": table,
+        "holding_days": holding_days,
+    }
 
 
 # ---- ClickHouse k-line -----------------------------------------------------

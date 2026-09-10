@@ -31,7 +31,11 @@
           <button class="nav-item nav-sub" data-tab="stratinfo" data-sub="strategy">策略</button>
         </div>
         <button class="nav-item" data-tab="snapshot">按日快照</button>
-        <button class="nav-item" data-tab="report">收益报表</button>
+        <div class="nav-group" data-group="offline">
+          <button class="nav-item nav-parent" data-tab="offline">离线报表</button>
+          <button class="nav-item nav-sub" data-tab="report"  data-sub="report">收益报表</button>
+          <button class="nav-item nav-sub" data-tab="sigqual" data-sub="sigqual">信号质量</button>
+        </div>
         <button class="nav-item" data-tab="series">随时间</button>
         <button class="nav-item" data-tab="compare">对比</button>
         <button class="nav-item" data-tab="kline">个股 K 线</button>
@@ -84,6 +88,26 @@
         <div id="report-table" class="table-wrap"></div>
       </section>
 
+      <!-- ============ Signal-quality report tab ============ -->
+      <section id="tab-sigqual" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <label>预测窗口
+              <select id="sq-holding">
+                <option value="1">1 日</option>
+                <option value="3" selected>3 日</option>
+                <option value="5">5 日</option>
+              </select>
+            </label>
+            <label>起 <input type="date" id="sq-start" /></label>
+            <label>止 <input type="date" id="sq-end" /></label>
+            <button id="sq-refresh">刷新</button>
+            <span id="sq-hint" class="hint">标签=复权开盘价 t+1→t+(N+1)，基准=中证全指；默认止=今天，起=一个月前</span>
+          </div>
+        </div>
+        <div id="sq-table" class="table-wrap"></div>
+      </section>
+
       <!-- ============ Time series tab ============ -->
       <section id="tab-series" class="tab-panel">
         <div class="subbar">
@@ -92,6 +116,7 @@
               <select id="series-dataset">
                 <option value="asset">资产快照</option>
                 <option value="returns">收益/滑点报表</option>
+                <option value="sigqual">信号质量</option>
               </select>
             </label>
             <div class="multi-select" id="series-metric-ms">
@@ -131,6 +156,7 @@
                 <select class="cmp-dataset">
                   <option value="asset">资产</option>
                   <option value="returns">收益报表</option>
+                  <option value="sigqual">信号质量</option>
                 </select>
                 <select class="cmp-metric"></select>
                 <button class="cmp-add">+ 添加序列</button>

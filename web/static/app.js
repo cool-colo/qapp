@@ -77,6 +77,9 @@ const RATE_COLS = new Set([
   "strat_daily_rate", "csi1000_daily_rate", "excess_daily_rate",
   "week_cum_strat_rate", "week_cum_csi1000_rate", "week_cum_excess_rate", "target_weight",
   "daily_volatility", "annual_volatility",
+  // Signal-quality label returns / excess / decile spread are all rates (right % axis).
+  "ls10", "top20_label_return", "top50_label_return",
+  "top20_label_excess", "top50_label_excess", "benchmark_label_return",
 ]);
 
 // A-share color convention: red = positive, green = negative, neutral = zero.
@@ -150,6 +153,7 @@ function refreshActiveTab() {
   const tab = active.id.replace(/^tab-/, "");
   if (tab === "snapshot") return; // loadSnapshotDates() already reloads it
   if (tab === "report") loadReport();
+  else if (tab === "sigqual") loadSignalQuality();
   else if (tab === "series") { if ($("#series-start").value && $("#series-end").value) $("#series-plot").click(); }
   else if (tab === "compare") { if (cmpSeries.length) plotCompare(); }
   else if (tab === "kline") { if ($("#kline-code").value.trim()) plotKline(); }
@@ -169,15 +173,21 @@ $$(".nav-item").forEach((btn) => {
     $$(".nav-item").forEach((b) => b.classList.remove("active"));
     $$(".tab-panel").forEach((p) => p.classList.remove("active"));
     btn.classList.add("active");
-    $(`#tab-${btn.dataset.tab}`).classList.add("active");
+    // 离线报表 is a parent-only group with no panel of its own — clicking it defaults
+    // to its first report (收益报表). Every other tab has a matching #tab-<id> panel.
+    let tab = btn.dataset.tab;
+    if (tab === "offline") tab = "report";
+    const panel = $(`#tab-${tab}`);
+    if (panel) panel.classList.add("active");
     // 实时信息 has 持仓 / 资产 sub-panels; a nav-sub click selects which one shows.
     // A click on the parent (no data-sub) defaults to 持仓.
-    if (btn.dataset.tab === "realtime") showRealtimeSub(btn.dataset.sub || "positions");
-    if (btn.dataset.tab === "stratinfo") showStratInfoSub(btn.dataset.sub || "signals");
-    if (btn.dataset.tab === "report") loadReport();
-    else if (btn.dataset.tab === "realtime") loadRealtime();
-    else if (btn.dataset.tab === "stratinfo") loadStratInfo();
-    else if (btn.dataset.tab === "control") loadControl();
+    if (tab === "realtime") showRealtimeSub(btn.dataset.sub || "positions");
+    if (tab === "stratinfo") showStratInfoSub(btn.dataset.sub || "signals");
+    if (tab === "report") loadReport();
+    else if (tab === "sigqual") loadSignalQuality();
+    else if (tab === "realtime") loadRealtime();
+    else if (tab === "stratinfo") loadStratInfo();
+    else if (tab === "control") loadControl();
     setTimeout(resizeCharts, 0);
   });
 });
@@ -667,6 +677,106 @@ async function loadReport() {
 $("#report-refresh").addEventListener("click", loadReport);
 
 // ---------------------------------------------------------------------------
+// Signal-quality report tab (信号质量)
+// ---------------------------------------------------------------------------
+// Per-day metric columns (must match SIGNAL_QUALITY_COLUMNS in the backend).
+const SIGQUAL_METRICS = [
+  "rankic", "ic", "ls10",
+  "top20_label_return", "top50_label_return",
+  "top20_label_excess", "top50_label_excess",
+  "benchmark_label_return", "sample_count",
+];
+const SQ_HEADERS = {
+  trade_date: "日期",
+  rankic: "RankIC",
+  ic: "IC",
+  ls10: "LS10",
+  top20_label_return: "Top20收益",
+  top50_label_return: "Top50收益",
+  top20_label_excess: "Top20超额",
+  top50_label_excess: "Top50超额",
+  benchmark_label_return: "基准收益",
+  sample_count: "样本数",
+};
+// ls10 / label returns / excess are on the % axis (RATE_COLS). rankic/ic are plain
+// signed 4-decimal numerics; sample_count is an int.
+const SQ_SIGN_COLS = new Set([
+  "rankic", "ic", "ls10",
+  "top20_label_return", "top50_label_return",
+  "top20_label_excess", "top50_label_excess", "benchmark_label_return",
+]);
+const SQ_INT_COLS = new Set(["sample_count"]);
+
+// Small stats helpers matching the reference aggregation (pandas mean / sample std
+// ddof=1 / share > 0). NaN-safe: they operate on the finite numbers only.
+function _finite(arr) { return arr.filter((x) => typeof x === "number" && isFinite(x)); }
+function _mean(arr) { const a = _finite(arr); return a.length ? a.reduce((s, x) => s + x, 0) / a.length : NaN; }
+function _stdSample(arr) {
+  const a = _finite(arr);
+  if (a.length < 2) return NaN;
+  const m = a.reduce((s, x) => s + x, 0) / a.length;
+  const v = a.reduce((s, x) => s + (x - m) * (x - m), 0) / (a.length - 1);
+  return Math.sqrt(v);
+}
+function _positiveRatio(arr) { const a = _finite(arr); return a.length ? a.filter((x) => x > 0).length / a.length : NaN; }
+function _fmtNum(v, d = 4) { return (typeof v === "number" && isFinite(v)) ? v.toFixed(d) : "—"; }
+function _fmtPct(v) { return (typeof v === "number" && isFinite(v)) ? (v * 100).toFixed(2) + "%" : "—"; }
+
+// Footer for 信号质量: period-level scalars computed over the visible per-day rows,
+// matching the reference's sub.ic.mean()/sub.ic.std() aggregation. RankICIR/ICIR go
+// under their base column; positive ratios under the topN columns; TopN means are the
+// straight column means (rate-formatted by the table).
+function buildSignalQualitySummary(rows) {
+  if (!rows || rows.length === 0) return null;
+  const col = (c) => rows.map((r) => r[c]);
+  const rankicMean = _mean(col("rankic")), rankicStd = _stdSample(col("rankic"));
+  const icMean = _mean(col("ic")), icStd = _stdSample(col("ic"));
+  const rankicIR = (isFinite(rankicStd) && rankicStd !== 0) ? rankicMean / rankicStd : NaN;
+  const icIR = (isFinite(icStd) && icStd !== 0) ? icMean / icStd : NaN;
+  const out = { trade_date: "合计/IR" };
+  // RankIC column: mean + RankICIR + positive ratio.
+  out.rankic = `均值 ${_fmtNum(rankicMean)}｜IR ${_fmtNum(rankicIR, 3)}｜胜率 ${_fmtPct(_positiveRatio(col("rankic")))}`;
+  out.ic = `均值 ${_fmtNum(icMean)}｜IR ${_fmtNum(icIR, 3)}｜胜率 ${_fmtPct(_positiveRatio(col("ic")))}`;
+  out.ls10 = `均值 ${_fmtPct(_mean(col("ls10")))}`;
+  // TopN columns: mean return + positive ratio (share of days with return > 0).
+  out.top20_label_return = `均值 ${_fmtPct(_mean(col("top20_label_return")))}｜胜率 ${_fmtPct(_positiveRatio(col("top20_label_return")))}`;
+  out.top50_label_return = `均值 ${_fmtPct(_mean(col("top50_label_return")))}｜胜率 ${_fmtPct(_positiveRatio(col("top50_label_return")))}`;
+  out.top20_label_excess = `均值 ${_fmtPct(_mean(col("top20_label_excess")))}`;
+  out.top50_label_excess = `均值 ${_fmtPct(_mean(col("top50_label_excess")))}`;
+  out.benchmark_label_return = `均值 ${_fmtPct(_mean(col("benchmark_label_return")))}`;
+  out.sample_count = "";
+  return out;
+}
+
+async function loadSignalQuality() {
+  if (!state.account) return;
+  if (!hasNodeApi()) { nodeApiHint("#sq-table"); return; }
+  const start = $("#sq-start").value || monthsBefore(null, 1);
+  const end = $("#sq-end").value || todayISO();
+  const holding = parseInt($("#sq-holding").value, 10) || 3;
+  if (!$("#sq-start").value) $("#sq-start").value = start;
+  if (!$("#sq-end").value) $("#sq-end").value = end;
+  try {
+    const res = await api("/api/signal_quality", { ...accountParams(), start, end, holding_days: holding });
+    const { columns, rows } = res;
+    const hint = $("#sq-hint");
+    if (hint) {
+      hint.textContent = `预测表 ${res.predictions_table || "?"}｜窗口 ${res.holding_days} 日｜`
+        + "标签=复权开盘价 t+1→t+(N+1)，基准=中证全指";
+    }
+    renderTable("#sq-table", rows, {
+      columns,
+      headers: SQ_HEADERS,
+      signCols: SQ_SIGN_COLS,
+      intCols: SQ_INT_COLS,
+      footerFn: buildSignalQualitySummary,
+    });
+  } catch (e) { toast(e.message); $("#sq-table").innerHTML = '<div class="empty">无数据</div>'; }
+}
+$("#sq-refresh").addEventListener("click", loadSignalQuality);
+$("#sq-holding").addEventListener("change", loadSignalQuality);
+
+// ---------------------------------------------------------------------------
 // Charts registry
 // ---------------------------------------------------------------------------
 const charts = {};
@@ -716,7 +826,10 @@ const RETURN_METRICS = [
   "return_amount", "week_cum_return_amount", "before_market_value", "after_market_value",
   "buy_slippage_bps", "sell_slippage_bps", "total_slippage_bps",
 ];
-const metricList = (dataset) => (dataset === "returns" ? RETURN_METRICS : ASSET_METRICS);
+const metricList = (dataset) =>
+  dataset === "returns" ? RETURN_METRICS
+  : dataset === "sigqual" ? SIGQUAL_METRICS
+  : ASSET_METRICS;
 // Single-select picker, used by the 对比 series builder.
 function fillMetricSelect(sel, dataset) {
   sel.innerHTML = metricList(dataset).map((m) => `<option>${m}</option>`).join("");
@@ -801,6 +914,9 @@ const tipPct = (v) => (v === null || v === undefined ? "-" : (v * 100).toFixed(4
 
 async function fetchSeriesData(dataset, base, start, end) {
   if (dataset === "returns") return (await api("/api/returns", { ...base, start, end })).rows;
+  // Signal quality: chart uses the default 3-day forward window (the report tab lets
+  // you switch it). Rows are keyed on trade_date, same as the other datasets.
+  if (dataset === "sigqual") return (await api("/api/signal_quality", { ...base, start, end, holding_days: 3 })).rows;
   return (await api("/api/asset", { ...base, start, end, snapshot_type: "after_trading" })).rows;
 }
 
@@ -1373,8 +1489,50 @@ function showStratInfoSub(sub) {
   $("#si-summary").style.display = sub === "signals" ? "" : "none";
 }
 
-// A UI-only rollup of the loaded signal rows — no backend involvement. Counts how
-// many names are up / down / flat (by 当日涨幅) and how many are currently held.
+// --- live signal-quality helpers (client-side, mirror the reference IC/RankIC) ---
+// Pearson correlation over paired finite numbers.
+function _pearson(xs, ys) {
+  const n = xs.length;
+  if (n < 2) return NaN;
+  const mx = xs.reduce((s, v) => s + v, 0) / n;
+  const my = ys.reduce((s, v) => s + v, 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - mx, dy = ys[i] - my;
+    sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+  }
+  const denom = Math.sqrt(sxx * syy);
+  return denom === 0 ? NaN : sxy / denom;
+}
+// Average-rank transform (ties share their mean rank) for Spearman.
+function _avgRanks(vals) {
+  const idx = vals.map((v, i) => [v, i]).sort((a, b) => a[0] - b[0]);
+  const ranks = new Array(vals.length);
+  let i = 0;
+  while (i < idx.length) {
+    let j = i;
+    while (j + 1 < idx.length && idx[j + 1][0] === idx[i][0]) j++;
+    const avg = (i + j) / 2 + 1; // 1-based average rank across the tie block
+    for (let k = i; k <= j; k++) ranks[idx[k][1]] = avg;
+    i = j + 1;
+  }
+  return ranks;
+}
+// safe_corr guard from the reference: need >=3 paired points and >=2 unique values on
+// each side, else NaN. method: "pearson" | "spearman".
+function _safeCorr(xs, ys, method) {
+  if (xs.length < 3) return NaN;
+  const uniq = (a) => new Set(a).size;
+  if (uniq(xs) < 2 || uniq(ys) < 2) return NaN;
+  if (method === "spearman") return _pearson(_avgRanks(xs), _avgRanks(ys));
+  return _pearson(xs, ys);
+}
+
+// A UI-only rollup of the loaded signal rows — no backend involvement. Shows the
+// up/down/flat/held counts plus live signal-quality chips computed from the visible
+// rows: RankIC/IC of score vs 当日涨幅 (the only realized label available live), and
+// Top50 收益/胜率. These mirror the reference IC/RankIC/TopN definitions, but 当日涨幅
+// (close-to-close today) stands in for the offline adjusted open-to-open label.
 function renderSignalSummary(signals) {
   const el = $("#si-summary");
   const rows = signals || [];
@@ -1392,13 +1550,45 @@ function renderSignalSummary(signals) {
   const rate = (n) => ` <span class="si-rate">${(n / total * 100).toFixed(1)}%</span>`;
   const chip = (label, value, cls = "", withRate = true) =>
     `<span class="si-chip ${cls}">${label} <b>${value}</b>${withRate ? rate(value) : ""}</span>`;
+
+  // Pairs with a numeric score AND a numeric 当日涨幅 feed the live IC/RankIC.
+  const valued = rows.filter((r) => typeof r.score === "number" && typeof r.day_change === "number");
+  const scores = valued.map((r) => r.score);
+  const labels = valued.map((r) => r.day_change);
+  const rankic = _safeCorr(scores, labels, "spearman");
+  const ic = _safeCorr(scores, labels, "pearson");
+  const corrChip = (label, v) => {
+    if (!isFinite(v)) return `<span class="si-chip">${label} <b>样本不足</b></span>`;
+    const cls = v > 0 ? "pos" : v < 0 ? "neg" : "";
+    return `<span class="si-chip ${cls}">${label} <b>${v.toFixed(4)}</b></span>`;
+  };
+  // Top50 by score (rows already arrive rank-ordered, but sort defensively). Uses all
+  // valued rows when fewer than 50 are present, noting the count.
+  const topSorted = valued.slice().sort((a, b) => b.score - a.score);
+  const topN = topSorted.slice(0, 50);
+  const n = topN.length;
+  const topMean = n ? topN.reduce((s, r) => s + r.day_change, 0) / n : NaN;
+  const topWin = n ? topN.filter((r) => r.day_change > 0).length / n : NaN;
+  const topLabel = n < 50 ? `Top${n}` : "Top50";
+  const topRetChip = isFinite(topMean)
+    ? `<span class="si-chip ${topMean > 0 ? "pos" : topMean < 0 ? "neg" : ""}">${topLabel}收益 <b>${(topMean * 100).toFixed(2)}%</b></span>`
+    : "";
+  const topWinChip = isFinite(topWin)
+    ? `<span class="si-chip">${topLabel}胜率 <b>${(topWin * 100).toFixed(1)}%</b></span>`
+    : "";
+
   el.innerHTML =
     chip("共", total, "", false) +
     chip("上涨", up, "pos") +
     chip("下跌", down, "neg") +
     chip("平", flat) +
     (unknown ? chip("无价", unknown) : "") +
-    chip("已持仓", held, "held");
+    chip("已持仓", held, "held") +
+    '<span class="si-chip-sep"></span>' +
+    corrChip("RankIC(实时)", rankic) +
+    corrChip("IC(实时)", ic) +
+    topRetChip +
+    topWinChip;
 }
 
 async function loadStratInfo() {
