@@ -166,6 +166,7 @@ button:disabled:hover { filter: none; }
   padding: 3px 12px; font-size: 13px; color: #aeb6c4;
 }
 .si-chip b { color: #e6ebf2; margin-left: 2px; }
+.si-chip .si-rate { color: #7f8ba0; font-size: 12px; }
 .si-chip.pos b { color: var(--up); }
 .si-chip.neg b { color: var(--down); }
 .si-chip.held { border-color: rgba(76, 141, 255, 0.6); }

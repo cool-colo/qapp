@@ -167,13 +167,23 @@ windowed AS (
             / NULLIF(FIRST_VALUE(csi_all_preclose) OVER w, 0) AS week_cum_csi_all_rate,
         -- 中证1000周累计收益率：(当日收盘 − 本周首日昨收) / 本周首日昨收
         (csi1000_close - FIRST_VALUE(csi1000_preclose) OVER w)
-            / NULLIF(FIRST_VALUE(csi1000_preclose) OVER w, 0) AS week_cum_csi1000_rate
+            / NULLIF(FIRST_VALUE(csi1000_preclose) OVER w, 0) AS week_cum_csi1000_rate,
+        -- 累计（扩张窗口）风险指标：按 trade_date 全区间累计，不按周分区。
+        -- 样本标准差 (n-1)；夏普用 2% 年化无风险利率折算到日 (0.02/252)。
+        STDDEV_SAMP(strat_daily_rate) OVER cum AS daily_volatility,
+        (AVG(strat_daily_rate) OVER cum - (0.02 / 252))
+            / NULLIF(STDDEV_SAMP(strat_daily_rate) OVER cum, 0) AS daily_sharpe
     FROM combined c
-    WINDOW w AS (
-        PARTITION BY week_num
-        ORDER BY trade_date
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    )
+    WINDOW
+        w AS (
+            PARTITION BY week_num
+            ORDER BY trade_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ),
+        cum AS (
+            ORDER BY trade_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
 )
 
 -- ========== 11. 最终输出 ==========
@@ -187,6 +197,10 @@ SELECT
     CONCAT(ROUND(w.csi1000_daily_rate * 100, 2), '%')     AS 中证1千收益率,
     -- 日超额收益：策略当日收益率 − 中证1000当日收益率
     CONCAT(ROUND((w.strat_daily_rate - w.csi1000_daily_rate) * 100, 2), '%') AS 超额收益,
+    CONCAT(ROUND(w.daily_volatility * 100, 2), '%')            AS 日波动率,
+    CONCAT(ROUND(w.daily_volatility * SQRT(252) * 100, 2), '%') AS 年化波动率,
+    ROUND(w.daily_sharpe, 2)                                    AS 日夏普,
+    ROUND(w.daily_sharpe * SQRT(252), 2)                        AS 年化夏普,
     CONCAT('W', w.week_num)  AS 周,
     ROUND(w.week_cum_return_amount, 0)   AS 周收益,
     CONCAT(ROUND(w.week_cum_strat_rate * 100, 2), '%')    AS 周收益率,

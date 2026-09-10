@@ -70,12 +70,13 @@ function pct(v) {
 }
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 
-const NUMERIC_RE = /_rate|_bps|price|value|asset|cash|pnl|amount|qty|volume|weight|score|return|equity|commission|balance/;
+const NUMERIC_RE = /_rate|_bps|price|value|asset|cash|pnl|amount|qty|volume|weight|score|return|equity|commission|balance|sharpe|volatil/;
 function isNumericCol(col) { return NUMERIC_RE.test(col); }
 
 const RATE_COLS = new Set([
   "strat_daily_rate", "csi1000_daily_rate", "excess_daily_rate",
   "week_cum_strat_rate", "week_cum_csi1000_rate", "week_cum_excess_rate", "target_weight",
+  "daily_volatility", "annual_volatility",
 ]);
 
 // A-share color convention: red = positive, green = negative, neutral = zero.
@@ -598,6 +599,10 @@ const REPORT_HEADERS = {
   strat_daily_rate: "策略日收益",
   csi1000_daily_rate: "中证1000日收益",
   excess_daily_rate: "日超额",
+  daily_volatility: "日波动率",
+  annual_volatility: "年化波动率",
+  daily_sharpe: "日夏普",
+  annual_sharpe: "年化夏普",
   week_label: "周",
   week_cum_return_amount: "本周累计盈亏",
   week_cum_strat_rate: "本周策略累计",
@@ -610,6 +615,7 @@ const REPORT_HEADERS = {
 // Columns to sign-color (rates, excess, pnl-like amounts, slippage).
 const REPORT_SIGN_COLS = new Set([
   "return_amount", "strat_daily_rate", "csi1000_daily_rate", "excess_daily_rate",
+  "daily_sharpe", "annual_sharpe",
   "week_cum_return_amount", "week_cum_strat_rate", "week_cum_csi1000_rate",
   "week_cum_excess_rate", "buy_slippage_bps", "sell_slippage_bps", "total_slippage_bps",
 ]);
@@ -706,6 +712,7 @@ const ASSET_METRICS = [
 const RETURN_METRICS = [
   "strat_daily_rate", "csi1000_daily_rate", "excess_daily_rate",
   "week_cum_strat_rate", "week_cum_csi1000_rate", "week_cum_excess_rate",
+  "daily_volatility", "annual_volatility", "daily_sharpe", "annual_sharpe",
   "return_amount", "week_cum_return_amount", "before_market_value", "after_market_value",
   "buy_slippage_bps", "sell_slippage_bps", "total_slippage_bps",
 ];
@@ -1381,10 +1388,12 @@ function renderSignalSummary(signals) {
     else if (c < 0) down += 1;
     else flat += 1;
   }
-  const chip = (label, value, cls = "") =>
-    `<span class="si-chip ${cls}">${label} <b>${value}</b></span>`;
+  const total = rows.length;
+  const rate = (n) => ` <span class="si-rate">${(n / total * 100).toFixed(1)}%</span>`;
+  const chip = (label, value, cls = "", withRate = true) =>
+    `<span class="si-chip ${cls}">${label} <b>${value}</b>${withRate ? rate(value) : ""}</span>`;
   el.innerHTML =
-    chip("共", rows.length) +
+    chip("共", total, "", false) +
     chip("上涨", up, "pos") +
     chip("下跌", down, "neg") +
     chip("平", flat) +

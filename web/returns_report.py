@@ -26,6 +26,12 @@ from typing import Any
 
 from web.db import MySqlSource
 
+# Risk-adjusted metric conventions (also hard-coded as literals in RETURNS_SQL and
+# the canonical .sql — keep all three in sync). Sharpe uses a 2% annual risk-free
+# rate converted to daily (rf_annual / TRADING_DAYS); annualization is × SQRT(252).
+ANNUAL_RISK_FREE = 0.02
+TRADING_DAYS = 252
+
 # Column order returned by RETURNS_SQL (all numeric except trade_date/week_label).
 RETURN_COLUMNS = [
     "trade_date",
@@ -35,6 +41,10 @@ RETURN_COLUMNS = [
     "strat_daily_rate",
     "csi1000_daily_rate",
     "excess_daily_rate",
+    "daily_volatility",
+    "annual_volatility",
+    "daily_sharpe",
+    "annual_sharpe",
     "week_label",
     "week_cum_return_amount",
     "week_cum_strat_rate",
@@ -192,13 +202,24 @@ windowed AS (
         (csi_all_close - FIRST_VALUE(csi_all_preclose) OVER w)
             / NULLIF(FIRST_VALUE(csi_all_preclose) OVER w, 0) AS week_cum_csi_all_rate,
         (csi1000_close - FIRST_VALUE(csi1000_preclose) OVER w)
-            / NULLIF(FIRST_VALUE(csi1000_preclose) OVER w, 0) AS week_cum_csi1000_rate
+            / NULLIF(FIRST_VALUE(csi1000_preclose) OVER w, 0) AS week_cum_csi1000_rate,
+        -- Expanding (cumulative) risk metrics over the full period up to this row
+        -- (ordered by trade_date, NOT partitioned by week). Sample std (n-1);
+        -- Sharpe uses a 2%% annual risk-free rate converted to daily (0.02/252).
+        STDDEV_SAMP(strat_daily_rate) OVER cum AS daily_volatility,
+        (AVG(strat_daily_rate) OVER cum - (0.02 / 252))
+            / NULLIF(STDDEV_SAMP(strat_daily_rate) OVER cum, 0) AS daily_sharpe
     FROM combined c
-    WINDOW w AS (
-        PARTITION BY week_num
-        ORDER BY trade_date
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    )
+    WINDOW
+        w AS (
+            PARTITION BY week_num
+            ORDER BY trade_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ),
+        cum AS (
+            ORDER BY trade_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
 )
 SELECT
     w.trade_date                                          AS trade_date,
@@ -208,6 +229,10 @@ SELECT
     w.strat_daily_rate                                    AS strat_daily_rate,
     w.csi1000_daily_rate                                  AS csi1000_daily_rate,
     (w.strat_daily_rate - w.csi1000_daily_rate)           AS excess_daily_rate,
+    w.daily_volatility                                    AS daily_volatility,
+    (w.daily_volatility * SQRT(252))                      AS annual_volatility,
+    w.daily_sharpe                                        AS daily_sharpe,
+    (w.daily_sharpe * SQRT(252))                          AS annual_sharpe,
     CONCAT('W', w.week_num)                               AS week_label,
     w.week_cum_return_amount                              AS week_cum_return_amount,
     w.week_cum_strat_rate                                 AS week_cum_strat_rate,
