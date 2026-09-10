@@ -61,6 +61,18 @@ exchange_trading_windows: "09:30-11:30,13:00-14:55"
 full_tick_refresh_secs: 1.0
 full_tick_prefetch_time: "09:27"
 
+# --- Whole-market (京沪深A) full-tick snapshot ---
+# Fetches a full-tick snapshot for the entire A-share universe (Beijing + Shanghai +
+# Shenzhen A) once at startup, at whole_market_full_tick_time daily, then every
+# whole_market_full_tick_interval_secs while the trading window is open. The universe
+# is whatever the instrument provider loaded into the Nautilus cache (whole market by
+# default). Intraday it is kept only in memory (latest-wins); the final snapshot is
+# persisted once after market close into MySQL live_stock_tick_snapshot
+# (snapshot_type = "whole_market"). Live-only; ignored in backtest.
+whole_market_full_tick_enabled: true
+whole_market_full_tick_time: "09:26"
+whole_market_full_tick_interval_secs: 600.0
+
 # --- Order tagging (live) ---
 order_id_tag: "001"
 

@@ -697,6 +697,14 @@ const SQ_HEADERS = {
   top50_label_excess: "Top50超额",
   benchmark_label_return: "基准收益",
   sample_count: "样本数",
+  label_source: "标签来源",
+};
+// Trailing-edge fallback flag -> Chinese. normal = exact open-to-open forward
+// return; t1_intraday = T+1 offline (收/开); realtime_intraday = live (现价/开).
+const SQ_LABEL_SOURCE = {
+  normal: "正常",
+  t1_intraday: "T+1日内",
+  realtime_intraday: "实时日内",
 };
 // ls10 / label returns / excess are on the % axis (RATE_COLS). rankic/ic are plain
 // signed 4-decimal numerics; sample_count is an int.
@@ -745,6 +753,7 @@ function buildSignalQualitySummary(rows) {
   out.top50_label_excess = `均值 ${_fmtPct(_mean(col("top50_label_excess")))}`;
   out.benchmark_label_return = `均值 ${_fmtPct(_mean(col("benchmark_label_return")))}`;
   out.sample_count = "";
+  out.label_source = "";
   return out;
 }
 
@@ -762,7 +771,8 @@ async function loadSignalQuality() {
     const hint = $("#sq-hint");
     if (hint) {
       hint.textContent = `预测表 ${res.predictions_table || "?"}｜窗口 ${res.holding_days} 日｜`
-        + "标签=复权开盘价 t+1→t+(N+1)，基准=中证全指";
+        + "标签=复权开盘价 t+1→t+(N+1)，基准=中证全指；"
+        + "近端信号无完整未来窗口时，用 T+1 日内(收/开)或实时(现价/开)近似，见「标签来源」列";
     }
     renderTable("#sq-table", rows, {
       columns,
@@ -770,6 +780,10 @@ async function loadSignalQuality() {
       signCols: SQ_SIGN_COLS,
       intCols: SQ_INT_COLS,
       footerFn: buildSignalQualitySummary,
+      // Map the raw label_source flag to Chinese; leave every other cell default.
+      cellFn: (c, v) => (c === "label_source" ? `<td class="text">${SQ_LABEL_SOURCE[v] || v || ""}</td>` : undefined),
+      // Amber-tint any approximate (non-normal) row so it's never mistaken for exact.
+      rowClass: (row) => (row.label_source && row.label_source !== "normal" ? "approx-row" : ""),
     });
   } catch (e) { toast(e.message); $("#sq-table").innerHTML = '<div class="empty">无数据</div>'; }
 }

@@ -97,6 +97,12 @@ The node's `X-Control-Token` stays server-side. `GET /api/accounts` returns a
 `has_node_api` flag per account so the UI enables the 实时信息 / 交易管理 tabs only for
 accounts that have a node configured.
 
+`GET /api/signal_quality` also reads the node's read-only `GET
+/realtime/whole_market_ticks` (whole 京沪深A full-tick snapshot: `stock_code, open,
+last_price, last_close`) best-effort, to approximate the label for the newest signal
+date that has no offline forward window yet (`label_source = realtime_intraday`); a node
+error just drops those live rows. Skipped when `predictions_table` is overridden.
+
 **Selling is opt-in.** `sell_enabled` in the config (**default false**, also settable as
 `WEB_SELL_ENABLED=true`) gates every sell action: `GET /api/config` exposes the flag so
 the UI renders the per-row **卖出** and 交易管理's **全部卖出** buttons grayed-out, and

@@ -84,6 +84,36 @@ def _node_api(data: DataAccess, account: str, trader: str) -> NodeApiClient:
     return client
 
 
+def _fetch_realtime_ticks(client: NodeApiClient) -> dict[str, Any] | None:
+    """Best-effort node whole-market snapshot for the signal-quality rule-2 fallback.
+
+    Returns ``{"date": "YYYY-MM-DD", "rows": [(code, open, last_price), …]}`` filtered
+    to positive open/last, or ``None`` if the node is unreachable or reports nothing —
+    the report still renders the normal + T+1 rows in that case.
+    """
+    try:
+        payload = client.get("/realtime/whole_market_ticks")
+    except Exception:  # noqa: BLE001 — node fetch is non-fatal; report still renders
+        return None
+    trade_date = payload.get("trade_date")
+    ticks = payload.get("ticks") or []
+    if not trade_date or not ticks:
+        return None
+    rows: list[tuple[str, float, float]] = []
+    for tick in ticks:
+        code = tick.get("stock_code")
+        open_price = tick.get("open")
+        last_price = tick.get("last_price")
+        if not code or not isinstance(open_price, (int, float)) or not isinstance(last_price, (int, float)):
+            continue
+        if open_price <= 0 or last_price <= 0:
+            continue
+        rows.append((str(code), float(open_price), float(last_price)))
+    if not rows:
+        return None
+    return {"date": str(trade_date), "rows": rows}
+
+
 def _check_snapshot_type(snapshot_type: str | None) -> None:
     if snapshot_type is not None and snapshot_type not in SNAPSHOT_TYPES:
         raise HTTPException(
@@ -388,6 +418,7 @@ def get_signal_quality(
             detail=f"holding_days must be one of {list(ALLOWED_HOLDING_DAYS)}",
         )
     table = predictions_table
+    realtime_ticks: dict[str, Any] | None = None
     if not table:
         client = _node_api(data, account, trader)
         try:
@@ -400,6 +431,11 @@ def get_signal_quality(
                 status_code=502,
                 detail="live node did not report a predictions_table",
             )
+        # Rule-2 fallback: best-effort fetch of the node's whole-market snapshot so
+        # yesterday's/today's signal date (no offline T+1 row yet) gets an approximate
+        # intraday label. Node errors are non-fatal — the report still renders normal
+        # + T+1 rows. Skipped on the predictions_table override path (no node).
+        realtime_ticks = _fetch_realtime_ticks(client)
     try:
         rows = query_signal_quality(
             data.clickhouse,
@@ -407,6 +443,7 @@ def get_signal_quality(
             start_date=start,
             end_date=end,
             holding_days=holding_days,
+            realtime_ticks=realtime_ticks,
         )
     except Exception as exc:  # noqa: BLE001 — surface DB errors as 500 with a message
         raise HTTPException(status_code=500, detail=f"signal_quality query failed: {exc}") from exc

@@ -727,6 +727,46 @@ class LiveControlServer:
             "signals": rows,
         }
 
+    def _whole_market_ticks_payload(self) -> dict:
+        """The live whole-market (京沪深A) full-tick snapshot, for label fallbacks.
+
+        Emits one row per instrument that has both a positive open and last_price
+        in the node's in-memory ``_whole_market_status``. Used by the dashboard's
+        信号质量 report to approximate the label for yesterday's signal date (which
+        has no offline T+1 row yet) as an intraday ``last_price/open - 1`` return.
+        ``trade_date`` is the node's current trading day so a stale snapshot can't
+        relabel older dates on the dashboard side.
+        """
+        try:
+            snapshot = self._strategy.whole_market_snapshot()
+        except Exception:
+            snapshot = {}
+        rows: list[dict] = []
+        for iid_text, tick in snapshot.items():
+            open_price = _float_or_none(tick.open)
+            last_price = _float_or_none(tick.last_price)
+            if open_price is None or open_price <= 0:
+                continue
+            if last_price is None or last_price <= 0:
+                continue
+            rows.append(
+                {
+                    "stock_code": self._stock_code(iid_text).upper(),
+                    "open": open_price,
+                    "last_price": last_price,
+                    "last_close": _float_or_none(tick.last_close),
+                },
+            )
+        try:
+            trade_date = str(self._strategy.control_clock_date())
+        except Exception:
+            trade_date = None
+        return {
+            "trade_date": trade_date,
+            "count": len(rows),
+            "ticks": rows,
+        }
+
     # ---- control actions -----------------------------------------------------
 
     def _set_paused(self, paused: bool) -> dict:
@@ -857,6 +897,8 @@ class LiveControlServer:
                         self._send(200, server._strategy_info_payload())
                     elif path == "/strategy/signals":
                         self._send(200, server._strategy_signals_payload())
+                    elif path == "/realtime/whole_market_ticks":
+                        self._send(200, server._whole_market_ticks_payload())
                     elif path == "/realtime/closed_debug":
                         self._send(200, server._closed_debug_payload())
                     elif path == "/realtime/fills_debug":

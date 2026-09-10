@@ -15,6 +15,10 @@ JsonMapping = Mapping[str, Any]
 BEFORE_TRADING = "before_trading"
 CONTINUOUS_TRADING = "continuous_trading"
 AFTER_TRADING = "after_trading"
+# Whole-market (京沪深A) full-tick snapshot, persisted once after market close.
+# Shares live_stock_tick_snapshot with AFTER_TRADING but keyed by its own
+# snapshot_type so the two never collide on (trade_date, snapshot_type, instrument_id).
+WHOLE_MARKET = "whole_market"
 
 # `source` marks whether a snapshot was captured at its natural time (``live``) or
 # reconstructed from intraday state because the process started after the window

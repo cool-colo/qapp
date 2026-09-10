@@ -46,6 +46,7 @@ from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import SOURCE_FALLBACK
 from backtests.result_writers.live_records import SOURCE_LIVE
+from backtests.result_writers.live_records import WHOLE_MARKET
 from backtests.result_writers.live_records import LiveAssetSnapshotRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
@@ -374,6 +375,37 @@ class SnapshotRecorder(Actor):
         self._backfill_trades(
             trading_date,
             on_complete=callback("live_trade"),
+        )
+        # Persist the whole-market (京沪深A) full-tick snapshot captured intraday by the
+        # strategy timer. Written once, after close, under its own snapshot_type so it
+        # never collides with the AFTER_TRADING universe rows on the unique key.
+        self._record_whole_market_ticks(
+            trading_date,
+            on_complete=callback("live_stock_tick_snapshot"),
+        )
+
+    def _record_whole_market_ticks(
+        self,
+        trading_date: date,
+        on_complete: SyncTaskCallback | None = None,
+    ) -> None:
+        snapshot = self._strategy.whole_market_snapshot()
+        if not snapshot:
+            self.log.warning(
+                "after-trading whole-market snapshot is empty; nothing to persist",
+            )
+            if on_complete is not None:
+                on_complete("skipped", 0, {"reason": "whole-market snapshot empty"})
+            return
+        # ``snapshot`` already holds normalized TickSnapshots keyed by instrument-id,
+        # so the lookup is a direct dict read rather than the strategy's traded-universe
+        # map. Pass a synthetic ``{id: None}`` payload as the id set to iterate.
+        self._record_stock_ticks(
+            trading_date,
+            {instrument_id: None for instrument_id in snapshot},
+            on_complete=on_complete,
+            snapshot_type=WHOLE_MARKET,
+            tick_lookup=snapshot.get,
         )
 
     # ---- asset snapshot ------------------------------------------------------
@@ -1616,16 +1648,22 @@ class SnapshotRecorder(Actor):
         trading_date: date,
         snapshot: dict[str, Any],
         on_complete: SyncTaskCallback | None = None,
+        snapshot_type: str = AFTER_TRADING,
+        tick_lookup: Callable[[str], Any] | None = None,
     ) -> None:
         now = self._now_naive()
         records: list[LiveStockTickSnapshotRecord] = []
         missing: list[str] = []
+        # ``tick_lookup`` resolves an instrument-id to its normalized TickSnapshot.
+        # Defaults to the strategy's traded-universe tick map; the whole-market pass
+        # passes a lookup backed by ``whole_market_snapshot()``.
+        lookup = tick_lookup or self._strategy.tick_snapshot_for
         instrument_ids = sorted(str(instrument_id) for instrument_id in snapshot)
         for instrument_id_text in instrument_ids:
-            tick = self._strategy.tick_snapshot_for(instrument_id_text)
+            tick = lookup(instrument_id_text)
             if tick is None:
                 self.log.warning(
-                    f"after-trading full-tick snapshot missing normalized tick: {instrument_id_text}",
+                    f"{snapshot_type} full-tick snapshot missing normalized tick: {instrument_id_text}",
                 )
                 missing.append(instrument_id_text)
                 continue
@@ -1633,7 +1671,7 @@ class SnapshotRecorder(Actor):
                 LiveStockTickSnapshotRecord(
                     trade_date=trading_date,
                     write_time=now,
-                    snapshot_type=AFTER_TRADING,
+                    snapshot_type=snapshot_type,
                     instrument_id=instrument_id_text,
                     stock_code=self._stock_code(instrument_id_text),
                     name=self._instrument_name(
@@ -1681,7 +1719,7 @@ class SnapshotRecorder(Actor):
                     },
                 )
         except Exception as exc:
-            self.log.warning(f"stock tick snapshot write failed ({AFTER_TRADING}): {exc}")
+            self.log.warning(f"stock tick snapshot write failed ({snapshot_type}): {exc}")
             if on_complete is not None:
                 on_complete(
                     "failed",

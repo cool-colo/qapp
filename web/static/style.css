@@ -326,6 +326,12 @@ a.klink:hover { text-decoration: underline; }
 /* Sold-out today (当前拥股 0): dimmed + italic, but realized day result still shown. */
 #rt-positions tr.closed-today td { opacity: .6; font-style: italic; }
 
+/* 信号质量: rows whose label is an approximate trailing-edge fallback (T+1 日内 /
+   实时日内, i.e. label_source != normal) get a subtle amber tint so they're never
+   read as the exact open-to-open forward return. */
+#sq-table tr.approx-row td { background: rgba(255, 196, 0, 0.07); }
+#sq-table tr.approx-row:hover td { background: rgba(255, 196, 0, 0.13); }
+
 /* Destructive control buttons (全部卖出). */
 button.danger { background: var(--down); }
 

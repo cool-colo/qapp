@@ -461,6 +461,9 @@ def build_target_model_node(
             subscribe_order_book_depth=True,
             full_tick_refresh_secs=params.full_tick_refresh_secs,
             full_tick_prefetch_time=params.full_tick_prefetch_time,
+            whole_market_full_tick_enabled=params.whole_market_full_tick_enabled,
+            whole_market_full_tick_time=params.whole_market_full_tick_time,
+            whole_market_full_tick_interval_secs=params.whole_market_full_tick_interval_secs,
             process_targets_on_timer=True,
             process_targets_interval_secs=params.resubmit_interval_secs,
         ),
@@ -521,7 +524,31 @@ def build_target_model_node(
             return {}
         return loader.full_tick_snapshot(codes)
 
+    def _fetch_whole_market_full_tick() -> dict[str, dict[str, float]]:
+        # Whole-market (京沪深A) full-tick snapshot. The universe is whatever the
+        # instrument provider loaded into the Nautilus cache at startup — with the
+        # default QMT_LOAD_ALL_INSTRUMENTS=True this is the entire A-share sector
+        # (QMT proxy: 沪深京A股; Big QMT: 沪深A股). We resolve stock codes from the
+        # cache (Nautilus-first) rather than re-enumerating a sector; if the node was
+        # started with --no-load-all-instruments the cache is empty and we no-op.
+        instrument_ids = strategy.cache.instrument_ids()
+        stock_codes: set[str] = set()
+        for instrument_id in instrument_ids:
+            stock_code = legacy.stock_code_from_instrument_id(instrument_id)
+            if stock_code:
+                stock_codes.add(stock_code)
+        if not stock_codes:
+            strategy.log.warning(
+                "whole-market full-tick: Nautilus cache holds no instruments "
+                "(started with --no-load-all-instruments?); skipping fetch",
+            )
+            return {}
+        return loader.full_tick_snapshot(sorted(stock_codes))
+
     strategy.configure_full_tick_source(fetch_full_tick=_fetch_full_tick)
+    strategy.configure_whole_market_full_tick_source(
+        fetch_whole_market_full_tick=_fetch_whole_market_full_tick,
+    )
 
     _divid_events_cache: dict[tuple[str, str], list[tuple[Any, float]]] = {}
 

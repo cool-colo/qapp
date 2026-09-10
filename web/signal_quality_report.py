@@ -50,6 +50,21 @@ from web.db import ClickHouseClient, quote_identifier, quote_literal
 # Benchmark index for the excess-return columns (中证全指).
 BENCHMARK_TS_CODE = "000985.CSI"
 
+# ---------------------------------------------------------------------------
+# Trailing-edge label fallbacks (dashboard-only approximations)
+# ---------------------------------------------------------------------------
+# The reference metric's label is strictly the adjusted open-to-open forward
+# return over the full h-window; the newest ``h+1`` signal dates have no such
+# window yet and the reference simply drops them. For a live dashboard those
+# freshest dates are the most interesting, so we approximate their label and
+# flag it via ``label_source`` (precedence: normal > t1_intraday > realtime):
+#
+#   normal            full h-window open-to-open return (exact, reference port)
+#   t1_intraday       T+1 offline intraday return  (close/open - 1) on the buy day
+#   realtime_intraday today's intraday return (last_price/open - 1) from the node
+#
+# (close/open - 1) is adj_factor-invariant, so the T+1 fallback needs no adj.
+
 # Forward-window choices offered in the UI / accepted by the API. Inlined as ints into
 # the SQL (ClickHouse rejects a Nullable/subquery leadInFrame offset), so the set is
 # closed and validated by the caller.
@@ -68,7 +83,26 @@ SIGNAL_QUALITY_COLUMNS = [
     "top50_label_excess",
     "benchmark_label_return",
     "sample_count",
+    "label_source",
 ]
+
+
+def _realtime_values_sql(rows: list[tuple[str, float, float]]) -> str:
+    """Inline the node's realtime ticks as a CH ``values(...)`` literal table.
+
+    Each row is ``(code, rt_open, rt_last)`` with ``code`` already in factor form
+    (``302132.SZ``). Codes are quoted via ``quote_literal``; numbers are formatted
+    as plain floats. Caller guarantees a non-empty list.
+    """
+    tuples = ", ".join(
+        f"({quote_literal(code)}, {float(rt_open)!r}, {float(rt_last)!r})"
+        for code, rt_open, rt_last in rows
+    )
+    return (
+        "SELECT code, rt_open, rt_last FROM "
+        "values('code String, rt_open Float64, rt_last Float64', "
+        f"{tuples})"
+    )
 
 
 def build_signal_quality_sql(
@@ -76,6 +110,7 @@ def build_signal_quality_sql(
     start_date: str,
     end_date: str,
     holding_days: int,
+    realtime_ticks: dict[str, Any] | None = None,
 ) -> str:
     """Build the per-day signal-quality ClickHouse SQL.
 
@@ -83,6 +118,13 @@ def build_signal_quality_sql(
     ``quote_identifier``; ``start_date``/``end_date`` via ``quote_literal``.
     ``holding_days`` MUST already be validated as one of ``ALLOWED_HOLDING_DAYS`` — it is
     inlined as an int (offsets ``1`` and ``h+1``, frame ``h+1``, gate ``h+2``).
+
+    ``realtime_ticks`` (optional) supplies the node's whole-market snapshot for the
+    rule-2 fallback: ``{"date": "YYYY-MM-DD", "rows": [(code, open, last_price), …]}``.
+    Its ``date`` is the node's clock (TODAY / the buy day); its intraday
+    ``last_price/open - 1`` label is applied to the signal date whose buy day is today
+    (the latest ``pred_date`` before ``date``), so a stale snapshot can't relabel older
+    dates.
     """
     if holding_days not in ALLOWED_HOLDING_DAYS:
         raise ValueError(f"holding_days must be one of {ALLOWED_HOLDING_DAYS}: {holding_days!r}")
@@ -97,15 +139,49 @@ def build_signal_quality_sql(
     frame_off = h + 1      # forward frame reaches the exit row
     full_window = h + 2    # a row + its (h+1) forward rows are all present
 
+    # --- rule-2 realtime CTE (optional) -------------------------------------
+    # The node's snapshot is TODAY's intraday tick (``rt_date`` = the node clock /
+    # buy day). It labels the signal date whose buy day is today — i.e. the latest
+    # prediction date strictly before ``rt_date`` (that date's t+1 open == today, so
+    # its intraday label is ``last_price(today)/open(today) - 1``). We resolve that
+    # signal date from the predictions themselves (``max(pred_date) < rt_date``)
+    # rather than assuming ``rt_date - 1`` calendar day, and apply the tick only
+    # there so a stale snapshot can't relabel older dates.
+    rt_rows = (realtime_ticks or {}).get("rows") or []
+    rt_date = (realtime_ticks or {}).get("date")
+    if rt_rows and rt_date:
+        rt_date_lit = quote_literal(str(rt_date))
+        realtime_cte = f"""
+realtime AS (
+    -- Node whole-market snapshot (today's intraday tick). last_price/open - 1.
+    {_realtime_values_sql(rt_rows)}
+),
+rt_signal_date AS (
+    -- The signal date whose buy day is today: latest pred_date < the node's date.
+    SELECT max(pred_date) AS sig_date FROM preds WHERE pred_date < toDate({rt_date_lit})
+),"""
+        # LEFT JOIN into preds keyed on code, only for the resolved signal date.
+        realtime_join = """
+    LEFT JOIN realtime rt
+        ON p.code = rt.code AND p.pred_date = (SELECT sig_date FROM rt_signal_date)"""
+        realtime_label_expr = "if(rt.rt_open > 0, rt.rt_last / rt.rt_open - 1, NULL)"
+    else:
+        realtime_cte = ""
+        realtime_join = ""
+        realtime_label_expr = "NULL"
+
     return f"""
 WITH
 adjpx AS (
-    -- Adjusted open per stock; buffered [start-15d, end+20d] so the trailing forward
-    -- window (and the benchmark alignment) always have rows to lead into.
+    -- Adjusted open per stock (for the exact open-to-open window) plus raw
+    -- open/close (for the adj-invariant T+1 intraday fallback). Buffered
+    -- [start-15d, end+20d] so the trailing forward window always has rows.
     SELECT
         source_code AS code,
         trade_date,
-        open * adj_factor AS aopen
+        open * adj_factor AS aopen,
+        open  AS o_raw,
+        close AS c_raw
     FROM {quote_identifier("dws_stock_factor_wide")}
     WHERE trade_date >= toDate({start}) - 15
       AND trade_date <= toDate({end}) + 20
@@ -113,25 +189,36 @@ adjpx AS (
       AND adj_factor IS NOT NULL
 ),
 lab AS (
-    -- Per-stock forward window: entry = t+1 open, exit = t+(h+1) open. ``avail`` gates
-    -- rows that lack a full forward window (edge of the series).
+    -- Per-stock forward window. Normal: entry = t+1 open, exit = t+(h+1) open,
+    -- ``avail`` gates a full window. T+1 intraday fallback: close/open on the
+    -- buy day (t+1), needing just the current row + its T+1 row (``t1_avail``).
     SELECT
         code,
         trade_date,
         leadInFrame(aopen, {entry_off}) OVER w AS entry_px,
         leadInFrame(aopen, {exit_off}) OVER w AS exit_px,
-        count() OVER w AS avail
+        count() OVER w AS avail,
+        leadInFrame(o_raw, {entry_off}) OVER w2 AS t1_open,
+        leadInFrame(c_raw, {entry_off}) OVER w2 AS t1_close,
+        count() OVER w2 AS t1_avail
     FROM adjpx
-    WINDOW w AS (
-        PARTITION BY code
-        ORDER BY trade_date
-        ROWS BETWEEN CURRENT ROW AND {frame_off} FOLLOWING
-    )
+    WINDOW
+        w AS (
+            PARTITION BY code
+            ORDER BY trade_date
+            ROWS BETWEEN CURRENT ROW AND {frame_off} FOLLOWING
+        ),
+        w2 AS (
+            PARTITION BY code
+            ORDER BY trade_date
+            ROWS BETWEEN CURRENT ROW AND {entry_off} FOLLOWING
+        )
 ),
 bench_px AS (
     SELECT
         trade_date,
-        argMax(open, _ingest_time) AS bopen
+        argMax(open, _ingest_time)  AS bopen,
+        argMax(close, _ingest_time) AS bclose
     FROM {quote_identifier("index_daily")}
     WHERE ts_code = {bench}
       AND trade_date >= toDate({start}) - 15
@@ -139,17 +226,26 @@ bench_px AS (
     GROUP BY trade_date
 ),
 bench AS (
-    -- Same open-to-open forward window applied to the benchmark index.
+    -- Open-to-open forward window (normal) plus the T+1 intraday benchmark
+    -- (close/open on the buy day) matching the rule-1 fallback.
     SELECT
         trade_date,
         leadInFrame(bopen, {entry_off}) OVER wb AS b_entry,
         leadInFrame(bopen, {exit_off}) OVER wb AS b_exit,
-        count() OVER wb AS b_avail
+        count() OVER wb AS b_avail,
+        leadInFrame(bopen, {entry_off}) OVER wb2  AS b_t1_open,
+        leadInFrame(bclose, {entry_off}) OVER wb2 AS b_t1_close,
+        count() OVER wb2 AS b_t1_avail
     FROM bench_px
-    WINDOW wb AS (
-        ORDER BY trade_date
-        ROWS BETWEEN CURRENT ROW AND {frame_off} FOLLOWING
-    )
+    WINDOW
+        wb AS (
+            ORDER BY trade_date
+            ROWS BETWEEN CURRENT ROW AND {frame_off} FOLLOWING
+        ),
+        wb2 AS (
+            ORDER BY trade_date
+            ROWS BETWEEN CURRENT ROW AND {entry_off} FOLLOWING
+        )
 ),
 preds AS (
     -- stock_code 'SZ302132' (exch-prefix, no dot) -> factor form '302132.SZ'.
@@ -159,18 +255,33 @@ preds AS (
         score
     FROM {tbl}
     WHERE pred_date BETWEEN toDate({start}) AND toDate({end})
-),
-joined AS (
+),{realtime_cte}
+resolved AS (
+    -- Resolve each (code, pred_date) label by precedence: normal (full window)
+    -- > t1_intraday (T+1 offline) > realtime_intraday (node snapshot). A row
+    -- with none of the three available is dropped.
     SELECT
         p.pred_date AS pred_date,
         p.code      AS code,
         p.score     AS score,
-        l.exit_px / l.entry_px - 1 AS label
+        (l.avail = {full_window} AND l.entry_px > 0)                       AS normal_ok,
+        (l.t1_avail >= {entry_off} + 1 AND l.t1_open > 0)                  AS t1_ok,
+        l.exit_px / l.entry_px - 1                                         AS normal_label,
+        l.t1_close / l.t1_open - 1                                         AS t1_label,
+        {realtime_label_expr}                                             AS rt_label
     FROM preds p
-    INNER JOIN lab l
-        ON p.code = l.code AND p.pred_date = l.trade_date
-    WHERE l.avail = {full_window}
-      AND l.entry_px > 0
+    LEFT JOIN lab l
+        ON p.code = l.code AND p.pred_date = l.trade_date{realtime_join}
+),
+joined AS (
+    SELECT
+        pred_date,
+        code,
+        score,
+        multiIf(normal_ok, normal_label, t1_ok, t1_label, rt_label) AS label,
+        multiIf(normal_ok, 'normal', t1_ok, 't1_intraday', 'realtime_intraday') AS label_source
+    FROM resolved
+    WHERE normal_ok OR t1_ok OR (rt_label IS NOT NULL)
 ),
 ranked AS (
     SELECT
@@ -178,6 +289,7 @@ ranked AS (
         code,
         score,
         label,
+        label_source,
         row_number() OVER (PARTITION BY pred_date ORDER BY score DESC, code ASC) AS rnk,
         count() OVER (PARTITION BY pred_date) AS cnt,
         greatest(intDiv(count() OVER (PARTITION BY pred_date), 10), 1) AS layer_n
@@ -191,6 +303,7 @@ flagged AS (
         pred_date,
         score,
         label,
+        label_source,
         rnk,
         cnt,
         rnk <= layer_n              AS is_top_decile,
@@ -199,14 +312,22 @@ flagged AS (
 )
 SELECT
     f.pred_date                                            AS trade_date,
+    -- label_source is constant within a pred_date (precedence is per-date).
+    any(f.label_source)                                    AS label_source,
     if(count() < 3, NULL, rankCorr(score, label))          AS rankic,
     if(count() < 3, NULL, corr(score, label))              AS ic,
     avgIf(label, is_top_decile) - avgIf(label, is_bot_decile) AS ls10,
     if(any(cnt) < 20, NULL, avgIf(label, rnk <= 20))       AS top20_label_return,
     if(any(cnt) < 50, NULL, avgIf(label, rnk <= 50))       AS top50_label_return,
-    any(b.b_exit / b.b_entry - 1)                          AS benchmark_label_return,
-    if(any(cnt) < 20, NULL, avgIf(label, rnk <= 20) - any(b.b_exit / b.b_entry - 1)) AS top20_label_excess,
-    if(any(cnt) < 50, NULL, avgIf(label, rnk <= 50) - any(b.b_exit / b.b_entry - 1)) AS top50_label_excess,
+    -- Benchmark matches the resolved label source: full-window vs T+1 intraday
+    -- (rule 1); for a realtime-only date the index isn't in the snapshot -> NULL.
+    multiIf(
+        any(f.label_source) = 'normal',      any(b.b_exit / b.b_entry - 1),
+        any(f.label_source) = 't1_intraday', any(if(b.b_t1_open > 0, b.b_t1_close / b.b_t1_open - 1, NULL)),
+        NULL
+    )                                                      AS benchmark_label_return,
+    if(any(cnt) < 20, NULL, avgIf(label, rnk <= 20) - benchmark_label_return) AS top20_label_excess,
+    if(any(cnt) < 50, NULL, avgIf(label, rnk <= 50) - benchmark_label_return) AS top50_label_excess,
     count()                                                AS sample_count
 FROM flagged f
 LEFT JOIN bench b ON f.pred_date = b.trade_date
@@ -222,7 +343,10 @@ def query_signal_quality(
     start_date: str,
     end_date: str,
     holding_days: int,
+    realtime_ticks: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Run the signal-quality SQL and return per-day rows (already JSON-native)."""
-    sql = build_signal_quality_sql(table, start_date, end_date, holding_days)
+    sql = build_signal_quality_sql(
+        table, start_date, end_date, holding_days, realtime_ticks=realtime_ticks
+    )
     return clickhouse.query(sql)
