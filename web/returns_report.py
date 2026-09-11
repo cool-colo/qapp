@@ -114,6 +114,7 @@ after_market AS (
     FROM live_position_snapshot p
     LEFT JOIN live_stock_tick_snapshot t
         ON p.stock_code = t.stock_code AND p.trade_date = t.trade_date
+        AND t.snapshot_type = 'after_trading'
     WHERE p.snapshot_type = 'after_trading' AND p.trader_id = %(trader_id)s
         AND p.trade_date BETWEEN %(start_date)s AND %(end_date)s
         AND t.instrument_id LIKE CONCAT('%%', %(instrument_suffix)s)

@@ -157,6 +157,7 @@ function refreshActiveTab() {
   else if (tab === "series") { if ($("#series-start").value && $("#series-end").value) $("#series-plot").click(); }
   else if (tab === "compare") { if (cmpSeries.length) plotCompare(); }
   else if (tab === "kline") { if ($("#kline-code").value.trim()) plotKline(); }
+  else if (tab === "rline") { if ($("#rline-code").value.trim()) plotRline(); }
   else if (tab === "realtime") loadRealtime();
   else if (tab === "stratinfo") loadStratInfo();
   else if (tab === "control") loadControl();
@@ -167,6 +168,11 @@ function refreshActiveTab() {
 // ---------------------------------------------------------------------------
 $$(".nav-item").forEach((btn) => {
   btn.addEventListener("click", () => {
+    // A sidebar click ends any jump: drop the remembered origin so the chart
+    // tabs' 返回 button doesn't point somewhere stale. (goBackFromChart clears it
+    // before replaying the origin click, so this is a no-op in that path.)
+    jumpOrigin = null;
+    updateBackButtons();
     // Fold every group, then open only the one this item belongs to (if any).
     const group = btn.closest(".nav-group");
     $$(".nav-group").forEach((g) => g.classList.toggle("open", g === group));
@@ -207,6 +213,36 @@ $$(".subtab").forEach((btn) => {
     $(`#snap-${btn.dataset.sub}`).classList.add("active");
   });
 });
+
+// --- Back navigation for 个股K线 / 信号R线 -----------------------------------
+// A name/code link jump switches tabs by toggling .active classes, losing the
+// origin. Before jumping we snapshot the active nav-item (and, if it's the
+// snapshot tab, its active sub-tab) so 返回 can re-open exactly where we came
+// from by replaying the original clicks. Cleared once consumed.
+let jumpOrigin = null;
+function captureJumpOrigin() {
+  const nav = document.querySelector(".nav-item.active");
+  if (!nav) { jumpOrigin = null; return; }
+  const activeSub = document.querySelector(".subtab.active");
+  jumpOrigin = { nav, sub: activeSub ? activeSub.dataset.sub : null };
+}
+function updateBackButtons() {
+  $("#kline-back").hidden = !jumpOrigin;
+  $("#rline-back").hidden = !jumpOrigin;
+}
+function goBackFromChart() {
+  const origin = jumpOrigin;
+  jumpOrigin = null;
+  updateBackButtons();
+  if (!origin) return;
+  origin.nav.click();               // restores group/panel/loader for the origin tab
+  if (origin.sub) {                 // snapshot sub-tab (持仓/信号/…) isn't a nav-item
+    const sub = document.querySelector(`.subtab[data-sub="${origin.sub}"]`);
+    if (sub) sub.click();
+  }
+}
+$("#kline-back").addEventListener("click", goBackFromChart);
+$("#rline-back").addEventListener("click", goBackFromChart);
 
 // Sidebar collapse / expand.
 $("#sidebar-toggle").addEventListener("click", () => {
@@ -322,8 +358,15 @@ function renderTable(container, rows, opts = {}) {
       : (c.includes("pnl") || c.includes("rate") || c.includes("excess"));
     if (wantSign) cls += signClass(v);
     if (c === "side" && typeof v === "string") cls += v.toLowerCase() === "buy" ? " pos" : " neg";
-    if (allowLink && linkStock && (c === "stock_code" || c === "stock_name") && row && row.stock_code) {
-      disp = `<a class="klink" data-code="${row.stock_code}">${disp || row.stock_code}</a>`;
+    // Code column → 个股K线 (.klink); name column → 信号R线 (.rlink). The 信号 table keys
+    // its name column "name", the others "stock_name"; either way the code comes from
+    // row.stock_code (present on every linkable row via attach_names).
+    if (allowLink && linkStock && row && row.stock_code) {
+      if (c === "stock_code") {
+        disp = `<a class="klink" data-code="${row.stock_code}">${disp || row.stock_code}</a>`;
+      } else if (c === "stock_name" || c === "name") {
+        disp = `<a class="rlink" data-code="${row.stock_code}">${disp || row.stock_code}</a>`;
+      }
     }
     return `<td class="${cls}">${disp}</td>`;
   }
@@ -401,6 +444,7 @@ function renderTable(container, rows, opts = {}) {
     });
     // 6. rebind row-level handlers (klinks always; caller extras via onRender)
     el.querySelectorAll("a.klink").forEach((a) => a.addEventListener("click", () => openKline(a.dataset.code)));
+    el.querySelectorAll("a.rlink").forEach((a) => a.addEventListener("click", () => openRline(a.dataset.code)));
     if (opts.onRender) opts.onRender(el);
   }
 
@@ -565,7 +609,7 @@ async function loadSnapshotDates() {
   } catch (e) { toast(e.message); }
 }
 function renderEmptySnapshot() {
-  ["#snap-asset", "#snap-positions", "#snap-target", "#snap-orders", "#snap-trades"]
+  ["#snap-asset", "#snap-positions", "#snap-target", "#snap-orders", "#snap-trades", "#snap-signals"]
     .forEach((c) => renderTable(c, []));
 }
 async function loadSnapshot() {
@@ -587,6 +631,21 @@ async function loadSnapshot() {
     renderTable("#snap-orders", orders.rows, { linkStock: true });
     renderTable("#snap-trades", trades.rows, { linkStock: true });
   } catch (e) { toast(e.message); }
+  // 信号: the historical ranked signal cross-section for the selected date, read from the
+  // ClickHouse warehouse (needs a live node only to resolve the table name). Loaded
+  // separately so a missing node or fetch error never blocks the other snapshot panels.
+  if (!hasNodeApi()) { nodeApiHint("#snap-signals"); return; }
+  try {
+    const sig = await api("/api/snapshot_signals",
+      { account: state.account.account_id, trader: state.account.trader_id, date });
+    renderTable("#snap-signals", sig.signals || [], {
+      columns: SNAP_SIGNAL_COLS, headers: SNAP_SIGNAL_HEADERS,
+      intCols: new Set(["rank"]),
+      rateCols: new Set(["pred_return_live"]),
+      signCols: new Set(["pred_return_live"]),
+      linkStock: true,
+    });
+  } catch (e) { $("#snap-signals").innerHTML = '<div class="empty">获取失败</div>'; }
 }
 $("#snap-refresh").addEventListener("click", loadSnapshot);
 $("#snap-date").addEventListener("change", loadSnapshot);
@@ -700,10 +759,11 @@ const SQ_HEADERS = {
   label_source: "标签来源",
 };
 // Trailing-edge fallback flag -> Chinese. normal = exact open-to-open forward
-// return; t1_intraday = T+1 offline (收/开); realtime_intraday = live (现价/开).
+// return; t1_intraday = 复权 T+1 open -> 现价 (buy at T+1 open, hold to now);
+// realtime_intraday = live (现价/开).
 const SQ_LABEL_SOURCE = {
   normal: "正常",
-  t1_intraday: "T+1日内",
+  t1_intraday: "T+1持有至今",
   realtime_intraday: "实时日内",
 };
 // ls10 / label returns / excess are on the % axis (RATE_COLS). rankic/ic are plain
@@ -772,7 +832,7 @@ async function loadSignalQuality() {
     if (hint) {
       hint.textContent = `预测表 ${res.predictions_table || "?"}｜窗口 ${res.holding_days} 日｜`
         + "标签=复权开盘价 t+1→t+(N+1)，基准=中证全指；"
-        + "近端信号无完整未来窗口时，用 T+1 日内(收/开)或实时(现价/开)近似，见「标签来源」列";
+        + "近端信号无完整未来窗口时，用 T+1 持有至今(复权开→现价)或实时(现价/开)近似，见「标签来源」列";
     }
     renderTable("#sq-table", rows, {
       columns,
@@ -1131,6 +1191,7 @@ function defaultKlineRange() {
 // Jumping from a snapshot link: anchor the window on the snapshot's date —
 // end = that date, start = 6 months before it.
 function openKline(stockCode) {
+  captureJumpOrigin();
   $("#kline-code").value = stockCode;
   const anchor = $("#snap-date").value;
   if (anchor) {
@@ -1144,6 +1205,7 @@ function openKline(stockCode) {
   $$(".tab-panel").forEach((p) => p.classList.remove("active"));
   document.querySelector('.nav-item[data-tab="kline"]').classList.add("active");
   $("#tab-kline").classList.add("active");
+  updateBackButtons();
   setTimeout(plotKline, 0);
 }
 // Change-driven redraws follow the same rule as plotSeries: quiet on incomplete
@@ -1300,6 +1362,138 @@ $("#kline-plot").addEventListener("click", () => plotKline());
   $(sel).addEventListener("change", () => plotKline(true));
 });
 $("#kline-marks").addEventListener("change", () => plotKline(true));
+
+// ---------------------------------------------------------------------------
+// 信号R线 tab — per-stock daily signal rank/score with buy/sell markers
+// ---------------------------------------------------------------------------
+// Jumping from a table name link: always show the latest month (end = today,
+// start = one month ago), overriding whatever was in the inputs before.
+function openRline(stockCode) {
+  captureJumpOrigin();
+  $("#rline-code").value = stockCode;
+  $("#rline-end").value = iso(new Date());
+  $("#rline-start").value = monthsBefore(null, 1);
+  $$(".nav-group").forEach((g) => g.classList.remove("open"));
+  $$(".nav-item").forEach((b) => b.classList.remove("active"));
+  $$(".tab-panel").forEach((p) => p.classList.remove("active"));
+  document.querySelector('.nav-item[data-tab="rline"]').classList.add("active");
+  $("#tab-rline").classList.add("active");
+  updateBackButtons();
+  setTimeout(plotRline, 0);
+}
+let rlineDraw = 0;
+async function plotRline(auto = false) {
+  const draw = ++rlineDraw;
+  const code = $("#rline-code").value.trim();
+  const start = $("#rline-start").value, end = $("#rline-end").value;
+  const withMarks = $("#rline-marks").checked;
+  if (!code || !start || !end) { if (!auto) toast("请填写代码与起止日期"); return; }
+  if (!state.account) { if (!auto) toast("请选择账户"); return; }
+  try {
+    const d = await api("/api/signal_series", { ...accountParams(), stock_code: code, start, end });
+    if (draw !== rlineDraw) return;
+    const series = d.series || [], trades = d.trades || [], name = d.stock_name || "";
+    if (series.length === 0) { toast("无该股票信号数据"); return; }
+
+    const dates = series.map((r) => String(r.date).slice(0, 10));
+    const rank = series.map((r) => (r.rank == null ? null : Number(r.rank)));
+    const score = series.map((r) => (r.score == null ? null : Number(r.score)));
+    const rankByDate = {};
+    series.forEach((r, i) => { rankByDate[dates[i]] = rank[i]; });
+
+    // Aggregate fills per day (for the tooltip), like 个股K线.
+    const dayFills = {};
+    trades.forEach((t) => {
+      const dd = String(t.trade_date).slice(0, 10);
+      const px = Number(t.price) || 0, qty = Number(t.quantity) || 0;
+      const amt = Number(t.amount) != null && !isNaN(Number(t.amount)) && Number(t.amount) !== 0
+        ? Number(t.amount) : px * qty;
+      const side = String(t.side).toLowerCase() === "buy" ? "buy" : "sell";
+      const day = dayFills[dd] || (dayFills[dd] = {
+        buy: { qty: 0, pxQty: 0, amt: 0 }, sell: { qty: 0, pxQty: 0, amt: 0 },
+      });
+      day[side].qty += qty; day[side].pxQty += px * qty; day[side].amt += amt;
+    });
+
+    // Buy/sell markers anchored on the rank line (blue up-arrow / orange down-pin),
+    // mirroring 个股K线. The rank axis is inverted, so "up" (toward rank 1) is a
+    // positive y-offset in pixels; "down" is negative.
+    const SYM = 16, GAP = 6;
+    const markData = trades.map((t) => {
+      const dd = String(t.trade_date).slice(0, 10);
+      const isBuy = String(t.side).toLowerCase() === "buy";
+      const anchor = rankByDate[dd];
+      if (anchor == null) return null;
+      const yOffset = isBuy ? (SYM / 2 + GAP) : -(SYM / 2 + GAP);
+      return {
+        name: isBuy ? "买" : "卖", coord: [dd, anchor],
+        value: `${isBuy ? "买" : "卖"} ${fmt(t.quantity)}@${fmt(t.price)}`,
+        symbol: isBuy ? "arrow" : "pin", symbolRotate: isBuy ? 0 : 180,
+        symbolSize: SYM, symbolOffset: [0, yOffset],
+        itemStyle: { color: isBuy ? "#4c8dff" : "#ffa726", borderColor: "#fff", borderWidth: 1 },
+        label: {
+          show: true, formatter: isBuy ? "买" : "卖", color: "#fff",
+          fontSize: 9, position: isBuy ? "top" : "bottom",
+          distance: 3, backgroundColor: "transparent",
+        },
+      };
+    }).filter(Boolean);
+
+    const title = name ? `${code} ${name} 信号R线` : `${code} 信号R线`;
+    const tipHtml = (ps) => {
+      const i = ps[0].dataIndex;
+      const rows = [`<b>${ps[0].axisValue}</b>`];
+      if (rank[i] != null) rows.push(`排名 ${fmt(rank[i])}`);
+      if (score[i] != null) rows.push(`分数 ${fmt(score[i])}`);
+      const day = dayFills[dates[i]];
+      if (day) {
+        const parts = [];
+        if (day.buy.qty) parts.push(`<span style="color:#4c8dff">买 均价 ${fmt(day.buy.pxQty / day.buy.qty)}　量 ${fmt(day.buy.qty)}　额 ${fmt(day.buy.amt)}</span>`);
+        if (day.sell.qty) parts.push(`<span style="color:#ffa726">卖 均价 ${fmt(day.sell.pxQty / day.sell.qty)}　量 ${fmt(day.sell.qty)}　额 ${fmt(day.sell.amt)}</span>`);
+        if (parts.length) rows.push('<div style="border-top:1px dashed #4c5468;margin:4px 0 2px"></div>' + parts.join("<br/>"));
+      }
+      return rows.join("<br/>");
+    };
+
+    const opt = {
+      backgroundColor: "transparent",
+      title: { text: title, left: 10, textStyle: { color: "#d7dce6", fontSize: 14 } },
+      tooltip: { trigger: "axis", axisPointer: { type: "cross" }, formatter: tipHtml, confine: true },
+      legend: { data: ["排名", "分数"], textStyle: { color: "#8a94a8" }, left: 10, top: 26 },
+      grid: { left: 66, right: 66, top: 74, bottom: 60 },
+      xAxis: { type: "category", data: dates, axisLabel: { color: "#8a94a8" } },
+      yAxis: [
+        // Rank: 1 is best → put it on top (inverse), start at 1.
+        { name: "排名", inverse: true, min: 1, axisLabel: { color: "#8a94a8" },
+          splitLine: { lineStyle: { color: "#2a3346" } } },
+        // Score: right axis, auto-scaled.
+        { name: "分数", scale: true, position: "right", axisLabel: { color: "#8a94a8" },
+          splitLine: { show: false } },
+      ],
+      dataZoom: [
+        { type: "inside", xAxisIndex: 0 },
+        { type: "slider", xAxisIndex: 0, height: 18, bottom: 8 },
+      ],
+      series: [
+        {
+          name: "排名", type: "line", data: rank, yAxisIndex: 0, connectNulls: true,
+          showSymbol: false, lineStyle: { color: "#4c8dff", width: 2 }, itemStyle: { color: "#4c8dff" },
+          markPoint: withMarks ? { data: markData, tooltip: { formatter: (p) => p.data.value } } : undefined,
+        },
+        {
+          name: "分数", type: "line", data: score, yAxisIndex: 1, connectNulls: true,
+          showSymbol: false, lineStyle: { color: "#ffa726", width: 2 }, itemStyle: { color: "#ffa726" },
+        },
+      ],
+    };
+    getChart("rline-chart").setOption(opt, true);
+  } catch (e) { if (draw === rlineDraw) toast(e.message); }
+}
+$("#rline-plot").addEventListener("click", () => plotRline());
+["#rline-start", "#rline-end"].forEach((sel) => {
+  $(sel).addEventListener("change", () => plotRline(true));
+});
+$("#rline-marks").addEventListener("change", () => plotRline(true));
 
 // ---------------------------------------------------------------------------
 // Realtime info tab (实时信息) — live positions from the node's control API
@@ -1488,6 +1682,12 @@ const SI_SIGNAL_COLS = ["rank", "stock_code", "name", "score", "pred_return_live
 const SI_SIGNAL_HEADERS = {
   rank: "排名", stock_code: "证券代码", name: "证券名称",
   score: "评分", pred_return_live: "预测收益", day_change: "当日涨幅", held: "已持仓",
+};
+// 按日快照 → 信号: historical warehouse cross-section (no live-runtime 当日涨幅/已持仓 columns).
+const SNAP_SIGNAL_COLS = ["rank", "stock_code", "stock_name", "score", "pred_return_live"];
+const SNAP_SIGNAL_HEADERS = {
+  rank: "排名", stock_code: "证券代码", stock_name: "证券名称",
+  score: "评分", pred_return_live: "预测收益",
 };
 const SI_INFO_LABELS = {
   risk_model_id: "风险模型 ID", alpha_model_id: "Alpha 模型 ID",

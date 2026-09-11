@@ -89,6 +89,8 @@ button {
 }
 button:hover { filter: brightness(1.1); }
 button.ghost { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+/* 返回 button on the chart tabs: subtle, sits at the left of the subbar. */
+button.back-btn { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); align-self: center; }
 /* Unusable actions — e.g. 卖出 / 全部卖出 while sell_enabled is off. The compound
    selectors are what keep this ahead of the red .danger / .rt-sell backgrounds. */
 button:disabled,
@@ -250,6 +252,10 @@ th.has-filter .filter-btn { color: var(--accent); }
 a.klink { color: var(--accent); cursor: pointer; text-decoration: none; }
 a.klink:hover { text-decoration: underline; }
 
+/* Stock-name link → 信号R线 (orange, matching the score line); code link stays blue. */
+a.rlink { color: #ffa726; cursor: pointer; text-decoration: none; }
+a.rlink:hover { text-decoration: underline; }
+
 .chart { width: calc(100% - 40px); height: 460px; margin: 16px 20px; background: var(--panel); border-radius: 6px; }
 .chart-tall { height: 620px; }
 
@@ -326,7 +332,7 @@ a.klink:hover { text-decoration: underline; }
 /* Sold-out today (当前拥股 0): dimmed + italic, but realized day result still shown. */
 #rt-positions tr.closed-today td { opacity: .6; font-style: italic; }
 
-/* 信号质量: rows whose label is an approximate trailing-edge fallback (T+1 日内 /
+/* 信号质量: rows whose label is an approximate trailing-edge fallback (T+1 持有至今 /
    实时日内, i.e. label_source != normal) get a subtle amber tint so they're never
    read as the exact open-to-open forward return. */
 #sq-table tr.approx-row td { background: rgba(255, 196, 0, 0.07); }

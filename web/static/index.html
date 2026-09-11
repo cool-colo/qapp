@@ -39,6 +39,7 @@
         <button class="nav-item" data-tab="series">随时间</button>
         <button class="nav-item" data-tab="compare">对比</button>
         <button class="nav-item" data-tab="kline">个股 K 线</button>
+        <button class="nav-item" data-tab="rline">信号R线</button>
         <button class="nav-item" data-tab="control">交易管理</button>
       </nav>
     </aside>
@@ -53,6 +54,7 @@
             <button class="subtab" data-sub="target">目标组合</button>
             <button class="subtab" data-sub="orders">委托</button>
             <button class="subtab" data-sub="trades">成交</button>
+            <button class="subtab" data-sub="signals">信号</button>
           </div>
           <div class="subbar-controls">
             <label>日期 <select id="snap-date"></select></label>
@@ -73,6 +75,7 @@
         <div id="snap-target" class="sub-panel table-wrap"></div>
         <div id="snap-orders" class="sub-panel table-wrap"></div>
         <div id="snap-trades" class="sub-panel table-wrap"></div>
+        <div id="snap-signals" class="sub-panel table-wrap"></div>
       </section>
 
       <!-- ============ Return report tab ============ -->
@@ -176,6 +179,7 @@
       <section id="tab-kline" class="tab-panel">
         <div class="subbar">
           <div class="subbar-controls">
+            <button id="kline-back" class="back-btn" hidden>← 返回</button>
             <label>股票代码 <input type="text" id="kline-code" placeholder="000001.SZ" /></label>
             <label>起 <input type="date" id="kline-start" /></label>
             <label>止 <input type="date" id="kline-end" /></label>
@@ -184,6 +188,22 @@
           </div>
         </div>
         <div id="kline-chart" class="chart chart-tall"></div>
+      </section>
+
+      <!-- ============ 信号R线 tab (per-stock signal rank/score) ============ -->
+      <section id="tab-rline" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <button id="rline-back" class="back-btn" hidden>← 返回</button>
+            <label>股票代码 <input type="text" id="rline-code" placeholder="000001.SZ" /></label>
+            <label>起 <input type="date" id="rline-start" /></label>
+            <label>止 <input type="date" id="rline-end" /></label>
+            <label class="inline"><input type="checkbox" id="rline-marks" checked /> 显示买卖点</label>
+            <button id="rline-plot">绘制</button>
+            <span class="hint">排名(左轴，1在上) + 分数(右轴)；默认止=今天，起=一个月前</span>
+          </div>
+        </div>
+        <div id="rline-chart" class="chart chart-tall"></div>
       </section>
 
       <!-- ============ Realtime info tab (实时信息) ============ -->

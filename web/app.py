@@ -29,6 +29,10 @@ from web.signal_quality_report import (
     SIGNAL_QUALITY_COLUMNS,
     query_signal_quality,
 )
+from web.signal_series_report import (
+    build_signal_series_sql,
+    build_snapshot_signals_sql,
+)
 
 
 class ComparePreset(BaseModel):
@@ -89,7 +93,9 @@ def _fetch_realtime_ticks(client: NodeApiClient) -> dict[str, Any] | None:
 
     Returns ``{"date": "YYYY-MM-DD", "rows": [(code, open, last_price), …]}`` filtered
     to positive open/last, or ``None`` if the node is unreachable or reports nothing —
-    the report still renders the normal + T+1 rows in that case.
+    the report still renders the normal + T+1 rows in that case. The ``t1_intraday``
+    label's dividend/split adjustment is sourced from ClickHouse (``dwd_stock_adj_factor``,
+    which carries today's factor intraday), so no ex-event data is needed from the node.
     """
     try:
         payload = client.get("/realtime/whole_market_ticks")
@@ -564,6 +570,110 @@ def get_kline_with_trades(
         "bars": bars,
         "trades": jsonable_rows(trades),
         "stock_name": data.resolve_names([stock_code]).get(stock_code, ""),
+    }
+
+
+@app.get("/api/signal_series")
+def get_signal_series(
+    account: str,
+    trader: str,
+    stock_code: str,
+    start: str,
+    end: str,
+    source: str | None = Query(None),
+    predictions_table: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """A stock's daily signal rank/score series (ClickHouse) + its buy/sell fills (MySQL).
+
+    The predictions table is per-account: unless overridden via ``predictions_table``, it is
+    read from the account's live node (``/strategy/info`` → ``predictions_table``), the same
+    source the 策略信息/信号质量 views use. ``rank`` is the per-day cross-section rank by score.
+    Buy/sell fills come from ``live_trade`` for the same account/stock/window (as 个股K线 does),
+    so they overlay the signal line as markers.
+    """
+    table = predictions_table
+    if not table:
+        client = _node_api(data, account, trader)
+        try:
+            info = client.get("/strategy/info")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        table = info.get("predictions_table")
+        if not table:
+            raise HTTPException(
+                status_code=502,
+                detail="live node did not report a predictions_table",
+            )
+    try:
+        series = data.clickhouse.query(build_signal_series_sql(table, stock_code, start, end))
+    except Exception as exc:  # noqa: BLE001 — surface DB errors as 500 with a message
+        raise HTTPException(status_code=500, detail=f"signal_series query failed: {exc}") from exc
+
+    trades: list[dict[str, Any]] = []
+    if source:
+        mysql = _mysql(data, source)
+        trades = mysql.query(
+            f"""
+            SELECT trade_date, side, price, quantity, amount, trade_time
+            FROM live_trade
+            WHERE {_ACCOUNT_KEYS}
+              AND stock_code = %(stock_code)s
+              AND trade_date BETWEEN %(start)s AND %(end)s
+            ORDER BY trade_time
+            """,
+            {
+                "account_id": account,
+                "trader_id": trader,
+                "stock_code": stock_code,
+                "start": start,
+                "end": end,
+            },
+        )
+    return {
+        "series": jsonable_rows(series),
+        "trades": jsonable_rows(trades),
+        "stock_name": data.resolve_names([stock_code]).get(stock_code, ""),
+        "predictions_table": table,
+    }
+
+
+@app.get("/api/snapshot_signals")
+def get_snapshot_signals(
+    account: str,
+    trader: str,
+    date: str,
+    predictions_table: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Historical ranked signal cross-section for one date (ClickHouse warehouse).
+
+    Backs 按日快照 → 信号. Unlike ``/api/strategy/signals`` (the live node's in-memory
+    top-N), this reads the per-account predictions table by ``pred_date``, so it works for
+    any past date. The table name comes from the account's live node (``/strategy/info`` →
+    ``predictions_table``) unless overridden.
+    """
+    table = predictions_table
+    if not table:
+        client = _node_api(data, account, trader)
+        try:
+            info = client.get("/strategy/info")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        table = info.get("predictions_table")
+        if not table:
+            raise HTTPException(
+                status_code=502,
+                detail="live node did not report a predictions_table",
+            )
+    try:
+        rows = data.clickhouse.query(build_snapshot_signals_sql(table, date))
+    except Exception as exc:  # noqa: BLE001 — surface DB errors as 500 with a message
+        raise HTTPException(status_code=500, detail=f"snapshot_signals query failed: {exc}") from exc
+    return {
+        "signals": data.attach_names(jsonable_rows(rows)),
+        "predictions_table": table,
+        "date": date,
     }
 
 

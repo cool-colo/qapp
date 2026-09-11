@@ -60,10 +60,20 @@ BENCHMARK_TS_CODE = "000985.CSI"
 # flag it via ``label_source`` (precedence: normal > t1_intraday > realtime):
 #
 #   normal            full h-window open-to-open return (exact, reference port)
-#   t1_intraday       T+1 offline intraday return  (close/open - 1) on the buy day
-#   realtime_intraday today's intraday return (last_price/open - 1) from the node
+#   t1_intraday       buy day (T+1) open from the offline factor row, EXIT at the
+#                     stock's CURRENT live node price. Both legs are put on the 后复权
+#                     basis with dwd_stock_adj_factor (which carries today's factor
+#                     intraday, unlike dws_stock_factor_wide) so a dividend/split
+#                     between the buy day and today does not leak into the label:
+#                     (rt_last * af_today) / (t1_open * af_buyday) - 1.
+#                     Needs the node snapshot; without it, falls back to the offline
+#                     T+1 (close/open - 1).
+#   realtime_intraday today's intraday return (last_price/open - 1) from the node,
+#                     both legs from the node snapshot (buy day == today, no offline
+#                     row yet).
 #
-# (close/open - 1) is adj_factor-invariant, so the T+1 fallback needs no adj.
+# (x/open - 1) is adj_factor-invariant, so the T+1 open needs no adjustment; the
+# live last_price is a raw quote, on the same scale as that raw open.
 
 # Forward-window choices offered in the UI / accepted by the API. Inlined as ints into
 # the SQL (ClickHouse rejects a Nullable/subquery leadInFrame offset), so the set is
@@ -124,7 +134,9 @@ def build_signal_quality_sql(
     Its ``date`` is the node's clock (TODAY / the buy day); its intraday
     ``last_price/open - 1`` label is applied to the signal date whose buy day is today
     (the latest ``pred_date`` before ``date``), so a stale snapshot can't relabel older
-    dates.
+    dates. The ``t1_intraday`` label puts its buy-day and today legs on the 后复权 basis
+    via ``dwd_stock_adj_factor`` (``af_buyday`` at the buy day, ``af_today`` at ``date``)
+    so a dividend/split in between does not distort it.
     """
     if holding_days not in ALLOWED_HOLDING_DAYS:
         raise ValueError(f"holding_days must be one of {ALLOWED_HOLDING_DAYS}: {holding_days!r}")
@@ -151,6 +163,49 @@ def build_signal_quality_sql(
     rt_date = (realtime_ticks or {}).get("date")
     if rt_rows and rt_date:
         rt_date_lit = quote_literal(str(rt_date))
+
+        # --- today's adj_factor CTEs ----------------------------------------
+        # A t1_intraday label buys at the offline RAW t+1 open (buy day) and exits
+        # at the stock's CURRENT live quote (today). Both legs are raw, so a
+        # dividend/split between the buy day and today puts them on different price
+        # scales and the ex-jump leaks into the label. We put both legs on the
+        # 后复权 basis with the same cumulative adj_factor the 'normal' label uses:
+        #   label = (rt_last * af_today) / (t1_open * af_buyday) - 1
+        # ``dwd_stock_adj_factor`` (unlike dws_stock_factor_wide) is built intraday,
+        # so it carries TODAY's factor — the piece the offline factor table lacks
+        # mid-session. ``sys_to = '2299-12-31 00:00:00.000'`` selects the current
+        # (open-ended) version, one row per (code, trade_date).
+        adj_factor_cte = f"""
+adj_now AS (
+    -- Today's (node clock) cumulative adj_factor per stock. Intraday-available.
+    SELECT
+        source_code AS code,
+        adj_factor  AS af_today
+    FROM {quote_identifier("dwd_stock_adj_factor")}
+    WHERE trade_date = toDate({rt_date_lit})
+      AND sys_to = '2299-12-31 00:00:00.000'
+      AND adj_factor IS NOT NULL
+),
+buyday_af AS (
+    -- adj_factor at each prediction's buy day (t1_date), per (code, pred_date).
+    SELECT
+        p.code      AS code,
+        p.pred_date AS pred_date,
+        a.adj_factor AS af_buyday
+    FROM preds p
+    INNER JOIN lab l
+        ON p.code = l.code AND p.pred_date = l.trade_date
+    INNER JOIN {quote_identifier("dwd_stock_adj_factor")} a
+        ON a.source_code = p.code AND a.trade_date = l.t1_date
+    WHERE a.sys_to = '2299-12-31 00:00:00.000'
+      AND a.adj_factor IS NOT NULL
+),"""
+        adj_factor_join = """
+    LEFT JOIN adj_now an
+        ON p.code = an.code
+    LEFT JOIN buyday_af ba
+        ON p.code = ba.code AND p.pred_date = ba.pred_date"""
+
         realtime_cte = f"""
 realtime AS (
     -- Node whole-market snapshot (today's intraday tick). last_price/open - 1.
@@ -159,16 +214,32 @@ realtime AS (
 rt_signal_date AS (
     -- The signal date whose buy day is today: latest pred_date < the node's date.
     SELECT max(pred_date) AS sig_date FROM preds WHERE pred_date < toDate({rt_date_lit})
-),"""
+),{adj_factor_cte}"""
         # LEFT JOIN into preds keyed on code, only for the resolved signal date.
-        realtime_join = """
+        realtime_join = f"""
     LEFT JOIN realtime rt
-        ON p.code = rt.code AND p.pred_date = (SELECT sig_date FROM rt_signal_date)"""
+        ON p.code = rt.code AND p.pred_date = (SELECT sig_date FROM rt_signal_date)
+    LEFT JOIN realtime rtl
+        ON p.code = rtl.code{adj_factor_join}"""
         realtime_label_expr = "if(rt.rt_open > 0, rt.rt_last / rt.rt_open - 1, NULL)"
+        # For t1_intraday rows: entry = offline RAW t+1 open on the buy-day 后复权
+        # basis (t1_open * af_buyday), exit = live raw quote on today's basis
+        # (rt_last * af_today). Both factors from dwd_stock_adj_factor.
+        t1_label_expr = (
+            "if(l.t1_open > 0 AND rtl.rt_last > 0 AND an.af_today > 0 AND ba.af_buyday > 0, "
+            "(rtl.rt_last * an.af_today) / (l.t1_open * ba.af_buyday) - 1, NULL)"
+        )
+        t1_ok_expr = (
+            f"(l.t1_avail >= {entry_off + 1} AND l.t1_open > 0 AND rtl.rt_last > 0 "
+            "AND an.af_today > 0 AND ba.af_buyday > 0)"
+        )
     else:
         realtime_cte = ""
         realtime_join = ""
         realtime_label_expr = "NULL"
+        # No node snapshot -> fall back to the offline T+1 intraday close/open.
+        t1_label_expr = "l.t1_close / l.t1_open - 1"
+        t1_ok_expr = f"(l.t1_avail >= {entry_off + 1} AND l.t1_open > 0)"
 
     return f"""
 WITH
@@ -200,6 +271,7 @@ lab AS (
         count() OVER w AS avail,
         leadInFrame(o_raw, {entry_off}) OVER w2 AS t1_open,
         leadInFrame(c_raw, {entry_off}) OVER w2 AS t1_close,
+        leadInFrame(trade_date, {entry_off}) OVER w2 AS t1_date,
         count() OVER w2 AS t1_avail
     FROM adjpx
     WINDOW
@@ -217,8 +289,7 @@ lab AS (
 bench_px AS (
     SELECT
         trade_date,
-        argMax(open, _ingest_time)  AS bopen,
-        argMax(close, _ingest_time) AS bclose
+        argMax(open, _ingest_time)  AS bopen
     FROM {quote_identifier("index_daily")}
     WHERE ts_code = {bench}
       AND trade_date >= toDate({start}) - 15
@@ -226,25 +297,18 @@ bench_px AS (
     GROUP BY trade_date
 ),
 bench AS (
-    -- Open-to-open forward window (normal) plus the T+1 intraday benchmark
-    -- (close/open on the buy day) matching the rule-1 fallback.
+    -- Open-to-open forward window; consumed only by the 'normal' benchmark
+    -- (the approximate label sources get a NULL benchmark, see final SELECT).
     SELECT
         trade_date,
         leadInFrame(bopen, {entry_off}) OVER wb AS b_entry,
         leadInFrame(bopen, {exit_off}) OVER wb AS b_exit,
-        count() OVER wb AS b_avail,
-        leadInFrame(bopen, {entry_off}) OVER wb2  AS b_t1_open,
-        leadInFrame(bclose, {entry_off}) OVER wb2 AS b_t1_close,
-        count() OVER wb2 AS b_t1_avail
+        count() OVER wb AS b_avail
     FROM bench_px
     WINDOW
         wb AS (
             ORDER BY trade_date
             ROWS BETWEEN CURRENT ROW AND {frame_off} FOLLOWING
-        ),
-        wb2 AS (
-            ORDER BY trade_date
-            ROWS BETWEEN CURRENT ROW AND {entry_off} FOLLOWING
         )
 ),
 preds AS (
@@ -265,9 +329,9 @@ resolved AS (
         p.code      AS code,
         p.score     AS score,
         (l.avail = {full_window} AND l.entry_px > 0)                       AS normal_ok,
-        (l.t1_avail >= {entry_off} + 1 AND l.t1_open > 0)                  AS t1_ok,
+        {t1_ok_expr}                                                       AS t1_ok,
         l.exit_px / l.entry_px - 1                                         AS normal_label,
-        l.t1_close / l.t1_open - 1                                         AS t1_label,
+        {t1_label_expr}                                                    AS t1_label,
         {realtime_label_expr}                                             AS rt_label
     FROM preds p
     LEFT JOIN lab l
@@ -319,13 +383,12 @@ SELECT
     avgIf(label, is_top_decile) - avgIf(label, is_bot_decile) AS ls10,
     if(any(cnt) < 20, NULL, avgIf(label, rnk <= 20))       AS top20_label_return,
     if(any(cnt) < 50, NULL, avgIf(label, rnk <= 50))       AS top50_label_return,
-    -- Benchmark matches the resolved label source: full-window vs T+1 intraday
-    -- (rule 1); for a realtime-only date the index isn't in the snapshot -> NULL.
-    multiIf(
-        any(f.label_source) = 'normal',      any(b.b_exit / b.b_entry - 1),
-        any(f.label_source) = 't1_intraday', any(if(b.b_t1_open > 0, b.b_t1_close / b.b_t1_open - 1, NULL)),
-        NULL
-    )                                                      AS benchmark_label_return,
+    -- Benchmark is the open-to-open forward window, defined ONLY for 'normal'
+    -- rows. The t1_intraday label now exits at the stock's CURRENT live price
+    -- (buy-day open -> now), which no offline index window matches; the index
+    -- also isn't in the node's stock-only realtime snapshot. So both approximate
+    -- sources get a NULL benchmark -> their *_excess columns show "—".
+    if(any(f.label_source) = 'normal', any(b.b_exit / b.b_entry - 1), NULL) AS benchmark_label_return,
     if(any(cnt) < 20, NULL, avgIf(label, rnk <= 20) - benchmark_label_return) AS top20_label_excess,
     if(any(cnt) < 50, NULL, avgIf(label, rnk <= 50) - benchmark_label_return) AS top50_label_excess,
     count()                                                AS sample_count
