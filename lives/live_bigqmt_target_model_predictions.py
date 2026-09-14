@@ -63,7 +63,7 @@ def _apply_bigqmt_args(args: Any) -> None:
     args.bigqmt_redis_db = int(_env("BIGQMT_REDIS_DB", "5"))
     args.bigqmt_redis_password = _env("BIGQMT_REDIS_PASSWORD")
     args.transport = _env("BIGQMT_TRANSPORT", "redis")
-    args.rpc_timeout_secs = float(_env("BIGQMT_RPC_TIMEOUT_SECONDS", "6.0"))
+    args.rpc_timeout_secs = float(_env("BIGQMT_RPC_TIMEOUT_SECONDS", "30.0"))
     # account_id falls back to BIGQMT_ACCOUNT_ID when QMT_ACCOUNT_ID is unset.
     if not str(getattr(args, "account_id", "") or "").strip():
         args.account_id = _env("BIGQMT_ACCOUNT_ID", "")
