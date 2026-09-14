@@ -99,9 +99,17 @@ class TradingController:
         """
         Sell held sellable quantity for the given instruments (or all holdings).
 
-        Copies the current target map and, for each affected instrument, lowers its
-        target to ``held - sellable`` (keeping any non-sellable remainder), then
-        pushes the new target and forces convergence — bypassing the manual-pause
+        For a per-name sell (``instrument_ids`` given), copies the current target
+        map and lowers only the requested holdings to ``held - sellable`` (keeping
+        any non-sellable remainder), preserving every other instrument's target.
+
+        For sell-all (``instrument_ids is None``), builds the target map from
+        scratch — every held name is targeted to its non-sellable remainder (0 when
+        fully sellable) and nothing else is targeted. It deliberately does NOT copy
+        the current targets: doing so left positive targets for names not yet held,
+        which convergence then bought. Sell-all must leave the book flat.
+
+        Then pushes the new target and forces convergence — bypassing the manual-pause
         flag for this one action without clearing it. There is no restore: the next
         daily/hourly target refresh repopulates targets.
 
@@ -122,11 +130,18 @@ class TradingController:
             if target_only:
                 affected_ids = [iid for iid in requested if iid in held]
                 missing = sorted(requested.difference(held))
+                # Per-name sell: preserve every other instrument's target and lower
+                # only the requested holdings below.
+                new_targets: dict[str, Decimal] = self._host.control_current_targets()
             else:
                 affected_ids = sorted(held)
                 missing = []
+                # Sell-all: build the target map from scratch so it targets zero for
+                # everything. Copying the current targets here left positive targets
+                # for names not yet held, which convergence then bought — the sell-all
+                # must leave the book flat, never long anything.
+                new_targets = {}
 
-            new_targets: dict[str, Decimal] = self._host.control_current_targets()
             affected: list[str] = []
             skipped: list[dict] = []
             for iid_text in affected_ids:
