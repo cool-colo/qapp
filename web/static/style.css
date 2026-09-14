@@ -156,13 +156,19 @@ button:disabled:hover { filter: none; }
 .rt-sub-panel.active { display: block; }
 .si-sub-panel { display: none; }
 .si-sub-panel.active { display: block; }
+.ctrl-sub-panel { display: none; }
+.ctrl-sub-panel.active { display: block; }
 /* Signals held in the current book get a strongly highlighted row. */
 #si-signals tr.held-row td { background: rgba(76, 141, 255, 0.28); font-weight: 600; }
 #si-signals tr.held-row:hover td { background: rgba(76, 141, 255, 0.38); }
+/* 当前目标: a target reached (current_qty == target_qty) is flagged green. */
+#tgt-table tr.achieved-row td { background: rgba(38, 166, 154, 0.28); font-weight: 600; }
+#tgt-table tr.achieved-row:hover td { background: rgba(38, 166, 154, 0.38); }
 
 /* UI-only signal rollup (counts of up/down/flat/held), rendered as chips. */
-.si-summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 10px; }
+.si-summary { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 10px; }
 .si-summary:empty { display: none; }
+.si-row { display: flex; flex-wrap: wrap; gap: 8px; }
 .si-chip {
   background: #152036; border: 1px solid #24314c; border-radius: 12px;
   padding: 3px 12px; font-size: 13px; color: #aeb6c4;

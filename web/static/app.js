@@ -160,48 +160,93 @@ function refreshActiveTab() {
   else if (tab === "rline") { if ($("#rline-code").value.trim()) plotRline(); }
   else if (tab === "realtime") loadRealtime();
   else if (tab === "stratinfo") loadStratInfo();
-  else if (tab === "control") loadControl();
+  else if (tab === "control") { loadControl(); loadTargets(); }
 }
 
 // ---------------------------------------------------------------------------
 // Sidebar nav + snapshot sub-tabs
 // ---------------------------------------------------------------------------
-$$(".nav-item").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    // A sidebar click ends any jump: drop the remembered origin so the chart
-    // tabs' 返回 button doesn't point somewhere stale. (goBackFromChart clears it
-    // before replaying the origin click, so this is a no-op in that path.)
-    jumpOrigin = null;
-    updateBackButtons();
-    // Fold every group, then open only the one this item belongs to (if any).
-    const group = btn.closest(".nav-group");
-    $$(".nav-group").forEach((g) => g.classList.toggle("open", g === group));
-    $$(".nav-item").forEach((b) => b.classList.remove("active"));
-    $$(".tab-panel").forEach((p) => p.classList.remove("active"));
-    btn.classList.add("active");
-    // 离线报表 is a parent-only group with no panel of its own — clicking it defaults
-    // to its first report (收益报表). Every other tab has a matching #tab-<id> panel.
-    let tab = btn.dataset.tab;
-    if (tab === "offline") tab = "report";
-    const panel = $(`#tab-${tab}`);
-    if (panel) panel.classList.add("active");
-    // 实时信息 has 持仓 / 资产 sub-panels; a nav-sub click selects which one shows.
-    // A click on the parent (no data-sub) defaults to 持仓.
-    if (tab === "realtime") showRealtimeSub(btn.dataset.sub || "positions");
-    if (tab === "stratinfo") showStratInfoSub(btn.dataset.sub || "signals");
+// Select a sidebar nav item: set the visual active/open state and the right
+// sub-panel. When `load` is true (a real user click) it also (re)fetches the
+// tab's data and remembers the choice so a page refresh stays on this page.
+// On restore (`load` false) the account-change flow does the fetching, so we
+// only apply the visual state and skip the extra load.
+const NAV_STORE_KEY = "dashboard.activeNav";
+
+function saveActiveNav(btn) {
+  try {
+    localStorage.setItem(
+      NAV_STORE_KEY,
+      JSON.stringify({ tab: btn.dataset.tab, sub: btn.dataset.sub || null }),
+    );
+  } catch (e) { /* storage may be unavailable; persistence is best-effort */ }
+}
+
+function activateNavItem(btn, { load = true } = {}) {
+  // A sidebar click ends any jump: drop the remembered origin so the chart
+  // tabs' 返回 button doesn't point somewhere stale. (goBackFromChart clears it
+  // before replaying the origin click, so this is a no-op in that path.)
+  jumpOrigin = null;
+  updateBackButtons();
+  // Fold every group, then open only the one this item belongs to (if any).
+  const group = btn.closest(".nav-group");
+  $$(".nav-group").forEach((g) => g.classList.toggle("open", g === group));
+  $$(".nav-item").forEach((b) => b.classList.remove("active"));
+  $$(".tab-panel").forEach((p) => p.classList.remove("active"));
+  btn.classList.add("active");
+  // 离线报表 is a parent-only group with no panel of its own — clicking it defaults
+  // to its first report (收益报表). Every other tab has a matching #tab-<id> panel.
+  let tab = btn.dataset.tab;
+  if (tab === "offline") tab = "report";
+  const panel = $(`#tab-${tab}`);
+  if (panel) panel.classList.add("active");
+  // 实时信息 has 持仓 / 资产 sub-panels; a nav-sub click selects which one shows.
+  // A click on the parent (no data-sub) defaults to 持仓.
+  if (tab === "realtime") showRealtimeSub(btn.dataset.sub || "positions");
+  if (tab === "stratinfo") showStratInfoSub(btn.dataset.sub || "signals");
+  if (tab === "control") showControlSub(btn.dataset.sub || "control");
+  saveActiveNav(btn);
+  if (load) {
     if (tab === "report") loadReport();
     else if (tab === "sigqual") loadSignalQuality();
     else if (tab === "realtime") loadRealtime();
     else if (tab === "stratinfo") loadStratInfo();
-    else if (tab === "control") loadControl();
-    setTimeout(resizeCharts, 0);
-  });
+    else if (tab === "control") { loadControl(); loadTargets(); }
+  }
+  setTimeout(resizeCharts, 0);
+}
+
+$$(".nav-item").forEach((btn) => {
+  btn.addEventListener("click", () => activateNavItem(btn));
 });
+
+// Restore the last-visited page from a previous session so a refresh stays put
+// instead of snapping back to 实时信息. Applies only the visual state; the
+// account-change flow (refreshActiveTab) does the actual data fetch. Falls back
+// to the default active nav if nothing valid is stored.
+function restoreActiveNav() {
+  let saved;
+  try {
+    saved = JSON.parse(localStorage.getItem(NAV_STORE_KEY) || "null");
+  } catch (e) { saved = null; }
+  if (!saved || !saved.tab) return;
+  const btn = $$(".nav-item").find(
+    (b) => b.dataset.tab === saved.tab && (b.dataset.sub || null) === (saved.sub || null),
+  );
+  if (btn) activateNavItem(btn, { load: false });
+}
 
 // Toggle between the 持仓 (#rt-positions) and 资产 (#rt-asset) sub-panels.
 function showRealtimeSub(sub) {
   $$(".rt-sub-panel").forEach((p) => p.classList.remove("active"));
   const target = $(`#rt-${sub}`);
+  if (target) target.classList.add("active");
+}
+
+// Toggle between the 控制 (#ctrl-control) and 当前目标 (#ctrl-targets) sub-panels.
+function showControlSub(sub) {
+  $$(".ctrl-sub-panel").forEach((p) => p.classList.remove("active"));
+  const target = $(`#ctrl-${sub}`);
   if (target) target.classList.add("active");
 }
 
@@ -1678,10 +1723,11 @@ $("#rt-auto").addEventListener("change", (e) => {
 // the views reflect exactly what this node is trading on. Data-driven so new
 // node-side fields render without frontend changes (extendable by design).
 // ---------------------------------------------------------------------------
-const SI_SIGNAL_COLS = ["rank", "stock_code", "name", "score", "pred_return_live", "day_change", "held"];
+const SI_SIGNAL_COLS = ["rank", "stock_code", "name", "score", "pred_return_live", "day_change", "day_change_open", "held"];
 const SI_SIGNAL_HEADERS = {
   rank: "排名", stock_code: "证券代码", name: "证券名称",
-  score: "评分", pred_return_live: "预测收益", day_change: "当日涨幅", held: "已持仓",
+  score: "评分", pred_return_live: "预测收益", day_change: "当日涨幅",
+  day_change_open: "当日涨幅(开)", held: "已持仓",
 };
 // 按日快照 → 信号: historical warehouse cross-section (no live-runtime 当日涨幅/已持仓 columns).
 const SNAP_SIGNAL_COLS = ["rank", "stock_code", "stock_name", "score", "pred_return_live"];
@@ -1744,9 +1790,40 @@ function _safeCorr(xs, ys, method) {
 
 // A UI-only rollup of the loaded signal rows — no backend involvement. Shows the
 // up/down/flat/held counts plus live signal-quality chips computed from the visible
-// rows: RankIC/IC of score vs 当日涨幅 (the only realized label available live), and
-// Top50 收益/胜率. These mirror the reference IC/RankIC/TopN definitions, but 当日涨幅
-// (close-to-close today) stands in for the offline adjusted open-to-open label.
+// rows: RankIC/IC of score vs the realized label, and Top50 收益/胜率. These mirror
+// the reference IC/RankIC/TopN definitions. Two label proxies are shown side by side:
+//   · 当日涨幅     (close-to-close off 昨收) — the original proxy
+//   · 当日涨幅(开)  (last_price/open − 1)    — the open-anchored intraday proxy, closest
+//                                             to the offline open-to-open forward label.
+function _signalQualityChips(rows, labelKey, suffix) {
+  // Pairs with a numeric score AND a numeric label feed the IC/RankIC.
+  const valued = rows.filter((r) => typeof r.score === "number" && typeof r[labelKey] === "number");
+  const scores = valued.map((r) => r.score);
+  const labels = valued.map((r) => r[labelKey]);
+  const rankic = _safeCorr(scores, labels, "spearman");
+  const ic = _safeCorr(scores, labels, "pearson");
+  const corrChip = (label, v) => {
+    if (!isFinite(v)) return `<span class="si-chip">${label} <b>样本不足</b></span>`;
+    const cls = v > 0 ? "pos" : v < 0 ? "neg" : "";
+    return `<span class="si-chip ${cls}">${label} <b>${v.toFixed(4)}</b></span>`;
+  };
+  // Top50 by score (rows already arrive rank-ordered, but sort defensively). Uses all
+  // valued rows when fewer than 50 are present, noting the count.
+  const topSorted = valued.slice().sort((a, b) => b.score - a.score);
+  const topN = topSorted.slice(0, 50);
+  const n = topN.length;
+  const topMean = n ? topN.reduce((s, r) => s + r[labelKey], 0) / n : NaN;
+  const topWin = n ? topN.filter((r) => r[labelKey] > 0).length / n : NaN;
+  const topLabel = (n < 50 ? `Top${n}` : "Top50") + suffix;
+  const topRetChip = isFinite(topMean)
+    ? `<span class="si-chip ${topMean > 0 ? "pos" : topMean < 0 ? "neg" : ""}">${topLabel}收益 <b>${(topMean * 100).toFixed(2)}%</b></span>`
+    : "";
+  const topWinChip = isFinite(topWin)
+    ? `<span class="si-chip">${topLabel}胜率 <b>${(topWin * 100).toFixed(1)}%</b></span>`
+    : "";
+  return corrChip("RankIC" + suffix, rankic) + corrChip("IC" + suffix, ic) + topRetChip + topWinChip;
+}
+
 function renderSignalSummary(signals) {
   const el = $("#si-summary");
   const rows = signals || [];
@@ -1765,44 +1842,19 @@ function renderSignalSummary(signals) {
   const chip = (label, value, cls = "", withRate = true) =>
     `<span class="si-chip ${cls}">${label} <b>${value}</b>${withRate ? rate(value) : ""}</span>`;
 
-  // Pairs with a numeric score AND a numeric 当日涨幅 feed the live IC/RankIC.
-  const valued = rows.filter((r) => typeof r.score === "number" && typeof r.day_change === "number");
-  const scores = valued.map((r) => r.score);
-  const labels = valued.map((r) => r.day_change);
-  const rankic = _safeCorr(scores, labels, "spearman");
-  const ic = _safeCorr(scores, labels, "pearson");
-  const corrChip = (label, v) => {
-    if (!isFinite(v)) return `<span class="si-chip">${label} <b>样本不足</b></span>`;
-    const cls = v > 0 ? "pos" : v < 0 ? "neg" : "";
-    return `<span class="si-chip ${cls}">${label} <b>${v.toFixed(4)}</b></span>`;
-  };
-  // Top50 by score (rows already arrive rank-ordered, but sort defensively). Uses all
-  // valued rows when fewer than 50 are present, noting the count.
-  const topSorted = valued.slice().sort((a, b) => b.score - a.score);
-  const topN = topSorted.slice(0, 50);
-  const n = topN.length;
-  const topMean = n ? topN.reduce((s, r) => s + r.day_change, 0) / n : NaN;
-  const topWin = n ? topN.filter((r) => r.day_change > 0).length / n : NaN;
-  const topLabel = n < 50 ? `Top${n}` : "Top50";
-  const topRetChip = isFinite(topMean)
-    ? `<span class="si-chip ${topMean > 0 ? "pos" : topMean < 0 ? "neg" : ""}">${topLabel}收益 <b>${(topMean * 100).toFixed(2)}%</b></span>`
-    : "";
-  const topWinChip = isFinite(topWin)
-    ? `<span class="si-chip">${topLabel}胜率 <b>${(topWin * 100).toFixed(1)}%</b></span>`
-    : "";
-
-  el.innerHTML =
+  const countRow =
     chip("共", total, "", false) +
     chip("上涨", up, "pos") +
     chip("下跌", down, "neg") +
     chip("平", flat) +
     (unknown ? chip("无价", unknown) : "") +
-    chip("已持仓", held, "held") +
-    '<span class="si-chip-sep"></span>' +
-    corrChip("RankIC(实时)", rankic) +
-    corrChip("IC(实时)", ic) +
-    topRetChip +
-    topWinChip;
+    chip("已持仓", held, "held");
+
+  // Three stacked rows: counts, then the two label-proxy metric groups.
+  el.innerHTML =
+    `<div class="si-row">${countRow}</div>` +
+    `<div class="si-row">${_signalQualityChips(rows, "day_change", "(实时)")}</div>` +
+    `<div class="si-row">${_signalQualityChips(rows, "day_change_open", "(开盘)")}</div>`;
 }
 
 async function loadStratInfo() {
@@ -1822,8 +1874,8 @@ async function loadStratInfo() {
     renderTable("#si-signals", sig.signals || [], {
       columns: SI_SIGNAL_COLS, headers: SI_SIGNAL_HEADERS,
       intCols: new Set(["rank"]),
-      rateCols: new Set(["pred_return_live", "day_change"]),
-      signCols: new Set(["pred_return_live", "day_change"]),
+      rateCols: new Set(["pred_return_live", "day_change", "day_change_open"]),
+      signCols: new Set(["pred_return_live", "day_change", "day_change_open"]),
       linkStock: true,
       rowClass: (row) => (row.held ? "held-row" : ""),
       cellFn: (c, v) => (c === "held" ? `<td>${v ? "✓" : ""}</td>` : undefined),
@@ -1903,8 +1955,62 @@ $("#ctrl-sell-all").addEventListener("click", () => controlPost("/api/control/se
 $("#ctrl-refresh").addEventListener("click", loadControl);
 
 // ---------------------------------------------------------------------------
+// 交易管理 → 当前目标 — the node's in-memory target book (target vs current qty).
+// Reads /api/strategy/targets (live strategy memory). A row is highlighted green
+// when current_qty == target_qty (已达标); frozen names are flagged separately.
+// ---------------------------------------------------------------------------
+const TGT_COLS = ["stock_code", "name", "target_qty", "current_qty", "diff", "frozen", "achieved"];
+const TGT_HEADERS = {
+  stock_code: "证券代码", name: "证券名称", target_qty: "目标数量",
+  current_qty: "当前数量", diff: "差额", frozen: "冻结", achieved: "已达标",
+};
+
+async function loadTargets() {
+  if (!state.account) return;
+  if (!hasNodeApi()) {
+    nodeApiHint("#tgt-table");
+    $("#tgt-meta").textContent = "";
+    return;
+  }
+  try {
+    const t = await api("/api/strategy/targets",
+      { account: state.account.account_id, trader: state.account.trader_id });
+    const achieved = (t.targets || []).filter((r) => r.achieved).length;
+    $("#tgt-meta").textContent =
+      `版本：${t.target_version || "—"} · 目标日期：${t.target_date || "—"} · ` +
+      `共 ${t.count || 0} 只，已达标 ${achieved} 只` +
+      (t.achieved_version ? " · 版本已全部达标" : "");
+    renderTable("#tgt-table", t.targets || [], {
+      columns: TGT_COLS, headers: TGT_HEADERS,
+      intCols: new Set(["target_qty", "current_qty", "diff"]),
+      signCols: new Set(["diff"]),
+      linkStock: true,
+      rowClass: (row) => (row.achieved ? "achieved-row" : ""),
+      cellFn: (c, v, row) => {
+        if (c === "achieved") return `<td>${v ? "✓" : ""}</td>`;
+        if (c === "frozen") return `<td class="text" title="${row.frozen_reason || ""}">${v ? "❄" : ""}</td>`;
+        return undefined;
+      },
+    });
+  } catch (e) {
+    $("#tgt-table").innerHTML = '<div class="empty">获取失败</div>';
+    $("#tgt-meta").textContent = "";
+    toast(e.message);
+  }
+}
+$("#tgt-refresh").addEventListener("click", loadTargets);
+let tgtTimer = null;
+$("#tgt-auto").addEventListener("change", (e) => {
+  clearInterval(tgtTimer);
+  if (e.target.checked) tgtTimer = setInterval(loadTargets, 15000);
+});
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 resetMetricSelection(ASSET_METRICS);
 defaultSeriesRange();
+// Restore the last-visited page (from a prior refresh) before init kicks off the
+// account-change flow, so data loads directly into the page the user was on.
+restoreActiveNav();
 initSources().catch((e) => toast("初始化失败: " + e.message));

@@ -765,6 +765,33 @@ def strategy_signals(
     return payload
 
 
+@app.get("/api/strategy/targets")
+def strategy_targets(
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """The live node's in-memory target book — target vs current qty per instrument.
+
+    Backs 交易管理 → 当前目标. Reads the running strategy's ``_target_quantities`` /
+    ``_target_version`` via the control API (node memory), never a snapshot table, so
+    it reflects exactly what the node is converging toward right now.
+    """
+    client = _node_api(data, account, trader)
+    try:
+        payload = client.get("/strategy/targets")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # Fill 证券名称 from ClickHouse when the node could not resolve a name (mirrors
+    # strategy_signals), keeping the node's own name if it set one.
+    targets = data.attach_names(payload.get("targets") or [])
+    for row in targets:
+        if not row.get("name"):
+            row["name"] = row.get("stock_name") or ""
+    payload["targets"] = targets
+    return payload
+
+
 @app.get("/api/control/state")
 def control_state(
     account: str,

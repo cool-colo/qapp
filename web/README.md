@@ -83,6 +83,7 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/kline` | `stock_code, start, end` |
 | `GET /api/kline_with_trades` | `source, account, trader, stock_code, start, end` |
 | `GET /api/realtime/positions` | `account, trader` |
+| `GET /api/strategy/targets` | `account, trader` |
 | `GET /api/control/state` | `account, trader` |
 | `POST /api/control/suspend` | `account, trader` |
 | `POST /api/control/resume` | `account, trader` |

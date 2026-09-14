@@ -677,6 +677,26 @@ class LiveControlServer:
             return None
         return (last_price - prev_close) / prev_close
 
+    def _day_change_open(self, instrument_id_text: str) -> float | None:
+        """当日涨幅(开): the stock's live move off *today's open* (last_price/open − 1).
+
+        This is the intraday, open-anchored return — the live proxy for the offline
+        open-to-open forward label the 信号质量 report uses. Both legs come from the
+        same live full-tick snapshot: the strategy's per-instrument ``_market_status``
+        for traded names, falling back to the whole-market snapshot for signal names
+        that are not in the traded universe.
+        """
+        snapshot = self._strategy._market_status.get(instrument_id_text)
+        if snapshot is None or snapshot.open is None:
+            snapshot = self._strategy._whole_market_status.get(instrument_id_text)
+        if snapshot is None:
+            return None
+        open_price = _float_or_none(snapshot.open)
+        last_price = _float_or_none(snapshot.last_price)
+        if open_price is None or open_price <= 0 or last_price is None or last_price <= 0:
+            return None
+        return (last_price - open_price) / open_price
+
     def _held_stock_codes(self) -> set[str]:
         """Stock codes currently held (open long positions in the Nautilus cache).
 
@@ -717,6 +737,7 @@ class LiveControlServer:
                         "score": _float_or_none(signal.get("score")),
                         "pred_return_live": _float_or_none(signal.get("pred_return_live")),
                         "day_change": (None if iid_text is None else self._day_change(iid_text)),
+                        "day_change_open": (None if iid_text is None else self._day_change_open(iid_text)),
                         "held": stock_code.upper() in held_codes,
                     },
                 )
@@ -725,6 +746,53 @@ class LiveControlServer:
             "signal_date": None if signal_date is None else str(signal_date),
             "count": len(rows),
             "signals": rows,
+        }
+
+    def _strategy_targets_payload(self) -> dict:
+        """The strategy's in-memory target book for the current target version.
+
+        One row per instrument the strategy is currently converging toward
+        (``_target_quantities``, which includes ``target_qty == 0`` liquidation
+        targets). ``current_qty`` is the live Nautilus net position, so ``achieved``
+        (current == target) marks the names that have reached their fixed share count.
+        ``frozen`` names hit a per-version limit (price cap / insufficient sellable)
+        and the strategy stopped trading them for this version, so they may sit at
+        ``achieved = false`` deliberately — surfaced as its own column, not folded
+        into ``achieved``. Read straight from strategy memory + the Nautilus cache;
+        never a DB or QMT poll.
+        """
+        strategy = self._strategy
+        targets = dict(strategy._target_quantities)
+        version = strategy._target_version
+        target_date = strategy._target_date
+        frozen = dict(strategy._frozen_instruments)
+        rows: list[dict] = []
+        for iid_text, target_qty in targets.items():
+            try:
+                current = strategy._current_quantity(InstrumentId.from_str(iid_text))
+            except Exception:
+                current = Decimal(0)
+            target_i = int(target_qty)
+            current_i = int(current)
+            rows.append(
+                {
+                    "stock_code": self._stock_code(iid_text),
+                    "name": self._instrument_name(iid_text),
+                    "target_qty": target_i,
+                    "current_qty": current_i,
+                    "diff": current_i - target_i,  # >0 待卖, <0 待买, 0 已达标
+                    "frozen": iid_text in frozen,
+                    "frozen_reason": frozen.get(iid_text),
+                    "achieved": current_i == target_i,
+                },
+            )
+        return {
+            "target_version": version or None,
+            "target_date": None if target_date is None else str(target_date),
+            "target_reason": strategy._target_reason,
+            "achieved_version": bool(version) and version in strategy._achieved_versions,
+            "count": len(rows),
+            "targets": rows,
         }
 
     def _whole_market_ticks_payload(self) -> dict:
@@ -897,6 +965,8 @@ class LiveControlServer:
                         self._send(200, server._strategy_info_payload())
                     elif path == "/strategy/signals":
                         self._send(200, server._strategy_signals_payload())
+                    elif path == "/strategy/targets":
+                        self._send(200, server._strategy_targets_payload())
                     elif path == "/realtime/whole_market_ticks":
                         self._send(200, server._whole_market_ticks_payload())
                     elif path == "/realtime/closed_debug":
