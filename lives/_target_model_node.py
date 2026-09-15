@@ -594,6 +594,27 @@ def build_target_model_node(
         )
         exporter.strategy_ref = strategy
         node.trader.add_actor(exporter)
+    # --- SUBSCRIBE_ALL_EXPERIMENT (remove this block + lives/subscribe_all_experiment.py to disable) ---
+    # Throwaway probe: does QMT hold quote-tick + order-book subscriptions for the
+    # whole A-share universe? Off unless SUBSCRIBE_ALL_EXPERIMENT=1; needs load-all.
+    import os as _os
+
+    if _os.environ.get("SUBSCRIBE_ALL_EXPERIMENT", "").strip() in ("1", "true", "True"):
+        from lives.subscribe_all_experiment import SubscribeAllExperimentActor
+        from lives.subscribe_all_experiment import SubscribeAllExperimentConfig
+
+        node.trader.add_actor(
+            SubscribeAllExperimentActor(
+                config=SubscribeAllExperimentConfig(
+                    max_instruments=int(_os.environ.get("SUBSCRIBE_ALL_EXPERIMENT_MAX", "0")),
+                ),
+            ),
+        )
+        node.get_logger().info(
+            "[subscribe-all-experiment] enabled via SUBSCRIBE_ALL_EXPERIMENT=1",
+            color=LogColor.MAGENTA,
+        )
+    # --- end SUBSCRIBE_ALL_EXPERIMENT ---
     node.add_data_client_factory(venue_clients.client_id, venue_clients.data_factory)
     node.add_exec_client_factory(venue_clients.client_id, venue_clients.exec_factory)
     node.build()
