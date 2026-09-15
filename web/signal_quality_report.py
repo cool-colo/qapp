@@ -65,9 +65,14 @@ BENCHMARK_TS_CODE = "000985.CSI"
 #                     basis with dwd_stock_adj_factor (which carries today's factor
 #                     intraday, unlike dws_stock_factor_wide) so a dividend/split
 #                     between the buy day and today does not leak into the label:
-#                     (rt_last * af_today) / (t1_open * af_buyday) - 1.
-#                     Needs the node snapshot; without it, falls back to the offline
-#                     T+1 (close/open - 1).
+#                     (rt_exit * af_today) / (t1_open * af_buyday) - 1.
+#                     rt_exit is today's LAST price for a record whose intended sell
+#                     session is still in the future, but today's OPEN (rt_last as
+#                     fallback) for the single record whose sell session IS today —
+#                     that record's sell leg is exactly today's open, so using it
+#                     matches the exact open-to-open 'normal' definition it is about
+#                     to become. Needs the node snapshot; without it, falls back to
+#                     the offline T+1 (close/open - 1).
 #   realtime_intraday today's intraday return (last_price/open - 1) from the node,
 #                     both legs from the node snapshot (buy day == today, no offline
 #                     row yet).
@@ -214,25 +219,70 @@ realtime AS (
 rt_signal_date AS (
     -- The signal date whose buy day is today: latest pred_date < the node's date.
     SELECT max(pred_date) AS sig_date FROM preds WHERE pred_date < toDate({rt_date_lit})
+),
+cal AS (
+    -- Market trading calendar (stock-agnostic distinct dates). We UNION in the node's
+    -- clock ``rt_date`` (a known live trading session) because the offline factor
+    -- table has NOT published today's row during the session — the exact window this
+    -- feature serves. Without today in the calendar, leadInFrame from the buy day
+    -- cannot reach today and the sell-day-is-today record would never be flagged.
+    SELECT DISTINCT trade_date FROM (
+        SELECT trade_date FROM {quote_identifier("dws_stock_factor_wide")}
+        WHERE trade_date >= toDate({start}) - 15
+          AND trade_date <= toDate({end}) + 20
+          AND open > 0
+          AND adj_factor IS NOT NULL
+        UNION DISTINCT
+        SELECT toDate({rt_date_lit}) AS trade_date
+    )
+),
+cal_sell AS (
+    -- For each prediction date, the intended sell session = t+(h+1) trading day.
+    -- A pred whose sell session has not occurred yet gets the leadInFrame default
+    -- (1970-01-01), which never equals rt_date, so only the true sell-day-is-today
+    -- record is flagged.
+    SELECT
+        trade_date  AS pred_date,
+        leadInFrame(trade_date, {exit_off}) OVER wc AS sell_date
+    FROM cal
+    WINDOW wc AS (ORDER BY trade_date ROWS BETWEEN CURRENT ROW AND {exit_off} FOLLOWING)
 ),{adj_factor_cte}"""
         # LEFT JOIN into preds keyed on code, only for the resolved signal date.
         realtime_join = f"""
     LEFT JOIN realtime rt
         ON p.code = rt.code AND p.pred_date = (SELECT sig_date FROM rt_signal_date)
     LEFT JOIN realtime rtl
-        ON p.code = rtl.code{adj_factor_join}"""
+        ON p.code = rtl.code
+    LEFT JOIN cal_sell cs
+        ON p.pred_date = cs.pred_date{adj_factor_join}"""
         realtime_label_expr = "if(rt.rt_open > 0, rt.rt_last / rt.rt_open - 1, NULL)"
         # For t1_intraday rows: entry = offline RAW t+1 open on the buy-day 后复权
         # basis (t1_open * af_buyday), exit = live raw quote on today's basis
-        # (rt_last * af_today). Both factors from dwd_stock_adj_factor.
+        # (rt_exit * af_today), both factors from dwd_stock_adj_factor.
+        #
+        # rt_exit: the record whose intended SELL session is today (cs.sell_date ==
+        # rt_date) is one open-to-open leg short of a full 'normal' window — its sell
+        # leg IS today's open. So it exits at today's OPEN (rtl.rt_open), matching the
+        # exact open-to-open definition; rtl.rt_last is only a fallback if the open is
+        # missing. Every other t1_intraday record's sell session is still in the future
+        # (no open exists yet), so it exits at the live last price (rtl.rt_last).
+        rt_exit_expr = (
+            "if(cs.sell_date = toDate({rt_date_lit}) AND rtl.rt_open > 0, rtl.rt_open, rtl.rt_last)"
+        ).format(rt_date_lit=rt_date_lit)
         t1_label_expr = (
-            "if(l.t1_open > 0 AND rtl.rt_last > 0 AND an.af_today > 0 AND ba.af_buyday > 0, "
-            "(rtl.rt_last * an.af_today) / (l.t1_open * ba.af_buyday) - 1, NULL)"
+            f"if(l.t1_open > 0 AND rtl.rt_last > 0 AND an.af_today > 0 AND ba.af_buyday > 0, "
+            f"({rt_exit_expr} * an.af_today) / (l.t1_open * ba.af_buyday) - 1, NULL)"
         )
         t1_ok_expr = (
             f"(l.t1_avail >= {entry_off + 1} AND l.t1_open > 0 AND rtl.rt_last > 0 "
             "AND an.af_today > 0 AND ba.af_buyday > 0)"
         )
+        # The sell-day-is-today record is a COMPLETE open-to-open window (buy-day open
+        # -> today's open); the only reason it is not 'normal' is that offline has not
+        # published today's row yet, so its sell open is taken from the live snapshot.
+        # It is therefore marked 'normal' (see the joined CTE) rather than as a
+        # trailing-edge approximation.
+        sell_today_expr = f"(cs.sell_date = toDate({rt_date_lit}))"
     else:
         realtime_cte = ""
         realtime_join = ""
@@ -240,6 +290,9 @@ rt_signal_date AS (
         # No node snapshot -> fall back to the offline T+1 intraday close/open.
         t1_label_expr = "l.t1_close / l.t1_open - 1"
         t1_ok_expr = f"(l.t1_avail >= {entry_off + 1} AND l.t1_open > 0)"
+        # No live open without a snapshot, so no t1 row can be a complete open-to-open
+        # window here — nothing gets relabelled to 'normal'.
+        sell_today_expr = "0"
 
     return f"""
 WITH
@@ -330,6 +383,7 @@ resolved AS (
         p.score     AS score,
         (l.avail = {full_window} AND l.entry_px > 0)                       AS normal_ok,
         {t1_ok_expr}                                                       AS t1_ok,
+        {sell_today_expr}                                                  AS sell_today,
         l.exit_px / l.entry_px - 1                                         AS normal_label,
         {t1_label_expr}                                                    AS t1_label,
         {realtime_label_expr}                                             AS rt_label
@@ -338,12 +392,22 @@ resolved AS (
         ON p.code = l.code AND p.pred_date = l.trade_date{realtime_join}
 ),
 joined AS (
+    -- A t1_intraday row whose sell session is today is a complete open-to-open
+    -- window sourced from the live open, so it is marked 'normal' (it will become a
+    -- true offline 'normal' row once today's factor bar publishes after close). Its
+    -- benchmark is still gated on a complete offline benchmark window in the final
+    -- SELECT, so it shows "—" until the index open for today lands.
     SELECT
         pred_date,
         code,
         score,
         multiIf(normal_ok, normal_label, t1_ok, t1_label, rt_label) AS label,
-        multiIf(normal_ok, 'normal', t1_ok, 't1_intraday', 'realtime_intraday') AS label_source
+        multiIf(
+            normal_ok, 'normal',
+            t1_ok AND sell_today, 'normal',
+            t1_ok, 't1_intraday',
+            'realtime_intraday'
+        ) AS label_source
     FROM resolved
     WHERE normal_ok OR t1_ok OR (rt_label IS NOT NULL)
 ),
@@ -383,12 +447,15 @@ SELECT
     avgIf(label, is_top_decile) - avgIf(label, is_bot_decile) AS ls10,
     if(any(cnt) < 20, NULL, avgIf(label, rnk <= 20))       AS top20_label_return,
     if(any(cnt) < 50, NULL, avgIf(label, rnk <= 50))       AS top50_label_return,
-    -- Benchmark is the open-to-open forward window, defined ONLY for 'normal'
-    -- rows. The t1_intraday label now exits at the stock's CURRENT live price
-    -- (buy-day open -> now), which no offline index window matches; the index
-    -- also isn't in the node's stock-only realtime snapshot. So both approximate
-    -- sources get a NULL benchmark -> their *_excess columns show "—".
-    if(any(f.label_source) = 'normal', any(b.b_exit / b.b_entry - 1), NULL) AS benchmark_label_return,
+    -- Benchmark is the open-to-open forward window. It is emitted only when the
+    -- benchmark's OWN forward window is complete (b_avail = full_window, b_exit > 0),
+    -- NOT merely when the day is labelled 'normal'. The sell-day-is-today record is
+    -- marked 'normal' but its benchmark exit (today's index open) has not published
+    -- offline yet — gating on the window keeps that row's benchmark NULL ("—") instead
+    -- of the garbage b_exit=0 -> -100% it would otherwise show. The other approximate
+    -- sources (t1_intraday future-sell, realtime_intraday) also lack a complete
+    -- window, so they stay NULL as before.
+    if(any(b.b_avail) = {full_window} AND any(b.b_exit) > 0, any(b.b_exit / b.b_entry - 1), NULL) AS benchmark_label_return,
     if(any(cnt) < 20, NULL, avgIf(label, rnk <= 20) - benchmark_label_return) AS top20_label_excess,
     if(any(cnt) < 50, NULL, avgIf(label, rnk <= 50) - benchmark_label_return) AS top50_label_excess,
     count()                                                AS sample_count
