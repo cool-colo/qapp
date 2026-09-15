@@ -45,6 +45,7 @@ class SellRequest(BaseModel):
     trader: str
     stock_code: str | None = None
     instrument_id: str | None = None
+    pin: str | None = None
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -139,7 +140,10 @@ def list_sources(data: DataAccess = Depends(get_data)) -> dict[str, list[str]]:
 @app.get("/api/config")
 def ui_config() -> dict[str, bool]:
     """Server-side switches the UI reads to decide what it may offer. Add new knobs here."""
-    return {"sell_enabled": _config().sell_enabled}
+    cfg = _config()
+    # pin_required is a boolean flag only — the PIN itself is validated server-side and
+    # never sent to the browser.
+    return {"sell_enabled": cfg.sell_enabled, "pin_required": cfg.control_pin is not None}
 
 
 @app.get("/api/accounts")
@@ -809,8 +813,10 @@ def control_state(
 def control_suspend(
     account: str,
     trader: str,
+    pin: str | None = None,
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
+    _require_pin(pin)
     return _control_post(data, account, trader, "/control/suspend")
 
 
@@ -818,8 +824,10 @@ def control_suspend(
 def control_resume(
     account: str,
     trader: str,
+    pin: str | None = None,
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
+    _require_pin(pin)
     return _control_post(data, account, trader, "/control/resume")
 
 
@@ -833,12 +841,25 @@ def _require_sell_enabled() -> None:
         )
 
 
+def _require_pin(pin: str | None) -> None:
+    """Gate the 交易管理/控制 write actions behind ``control_pin``. A configured PIN must be
+    matched exactly; when no PIN is configured the check is a no-op. The PIN is compared
+    server-side so the value never has to reach the browser."""
+    expected = _config().control_pin
+    if expected is None:
+        return
+    if not pin or pin != expected:
+        raise HTTPException(status_code=403, detail="PIN 码错误")
+
+
 @app.post("/api/control/sell_all")
 def control_sell_all(
     account: str,
     trader: str,
+    pin: str | None = None,
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
+    _require_pin(pin)
     _require_sell_enabled()
     return _control_post(data, account, trader, "/control/sell_all")
 
@@ -848,6 +869,7 @@ def control_sell(
     body: SellRequest,
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
+    _require_pin(body.pin)
     _require_sell_enabled()
     node_body: dict[str, Any] = {}
     if body.instrument_id:

@@ -15,6 +15,12 @@
 # is off.
 sell_enabled: ${WEB_SELL_ENABLED:-false}
 
+# 4-character PIN required to confirm the 交易管理/控制 write actions (暂停交易 / 恢复交易 /
+# 全部卖出 and the per-row 卖出). Blank/absent = no PIN prompt. The value never reaches the
+# browser; the control endpoints validate it server-side and answer 403 on a mismatch.
+# 刷新 is never gated. Must be exactly 4 characters when set.
+control_pin: ${WEB_CONTROL_PIN:-}
+
 sources:
   - name: 模拟盘
     mysql:

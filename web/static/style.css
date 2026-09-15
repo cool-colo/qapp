@@ -349,6 +349,32 @@ button.danger { background: var(--down); }
 
 #tab-control .ctrl-heading { margin: 18px 20px 6px; color: var(--muted); font-size: 12px; }
 
+/* 实盘 real-money caveat banner on 交易管理/控制. */
+.ctrl-caveat {
+  margin: 14px 20px 0; padding: 10px 14px; border-radius: 6px;
+  background: rgba(239, 83, 80, .12); border: 1px solid rgba(239, 83, 80, .5);
+  color: #f0a3a1; font-size: 12px; line-height: 1.6;
+}
+.ctrl-caveat b { color: var(--up); font-weight: 700; }
+
+/* 实盘 caveat re-stated inside the confirm / PIN dialog. */
+.modal-warn {
+  margin-top: 12px; padding: 8px 10px; border-radius: 5px;
+  background: rgba(239, 83, 80, .12); border: 1px solid rgba(239, 83, 80, .5);
+  color: #f0a3a1; font-size: 12px; line-height: 1.5;
+}
+.modal-warn b { color: var(--up); font-weight: 700; }
+
+/* PIN entry inside the confirm dialog. */
+.pin-label { display: flex; flex-direction: column; gap: 6px; margin-top: 14px;
+  color: var(--muted); font-size: 12px; }
+.pin-input {
+  width: 120px; letter-spacing: 8px; text-align: center; font-size: 18px;
+  padding: 6px 8px; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 5px;
+}
+.pin-input:focus { outline: none; border-color: var(--accent); }
+
 #toast {
   position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
   background: #b23b3b; color: #fff; padding: 10px 18px; border-radius: 6px;

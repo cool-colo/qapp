@@ -67,6 +67,10 @@ class AppConfig:
     # Master switch for every sell action in the UI (卖出 / 全部卖出). Off by default:
     # the sell endpoints answer 403 and the buttons render grayed out.
     sell_enabled: bool = False
+    # 4-character PIN gating the 交易管理/控制 write actions (暂停/恢复/全部卖出 and the
+    # per-row 卖出). None = no PIN required. The PIN itself never leaves the server; the
+    # control endpoints reject a wrong/missing PIN with 403.
+    control_pin: str | None = None
 
     def source(self, name: str) -> SourceConfig:
         for src in self.sources:
@@ -209,6 +213,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
 
     node_api = _build_node_api(raw.get("node_api") or {})
     sell_enabled = _parse_bool(raw.get("sell_enabled", False), "sell_enabled")
+    control_pin = _parse_control_pin(raw.get("control_pin"))
 
     return AppConfig(
         sources=sources,
@@ -217,7 +222,21 @@ def load_config(path: str | os.PathLike[str] | None = None) -> AppConfig:
         account_blacklist=account_blacklist,
         node_api=node_api,
         sell_enabled=sell_enabled,
+        control_pin=control_pin,
     )
+
+
+def _parse_control_pin(value: Any) -> str | None:
+    """Normalize the control PIN: a blank/absent value disables the PIN gate, and any
+    set value must be exactly 4 characters (an unfilled ``${ENV:-}`` reads as blank)."""
+    if value is None:
+        return None
+    pin = str(value).strip()
+    if not pin:
+        return None
+    if len(pin) != 4:
+        raise ValueError(f"control_pin must be exactly 4 characters, got {len(pin)}")
+    return pin
 
 
 def _build_node_api(raw: Any) -> dict[str, NodeApiConfig]:

@@ -241,6 +241,10 @@
       <section id="tab-control" class="tab-panel">
         <!-- 控制 sub-panel: suspend / resume / sell-all + audit log -->
         <div id="ctrl-control" class="ctrl-sub-panel active">
+          <div id="ctrl-live-caveat" class="ctrl-caveat" hidden>
+            ⚠ 当前数据源为<b>实盘</b>（真实资金账户）。此页的暂停 / 恢复 / 全部卖出操作将
+            直接作用于真实账户且不可撤销，请务必确认账户与操作无误后再执行。
+          </div>
           <div class="subbar">
             <div class="subbar-controls">
               <span>交易状态：<b id="ctrl-state">—</b></span>

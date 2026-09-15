@@ -41,6 +41,51 @@ function confirmDialog({ title = "请确认", bodyHtml = "", okText = "确定", 
   });
 }
 
+// A confirm dialog that also collects a 4-digit PIN. Resolves the entered PIN string
+// on confirm, or null on cancel/backdrop/Esc. When `warnHtml` is set (实盘 source), an
+// extra caveat line is shown inside the dialog. The PIN is validated server-side; this
+// only gathers it. Enter submits only once 4 digits are entered.
+function pinDialog({ title = "请确认", bodyHtml = "", warnHtml = "", okText = "确定", danger = false } = {}) {
+  return new Promise((resolve) => {
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.innerHTML =
+      `<div class="modal" role="dialog" aria-modal="true">
+         <div class="modal-title">${title}</div>
+         <div class="modal-body">${bodyHtml}
+           ${warnHtml ? `<div class="modal-warn">${warnHtml}</div>` : ""}
+           <label class="pin-label">请输入 4 位 PIN 码确认
+             <input class="pin-input" type="password" inputmode="numeric" autocomplete="off"
+                    maxlength="4" pattern="[0-9]*" />
+           </label>
+         </div>
+         <div class="modal-actions">
+           <button class="ghost modal-cancel">取消</button>
+           <button class="${danger ? "danger" : ""} modal-ok" disabled>${okText}</button>
+         </div>
+       </div>`;
+    document.body.appendChild(back);
+    const input = back.querySelector(".pin-input");
+    const okBtn = back.querySelector(".modal-ok");
+    const done = (val) => { window.removeEventListener("keydown", onKey); back.remove(); resolve(val); };
+    const submit = () => { if (input.value.length === 4) done(input.value); };
+    const onKey = (e) => {
+      if (e.key === "Escape") done(null);
+      if (e.key === "Enter") submit();
+    };
+    input.addEventListener("input", () => {
+      input.value = input.value.replace(/\D/g, "").slice(0, 4);
+      okBtn.disabled = input.value.length !== 4;
+    });
+    okBtn.addEventListener("click", submit);
+    back.querySelector(".modal-cancel").addEventListener("click", () => done(null));
+    back.addEventListener("mousedown", (e) => { if (e.target === back) done(null); });
+    window.addEventListener("keydown", onKey);
+    requestAnimationFrame(() => back.classList.add("show"));
+    input.focus();
+  });
+}
+
 async function api(path, params, opts = {}) {
   const url = new URL(path, window.location.origin);
   Object.entries(params || {}).forEach(([k, v]) => {
@@ -93,7 +138,7 @@ function signClass(v) {
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-const state = { source: null, accounts: [], account: null, sellEnabled: false };
+const state = { source: null, accounts: [], account: null, sellEnabled: false, pinRequired: false };
 // Sell gating is a backend decision (web/config.yaml: sell_enabled). It starts off so
 // the UI never offers a sell action before /api/config has answered.
 const SELL_OFF_HINT = "卖出功能未启用（web/config.yaml: sell_enabled）";
@@ -114,6 +159,7 @@ function accountParams() {
 async function initSources() {
   const [{ sources }, cfg] = await Promise.all([api("/api/sources"), api("/api/config")]);
   state.sellEnabled = !!cfg.sell_enabled;
+  state.pinRequired = !!cfg.pin_required;
   setSellAllEnabled(state.sellEnabled);
   const sel = $("#sel-source");
   sel.innerHTML = sources.map((s) => `<option>${s}</option>`).join("");
@@ -1672,12 +1718,25 @@ async function sellStock(code, name, qty) {
   const title = "确认卖出";
   const body = `即将市价卖出<br><b>${name ? name + " " : ""}${code}</b>`
     + (qty ? `<br>可用数量 <b>${Number(qty).toLocaleString()}</b> 股` : "");
-  const ok = await confirmDialog({ title, bodyHtml: body, okText: "卖出", danger: true });
-  if (!ok) return;
+  let pin = null;
+  if (state.pinRequired) {
+    pin = await pinDialog({ title, bodyHtml: body, warnHtml: liveWarnHtml(), okText: "卖出", danger: true });
+    if (pin === null) return;
+  } else {
+    const ok = await confirmDialog({
+      title,
+      bodyHtml: body + (liveWarnHtml() ? `<div class="modal-warn">${liveWarnHtml()}</div>` : ""),
+      okText: "卖出", danger: true,
+    });
+    if (!ok) return;
+  }
   try {
     const r = await api("/api/control/sell", {}, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ account: state.account.account_id, trader: state.account.trader_id, stock_code: code }),
+      body: JSON.stringify({
+        account: state.account.account_id, trader: state.account.trader_id,
+        stock_code: code, pin,
+      }),
     });
     toast(r && r.ok ? `已提交卖出 ${code}` : "已提交");
     loadRealtime();
@@ -1914,6 +1973,9 @@ const CTRL_LOG_HEADERS = { ts: "时间", action: "操作", detail_json: "详情"
 
 async function loadControl() {
   if (!state.account) return;
+  // The 实盘 (real-money) caveat banner: shown whenever the selected data source is 实盘,
+  // independent of node-api availability.
+  $("#ctrl-live-caveat").hidden = state.source !== "实盘";
   if (!hasNodeApi()) {
     $("#ctrl-state").textContent = "未配置节点";
     $("#ctrl-state").className = "";
@@ -1941,17 +2003,38 @@ async function loadControl() {
   }
 }
 
-async function controlPost(path, confirmMsg) {
+// The 实盘 (real-money) caveat re-stated inside the confirm dialog, so the warning is
+// present at the exact moment of action, not only in the page banner.
+function liveWarnHtml() {
+  return state.source === "实盘"
+    ? "⚠ 当前数据源为 <b>实盘</b>（真实资金），此操作将直接作用于真实账户，务必谨慎。"
+    : "";
+}
+
+// Confirm (and, when a PIN is configured, collect a 4-digit PIN for) a 控制 write action.
+// 刷新 never routes through here. Suspend/resume/sell-all all confirm; sell-all is danger.
+async function controlPost(path, { title, bodyHtml, danger = false } = {}) {
   if (!hasNodeApi()) { toast("该账户未配置实盘节点 API"); return; }
-  if (confirmMsg && !window.confirm(confirmMsg)) return;
+  const params = { account: state.account.account_id, trader: state.account.trader_id };
+  if (state.pinRequired) {
+    const pin = await pinDialog({ title, bodyHtml, warnHtml: liveWarnHtml(), okText: "确认", danger });
+    if (pin === null) return;
+    params.pin = pin;
+  } else {
+    const ok = await confirmDialog({ title, bodyHtml: bodyHtml + (liveWarnHtml() ? `<div class="modal-warn">${liveWarnHtml()}</div>` : ""), okText: "确认", danger });
+    if (!ok) return;
+  }
   try {
-    await api(path, { account: state.account.account_id, trader: state.account.trader_id }, { method: "POST" });
+    await api(path, params, { method: "POST" });
     loadControl();
   } catch (e) { toast(e.message); }
 }
-$("#ctrl-suspend").addEventListener("click", () => controlPost("/api/control/suspend"));
-$("#ctrl-resume").addEventListener("click", () => controlPost("/api/control/resume"));
-$("#ctrl-sell-all").addEventListener("click", () => controlPost("/api/control/sell_all", "确认卖出全部可卖持仓？此操作不可撤销。"));
+$("#ctrl-suspend").addEventListener("click", () =>
+  controlPost("/api/control/suspend", { title: "确认暂停交易", bodyHtml: "确认<b>暂停</b>该账户的自动交易？" }));
+$("#ctrl-resume").addEventListener("click", () =>
+  controlPost("/api/control/resume", { title: "确认恢复交易", bodyHtml: "确认<b>恢复</b>该账户的自动交易？" }));
+$("#ctrl-sell-all").addEventListener("click", () =>
+  controlPost("/api/control/sell_all", { title: "确认全部卖出", bodyHtml: "确认<b>卖出全部可卖持仓</b>？此操作不可撤销。", danger: true }));
 $("#ctrl-refresh").addEventListener("click", loadControl);
 
 // ---------------------------------------------------------------------------
