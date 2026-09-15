@@ -1978,8 +1978,11 @@ async function loadControl() {
   $("#ctrl-live-caveat").hidden = state.source !== "实盘";
   if (!hasNodeApi()) {
     $("#ctrl-state").textContent = "未配置节点";
-    $("#ctrl-state").className = "";
+    $("#ctrl-state").className = "ctrl-value";
     $("#ctrl-suspend").disabled = $("#ctrl-resume").disabled = true;
+    $("#ctrl-tu-state").textContent = "未配置节点";
+    $("#ctrl-tu-state").className = "ctrl-value";
+    $("#ctrl-tu-pause").disabled = $("#ctrl-tu-resume").disabled = true;
     setSellAllEnabled(false, "该账户未配置实盘节点 API（node_api）");
     nodeApiHint("#ctrl-log");
     return;
@@ -1990,9 +1993,15 @@ async function loadControl() {
     const paused = !!st.trading_paused;
     const b = $("#ctrl-state");
     b.textContent = paused ? "已暂停" : "运行中";
-    b.className = paused ? "neg" : "pos";
+    b.className = "ctrl-value " + (paused ? "neg" : "pos");
     $("#ctrl-suspend").disabled = paused;
     $("#ctrl-resume").disabled = !paused;
+    const tuPaused = !!st.target_updates_paused;
+    const tb = $("#ctrl-tu-state");
+    tb.textContent = tuPaused ? "已暂停" : "自动更新中";
+    tb.className = "ctrl-value " + (tuPaused ? "neg" : "pos");
+    $("#ctrl-tu-pause").disabled = tuPaused;
+    $("#ctrl-tu-resume").disabled = !tuPaused;
     setSellAllEnabled(state.sellEnabled);
     renderTable("#ctrl-log", st.recent_actions || [], {
       columns: CTRL_LOG_COLS, headers: CTRL_LOG_HEADERS,
@@ -2033,6 +2042,10 @@ $("#ctrl-suspend").addEventListener("click", () =>
   controlPost("/api/control/suspend", { title: "确认暂停交易", bodyHtml: "确认<b>暂停</b>该账户的自动交易？" }));
 $("#ctrl-resume").addEventListener("click", () =>
   controlPost("/api/control/resume", { title: "确认恢复交易", bodyHtml: "确认<b>恢复</b>该账户的自动交易？" }));
+$("#ctrl-tu-pause").addEventListener("click", () =>
+  controlPost("/api/control/pause_target_updates", { title: "确认暂停目标更新", bodyHtml: "确认<b>暂停</b>自动目标更新（每日/每小时刷新与快照恢复）？手动卖出不受影响。" }));
+$("#ctrl-tu-resume").addEventListener("click", () =>
+  controlPost("/api/control/resume_target_updates", { title: "确认恢复目标更新", bodyHtml: "确认<b>恢复</b>自动目标更新？" }));
 $("#ctrl-sell-all").addEventListener("click", () =>
   controlPost("/api/control/sell_all", { title: "确认全部卖出", bodyHtml: "确认<b>卖出全部可卖持仓</b>？此操作不可撤销。", danger: true }));
 $("#ctrl-refresh").addEventListener("click", loadControl);

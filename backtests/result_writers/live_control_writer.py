@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS `live_control_state` (
   `account_id`     VARCHAR(64)  NOT NULL,
   `trader_id`      VARCHAR(64)  NOT NULL,
   `trading_paused` TINYINT(1)   NOT NULL DEFAULT 0,
+  `target_updates_paused` TINYINT(1) NOT NULL DEFAULT 0,
   `updated_at`     DATETIME     NOT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_ctrl` (`account_id`,`trader_id`)
@@ -143,6 +144,28 @@ class LiveControlWriter:
     def create_tables(self) -> None:
         for statement in CREATE_CONTROL_TABLES_SQL:
             self._execute(statement, ())
+        self._ensure_target_updates_paused_column()
+
+    def _ensure_target_updates_paused_column(self) -> None:
+        """Idempotently add ``target_updates_paused`` to a pre-existing table.
+
+        ``CREATE TABLE IF NOT EXISTS`` never alters an existing table, so a live_control_state
+        created before this column existed would be missing it. Add it if absent.
+        """
+        rows = self._query(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='live_control_state' "
+            "AND COLUMN_NAME='target_updates_paused'",
+            (),
+        )
+        if rows and int(rows[0][0]) > 0:
+            return
+        self._execute(
+            "ALTER TABLE `live_control_state` "
+            "ADD COLUMN `target_updates_paused` TINYINT(1) NOT NULL DEFAULT 0 "
+            "AFTER `trading_paused`",
+            (),
+        )
 
     # ------------------------------------------------------------------
     # State
@@ -164,6 +187,27 @@ class LiveControlWriter:
             "VALUES (%s,%s,%s,%s) "
             "ON DUPLICATE KEY UPDATE "
             "`trading_paused`=VALUES(`trading_paused`), `updated_at`=VALUES(`updated_at`)",
+            (account_id, trader_id, 1 if paused else 0, datetime.now()),
+        )
+
+    def load_target_updates_paused(self, account_id: str, trader_id: str) -> bool:
+        rows = self._query(
+            "SELECT `target_updates_paused` FROM `live_control_state` "
+            "WHERE `account_id`=%s AND `trader_id`=%s",
+            (account_id, trader_id),
+        )
+        if not rows:
+            return False
+        return bool(rows[0][0])
+
+    def set_target_updates_paused(self, account_id: str, trader_id: str, paused: bool) -> None:
+        self._execute(
+            "INSERT INTO `live_control_state` "
+            "(`account_id`,`trader_id`,`target_updates_paused`,`updated_at`) "
+            "VALUES (%s,%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE "
+            "`target_updates_paused`=VALUES(`target_updates_paused`), "
+            "`updated_at`=VALUES(`updated_at`)",
             (account_id, trader_id, 1 if paused else 0, datetime.now()),
         )
 

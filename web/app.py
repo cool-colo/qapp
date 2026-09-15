@@ -831,6 +831,28 @@ def control_resume(
     return _control_post(data, account, trader, "/control/resume")
 
 
+@app.post("/api/control/pause_target_updates")
+def control_pause_target_updates(
+    account: str,
+    trader: str,
+    pin: str | None = None,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    _require_pin(pin)
+    return _control_post(data, account, trader, "/control/pause_target_updates")
+
+
+@app.post("/api/control/resume_target_updates")
+def control_resume_target_updates(
+    account: str,
+    trader: str,
+    pin: str | None = None,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    _require_pin(pin)
+    return _control_post(data, account, trader, "/control/resume_target_updates")
+
+
 def _require_sell_enabled() -> None:
     """Sells are opt-in through ``sell_enabled`` in the dashboard config. The UI grays
     the buttons out; this is what actually keeps them from doing anything."""

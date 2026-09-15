@@ -847,6 +847,16 @@ class LiveControlServer:
         )
         return {"ok": True, "trading_paused": paused}
 
+    def _set_target_updates_paused(self, paused: bool) -> dict:
+        self._strategy.trading_controller.set_target_updates_paused(paused)
+        self._persist_target_updates_paused(paused)
+        self._append_action(
+            "pause_target_updates" if paused else "resume_target_updates",
+            {"target_updates_paused": paused},
+            "ok",
+        )
+        return {"ok": True, "target_updates_paused": paused}
+
     def _sell(self, instrument_ids: list[str] | None, action: str, reason: str) -> dict:
         result = self._strategy.trading_controller.sell(instrument_ids, reason)
         self._append_action(action, {"instrument_ids": instrument_ids}, json.dumps(result, default=str))
@@ -884,6 +894,9 @@ class LiveControlServer:
                 recent = []
         return {
             "trading_paused": bool(self._strategy.trading_controller.is_paused()),
+            "target_updates_paused": bool(
+                self._strategy.trading_controller.is_target_updates_paused()
+            ),
             "recent_actions": recent,
         }
 
@@ -892,6 +905,16 @@ class LiveControlServer:
             return
         try:
             self._control_writer.set_trading_paused(self._account_id, self._trader_id, paused)
+        except Exception:
+            pass
+
+    def _persist_target_updates_paused(self, paused: bool) -> None:
+        if self._control_writer is None:
+            return
+        try:
+            self._control_writer.set_target_updates_paused(
+                self._account_id, self._trader_id, paused
+            )
         except Exception:
             pass
 
@@ -984,6 +1007,8 @@ class LiveControlServer:
                     if path not in (
                         "/control/suspend",
                         "/control/resume",
+                        "/control/pause_target_updates",
+                        "/control/resume_target_updates",
                         "/control/sell",
                         "/control/sell_all",
                     ):
@@ -996,6 +1021,10 @@ class LiveControlServer:
                         self._send(200, server._set_paused(True))
                     elif path == "/control/resume":
                         self._send(200, server._set_paused(False))
+                    elif path == "/control/pause_target_updates":
+                        self._send(200, server._set_target_updates_paused(True))
+                    elif path == "/control/resume_target_updates":
+                        self._send(200, server._set_target_updates_paused(False))
                     elif path == "/control/sell_all":
                         self._send(200, server._sell(None, "sell_all", SELL_ALL_REASON))
                     elif path == "/control/sell":

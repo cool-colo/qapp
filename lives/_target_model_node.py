@@ -656,8 +656,13 @@ def build_target_model_node(
         # Safe to apply directly here: this runs before node.run(), so it is
         # uncontended by the trading thread.
         strategy.trading_controller.set_paused(bool(paused))
+        target_updates_paused = control_writer.load_target_updates_paused(
+            str(args.account_id), str(args.trader_id)
+        )
+        strategy.trading_controller.set_target_updates_paused(bool(target_updates_paused))
         node.get_logger().info(
-            f"Loaded trading_paused={paused} from live_control_state",
+            f"Loaded trading_paused={paused} "
+            f"target_updates_paused={target_updates_paused} from live_control_state",
             color=LogColor.GREEN,
         )
     except Exception as exc:  # noqa: BLE001 - best-effort, never fatal

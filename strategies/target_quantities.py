@@ -380,6 +380,13 @@ class TargetQuantityStrategy(Strategy):
         # (it forces convergence for that one action without clearing the flag).
         # Loaded from MySQL at node startup; mutated only by set_trading_paused.
         self._trading_paused = False
+        # Persistent guard, controlled via the live-node control API, that freezes
+        # automatic target acceptance (daily/hourly refresh, snapshot recorder) so a
+        # fresh target map cannot clobber a manual sell in the window between
+        # control_apply_targets and control_force_converge. Orthogonal to
+        # _trading_paused: it blocks target *writes*, not convergence, and the manual
+        # sell bypasses it (control_apply_targets passes bypass_pause=True).
+        self._target_updates_paused = False
         # Standalone manual trading-control state/logic (pause flag + manual sell),
         # driven from the live-node control-server thread via the host primitives.
         self._trading_controller = TradingController(self)
@@ -897,6 +904,12 @@ class TargetQuantityStrategy(Strategy):
         # matches the pause state outside the on_bar window handling.
         self._convergence_suspended = self._trading_paused
 
+    def control_set_target_updates_paused_flag(self, paused: bool) -> None:
+        self._target_updates_paused = bool(paused)
+
+    def control_target_updates_paused(self) -> bool:
+        return self._target_updates_paused
+
     def control_current_targets(self) -> dict[str, Decimal]:
         return dict(self._target_quantities)
 
@@ -939,6 +952,7 @@ class TargetQuantityStrategy(Strategy):
             target_date=target_date,
             reason=reason,
             version=target_version(target_date, targets, reason),
+            bypass_pause=True,
         )
 
     def control_force_converge(self, current_date: date, trigger: str) -> None:
@@ -1022,6 +1036,7 @@ class TargetQuantityStrategy(Strategy):
         target_date: date,
         reason: str,
         version: str | None = None,
+        bypass_pause: bool = False,
     ) -> None:
         """
         Accept the day's per-instrument target share counts (固定目标股数).
@@ -1031,7 +1046,19 @@ class TargetQuantityStrategy(Strategy):
         none) and is retained. Called from the bar/timer path and from the snapshot
         recorder (once per day, after the target is generated or loaded from MySQL on
         restart).
+
+        ``bypass_pause`` is set only by the manual-sell path (control_apply_targets):
+        while ``_target_updates_paused`` is set, every other caller (daily/hourly
+        refresh, snapshot recorder) early-returns without touching the target map, so
+        a fresh target cannot clobber the sell before its forced convergence runs.
         """
+        if self._target_updates_paused and not bypass_pause:
+            self.log.info(
+                f"target update skipped (target_updates_paused) date={target_date} "
+                f"count={len(quantities)} reason={reason}",
+                color=LogColor.YELLOW,
+            )
+            return
         normalized: dict[str, Decimal] = {}
         for instrument_id, quantity in quantities.items():
             instrument_id_text = str(instrument_id)

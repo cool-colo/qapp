@@ -87,6 +87,8 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/control/state` | `account, trader` |
 | `POST /api/control/suspend` | `account, trader` |
 | `POST /api/control/resume` | `account, trader` |
+| `POST /api/control/pause_target_updates` | `account, trader` |
+| `POST /api/control/resume_target_updates` | `account, trader` |
 | `POST /api/control/sell_all` | `account, trader` |
 | `POST /api/control/sell` | body: `{account, trader, stock_code}` |
 

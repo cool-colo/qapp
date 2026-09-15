@@ -349,6 +349,19 @@ button.danger { background: var(--down); }
 
 #tab-control .ctrl-heading { margin: 18px 20px 6px; color: var(--muted); font-size: 12px; }
 
+/* 交易管理/控制 — one card per business function (交易控制 / 目标更新 / 卖出),
+   stacked full-width. Each card carries its own title + status + actions. */
+.ctrl-cards { display: flex; flex-direction: column; gap: 12px; margin: 16px 20px; }
+.ctrl-card {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 12px;
+}
+.ctrl-card-danger { border-color: rgba(239, 83, 80, .4); }
+.ctrl-card-head { display: flex; align-items: baseline; gap: 12px; }
+.ctrl-card-title { color: var(--text); font-size: 14px; font-weight: 700; }
+.ctrl-card-head .ctrl-value { font-weight: 700; font-size: 13px; }
+.ctrl-card-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+
 /* 实盘 real-money caveat banner on 交易管理/控制. */
 .ctrl-caveat {
   margin: 14px 20px 0; padding: 10px 14px; border-radius: 6px;

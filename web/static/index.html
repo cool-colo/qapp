@@ -247,11 +247,37 @@
           </div>
           <div class="subbar">
             <div class="subbar-controls">
-              <span>交易状态：<b id="ctrl-state">—</b></span>
-              <button id="ctrl-suspend">暂停交易</button>
-              <button id="ctrl-resume">恢复交易</button>
-              <button id="ctrl-sell-all" class="danger">全部卖出</button>
               <button id="ctrl-refresh">刷新</button>
+            </div>
+          </div>
+          <div class="ctrl-cards">
+            <div class="ctrl-card">
+              <div class="ctrl-card-head">
+                <span class="ctrl-card-title">交易控制</span>
+                <b id="ctrl-state" class="ctrl-value">—</b>
+              </div>
+              <div class="ctrl-card-actions">
+                <button id="ctrl-suspend">暂停交易</button>
+                <button id="ctrl-resume">恢复交易</button>
+              </div>
+            </div>
+            <div class="ctrl-card">
+              <div class="ctrl-card-head">
+                <span class="ctrl-card-title">目标更新</span>
+                <b id="ctrl-tu-state" class="ctrl-value">—</b>
+              </div>
+              <div class="ctrl-card-actions">
+                <button id="ctrl-tu-pause">暂停目标更新</button>
+                <button id="ctrl-tu-resume">恢复目标更新</button>
+              </div>
+            </div>
+            <div class="ctrl-card ctrl-card-danger">
+              <div class="ctrl-card-head">
+                <span class="ctrl-card-title">卖出</span>
+              </div>
+              <div class="ctrl-card-actions">
+                <button id="ctrl-sell-all" class="danger">全部卖出</button>
+              </div>
             </div>
           </div>
           <h4 class="ctrl-heading">操作记录</h4>

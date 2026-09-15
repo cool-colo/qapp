@@ -38,6 +38,12 @@ class TradingControlHost(Protocol):
     def control_set_paused_flag(self, paused: bool) -> None:
         """Set the persistent pause guard the convergence chokepoint consults."""
 
+    def control_set_target_updates_paused_flag(self, paused: bool) -> None:
+        """Set the guard that freezes automatic target acceptance (refresh/snapshot)."""
+
+    def control_target_updates_paused(self) -> bool:
+        """Return whether automatic target acceptance is currently frozen."""
+
     def control_current_targets(self) -> dict[str, Decimal]:
         """Return a copy of the current per-instrument target quantities."""
 
@@ -91,6 +97,23 @@ class TradingController:
 
     def is_paused(self) -> bool:
         return self._paused
+
+    # ------------------------------------------------------------------
+    # Pause / resume automatic target updates
+    # ------------------------------------------------------------------
+    def set_target_updates_paused(self, paused: bool) -> None:
+        """Freeze/unfreeze automatic target acceptance in the host.
+
+        While set, the daily/hourly refresh and snapshot recorder cannot overwrite the
+        target map — but ``manual_sell`` still applies its own targets (it bypasses the
+        guard). Use it to hold automatic refreshes off while operating manually, so a
+        refresh cannot clobber a manual sell mid-flight.
+        """
+        self._host.control_set_target_updates_paused_flag(bool(paused))
+        self._host.control_log(f"target_updates_paused set to {bool(paused)}")
+
+    def is_target_updates_paused(self) -> bool:
+        return self._host.control_target_updates_paused()
 
     # ------------------------------------------------------------------
     # Manual sell
