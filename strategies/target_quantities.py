@@ -6,6 +6,7 @@ import random
 import threading
 import time
 from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import date
@@ -420,6 +421,14 @@ class TargetQuantityStrategy(Strategy):
         # broker's freeze-release for the just-canceled order (see
         # `_handle_order_not_accepted`).
         self._recent_sell_cancel_ts: dict[str, int] = {}
+        # Full-tick fetches (per-universe + whole-market 京沪深A) do a blocking,
+        # chunked RPC to the broker. Running that on the timer callback thread (a Rust
+        # tokio worker that also delivers order events) stalls the worker. The fetch
+        # is framework-independent — only applying the result mutates strategy state —
+        # so it runs on this dedicated worker thread and the apply is marshaled back
+        # onto the node loop. One shared single worker serializes both fetch kinds;
+        # each kind additionally has its own overlap guard. Created in on_start.
+        self._fetch_executor: ThreadPoolExecutor | None = None
         self._last_account_sizing_snapshot: str | None = None
         self.target_events: list[TargetQuantityTargetEvent] = []
         self.order_events: list[TargetQuantityOrderEvent] = []
@@ -502,8 +511,78 @@ class TargetQuantityStrategy(Strategy):
                 callback=self._on_converge_timer,
                 fire_immediately=False,
             )
+        if self._fetch_executor is None:
+            self._fetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="full-tick-fetch",
+            )
         self._start_full_tick_refresh()
         self._start_whole_market_full_tick_refresh()
+
+    def on_stop(self) -> None:
+        executor = self._fetch_executor
+        self._fetch_executor = None
+        if executor is not None:
+            # Do not block on the node/timer thread waiting for an in-flight blocking
+            # RPC; let the worker drain on its own.
+            executor.shutdown(wait=False)
+
+    def _schedule_fetch(
+        self,
+        source: Any,
+    ) -> ConcurrentFuture[Any] | asyncio.Future[Any] | None:
+        """
+        Run a full-tick source and return a future for its result.
+
+        A synchronous source (blocking RPC) runs on the dedicated fetch worker so it
+        never stalls the node loop or a Rust timer thread; an awaitable source is
+        scheduled on the node loop as before. Returns None when neither a worker nor a
+        loop is available (fetch cannot be started).
+        """
+        executor = self._fetch_executor
+        if executor is not None:
+            # Call the source inside the worker too, so even constructing the request
+            # (and any synchronous work before the first await) is off the loop.
+            return executor.submit(self._resolve_fetch_source, source)
+        # No worker (e.g. never started): fall back to the loop scheduler, which
+        # resolves an awaitable on the loop and a sync result inline.
+        try:
+            result = source()
+        except Exception as exc:  # noqa: BLE001 - surfaced via a resolved future
+            failed: ConcurrentFuture[Any] = ConcurrentFuture()
+            failed.set_exception(exc)
+            return failed
+        if inspect.isawaitable(result):
+            return self._async_scheduler.schedule(result)
+        resolved: ConcurrentFuture[Any] = ConcurrentFuture()
+        resolved.set_result(result)
+        return resolved
+
+    @staticmethod
+    def _resolve_fetch_source(source: Any) -> Any:
+        """Invoke a fetch source on the worker thread, resolving an awaitable if needed."""
+        result = source()
+        if inspect.isawaitable(result):
+
+            async def _await() -> Any:
+                return await result
+
+            return asyncio.run(_await())
+        return result
+
+    def _run_on_loop(self, fn: Callable[[], None]) -> None:
+        """
+        Run ``fn`` on the node event loop so strategy-state mutation stays single-
+        threaded, regardless of which thread invoked this.
+
+        In backtests / tests there is no running node loop; ``schedule`` then resolves
+        the wrapping coroutine inline, so ``fn`` still runs (synchronously here).
+        """
+
+        async def _invoke() -> None:
+            fn()
+
+        self._async_scheduler.schedule(_invoke())
 
     def _start_full_tick_refresh(self) -> None:
 
@@ -608,15 +687,13 @@ class TargetQuantityStrategy(Strategy):
             )
             return
         started = time.monotonic()
-        try:
-            result = self._whole_market_full_tick_source()
-        except Exception as exc:
-            self.log.warning(f"whole-market full-tick fetch failed to start ({trigger}): {exc}")
+        task = self._schedule_fetch(self._whole_market_full_tick_source)
+        if task is None:
+            self.log.warning(
+                f"whole-market full-tick fetch failed to start ({trigger}): "
+                "no executor or loop available",
+            )
             return
-        if not inspect.isawaitable(result):
-            self._apply_whole_market_full_tick(result, trigger, started)
-            return
-        task = self._async_scheduler.schedule(result)
         self._whole_market_full_tick_task = task
         task.add_done_callback(
             lambda t: self._on_whole_market_full_tick_done(t, trigger, started),
@@ -634,7 +711,11 @@ class TargetQuantityStrategy(Strategy):
         except Exception as exc:
             self.log.warning(f"whole-market full-tick fetch failed ({trigger}): {exc}")
             return
-        self._apply_whole_market_full_tick(result, trigger, started)
+        # The done-callback fires on the fetch worker thread; marshal the state-
+        # mutating apply back onto the node loop so it stays single-threaded.
+        self._run_on_loop(
+            lambda: self._apply_whole_market_full_tick(result, trigger, started),
+        )
 
     def _apply_whole_market_full_tick(
         self,
@@ -683,24 +764,18 @@ class TargetQuantityStrategy(Strategy):
                     {"reason": "previous full-tick fetch is still running"},
                 )
             return
-        try:
-            result = self._full_tick_source()
-        except Exception as exc:
-            self.log.warning(f"full-tick fetch failed to start ({trigger}): {exc}")
-            if on_complete is not None:
-                self._notify_full_tick_completion(on_complete, "failed", {"error": str(exc)})
-            return
-        if not inspect.isawaitable(result):
-            self._apply_full_tick(result, trigger)
-            valid = isinstance(result, dict) and bool(result)
+        task = self._schedule_fetch(self._full_tick_source)
+        if task is None:
+            self.log.warning(
+                f"full-tick fetch failed to start ({trigger}): no executor or loop available",
+            )
             if on_complete is not None:
                 self._notify_full_tick_completion(
                     on_complete,
-                    "success" if valid else "failed",
-                    {"instruments": len(result) if isinstance(result, dict) else 0},
+                    "failed",
+                    {"error": "no executor or loop available"},
                 )
             return
-        task = self._async_scheduler.schedule(result)
         self._full_tick_task = task
         task.add_done_callback(
             lambda t: self._on_full_tick_fetch_done(t, trigger, on_complete),
@@ -720,6 +795,17 @@ class TargetQuantityStrategy(Strategy):
             if on_complete is not None:
                 self._notify_full_tick_completion(on_complete, "failed", {"error": str(exc)})
             return
+        # The done-callback fires on the fetch worker thread; marshal the state-
+        # mutating apply (and the ordered completion notification) back onto the
+        # node loop so strategy state stays single-threaded.
+        self._run_on_loop(lambda: self._apply_full_tick_and_notify(result, trigger, on_complete))
+
+    def _apply_full_tick_and_notify(
+        self,
+        result: Any,
+        trigger: str,
+        on_complete: Callable[[str, dict[str, Any]], None] | None,
+    ) -> None:
         self._apply_full_tick(result, trigger)
         valid = isinstance(result, dict) and bool(result)
         if on_complete is not None:
