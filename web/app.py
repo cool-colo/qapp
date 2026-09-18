@@ -6,6 +6,7 @@ static ECharts frontend mounted at ``/``. Bind to 127.0.0.1 (see web/run.sh).
 
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -18,7 +19,7 @@ from pydantic import BaseModel
 
 from web import compare_presets
 from web.config import AppConfig, load_config
-from web.db import DataAccess, MySqlSource, NodeApiClient, jsonable_rows, quote_literal
+from web.db import DataAccess, MySqlSource, NodeApiClient, jsonable, jsonable_rows, quote_literal
 from web.returns_report import (
     RETURN_COLUMNS,
     derive_instrument_suffix,
@@ -33,6 +34,7 @@ from web.signal_series_report import (
     build_signal_series_sql,
     build_snapshot_signals_sql,
 )
+from web import dqc_report
 
 
 class ComparePreset(BaseModel):
@@ -704,6 +706,240 @@ def delete_compare_preset(name: str) -> dict[str, Any]:
     if not existed:
         raise HTTPException(status_code=404, detail=f"no such preset: {name!r}")
     return {"ok": True}
+
+
+# ---- data quality (DQC) ----------------------------------------------------
+# Read-only views over the tushare-integration DQC tables in the SHARED ClickHouse
+# (dq_dqc_* systematic checks + dq_validation_* publish gates). These are GLOBAL data
+# quality — NOT account-scoped — so no source/account/trader params. Every query dedups
+# to the latest run per grouping (see web/dqc_report.py). Enum params are validated here
+# against allow-lists before reaching SQL; date/name values are quoted in the report module.
+
+
+def _validate_enum(name: str, value: str | None, allowed: set[str]) -> str | None:
+    if value and value not in allowed:
+        raise HTTPException(status_code=400, detail=f"invalid {name}: {value!r}")
+    return value or None
+
+
+def _dqc_query(data: DataAccess, sql: str, label: str) -> list[dict[str, Any]]:
+    try:
+        return data.clickhouse.query(sql)
+    except Exception as exc:  # noqa: BLE001 — surface DB errors as 500 with a message
+        raise HTTPException(status_code=500, detail=f"{label} query failed: {exc}") from exc
+
+
+@app.get("/api/dqc/health")
+def get_dqc_health(
+    start: str,
+    end: str,
+    layer: str | None = Query(None),
+    suite: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    layer = _validate_enum("layer", layer, dqc_report.DQC_LAYERS)
+    sql = dqc_report.build_dqc_health_timeline_sql(start, end, layer, suite)
+    rows = _dqc_query(data, sql, "dqc health")
+    return {"columns": dqc_report.DQC_HEALTH_COLUMNS, "rows": jsonable_rows(rows)}
+
+
+@app.get("/api/dqc/runs")
+def get_dqc_runs(
+    start: str,
+    end: str,
+    layer: str | None = Query(None),
+    suite: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    layer = _validate_enum("layer", layer, dqc_report.DQC_LAYERS)
+    sql = dqc_report.build_dqc_runs_sql(start, end, layer, suite)
+    rows = _dqc_query(data, sql, "dqc runs")
+    return {"columns": dqc_report.DQC_RUN_COLUMNS, "rows": jsonable_rows(rows)}
+
+
+@app.get("/api/dqc/run_tables")
+def get_dqc_run_tables(data: DataAccess = Depends(get_data)) -> dict[str, Any]:
+    """DISTINCT table_name values in dq_dqc_run — populates the 最新运行检查 table dropdown."""
+    rows = _dqc_query(data, dqc_report.build_dqc_run_tables_sql(), "dqc run tables")
+    return {"tables": [r["table_name"] for r in rows if r.get("table_name")]}
+
+
+@app.get("/api/dqc/checks")
+def get_dqc_checks(
+    as_of_date: str | None = Query(None),
+    table: str | None = Query(None),
+    layer: str | None = Query(None),
+    suite: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    layer = _validate_enum("layer", layer, dqc_report.DQC_LAYERS)
+    # Validate the chosen suite table against the live run-table list (guards the SQL literal
+    # and rejects a bogus value with 400 rather than silently returning nothing).
+    table_rows = _dqc_query(data, dqc_report.build_dqc_run_tables_sql(), "dqc run tables")
+    valid_tables = {r["table_name"] for r in table_rows if r.get("table_name")}
+    table_name = table or dqc_report.FACTOR_WIDE_TABLE
+    if valid_tables and table_name not in valid_tables:
+        raise HTTPException(status_code=400, detail=f"unknown table: {table_name}")
+    resolved = as_of_date
+    if not resolved:
+        max_rows = _dqc_query(
+            data,
+            dqc_report.build_dqc_max_date_sql(table_name, layer, suite),
+            "dqc max date",
+        )
+        resolved = (max_rows[0].get("as_of_date") if max_rows else None) or ""
+    rows: list[dict[str, Any]] = []
+    if resolved:
+        sql = dqc_report.build_dqc_latest_checks_sql(resolved, table_name, layer, suite)
+        rows = _dqc_query(data, sql, "dqc checks")
+    return {
+        "columns": dqc_report.DQC_CHECK_COLUMNS,
+        "rows": jsonable_rows(rows),
+        "as_of_date": resolved,
+        "table": table_name,
+    }
+
+
+@app.get("/api/dqc/metric_options")
+def get_dqc_metric_options(
+    layer: str | None = Query(None),
+    suite: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    layer = _validate_enum("layer", layer, dqc_report.DQC_LAYERS)
+    sql = dqc_report.build_dqc_metric_options_sql(layer, suite)
+    rows = _dqc_query(data, sql, "dqc metric options")
+    return {"rows": jsonable_rows(rows)}
+
+
+@app.get("/api/dqc/metric_trend")
+def get_dqc_metric_trend(
+    metric_name: str,
+    entity_name: str,
+    start: str,
+    end: str,
+    as_of_date: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    sql = dqc_report.build_dqc_metric_trend_sql(metric_name, entity_name, start, end)
+    rows = _dqc_query(data, sql, "dqc metric trend")
+    baseline: dict[str, Any] | None = None
+    if as_of_date:
+        b_rows = _dqc_query(
+            data,
+            dqc_report.build_dqc_drift_baseline_sql(entity_name, as_of_date),
+            "dqc drift baseline",
+        )
+        if b_rows:
+            baseline = jsonable_rows(b_rows)[0]
+    return {
+        "columns": dqc_report.DQC_METRIC_TREND_COLUMNS,
+        "rows": jsonable_rows(rows),
+        "baseline": baseline,
+    }
+
+
+@app.get("/api/dqc/samples")
+def get_dqc_samples(
+    rule_id: str,
+    as_of_date: str,
+    sample_type: str | None = Query(None),
+    limit: int = Query(500),
+    table: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    sample_type = _validate_enum("sample_type", sample_type, dqc_report.DQC_SAMPLE_TYPES)
+    # A concrete table scopes the samples to that table (the 最新运行检查 selection carries
+    # through); 'all' / omitted shows every table's samples. Validate a concrete value against
+    # the live run-table list, mirroring /api/dqc/checks.
+    if table and table != dqc_report.RUN_TABLE_ALL:
+        table_rows = _dqc_query(data, dqc_report.build_dqc_run_tables_sql(), "dqc run tables")
+        valid_tables = {r["table_name"] for r in table_rows if r.get("table_name")}
+        if valid_tables and table not in valid_tables:
+            raise HTTPException(status_code=400, detail=f"unknown table: {table}")
+    sql = dqc_report.build_dqc_samples_sql(rule_id, as_of_date, sample_type, limit, table)
+    rows = _dqc_query(data, sql, "dqc samples")
+    return {"rows": [_flatten_sample(r) for r in jsonable_rows(rows)]}
+
+
+def _flatten_sample(row: dict[str, Any]) -> dict[str, Any]:
+    """Parse sample_json and hoist its fields to top-level (raw JSON retained).
+
+    Both known shapes (factor_cross_check / spot_check) carry ``source_code`` + ``trade_date``,
+    which the investigate SQL keys on. A parse failure marks the row and keeps the raw string.
+    """
+    raw = row.get("sample_json")
+    parsed: dict[str, Any] = {}
+    if isinstance(raw, str) and raw.strip():
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                parsed = obj
+            else:
+                row["sample_parse_error"] = "sample_json is not an object"
+        except (ValueError, TypeError) as exc:
+            row["sample_parse_error"] = str(exc)
+    out: dict[str, Any] = {}
+    # Prefer flattened fields first, keep DB columns (rule_id/entity_name/etc.) after.
+    for k, v in parsed.items():
+        out[k] = jsonable(v)
+    for k, v in row.items():
+        if k == "sample_json":
+            continue
+        out.setdefault(k, v)
+    out["sample_json"] = raw
+    return out
+
+
+@app.get("/api/dqc/investigate_sql")
+def get_dqc_investigate_sql(
+    source_code: str,
+    trade_date: str,
+    history_start: str | None = Query(None),
+    history_end: str | None = Query(None),
+) -> dict[str, Any]:
+    """Return copy-able ClickHouse SQL (strings, not executed) re-selecting the offending rows.
+
+    A point query for the exact (source_code, trade_date) the sample flagged, and — when a
+    history window is given (cross-check/drift) — a rolling-history query over that window.
+    """
+    point_sql = dqc_report.build_dqc_investigate_point_sql(source_code, trade_date)
+    history_sql = None
+    if history_start and history_end:
+        history_sql = dqc_report.build_dqc_investigate_history_sql(
+            source_code, history_start, history_end
+        )
+    return {"point_sql": point_sql, "history_sql": history_sql}
+
+
+@app.get("/api/dqc/validation/runs")
+def get_dqc_validation_runs(
+    start: str,
+    end: str,
+    layer: str | None = Query(None),
+    stage: str | None = Query(None),
+    table: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    layer = _validate_enum("layer", layer, dqc_report.DQC_LAYERS)
+    sql = dqc_report.build_validation_runs_sql(start, end, layer, stage, table)
+    rows = _dqc_query(data, sql, "validation runs")
+    return {"columns": dqc_report.VALIDATION_RUN_COLUMNS, "rows": jsonable_rows(rows)}
+
+
+@app.get("/api/dqc/validation/results")
+def get_dqc_validation_results(
+    start: str,
+    end: str,
+    layer: str | None = Query(None),
+    stage: str | None = Query(None),
+    table: str | None = Query(None),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    layer = _validate_enum("layer", layer, dqc_report.DQC_LAYERS)
+    sql = dqc_report.build_validation_results_sql(start, end, layer, stage, table)
+    rows = _dqc_query(data, sql, "validation results")
+    return {"columns": dqc_report.VALIDATION_RESULT_COLUMNS, "rows": jsonable_rows(rows)}
 
 
 # ---- live-node realtime + control proxy ------------------------------------

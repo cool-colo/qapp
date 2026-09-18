@@ -36,6 +36,11 @@
           <button class="nav-item nav-sub" data-tab="report"  data-sub="report">收益报表</button>
           <button class="nav-item nav-sub" data-tab="sigqual" data-sub="sigqual">信号质量</button>
         </div>
+        <div class="nav-group" data-group="dqc">
+          <button class="nav-item nav-parent" data-tab="dqc">数据质量</button>
+          <button class="nav-item nav-sub" data-tab="dqc" data-sub="systematic">系统 DQC</button>
+          <button class="nav-item nav-sub" data-tab="dqc" data-sub="validation">发布校验</button>
+        </div>
         <button class="nav-item" data-tab="series">随时间</button>
         <button class="nav-item" data-tab="compare">对比</button>
         <button class="nav-item" data-tab="kline">个股 K 线</button>
@@ -245,6 +250,50 @@
             ⚠ 当前数据源为<b>实盘</b>（真实资金账户）。此页的暂停 / 恢复 / 全部卖出操作将
             直接作用于真实账户且不可撤销，请务必确认账户与操作无误后再执行。
           </div>
+          <!-- 交易控制 SOP: collapsed by default; each procedure expands only on click. -->
+          <details class="ctrl-sop">
+            <summary>交易控制 SOP（点击展开操作步骤）</summary>
+            <div class="ctrl-sop-body">
+              <details class="ctrl-sop-item">
+                <summary>股票清仓（模拟盘，操作未验证）</summary>
+                <ol>
+                  <li>暂停交易</li>
+                  <li>暂停目标更新</li>
+                  <li>全部卖出</li>
+                  <li>查看当前目标</li>
+                  <li>目标正确后，恢复交易</li>
+                  <li>9:30 后系统自动卖出</li>
+                </ol>
+              </details>
+              <details class="ctrl-sop-item">
+                <summary>股票清仓（实盘）</summary>
+                <ol>
+                  <li>暂停交易</li>
+                  <li>暂停目标更新</li>
+                  <li>盘前点全部卖出</li>
+                  <li>查看当前目标</li>
+                  <li>目标正确后，9:30 以后点全部卖出</li>
+                  <li>如果有没卖出的股票，重复点全部卖出</li>
+                </ol>
+              </details>
+              <details class="ctrl-sop-item">
+                <summary>当日盘中需要恢复交易</summary>
+                <ol>
+                  <li>恢复交易</li>
+                  <li>恢复目标更新</li>
+                  <li>重启系统</li>
+                </ol>
+              </details>
+              <details class="ctrl-sop-item">
+                <summary>第二天需要恢复交易（盘后操作）</summary>
+                <ol>
+                  <li>恢复交易</li>
+                  <li>恢复目标更新</li>
+                  <li>重启系统（第二天早上会自动重启）</li>
+                </ol>
+              </details>
+            </div>
+          </details>
           <div class="subbar">
             <div class="subbar-controls">
               <button id="ctrl-refresh">刷新</button>
@@ -293,6 +342,58 @@
             </div>
           </div>
           <div id="tgt-table" class="table-wrap"></div>
+        </div>
+      </section>
+
+      <!-- ============ Data-quality tab (数据质量 · DQC) ============ -->
+      <!-- Global data-integration quality from the tushare-integration DQC tables in
+           the shared ClickHouse. NOT account-scoped. FAIL reads red, PASS green — the
+           OPPOSITE of the A-share up/down colors elsewhere (see dqcStatusClass in app.js). -->
+      <section id="tab-dqc" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <label>起 <input type="date" id="dqc-start" /></label>
+            <label>止 <input type="date" id="dqc-end" /></label>
+            <button id="dqc-refresh">刷新</button>
+            <span class="hint">数据质量为全局（与账户无关）；默认止=今天，起=一个月前。FAIL=红(异常)，PASS=绿(正常)</span>
+          </div>
+        </div>
+
+        <!-- 系统 DQC sub-panel: health timeline → latest checks → metric drift → sample drill-down -->
+        <div id="dqc-systematic" class="dqc-sub-panel active">
+          <div id="dqc-health-chart" class="chart"></div>
+
+          <h4 class="dqc-heading">最新运行检查 <span id="dqc-checks-date" class="hint"></span></h4>
+          <div class="subbar">
+            <div class="subbar-controls">
+              <label>检查表 <select id="dqc-checks-table-sel"></select></label>
+              <span class="hint">all=综合汇总（全部检查层）；dws_stock_factor_wide=单表子集</span>
+            </div>
+          </div>
+          <div id="dqc-checks-table" class="table-wrap"></div>
+
+          <h4 class="dqc-heading">指标趋势 / 漂移</h4>
+          <div class="subbar">
+            <div class="subbar-controls">
+              <label>指标 <select id="dqc-metric-name"></select></label>
+              <label>实体 <select id="dqc-metric-entity"></select></label>
+              <button id="dqc-metric-plot">绘制</button>
+              <span class="hint">调查漂移：先选指标(如 null_ratio/mean)，实体列表随之过滤；存在基线时叠加 ±std 漂移带</span>
+            </div>
+          </div>
+          <div id="dqc-metric-chart" class="chart"></div>
+
+          <h4 class="dqc-heading">问题明细 <span id="dqc-samples-hint" class="hint">点击上方检查行的 rule_id：逐行检查(交叉校验/抽查)列出问题行；指标漂移(dqc_metric_drift)列出每个漂移指标(含 Z 分数/基线)，点「查看趋势」跳转趋势图；其它指标级检查引导至上方趋势图</span></h4>
+          <div id="dqc-samples-table" class="table-wrap"></div>
+          <div id="dqc-sql-box" class="dqc-sql-box" hidden></div>
+        </div>
+
+        <!-- 发布校验 sub-panel: pre-publish validation runs + results -->
+        <div id="dqc-validation" class="dqc-sub-panel">
+          <h4 class="dqc-heading">校验运行</h4>
+          <div id="dqc-val-runs-table" class="table-wrap"></div>
+          <h4 class="dqc-heading">校验结果</h4>
+          <div id="dqc-val-results-table" class="table-wrap"></div>
         </div>
       </section>
     </div>

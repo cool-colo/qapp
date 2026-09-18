@@ -242,6 +242,13 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     # the just-canceled order) rather than day-long sellable exhaustion, so the
     # periodic convergence retries instead of latching the instrument out.
     sellable_denial_retry_window_secs: float = 30.0
+    # A venue can acknowledge our cancel and then still fill the *same* order a few
+    # ms later (a cancel/fill race). Convergence triggered by OrderCanceled is
+    # therefore deferred onto the node event loop and delayed by this many seconds,
+    # so a racing OrderFilled is dispatched and applied to net_position before we
+    # recompute the buy/sell delta — otherwise we re-submit a replacement order and
+    # over-trade. Set to 0 to skip the delay (still deferred onto the loop).
+    cancel_reconverge_delay_secs: float = 0.1
     cash_buffer_percent: float = 0.01
     target_cash_buffer_percent: float = 0.05
     buy_offset_bps: float = 5.0
@@ -1339,7 +1346,22 @@ class TargetQuantityStrategy(Strategy):
             order = self.cache.order(event.client_order_id)
             if order is not None and order.side == OrderSide.SELL:
                 self._recent_sell_cancel_ts[instrument_id_text] = self.clock.timestamp_ns()
-        self._converge_to_target(current_date=self._clock_date(), trigger="cancel")
+        # A venue can acknowledge our cancel and then still fill the *same* order a
+        # few ms later (a cancel/fill race). Running convergence inline here — often
+        # on the Rust timer/exec thread — recomputes the buy/sell delta before the
+        # racing OrderFilled has been dispatched, so it re-submits a replacement
+        # order and over-trades. Defer convergence onto the node event loop and delay
+        # it by `cancel_reconverge_delay_secs` so any racing fill is applied to
+        # net_position first, then re-converge against the settled state.
+        self._async_scheduler.schedule(
+            self._converge_async(current_date=self._clock_date(), trigger="cancel"),
+        )
+
+    async def _converge_async(self, current_date: date, trigger: str) -> None:
+        delay_secs = float(self.config.cancel_reconverge_delay_secs)
+        if delay_secs > 0:
+            await asyncio.sleep(delay_secs)
+        self._converge_to_target(current_date=current_date, trigger=trigger)
 
     def on_order_denied(self, event: Any) -> None:
         self._handle_order_not_accepted(event)

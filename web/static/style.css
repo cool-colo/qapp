@@ -362,6 +362,34 @@ button.danger { background: var(--down); }
 .ctrl-card-head .ctrl-value { font-weight: 700; font-size: 13px; }
 .ctrl-card-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 
+/* 交易控制 SOP — collapsible playbook; collapsed by default, expands on click. */
+.ctrl-sop {
+  margin: 14px 20px 0; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-2);
+}
+.ctrl-sop > summary {
+  cursor: pointer; padding: 10px 14px; color: var(--text); font-size: 13px;
+  font-weight: 700; list-style: none; user-select: none;
+}
+.ctrl-sop > summary::-webkit-details-marker { display: none; }
+.ctrl-sop > summary::before { content: "▸ "; color: var(--muted); }
+.ctrl-sop[open] > summary::before { content: "▾ "; }
+.ctrl-sop-body {
+  padding: 0 14px 8px; display: flex; flex-direction: column; gap: 6px;
+}
+.ctrl-sop-item { border-top: 1px solid var(--border); }
+.ctrl-sop-item > summary {
+  cursor: pointer; padding: 8px 2px; color: var(--text); font-size: 13px;
+  font-weight: 600; list-style: none; user-select: none;
+}
+.ctrl-sop-item > summary::-webkit-details-marker { display: none; }
+.ctrl-sop-item > summary::before { content: "▸ "; color: var(--muted); }
+.ctrl-sop-item[open] > summary::before { content: "▾ "; }
+.ctrl-sop-item ol {
+  margin: 0 0 8px; padding-left: 26px; color: var(--muted);
+  font-size: 12px; line-height: 1.8;
+}
+
 /* 实盘 real-money caveat banner on 交易管理/控制. */
 .ctrl-caveat {
   margin: 14px 20px 0; padding: 10px 14px; border-radius: 6px;
@@ -414,3 +442,67 @@ button.danger { background: var(--down); }
 .modal-body b { color: var(--accent); font-weight: 600; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 .modal-actions button { padding: 7px 16px; font-size: 13px; border-radius: 5px; }
+
+/* ---- Data quality (数据质量 · DQC) ---- */
+/* Semantic status tokens INTENTIONALLY OPPOSITE the A-share --up/--down convention:
+   FAIL reads red (bad), PASS green (good). These are separate tokens on purpose — never
+   route DQC status through .pos/.neg/signClass, which would color FAIL green. */
+:root {
+  --dqc-bad:  #e5484d;  /* FAIL */
+  --dqc-ok:   #26a69a;  /* PASS */
+  --dqc-warn: #f5a524;  /* MONITOR */
+}
+
+.dqc-sub-panel { display: none; }
+.dqc-sub-panel.active { display: block; }
+.dqc-heading { margin: 18px 20px 6px; color: var(--muted); font-size: 12px; }
+
+/* status / severity chips inside the checks & validation tables. */
+.chip {
+  display: inline-block; padding: 1px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 600; line-height: 1.6;
+}
+.dqc-pass    { color: var(--dqc-ok);   background: rgba(38, 166, 154, .14); }
+.dqc-fail    { color: var(--dqc-bad);  background: rgba(229, 72, 77, .16); }
+.dqc-monitor { color: var(--dqc-warn); background: rgba(245, 165, 36, .16); }
+.dqc-skip    { color: var(--muted);    background: rgba(138, 148, 168, .14); }
+.sev-blocker { color: var(--dqc-bad);  background: rgba(229, 72, 77, .16); }
+.sev-warn    { color: var(--dqc-warn); background: rgba(245, 165, 36, .16); }
+.sev-monitor { color: var(--muted);    background: rgba(138, 148, 168, .14); }
+
+/* Row tints scoped under each table id (mirrors #sq-table tr.approx-row td). */
+#dqc-checks-table tr.dqc-fail-row td,
+#dqc-val-runs-table tr.dqc-fail-row td,
+#dqc-val-results-table tr.dqc-fail-row td { background: rgba(229, 72, 77, .08); }
+#dqc-checks-table tr.dqc-fail-row:hover td,
+#dqc-val-runs-table tr.dqc-fail-row:hover td,
+#dqc-val-results-table tr.dqc-fail-row:hover td { background: rgba(229, 72, 77, .14); }
+#dqc-checks-table tr.dqc-monitor-row td { background: rgba(245, 165, 36, .06); }
+#dqc-checks-table tr.dqc-monitor-row:hover td { background: rgba(245, 165, 36, .12); }
+
+/* rule_id → samples drill-down link, and the per-sample 生成 SQL button. */
+a.dqc-rule-link { color: var(--accent); cursor: pointer; text-decoration: none; }
+a.dqc-rule-link:hover { text-decoration: underline; }
+button.dqc-sql-btn, button.dqc-trend-btn { padding: 2px 8px; font-size: 11px; border-radius: 4px; }
+
+/* Investigate-SQL panel: copy-able point + history queries. */
+.dqc-sql-box {
+  margin: 8px 20px 16px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-2); padding: 12px 14px;
+}
+.dqc-sql-head { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+.dqc-sql-block { margin-bottom: 12px; }
+.dqc-sql-block:last-child { margin-bottom: 0; }
+.dqc-sql-title {
+  display: flex; align-items: center; justify-content: space-between;
+  color: var(--text); font-size: 12px; font-weight: 600; margin-bottom: 4px;
+}
+.dqc-copy-btn { padding: 2px 10px; font-size: 11px; border-radius: 4px; }
+.dqc-sql-box pre {
+  margin: 0; padding: 10px 12px; overflow-x: auto;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+}
+.dqc-sql-box code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 12px; color: var(--text); white-space: pre;
+}

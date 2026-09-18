@@ -135,6 +135,25 @@ function signClass(v) {
   return " zero";
 }
 
+// DQC status/severity color classes. INTENTIONALLY the OPPOSITE of the A-share
+// signClass above: for data quality, FAIL is bad (red) and PASS is good (green).
+// Do NOT route DQC status through signClass — it would paint FAIL green.
+function dqcStatusClass(s) {
+  s = String(s || "").toUpperCase();
+  if (s === "PASS") return "dqc-pass";
+  if (s === "FAIL") return "dqc-fail";
+  if (s === "MONITOR") return "dqc-monitor";
+  if (s === "SKIPPED") return "dqc-skip";
+  return "";
+}
+function dqcSeverityClass(s) {
+  s = String(s || "").toUpperCase();
+  if (s === "BLOCKER") return "sev-blocker";
+  if (s === "WARN") return "sev-warn";
+  if (s === "MONITOR") return "sev-monitor";
+  return "";
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -207,6 +226,7 @@ function refreshActiveTab() {
   else if (tab === "realtime") loadRealtime();
   else if (tab === "stratinfo") loadStratInfo();
   else if (tab === "control") { loadControl(); loadTargets(); }
+  else if (tab === "dqc") loadDqc();
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +271,7 @@ function activateNavItem(btn, { load = true } = {}) {
   if (tab === "realtime") showRealtimeSub(btn.dataset.sub || "positions");
   if (tab === "stratinfo") showStratInfoSub(btn.dataset.sub || "signals");
   if (tab === "control") showControlSub(btn.dataset.sub || "control");
+  if (tab === "dqc") showDqcSub(btn.dataset.sub || "systematic");
   saveActiveNav(btn);
   if (load) {
     if (tab === "report") loadReport();
@@ -258,6 +279,7 @@ function activateNavItem(btn, { load = true } = {}) {
     else if (tab === "realtime") loadRealtime();
     else if (tab === "stratinfo") loadStratInfo();
     else if (tab === "control") { loadControl(); loadTargets(); }
+    else if (tab === "dqc") loadDqc();
   }
   setTimeout(resizeCharts, 0);
 }
@@ -294,6 +316,16 @@ function showControlSub(sub) {
   $$(".ctrl-sub-panel").forEach((p) => p.classList.remove("active"));
   const target = $(`#ctrl-${sub}`);
   if (target) target.classList.add("active");
+}
+
+// Toggle between 系统 DQC (#dqc-systematic) and 发布校验 (#dqc-validation).
+function showDqcSub(sub) {
+  $$(".dqc-sub-panel").forEach((p) => p.classList.remove("active"));
+  const target = $(`#dqc-${sub}`);
+  if (target) target.classList.add("active");
+  // The validation sub-panel loads lazily on first show; loadDqc drives the rest.
+  if (sub === "validation") loadValidation();
+  setTimeout(resizeCharts, 0);
 }
 
 $$(".subtab").forEach((btn) => {
@@ -814,8 +846,12 @@ async function loadReport() {
     const { columns, rows } = await api("/api/returns", { ...accountParams(), start, end });
     // Row filtering (drop dates lacking both 盘前/盘后 market values) is done in
     // SQL so the weekly cumulative columns stay consistent with the visible rows.
+    // Temporarily hide the volatility/sharpe columns (日波动率/年化波动率/日夏普/年化夏普).
+    const HIDDEN_REPORT_COLS = new Set([
+      "daily_volatility", "annual_volatility", "daily_sharpe", "annual_sharpe",
+    ]);
     renderTable("#report-table", rows, {
-      columns,
+      columns: columns.filter((c) => !HIDDEN_REPORT_COLS.has(c)),
       headers: REPORT_HEADERS,
       signCols: REPORT_SIGN_COLS,
       intCols: REPORT_INT_COLS,
@@ -2100,6 +2136,385 @@ $("#tgt-auto").addEventListener("change", (e) => {
   clearInterval(tgtTimer);
   if (e.target.checked) tgtTimer = setInterval(loadTargets, 15000);
 });
+
+// ---------------------------------------------------------------------------
+// Data quality (数据质量 · DQC)
+// ---------------------------------------------------------------------------
+// Global data-integration quality — NOT account-scoped, so (unlike loadSignalQuality)
+// these loaders never gate on state.account / hasNodeApi(). Colors follow dqcStatusClass:
+// FAIL red, PASS green (opposite of A-share up/down). Every backend query dedups to the
+// latest run per grouping (see web/dqc_report.py).
+
+// Categorical colors per check_layer for the health stacked bar (NOT the up/down palette).
+const DQC_LAYER_COLORS = {
+  semantic: "#e5484d", statistical: "#f5a524", consistency: "#7c5cff",
+  completeness: "#3aa0ff", freshness: "#2bb673", system: "#8a94a8",
+};
+
+const DQC_CHECK_HEADERS = {
+  check_layer: "检查层", check_type: "类型", rule_id: "规则", severity: "级别", status: "状态",
+  checked_count: "检查数", issue_count: "问题数", issue_rate: "问题率",
+  observed_value: "观测值", expected_min: "下限", expected_max: "上限",
+  baseline_mean: "基线均值", baseline_std: "基线std", z_score: "z", message: "说明", run_id: "run",
+};
+const DQC_CHECK_COLS = [
+  "check_layer", "check_type", "rule_id", "severity", "status",
+  "checked_count", "issue_count", "issue_rate",
+  "observed_value", "expected_min", "expected_max",
+  "baseline_mean", "baseline_std", "z_score", "message",
+];
+
+// The as_of_date resolved by the latest /api/dqc/checks call — carried into sample loads.
+let dqcChecksDate = null;
+// Metric-scope map (entity_name -> metric_scope) + full option list, from metric_options.
+let dqcMetricOptions = [];
+// Whether the 最新运行检查 table dropdown has been populated (once per session).
+let dqcCheckTablesLoaded = false;
+
+function dqcDefaultDates() {
+  if (!$("#dqc-start").value) $("#dqc-start").value = monthsBefore(null, 1);
+  if (!$("#dqc-end").value) $("#dqc-end").value = todayISO();
+  return { start: $("#dqc-start").value, end: $("#dqc-end").value };
+}
+
+async function loadDqc() {
+  dqcDefaultDates();
+  await loadDqcCheckTables();  // populate the table dropdown before the first checks load
+  await Promise.all([loadDqcHealth(), loadDqcChecks(), loadDqcMetricOptions()]);
+  // If the 发布校验 sub-panel is the active one, refresh it too.
+  if ($("#dqc-validation") && $("#dqc-validation").classList.contains("active")) loadValidation();
+}
+
+// Populate the 最新运行检查 table dropdown once, defaulting to dws_stock_factor_wide.
+async function loadDqcCheckTables() {
+  if (dqcCheckTablesLoaded) return;
+  const sel = $("#dqc-checks-table-sel");
+  try {
+    const res = await api("/api/dqc/run_tables", {});
+    const tables = res.tables || [];
+    sel.innerHTML = tables.map((t) => `<option>${t}</option>`).join("");
+    if (tables.includes("dws_stock_factor_wide")) sel.value = "dws_stock_factor_wide";
+    dqcCheckTablesLoaded = true;
+  } catch (e) { toast(e.message); }
+}
+
+async function loadDqcHealth() {
+  const { start, end } = dqcDefaultDates();
+  try {
+    const res = await api("/api/dqc/health", { start, end });
+    const rows = res.rows || [];
+    // Pivot (as_of_date, check_layer) -> one stacked bar series per layer carrying fail counts.
+    const dates = Array.from(new Set(rows.map((r) => r.as_of_date))).sort();
+    const layers = Array.from(new Set(rows.map((r) => r.check_layer))).sort();
+    const idx = {};
+    dates.forEach((d, i) => (idx[d] = i));
+    const series = layers.map((layer) => {
+      const data = new Array(dates.length).fill(0);
+      rows.filter((r) => r.check_layer === layer).forEach((r) => { data[idx[r.as_of_date]] = r.fails; });
+      return {
+        name: layer, type: "bar", stack: "fail", data,
+        itemStyle: { color: DQC_LAYER_COLORS[layer] || "#8a94a8" },
+      };
+    });
+    const opt = baseLineOption("每日 FAIL 检查数（按检查层）");
+    opt.xAxis.data = dates;
+    opt.yAxis.name = "FAIL 数";
+    opt.tooltip = { trigger: "axis", axisPointer: { type: "shadow" } };
+    opt.series = series;
+    getChart("dqc-health-chart").setOption(opt, true);
+  } catch (e) { toast(e.message); }
+}
+
+async function loadDqcChecks() {
+  const table = $("#dqc-checks-table-sel").value || undefined;
+  try {
+    const res = await api("/api/dqc/checks", { table });
+    dqcChecksDate = res.as_of_date || null;
+    const tbl = res.table ? ` · ${res.table}` : "";
+    $("#dqc-checks-date").textContent = dqcChecksDate ? `（${dqcChecksDate}${tbl}）` : "";
+    renderTable("#dqc-checks-table", res.rows || [], {
+      columns: DQC_CHECK_COLS,
+      headers: DQC_CHECK_HEADERS,
+      intCols: new Set(["checked_count", "issue_count"]),
+      rateCols: new Set(["issue_rate"]),
+      // status / severity → colored chip; rule_id → clickable to drill into the rule.
+      cellFn: (c, v, row) => {
+        if (c === "status") return `<td class="text"><span class="chip ${dqcStatusClass(v)}">${v || ""}</span></td>`;
+        if (c === "severity") return `<td class="text"><span class="chip ${dqcSeverityClass(v)}">${v || ""}</span></td>`;
+        if (c === "rule_id") return `<td class="text"><a class="dqc-rule-link" data-rule="${v}" data-ctype="${row.check_type || ""}">${v || ""}</a></td>`;
+        return undefined;
+      },
+      rowClass: (row) => (row.status === "FAIL" ? "dqc-fail-row" : row.status === "MONITOR" ? "dqc-monitor-row" : ""),
+      defaultSort: {},  // backend already orders FAIL-first; keep that until the user sorts
+      onRender: (el) => {
+        el.querySelectorAll("a.dqc-rule-link").forEach((a) =>
+          a.addEventListener("click", () => onDqcRuleClick(a.dataset.rule, a.dataset.ctype)));
+      },
+    });
+  } catch (e) { toast(e.message); $("#dqc-checks-table").innerHTML = '<div class="empty">无数据</div>'; }
+}
+
+// Route a clicked check by its check_type. Row-level checks (cross-check / spot-check) have
+// offending-row samples → load them. The aggregate drift rule (dqc_metric_drift) also now
+// persists per-metric samples (one row per drifted metric, sample_type=metric_drift) → load
+// them too. Other metric-level checks (row_count, bounds, drift warm-up/example …) do NOT
+// produce row samples; the way to investigate those is the metric-trend chart, so send the
+// user there with a hint instead of an empty samples table.
+const DQC_ROWLEVEL_TYPES = new Set(["cross_check", "spot_check", "cross_validation", "business_cross_validation"]);
+const DQC_SAMPLE_RULES = new Set(["dqc_metric_drift"]);
+
+function onDqcRuleClick(rule_id, check_type) {
+  const ct = String(check_type || "").toLowerCase();
+  const rowLevel = DQC_ROWLEVEL_TYPES.has(ct) || ct.includes("cross") || ct.includes("spot")
+    || DQC_SAMPLE_RULES.has(rule_id);
+  if (rowLevel) { loadDqcSamples(rule_id, dqcChecksDate); return; }
+  // Metric-level (e.g. drift): guide the user to the trend chart.
+  const hint = $("#dqc-samples-hint");
+  hint.textContent = `规则 ${rule_id} 为指标级检查（${check_type || "metric"}），无逐行样本；`
+    + `请在上方「指标趋势 / 漂移」选择指标与实体绘制趋势图查看漂移。`;
+  $("#dqc-samples-table").innerHTML = '<div class="empty">指标级检查无问题明细行，请用上方趋势图调查</div>';
+  $("#dqc-sql-box").hidden = true;
+  const anchor = document.querySelector('#tab-dqc .dqc-heading + .subbar') || $("#dqc-metric-chart");
+  if (anchor) anchor.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+async function loadDqcMetricOptions() {
+  try {
+    const res = await api("/api/dqc/metric_options", {});
+    dqcMetricOptions = res.rows || [];
+    // 4667 (metric_name, entity_name) pairs are unusable as two flat lists, so the selectors
+    // cascade: pick one of the 16 metric_names, and the entity dropdown filters to the
+    // entities that actually carry that metric.
+    const metrics = Array.from(new Set(dqcMetricOptions.map((r) => r.metric_name))).sort();
+    $("#dqc-metric-name").innerHTML = metrics.map((m) => `<option>${m}</option>`).join("");
+    refreshDqcEntityOptions();
+  } catch (e) { toast(e.message); }
+}
+
+// Populate the entity dropdown with entities that carry the currently-selected metric_name.
+// The currently-selected entity is kept when it still exists under the new metric; an explicit
+// `preferEntity` overrides that. Returns the entity that ended up selected (or "" if none).
+function refreshDqcEntityOptions(preferEntity) {
+  const metric = $("#dqc-metric-name").value;
+  const prev = $("#dqc-metric-entity").value;
+  const entities = Array.from(new Set(
+    dqcMetricOptions.filter((r) => r.metric_name === metric).map((r) => r.entity_name)
+  )).sort();
+  $("#dqc-metric-entity").innerHTML = entities.map((e) => `<option>${e}</option>`).join("");
+  const keep = (preferEntity && entities.includes(preferEntity)) ? preferEntity
+    : (entities.includes(prev) ? prev : null);
+  if (keep) $("#dqc-metric-entity").value = keep;
+  return $("#dqc-metric-entity").value;
+}
+
+async function plotDqcMetric() {
+  const metric_name = $("#dqc-metric-name").value;
+  const entity_name = $("#dqc-metric-entity").value;
+  if (!metric_name || !entity_name) { toast("请选择指标与实体"); return; }
+  const { start, end } = dqcDefaultDates();
+  try {
+    const res = await api("/api/dqc/metric_trend",
+      { metric_name, entity_name, start, end, as_of_date: dqcChecksDate || undefined });
+    const rows = res.rows || [];
+    const dates = rows.map((r) => r.trade_date);
+    const values = rows.map((r) => r.metric_value);
+    const opt = baseLineOption(`${metric_name} · ${entity_name}`);
+    opt.xAxis.data = dates;
+    const series = [{ name: metric_name, type: "line", showSymbol: false, data: values, lineStyle: { color: "#3aa0ff" }, itemStyle: { color: "#3aa0ff" } }];
+    // Overlay the drift baseline (flat mean line) + ±std band when a baseline exists.
+    const b = res.baseline;
+    if (b && typeof b.baseline_mean === "number") {
+      series.push({
+        name: "基线均值", type: "line", showSymbol: false,
+        data: dates.map(() => b.baseline_mean),
+        lineStyle: { color: "#f5a524", type: "dashed", width: 1 }, itemStyle: { color: "#f5a524" },
+      });
+      if (typeof b.baseline_std === "number" && b.baseline_std > 0) {
+        series[0].markArea = {
+          silent: true,
+          itemStyle: { color: "rgba(245,165,36,0.10)" },
+          data: [[{ yAxis: b.baseline_mean - b.baseline_std }, { yAxis: b.baseline_mean + b.baseline_std }]],
+        };
+      }
+    }
+    opt.series = series;
+    getChart("dqc-metric-chart").setOption(opt, true);
+  } catch (e) { toast(e.message); }
+}
+
+// From a drift sample's 查看趋势 button: point the metric/entity selectors at that drifted
+// (metric_name, entity_name), plot its trend, and scroll the chart into view — turning the
+// drift-detail row into the "how did this drift?" investigation the trend chart is for.
+function showDriftTrend(metric_name, entity_name) {
+  if (!metric_name || !entity_name) { toast("样本缺少指标/实体"); return; }
+  const mSel = $("#dqc-metric-name");
+  if (Array.from(mSel.options).some((o) => o.value === metric_name)) mSel.value = metric_name;
+  refreshDqcEntityOptions(entity_name);
+  plotDqcMetric();
+  const chart = $("#dqc-metric-chart");
+  if (chart) chart.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+// Sample columns differ by shape; render a generous superset and let renderTable
+// drop absent keys (it renders only `columns` present in the data's first row via
+// Object.keys fallback — but here we pin an explicit union and blanks show empty).
+const DQC_SAMPLE_HEADERS = {
+  trade_date: "交易日", source_code: "代码", instrument_id: "标的", entity_name: "实体/字段",
+  factor_id: "因子", factor_name: "因子名", expression: "表达式",
+  actual_value: "实际值", expected_value: "期望值", abs_diff: "绝对差", rel_diff: "相对差",
+  history_start: "历史起", history_end: "历史止", oracle: "校验器", sample_type: "样本类型",
+  // metric_drift samples (rule_id=dqc_metric_drift): per-metric drift detail.
+  metric_name: "指标", metric_scope: "范围", observed_value: "当前值",
+  baseline_mean: "基线均值", baseline_std: "基线标准差", baseline_days: "基线天数",
+  z_score: "Z 分数", relative_change: "相对变化",
+};
+
+async function loadDqcSamples(rule_id, as_of_date) {
+  if (!as_of_date) { toast("无检查日期，无法加载样本"); return; }
+  const hint = $("#dqc-samples-hint");
+  // The samples section is far down the page — always scroll it into view on click so a
+  // successful (or empty) load is visible instead of looking like nothing happened.
+  const scrollToSamples = () => hint.scrollIntoView({ behavior: "smooth", block: "start" });
+  hint.textContent = `规则 ${rule_id}（${as_of_date}）加载中…`;
+  $("#dqc-sql-box").hidden = true;
+  scrollToSamples();
+  try {
+    // Scope samples to the table selected in 最新运行检查 (the samples originate from that
+    // section). 'all' → no filter (every table's samples); the server ignores 'all' too.
+    const table = $("#dqc-checks-table-sel").value || undefined;
+    const res = await api("/api/dqc/samples", { rule_id, as_of_date, limit: 500, table });
+    const rows = res.rows || [];
+    if (rows.length === 0) {
+      // Metric-level rules (drift / row-count / bounds) have no offending-row samples — that
+      // is expected, not an error. Say so explicitly rather than a bare "无数据".
+      hint.textContent = `规则 ${rule_id}（${as_of_date}）· 无逐行样本（该检查为指标级，无问题明细行）`;
+      $("#dqc-samples-table").innerHTML = '<div class="empty">该规则无逐行样本</div>';
+      return;
+    }
+    hint.textContent = `规则 ${rule_id}（${as_of_date}）· ${rows.length} 条`;
+    // Drift samples (rule_id=dqc_metric_drift) are per-metric, not per-row: they carry
+    // metric_name/z_score/baseline_*, no source_code. Their investigation is the trend chart,
+    // not a warehouse point-query — so use a different column set + a 查看趋势 action.
+    const isDrift = rule_id === "dqc_metric_drift";
+    // Column union across whatever keys the flattened samples carry, in a sensible order.
+    const preferred = isDrift
+      ? ["metric_name", "entity_name", "observed_value", "baseline_mean", "baseline_std",
+         "baseline_days", "z_score", "relative_change", "trade_date"]
+      : ["trade_date", "source_code", "entity_name", "factor_id", "factor_name", "expression",
+         "actual_value", "expected_value", "abs_diff", "rel_diff", "history_start", "history_end",
+         "oracle", "sample_type"];
+    const present = new Set();
+    rows.forEach((r) => Object.keys(r).forEach((k) => present.add(k)));
+    let columns = preferred.filter((c) => present.has(c));
+    columns.push("__sql");  // synthetic column: the investigate action
+    renderTable("#dqc-samples-table", rows, {
+      columns,
+      headers: { ...DQC_SAMPLE_HEADERS, __sql: "调查" },
+      rateCols: new Set(["rel_diff", "relative_change"]),
+      defaultSort: isDrift ? { col: "z_score", dir: "desc" } : undefined,
+      noSort: new Set(["__sql", "expression"]),
+      noFilter: new Set(["__sql"]),
+      cellFn: (c, v, row) => {
+        if (c === "__sql") {
+          if (isDrift) {
+            return `<td class="text"><button class="dqc-trend-btn" `
+              + `data-metric="${row.metric_name || ""}" data-entity="${row.entity_name || ""}">查看趋势</button></td>`;
+          }
+          return `<td class="text"><button class="dqc-sql-btn" data-code="${row.source_code || ""}" `
+            + `data-td="${row.trade_date || ""}" data-hs="${row.history_start || ""}" `
+            + `data-he="${row.history_end || ""}">生成 SQL</button></td>`;
+        }
+        return undefined;
+      },
+      onRender: (el) => {
+        el.querySelectorAll("button.dqc-sql-btn").forEach((b) =>
+          b.addEventListener("click", () => showInvestigateSql({
+            source_code: b.dataset.code, trade_date: b.dataset.td,
+            history_start: b.dataset.hs, history_end: b.dataset.he,
+          })));
+        el.querySelectorAll("button.dqc-trend-btn").forEach((b) =>
+          b.addEventListener("click", () => showDriftTrend(b.dataset.metric, b.dataset.entity)));
+      },
+    });
+  } catch (e) { toast(e.message); $("#dqc-samples-table").innerHTML = '<div class="empty">无数据</div>'; }
+}
+
+async function showInvestigateSql(row) {
+  if (!row.source_code || !row.trade_date) { toast("样本缺少 source_code / trade_date"); return; }
+  // trade_date may carry a time part ("2026-09-15 00:00:00"); the SQL builder only needs the date.
+  const td = String(row.trade_date).slice(0, 10);
+  const params = { source_code: row.source_code, trade_date: td };
+  if (row.history_start && row.history_end) {
+    params.history_start = String(row.history_start).slice(0, 10);
+    params.history_end = String(row.history_end).slice(0, 10);
+  }
+  try {
+    const res = await api("/api/dqc/investigate_sql", params);
+    const box = $("#dqc-sql-box");
+    const block = (title, sql) => sql
+      ? `<div class="dqc-sql-block"><div class="dqc-sql-title">${title}`
+        + `<button class="dqc-copy-btn" title="复制">复制 SQL</button></div>`
+        + `<pre><code>${sql.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</code></pre></div>`
+      : "";
+    box.innerHTML =
+      `<div class="dqc-sql-head">调查 SQL · ${row.source_code} @ ${td}（粘贴到 ClickHouse 执行）</div>`
+      + block("问题行（point query）", res.point_sql)
+      + block("历史窗口（rolling history）", res.history_sql);
+    box.hidden = false;
+    box.querySelectorAll("button.dqc-copy-btn").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        const sql = btn.closest(".dqc-sql-block").querySelector("code").textContent;
+        navigator.clipboard.writeText(sql).then(() => toast("已复制"), () => toast("复制失败"));
+      }));
+    box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (e) { toast(e.message); }
+}
+
+const DQC_VAL_RUN_HEADERS = {
+  layer: "层", stage: "阶段", table_name: "表", target_table_name: "目标表",
+  mode: "模式", status: "状态", started_at: "开始", finished_at: "结束", run_id: "run",
+};
+const DQC_VAL_RUN_COLS = ["layer", "stage", "table_name", "target_table_name", "mode", "status", "started_at", "finished_at"];
+const DQC_VAL_RESULT_HEADERS = {
+  table_name: "表", layer: "层", stage: "阶段", rule_id: "规则", severity: "级别",
+  status: "状态", issue_count: "问题数", issue_rate: "问题率", description: "描述", message: "说明", run_id: "run",
+};
+const DQC_VAL_RESULT_COLS = ["table_name", "layer", "stage", "rule_id", "severity", "status", "issue_count", "issue_rate", "description", "message"];
+
+async function loadValidation() {
+  const { start, end } = dqcDefaultDates();
+  const chip = (c, v) => (c === "status")
+    ? `<td class="text"><span class="chip ${dqcStatusClass(v)}">${v || ""}</span></td>`
+    : (c === "severity") ? `<td class="text"><span class="chip ${dqcSeverityClass(v)}">${v || ""}</span></td>` : undefined;
+  const failRow = (row) => (row.status === "FAIL" ? "dqc-fail-row" : "");
+  try {
+    const runs = await api("/api/dqc/validation/runs", { start, end });
+    renderTable("#dqc-val-runs-table", runs.rows || [], {
+      columns: DQC_VAL_RUN_COLS, headers: DQC_VAL_RUN_HEADERS,
+      cellFn: chip, rowClass: failRow, defaultSort: {},
+    });
+  } catch (e) { toast(e.message); $("#dqc-val-runs-table").innerHTML = '<div class="empty">无数据</div>'; }
+  try {
+    const results = await api("/api/dqc/validation/results", { start, end });
+    renderTable("#dqc-val-results-table", results.rows || [], {
+      columns: DQC_VAL_RESULT_COLS, headers: DQC_VAL_RESULT_HEADERS,
+      intCols: new Set(["issue_count"]),
+      rateCols: new Set(["issue_rate"]),
+      cellFn: chip, rowClass: failRow, defaultSort: {},
+    });
+  } catch (e) { toast(e.message); $("#dqc-val-results-table").innerHTML = '<div class="empty">无数据</div>'; }
+}
+
+$("#dqc-refresh").addEventListener("click", loadDqc);
+$("#dqc-start").addEventListener("change", loadDqc);
+$("#dqc-end").addEventListener("change", loadDqc);
+$("#dqc-checks-table-sel").addEventListener("change", loadDqcChecks);
+$("#dqc-metric-name").addEventListener("change", () => {
+  // Keep the entity selection across a metric switch, and redraw right away if it survived.
+  if (refreshDqcEntityOptions()) plotDqcMetric();
+});
+$("#dqc-metric-entity").addEventListener("change", plotDqcMetric);
+$("#dqc-metric-plot").addEventListener("click", plotDqcMetric);
 
 // ---------------------------------------------------------------------------
 // Init
