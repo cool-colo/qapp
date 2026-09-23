@@ -975,6 +975,19 @@ class TargetQuantityStrategy(Strategy):
         """Return the latest broker-reconciled sellable quantity for an instrument."""
         return self._execution_state_reconciler.venue_sellable_quantity(instrument_id)
 
+    def _awaiting_pre_open_reconcile(self) -> bool:
+        """
+        True when the strategy-side pre-open (mass-status) reconciliation is configured
+        (live path) but has not yet populated the broker sellable map since start.
+
+        Convergence gates on this so it never trades against a restart-rebuilt cache
+        that the pre-open reconcile has not yet corrected. In backtests / tests the
+        reconciler is never configured, so this is always False and convergence runs
+        normally.
+        """
+        reconciler = self._execution_state_reconciler
+        return reconciler.is_configured and not reconciler.has_reconciled_once
+
     # ------------------------------------------------------------------
     # Manual trading control host primitives
     # ------------------------------------------------------------------
@@ -1420,7 +1433,26 @@ class TargetQuantityStrategy(Strategy):
             # buy, `_handle_order_not_accepted` re-latches it until the next SELL fill,
             # so this does not hammer a broker whose cash is genuinely short.
             self._insufficient_funds.clear()
-            self._converge_to_target(current_date=self._clock_date(), trigger="sell_fill")
+            # A SELL fill replayed by execution reconciliation on restart carries its
+            # original (pre-startup) ts_event. Convergence must NOT be triggered by it:
+            # the cache is still being rebuilt, so a converge here computes a delta
+            # against half-reconciled state and can trade before reconciliation
+            # completes. Bookkeeping above is still correct; the periodic timer drives
+            # convergence once the strategy is live.
+            if self._is_historical_event(event):
+                self.log.info(
+                    "Ignoring reconciliation-replayed SELL fill for convergence "
+                    f"({instrument_id_text}); periodic timer will converge once live",
+                )
+                return
+            # on_order_filled runs inside the LiveExecutionEngine event-queue task on
+            # the node loop. Scheduling converge as a fresh loop task (rather than
+            # calling it inline) lets the event queue drain any events already enqueued
+            # behind this fill before the converge runs, so it sees settled position
+            # state. The non-blocking lock in _converge_to_target still applies.
+            self._async_scheduler.schedule(
+                self._converge_async(current_date=self._clock_date(), trigger="sell_fill"),
+            )
 
     def on_order_canceled(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
@@ -1433,18 +1465,45 @@ class TargetQuantityStrategy(Strategy):
             if order is not None and order.side == OrderSide.SELL:
                 self._recent_sell_cancel_ts[instrument_id_text] = self.clock.timestamp_ns()
         # A venue can acknowledge our cancel and then still fill the *same* order a
-        # few ms later (a cancel/fill race). Running convergence inline here — often
-        # on the Rust timer/exec thread — recomputes the buy/sell delta before the
-        # racing OrderFilled has been dispatched, so it re-submits a replacement
-        # order and over-trades. Defer convergence onto the node event loop and delay
-        # it by `cancel_reconverge_delay_secs` so any racing fill is applied to
-        # net_position first, then re-converge against the settled state.
+        # few ms later (a cancel/fill race). on_order_canceled runs inside the
+        # LiveExecutionEngine event-queue task on the node loop; the racing OrderFilled
+        # is typically already sitting in that same event queue behind this cancel.
+        # Running convergence inline here recomputes the buy/sell delta before that
+        # queued fill is applied to net_position, so it re-submits a replacement order
+        # and over-trades. Schedule converge as a fresh loop task so the event queue
+        # drains the racing fill first, and additionally delay it by
+        # `cancel_reconverge_delay_secs` as a margin for a fill the adapter enqueues a
+        # beat later. Then re-converge against the settled state.
+        #
+        # A cancel replayed by execution reconciliation on restart carries its
+        # original (pre-startup) ts_event. Skip convergence for it: the cache is
+        # still being rebuilt, so converging here trades against half-reconciled
+        # state. Bookkeeping above is still correct; the periodic timer converges
+        # once live.
+        if self._is_historical_event(event):
+            self.log.info(
+                "Ignoring reconciliation-replayed cancel for convergence "
+                f"({instrument_id_text}); periodic timer will converge once live",
+            )
+            return
         self._async_scheduler.schedule(
-            self._converge_async(current_date=self._clock_date(), trigger="cancel"),
+            self._converge_async(
+                current_date=self._clock_date(),
+                trigger="cancel",
+                delay_secs=float(self.config.cancel_reconverge_delay_secs),
+            ),
         )
 
-    async def _converge_async(self, current_date: date, trigger: str) -> None:
-        delay_secs = float(self.config.cancel_reconverge_delay_secs)
+    async def _converge_async(
+        self,
+        current_date: date,
+        trigger: str,
+        delay_secs: float = 0.0,
+    ) -> None:
+        # Runs on the node event loop. `delay_secs` is used only by the cancel path
+        # (see on_order_canceled) to let a racing OrderFilled settle first; other
+        # callers pass 0. `_converge_to_target` still takes the non-blocking lock, so
+        # a converge already in progress makes this a no-op rather than stacking.
         if delay_secs > 0:
             await asyncio.sleep(delay_secs)
         self._converge_to_target(current_date=current_date, trigger=trigger)
@@ -1525,8 +1584,15 @@ class TargetQuantityStrategy(Strategy):
         return 0 <= elapsed_ns <= int(window_secs * 1_000_000_000)
 
     def _on_converge_timer(self, _event: Any) -> None:
+        # The converge timer fires on a Rust tokio worker thread (see nautilus timer
+        # threads), which can overlap order-event delivery. Marshal onto the node loop
+        # so convergence runs single-threaded behind any queued events. The
+        # non-blocking lock in _converge_to_target still makes an overlapping cycle a
+        # no-op rather than stacking.
         try:
-            self._converge_to_target(current_date=self._clock_date(), trigger="timer")
+            self._async_scheduler.schedule(
+                self._converge_async(current_date=self._clock_date(), trigger="timer"),
+            )
         except Exception as exc:
             self.log.warning(f"target convergence failed: {exc}")
 
@@ -1553,6 +1619,19 @@ class TargetQuantityStrategy(Strategy):
     def _converge_to_target_locked(self, current_date: date, trigger: str) -> None:
         if not self._target_version:
             self.log.warning("target convergence skipped: no target version set")
+            return
+        if self._awaiting_pre_open_reconcile():
+            # On restart the kernel rebuilds the cache, but the broker's authoritative
+            # sellable/position view (mass status) arrives a little later via the
+            # strategy-side pre-open reconcile. Converging in that window trades against
+            # an uncorrected cache (e.g. a holding that looks under-held), which can
+            # over-buy. Skip until the first mass-status report lands; on-bar / depth /
+            # timer triggers will re-drive convergence right after it does.
+            self.log.info(
+                f"target convergence skipped: awaiting pre-open execution-state "
+                f"reconciliation (trigger={trigger})",
+                color=LogColor.BLUE,
+            )
             return
         if self._target_version in self._achieved_versions:
             self.log.info(

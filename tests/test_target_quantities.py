@@ -287,6 +287,8 @@ class TestableTargetQuantityStrategy:
     _is_transient_sellable_denial = TargetQuantityStrategy._is_transient_sellable_denial
     _converge_to_target = TargetQuantityStrategy._converge_to_target
     _converge_to_target_locked = TargetQuantityStrategy._converge_to_target_locked
+    _converge_async = TargetQuantityStrategy._converge_async
+    _awaiting_pre_open_reconcile = TargetQuantityStrategy._awaiting_pre_open_reconcile
     _order_book_depth_logging_enabled = TargetQuantityStrategy._order_book_depth_logging_enabled
     _should_log_sample = staticmethod(TargetQuantityStrategy._should_log_sample)
     _on_converge_timer = TargetQuantityStrategy._on_converge_timer
@@ -374,6 +376,12 @@ class TestableTargetQuantityStrategy:
     _on_full_tick_refresh_timer = TargetQuantityStrategy._on_full_tick_refresh_timer
     _run_full_tick_fetch = TargetQuantityStrategy._run_full_tick_fetch
     _on_full_tick_fetch_done = TargetQuantityStrategy._on_full_tick_fetch_done
+    _apply_full_tick_and_notify = TargetQuantityStrategy._apply_full_tick_and_notify
+    _notify_full_tick_completion = TargetQuantityStrategy._notify_full_tick_completion
+    _run_on_loop = TargetQuantityStrategy._run_on_loop
+    _schedule_fetch = TargetQuantityStrategy._schedule_fetch
+    _resolve_fetch_source = staticmethod(TargetQuantityStrategy._resolve_fetch_source)
+    _start_whole_market_full_tick_refresh = TargetQuantityStrategy._start_whole_market_full_tick_refresh
 
     def request_instrument(self, instrument_id) -> None:
         self.requested_instruments.append(instrument_id)
@@ -494,6 +502,12 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             strategy.config.full_tick_prefetch_time,
         )
         strategy._full_tick_task = None
+        strategy._whole_market_status = {}
+        strategy._whole_market_full_tick_source = None
+        strategy._whole_market_full_tick_time = TargetQuantityStrategy._parse_hh_mm(
+            strategy.config.whole_market_full_tick_time,
+        )
+        strategy._whole_market_full_tick_task = None
         strategy._depth_books = {}
         strategy._subscribed_order_book_depth_instruments = set()
         strategy._sleep_calls = []
@@ -508,6 +522,8 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 10:00:00")
         strategy._convergence_suspended = False
         strategy._trading_paused = False
+        strategy._target_updates_paused = False
+        strategy._fetch_executor = None
         strategy._converge_lock = threading.Lock()
         strategy._async_scheduler = AsyncAwaitableScheduler()
         strategy._execution_state_reconciler = ExecutionStateReconciler(
@@ -523,6 +539,10 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             reconcile_time="09:15",
             timeout_secs=30.0,
         )
+        # Open the pre-open-reconcile convergence gate by default so these tests
+        # exercise convergence directly. A dedicated test flips it back to False to
+        # verify the gate blocks convergence until the pre-open reconcile completes.
+        strategy._execution_state_reconciler._reconciled_once = True
         strategy._sellable_exhausted = {}
         strategy._recent_sell_cancel_ts = {}
         strategy._startup_ts_ns = -1
@@ -1268,6 +1288,33 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._converge_to_target(trading_date, "timer")
 
         self.assertEqual(strategy.submitted_orders, [])
+
+    def test_converge_to_target_skips_until_pre_open_reconcile(self) -> None:
+        # On restart the broker's authoritative view (mass status) arrives via the
+        # strategy-side pre-open reconcile a little after the kernel rebuilds the cache.
+        # Convergence must not trade in that window. With the gate closed no orders are
+        # submitted; once a mass-status report opens it, convergence proceeds.
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(
+            free_cash="1000000",
+            equity="1000000",
+            prices={INST_A: 10.0},
+        )
+        strategy._target_quantities = {str(INST_A): Decimal("1200")}
+        strategy._target_date = trading_date
+        strategy._target_reason = "manual"
+        strategy._target_version = "manual-version"
+        # Close the gate: pre-open reconcile configured but not yet completed.
+        strategy._execution_state_reconciler._reconciled_once = False
+
+        strategy._converge_to_target(trading_date, "timer")
+        self.assertEqual(strategy.submitted_orders, [])
+
+        # A successful reconcile opens the gate; convergence now submits.
+        strategy._execution_state_reconciler._reconciled_once = True
+        strategy._converge_to_target(trading_date, "timer")
+        self.assertEqual(len(strategy.submitted_orders), 1)
+        self.assertEqual(strategy.submitted_orders[0].side, OrderSide.BUY)
 
     def test_reentrant_convergence_is_skipped_while_in_progress(self) -> None:
         # Reproduces the duplicate-sell race: a second convergence trigger arrives on

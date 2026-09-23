@@ -34,6 +34,12 @@ class ExecutionStateReconciler:
         self._timeout_secs = 30.0
         self._task: asyncio.Future[Any] | ConcurrentFuture[Any] | None = None
         self._venue_sellable: dict[str, Decimal] = {}
+        # True once a mass-status report has populated the broker sellable map at
+        # least once since start. Convergence gates on this so it never trades against
+        # a cache that the pre-open reconcile has not yet corrected (see
+        # `_converge_to_target_locked`). Once True it stays True; a later empty report
+        # replaces the map but does not un-reconcile.
+        self._reconciled_once: bool = False
         self._event_reporter: Callable[[str, str, dict[str, Any]], None] | None = None
 
     def bind_runtime(self, clock: Any, log: Any) -> None:
@@ -159,10 +165,20 @@ class ExecutionStateReconciler:
                 except Exception:
                     continue
         self._venue_sellable = sellable
+        self._reconciled_once = True
         self._runtime_log().info(
             f"Updated broker sellable map from mass status: instruments={len(sellable)}",
             color=LogColor.BLUE,
         )
+
+    @property
+    def has_reconciled_once(self) -> bool:
+        """
+        True once a mass-status report has populated the broker sellable map since
+        start. Convergence uses this to avoid trading before the pre-open reconcile
+        has corrected the restart-rebuilt cache.
+        """
+        return self._reconciled_once
 
     def venue_sellable_quantity(self, instrument_id: str) -> Decimal | None:
         return self._venue_sellable.get(instrument_id)
@@ -226,6 +242,12 @@ class ExecutionStateReconciler:
     def _log_result(self, succeeded: bool) -> None:
         log = self._runtime_log()
         if succeeded:
+            # A successful reconcile means the venue answered and the broker view has
+            # been applied — even for an account with zero open positions (empty but
+            # valid sellable map). This is the authoritative "reconciled once" signal
+            # that gates convergence; keying off a non-empty mass-status report alone
+            # would block a flat account forever.
+            self._reconciled_once = True
             log.info(
                 "Pre-open execution-state reconciliation succeeded",
                 color=LogColor.GREEN,
