@@ -2674,7 +2674,13 @@ class TargetQuantityStrategy(Strategy):
         return investable if investable > 0 else Decimal("0")
 
     def _portfolio_value(self) -> Decimal:
-        broker_total_asset = self._broker_account_decimal("total_asset")
+        # QMT's reported ``total_asset`` does not reliably equal
+        # 总市值 + 可用金额 + 冻结金额 (market_value + cash + frozen_cash) and can be
+        # larger than the true investable asset — sizing off it over-states buying
+        # power and leaves the last buy target under-funded. Recompute total asset
+        # from the settled components instead, matching the QMT UI invariant
+        # 总资产 = 总市值 + 可用金额 + 冻结金额.
+        broker_total_asset = self._broker_total_asset_from_components()
         if broker_total_asset is not None and broker_total_asset > 0:
             return broker_total_asset
         nautilus_equity = self._nautilus_portfolio_equity()
@@ -2682,6 +2688,41 @@ class TargetQuantityStrategy(Strategy):
             self.log.warning("Using nautilus portfolio equity as fallback for portfolio value.")
             return nautilus_equity
         return Decimal(str(self.config.initial_cash))
+
+    def _broker_total_asset_from_components(self) -> Decimal | None:
+        """
+        Total asset computed as 总市值 + 可用金额 + 冻结金额
+        (market_value + available_cash + frozen_cash) from a single broker account
+        info dict, rather than trusting the broker's own ``total_asset`` field.
+
+        All three components must come from the *same* account snapshot so they
+        reconcile; ``market_value`` and ``cash`` are required (a snapshot missing
+        either is skipped), while ``frozen_cash`` defaults to 0 when absent.
+        Returns None when no account exposes the required components.
+        """
+        for account in self._broker_accounts():
+            info = self._account_info(account)
+            market_value = self._info_decimal(info, "market_value")
+            cash = self._info_decimal(info, "available_cash", "cash")
+            if market_value is None or cash is None:
+                continue
+            frozen = self._info_decimal(info, "frozen_cash") or Decimal("0")
+            return market_value + cash + frozen
+        return None
+
+    @staticmethod
+    def _info_decimal(info: Mapping[str, Any], *keys: str) -> Decimal | None:
+        for key in keys:
+            value = info.get(key)
+            if value is None:
+                continue
+            try:
+                result = Decimal(str(value))
+            except Exception:
+                continue
+            if result >= 0:
+                return result
+        return None
 
     def _nautilus_portfolio_equity(self) -> Decimal | None:
         venue = self._instrument_ids[0].venue if self._instrument_ids else None
@@ -2732,12 +2773,14 @@ class TargetQuantityStrategy(Strategy):
         broker_cash = self._broker_account_decimal("available_cash", "cash")
         broker_market_value = self._broker_account_decimal("market_value")
         broker_fetch_balance = self._broker_account_decimal("fetch_balance")
+        broker_frozen_cash = self._broker_account_decimal("frozen_cash")
+        broker_total_asset_computed = self._broker_total_asset_from_components()
         nautilus_equity = self._nautilus_portfolio_equity()
         nautilus_free_cash = self._nautilus_free_cash()
         selected_portfolio_value = self._portfolio_value()
         selected_free_cash = self._free_cash()
-        if broker_total_asset is not None and broker_total_asset > 0:
-            value_source = "account_state_info.total_asset"
+        if broker_total_asset_computed is not None and broker_total_asset_computed > 0:
+            value_source = "market_value+cash+frozen_cash"
         elif nautilus_equity is not None:
             value_source = "portfolio.equity"
         else:
@@ -2750,7 +2793,9 @@ class TargetQuantityStrategy(Strategy):
         snapshot = (
             f"value_source={value_source} selected_portfolio_value={selected_portfolio_value} "
             f"nautilus_portfolio_equity={nautilus_equity} "
-            f"broker_total_asset={broker_total_asset} broker_market_value={broker_market_value} "
+            f"broker_total_asset_reported={broker_total_asset} "
+            f"broker_total_asset_computed={broker_total_asset_computed} "
+            f"broker_market_value={broker_market_value} broker_frozen_cash={broker_frozen_cash} "
             f"cash_source={cash_source} selected_free_cash={selected_free_cash} "
             f"nautilus_free_cash={nautilus_free_cash} broker_cash={broker_cash} "
             f"broker_fetch_balance={broker_fetch_balance}"
