@@ -41,6 +41,8 @@ start_calculate_daily_returns_prod.sh
 start_big_qmt_live_trading.sh
 start_big_qmt_live_trading_2.sh
 start_big_qmt_live_trading_3.sh
+start_big_qmt_live_trading_4.sh
+start_big_qmt_live_trading_5.sh
 start_bigqmt_full_tick_snapshot.sh
 start_prod_live_trading.sh
 .envs

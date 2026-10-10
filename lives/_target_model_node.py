@@ -373,6 +373,7 @@ def build_target_model_node(
         ),
         exec_engine=LiveExecEngineConfig(
             load_cache=args.load_cache_on_start,
+            graceful_shutdown_on_exception=True,
             reconciliation=True,
             reconciliation_lookback_mins=1440,
             reconciliation_instrument_ids=venue_clients.reconciliation_instrument_ids,

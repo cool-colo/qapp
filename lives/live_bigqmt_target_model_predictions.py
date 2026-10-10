@@ -151,7 +151,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             data_factory=BigQMTLiveDataClientFactory,
             exec_factory=BigQMTLiveExecClientFactory,
             reconciliation_instrument_ids=reconciliation_ids,
-            timeout_connection_secs=300.0,
+            timeout_connection_secs=600.0,
         )
 
     return build_target_model_node(args, loader, _make_venue_clients, _add_snapshot_recorder)
