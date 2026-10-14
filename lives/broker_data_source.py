@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 import urllib.error
 import urllib.request
@@ -450,9 +451,8 @@ class BigQmtBrokerDataSource:
         ex-event list (all events up to ``end_time`` if given), leaving the
         ``(entry_date, today]`` windowing and cumulative product to the strategy.
 
-        ``get_divid_factors`` returns a dict keyed by ms-epoch ex-date whose value
-        is ``[div/share, songzhuan, zhuanzeng, allot, allot_price, is_gugai,
-        复权系数]``; index 6 is the per-event adjust coefficient.
+        ``get_divid_factors`` returns a DataFrame. Its ``time`` column contains
+        each ex-date's millisecond timestamp and ``dr`` the per-event coefficient.
         """
         if not stock_codes:
             return {}
@@ -469,24 +469,21 @@ class BigQmtBrokerDataSource:
             if not code:
                 continue
             try:
-                factors = self._xtdata.get_divid_factors(code, "", end_time) or {}
+                factors = self._xtdata.get_divid_factors(code, "", end_time)
+                if not isinstance(factors, pd.DataFrame):
+                    raise TypeError("get_divid_factors must return a DataFrame")
+                factors = factors.loc[:, ["time", "dr"]]
             except Exception as exc:  # noqa: BLE001 - RPC failures degrade to no data
                 _LOGGER.warning("get_divid_factors failed for %s: %s", code, exc)
                 continue
             events: list[tuple[Any, float]] = []
-            for ms_ts, row in factors.items():
-                if not isinstance(row, (list, tuple)) or len(row) < 7:
-                    _LOGGER.warning(
-                        "get_divid_factors returned unusable row for %s @ %s: %s",
-                        code,
-                        ms_ts,
-                        row,
-                    )
-                    continue
+            for ms_ts, raw_coef in factors.itertuples(index=False, name=None):
                 try:
                     ex_date = pd.Timestamp(int(ms_ts), unit="ms", tz="Asia/Shanghai").date()
-                    coef = float(row[6])
-                except (TypeError, ValueError) as exc:
+                    coef = float(raw_coef)
+                    if not math.isfinite(coef):
+                        raise ValueError("dividend coefficient must be finite")
+                except (TypeError, ValueError, OverflowError) as exc:
                     _LOGGER.warning(
                         "get_divid_factors bad ex-date/coef for %s @ %s: %s",
                         code,

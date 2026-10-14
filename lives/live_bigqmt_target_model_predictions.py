@@ -15,14 +15,11 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-NAUTILUS_TRADER_PATH = Path(
-    os.environ.get("NAUTILUS_TRADER_PATH", "/data/flc/code/quant/nautilus_trader"),
-)
-
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-if NAUTILUS_TRADER_PATH.exists() and str(NAUTILUS_TRADER_PATH) not in sys.path:
-    sys.path.insert(0, str(NAUTILUS_TRADER_PATH))
+from pipe_runtime import configure_runtime_paths  # noqa: E402
+
+configure_runtime_paths(PROJECT_ROOT)
 
 from lives import live_common as legacy
 from lives._target_model_node import VenueClients
@@ -130,6 +127,8 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
                 redis_password=args.bigqmt_redis_password,
                 transport=args.transport,
                 rpc_timeout_secs=args.rpc_timeout_secs,
+                use_quote_push=False,
+                poll_enabled=True,
                 poll_interval_secs=args.poll_interval_secs,
                 instrument_provider=instrument_provider,
                 adjust_type=args.adjust_type,
@@ -143,7 +142,8 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
                 redis_password=args.bigqmt_redis_password,
                 transport=args.transport,
                 rpc_timeout_secs=args.rpc_timeout_secs,
-                poll_interval_secs=args.poll_interval_secs,
+                poll_enabled=True,
+                poll_interval_secs=1.0,
                 strategy_name=args.strategy_name,
                 enforce_sellable_position=not args.no_sellable_check,
                 instrument_provider=instrument_provider,

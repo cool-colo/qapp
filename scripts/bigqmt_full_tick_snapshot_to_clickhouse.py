@@ -32,14 +32,11 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-NAUTILUS_TRADER_PATH = Path(
-    os.environ.get("NAUTILUS_TRADER_PATH", "/data/flc/code/quant/nautilus_trader"),
-)
-
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-if NAUTILUS_TRADER_PATH.exists() and str(NAUTILUS_TRADER_PATH) not in sys.path:
-    sys.path.insert(0, str(NAUTILUS_TRADER_PATH))
+from pipe_runtime import configure_runtime_paths  # noqa: E402
+
+configure_runtime_paths(PROJECT_ROOT)
 
 from lives.live_common import env  # noqa: E402
 from lives.live_common import env_bool  # noqa: E402

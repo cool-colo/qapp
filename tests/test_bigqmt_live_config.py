@@ -21,7 +21,7 @@ def test_bigqmt_node_uses_extended_connection_timeout() -> None:
         bigqmt_redis_password="secret",
         transport="redis",
         rpc_timeout_secs=6.0,
-        poll_interval_secs=1.0,
+        poll_interval_secs=3.0,
         adjust_type="none",
         strategy_name="target-model-predictions",
         no_sellable_check=False,
@@ -39,7 +39,16 @@ def test_bigqmt_node_uses_extended_connection_timeout() -> None:
     venue_clients = make_venue_clients(args, context)
 
     assert result is expected
-    assert venue_clients.timeout_connection_secs == 300.0
+    assert venue_clients.timeout_connection_secs == 600.0
+    data = venue_clients.data_client_config
+    execution = venue_clients.exec_client_config
+    assert data.transport == execution.transport == "redis"
+    assert data.use_quote_push is False
+    assert data.poll_enabled is True
+    assert data.poll_interval_secs == 3.0
+    assert execution.poll_enabled is True
+    assert execution.poll_interval_secs == 1.0
+    assert data.rpc_timeout_secs == execution.rpc_timeout_secs == 6.0
 
 
 def test_bigqmt_order_snapshot_exposes_recorder_client_order_id() -> None:
