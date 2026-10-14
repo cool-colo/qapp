@@ -20,6 +20,12 @@ today (``after_trading volume - today's buy volume``).  It is reconciled with
 ``before_trading volume - today's sell volume``; a discrepancy fails loudly so
 that a partial/missing snapshot is not silently reported as P&L.
 
+The portfolio ``summary`` uses the change in after-trading net value from the
+previous trading day: ``net value = market_value + cash + frozen_cash`` from
+``live_asset_snapshot``. Its return rate is the change divided by the previous
+net value. If either day's asset snapshot is missing, the summary falls back to
+the sum of the per-stock returns above.
+
 Usage::
 
     python -m scripts.calculate_daily_returns --trade-date 2026-07-27
@@ -142,12 +148,24 @@ def _weighted_price(trades: list[dict[str, Any]]) -> tuple[int, Decimal, Decimal
     return quantity, amount / Decimal(quantity), amount
 
 
+def _asset_net_value(row: dict[str, Any]) -> Decimal:
+    for column in ("market_value", "cash", "frozen_cash"):
+        if row[column] is None:
+            raise ValueError(
+                f"missing {column} in after-trading asset snapshot for {row['account_id']}/{row['trader_id']}",
+            )
+    return sum((_decimal(row[column]) for column in ("market_value", "cash", "frozen_cash")), ZERO)
+
+
 def calculate_records(
     trade_date: date | str,
     trades: list[dict[str, Any]],
     before_positions: list[dict[str, Any]],
     after_positions: list[dict[str, Any]],
     ticks: list[dict[str, Any]],
+    *,
+    current_asset: dict[str, Any] | None = None,
+    previous_asset: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build detail and summary rows without database side effects.
 
@@ -259,9 +277,24 @@ def calculate_records(
     for row in details:
         if row["calculation_type"] == "all":
             by_account[(row["account_id"], row["trader_id"])].append(row)
-    for (account_id, trader_id), rows in sorted(by_account.items()):
+    summary_keys = set(by_account)
+    asset_key = None
+    if current_asset is not None and previous_asset is not None:
+        asset_key = (str(current_asset["account_id"]), str(current_asset["trader_id"]))
+        previous_key = (str(previous_asset["account_id"]), str(previous_asset["trader_id"]))
+        if asset_key != previous_key:
+            raise ValueError("current and previous asset snapshots must belong to the same account/trader")
+        current_net_value = _asset_net_value(current_asset)
+        previous_net_value = _asset_net_value(previous_asset)
+        summary_keys.add(asset_key)
+    for account_id, trader_id in sorted(summary_keys):
+        key = (account_id, trader_id)
+        rows = by_account[key]
         reference = sum((_decimal(row["reference_amount"]) for row in rows), ZERO)
         pnl = sum((_decimal(row["return_amount"]) for row in rows), ZERO)
+        if key == asset_key:
+            reference = previous_net_value
+            pnl = current_net_value - reference
         summaries.append({
             "trade_date": trade_date_text, "account_id": account_id, "trader_id": trader_id,
             # ``all`` keeps the type vocabulary identical to a per-stock total;
@@ -283,6 +316,9 @@ def calculate_records_by_account(
     before_positions: list[dict[str, Any]],
     after_positions: list[dict[str, Any]],
     ticks: list[dict[str, Any]],
+    *,
+    current_assets: list[dict[str, Any]] | None = None,
+    previous_assets: list[dict[str, Any]] | None = None,
 ) -> tuple[
     dict[tuple[str, str], list[dict[str, Any]]],
     dict[tuple[str, str], Exception],
@@ -300,7 +336,17 @@ def calculate_records_by_account(
             key = (str(row["account_id"]), str(row["trader_id"]))
             grouped[key].append(row)
 
-    account_keys = set(trades_by_account) | set(before_by_account) | set(after_by_account)
+    # Each account/trader has one snapshot per trade_date and snapshot_type.
+    current_assets_by_account = {
+        (str(row["account_id"]), str(row["trader_id"])): row for row in current_assets or []
+    }
+    previous_assets_by_account = {
+        (str(row["account_id"]), str(row["trader_id"])): row for row in previous_assets or []
+    }
+    account_keys = (
+        set(trades_by_account) | set(before_by_account) | set(after_by_account)
+        | set(current_assets_by_account) | set(previous_assets_by_account)
+    )
     records: dict[tuple[str, str], list[dict[str, Any]]] = {}
     failures: dict[tuple[str, str], Exception] = {}
     for key in sorted(account_keys):
@@ -311,6 +357,8 @@ def calculate_records_by_account(
                 before_by_account[key],
                 after_by_account[key],
                 ticks,
+                current_asset=current_assets_by_account.get(key),
+                previous_asset=previous_assets_by_account.get(key),
             )
         except Exception as exc:
             failures[key] = exc
@@ -413,7 +461,20 @@ def fetch_mysql_inputs(connection, args: argparse.Namespace, trade_date: str) ->
             (trade_date,),
         )
         ticks = list(cursor.fetchall())
-    return trades, before, after, ticks
+        asset_columns = "`account_id`, `trader_id`, `market_value`, `cash`, `frozen_cash`"
+        cursor.execute(
+            f"SELECT {asset_columns} FROM `live_asset_snapshot` WHERE `trade_date` = %s "
+            "AND `snapshot_type` = 'after_trading'" + scope,
+            [trade_date, *scope_params],
+        )
+        current_assets = list(cursor.fetchall())
+        cursor.execute(
+            f"SELECT {asset_columns} FROM `live_asset_snapshot` WHERE `trade_date` = %s "
+            "AND `snapshot_type` = 'after_trading'" + scope,
+            [previous_trade_date, *scope_params],
+        )
+        previous_assets = list(cursor.fetchall())
+    return trades, before, after, ticks, current_assets, previous_assets
 
 
 def create_table(connection, table: str) -> None:
@@ -471,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"--trade-date must be YYYY-MM-DD: {trade_date!r}") from exc
     connection = _connect_mysql(args)
     try:
-        trades, before, after, ticks = fetch_mysql_inputs(connection, args, trade_date)
+        trades, before, after, ticks, current_assets, previous_assets = fetch_mysql_inputs(connection, args, trade_date)
         if not args.dry_run and not args.no_create_table:
             create_table(connection, args.mysql_result_table)
         records_by_account, failures = calculate_records_by_account(
@@ -480,6 +541,8 @@ def main(argv: list[str] | None = None) -> int:
             before,
             after,
             ticks,
+            current_assets=current_assets,
+            previous_assets=previous_assets,
         )
         for (account_id, trader_id), exc in failures.items():
             LOGGER.error(

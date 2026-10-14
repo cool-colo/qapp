@@ -1,6 +1,7 @@
 #!/bin/bash
 
-LOG_DIR=/data/flc/code/quant/qapp/logs
+QAPP_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="${QAPP_ROOT}/logs"
 LOG_FILE="$LOG_DIR/restart_$(date +%F).log"
 
 exec >> "$LOG_FILE" 2>&1
@@ -8,7 +9,7 @@ exec >> "$LOG_FILE" 2>&1
 echo "========== $(date '+%F %T') Restart begin =========="
 
 SESSION=bigqmt5
-WORKDIR=/data/flc/code/quant/qapp
+WORKDIR="${QAPP_ROOT}"
 
 tmux send-keys -t "$SESSION" C-c
 sleep 15
