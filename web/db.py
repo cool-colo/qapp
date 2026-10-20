@@ -175,6 +175,58 @@ WHERE {" AND ".join(where)}
 ORDER BY {ts} ASC{limit_clause}
 """
 
+    def stock_info_query(self, stock_code: str, as_of: str) -> str:
+        """Latest daily stock metrics on/before as_of, with current basic details.
+
+        The wide table retains Tushare units: market caps in 万元, amount in 千元,
+        volume in 手, and rates in percent. Expose CNY, shares and fractional rates
+        to the frontend. Missing/non-finite metrics remain NULL, never zero.
+        """
+        metrics = [
+            ("close", "close"),
+            ("open", "open"),
+            ("high", "high"),
+            ("low", "low"),
+            ("pre_close", "previous_close"),
+            ("pct_chg / 100.0", "daily_change"),
+            ("total_mv * 10000.0", "total_market_cap"),
+            ("circ_mv * 10000.0", "circulating_market_cap"),
+            ("turn_over / 100.0", "turnover_rate"),
+            ("turnover_rate_f / 100.0", "free_float_turnover_rate"),
+            ("vol_ratio", "volume_ratio"),
+            ("pe_ttm", "pe_ttm"),
+            ("pb", "pb"),
+            ("vol * 100.0", "volume"),
+            ("amount * 1000.0", "amount"),
+        ]
+        select_metrics = ",\n        ".join(
+            f"if(isFinite({expression}), {expression}, NULL) AS {alias}"
+            for expression, alias in metrics
+        )
+        metric_names = ", ".join(f"daily.{alias}" for _, alias in metrics)
+        return f"""
+SELECT
+    basic.name AS stock_name, basic.industry, basic.area, basic.market,
+    nullIf(basic.list_date, toDate('1970-01-01')) AS listed_date,
+    daily.trade_date, {metric_names}
+FROM (
+    SELECT name, industry, area, market, list_date
+    FROM stock_basic
+    WHERE ts_code = {quote_literal(stock_code)}
+    LIMIT 1
+) AS basic
+LEFT JOIN (
+    SELECT trade_date,
+        {select_metrics}
+    FROM dws_stock_factor_wide
+    WHERE source_code = {quote_literal(stock_code)}
+      AND trade_date <= toDate({quote_literal(as_of)})
+    ORDER BY trade_date DESC
+    LIMIT 1
+) AS daily ON 1 = 1
+SETTINGS join_use_nulls = 1
+"""
+
 
 class NodeApiClient:
     """Minimal client for a live node's control API (stdlib urllib, like ClickHouse).

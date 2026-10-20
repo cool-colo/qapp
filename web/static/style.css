@@ -262,6 +262,30 @@ a.klink:hover { text-decoration: underline; }
 a.rlink { color: #ffa726; cursor: pointer; text-decoration: none; }
 a.rlink:hover { text-decoration: underline; }
 
+/* Delayed stock-name hover card, outside scrollable table containers. */
+.stock-hover-panel {
+  position: fixed; z-index: 60; width: 340px; max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 24px); overflow-y: auto; padding: 14px 16px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, .5); font-size: 12px; line-height: 1.5;
+}
+.stock-hover-panel[hidden] { display: none; }
+.stock-hover-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+.stock-hover-heading strong { font-size: 16px; color: var(--text); }
+.stock-hover-heading span, .stock-hover-meta, .stock-hover-footer { color: var(--muted); }
+.stock-hover-meta { margin-top: 3px; }
+.stock-hover-quote { display: flex; align-items: baseline; gap: 10px; margin: 12px 0; }
+.stock-hover-quote strong { font-size: 23px; }
+.stock-hover-quote > span:last-child { margin-left: auto; color: var(--muted); font-size: 11px; }
+.stock-hover-metrics {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px;
+  margin: 0; padding: 12px 0; border-top: 1px solid var(--border);
+}
+.stock-hover-metrics dt { color: var(--muted); font-size: 11px; }
+.stock-hover-metrics dd { margin: 2px 0 0; font-weight: 600; overflow-wrap: anywhere; }
+.stock-hover-footer { padding-top: 9px; border-top: 1px solid var(--border); font-size: 11px; }
+.stock-hover-message { padding: 16px 0; color: var(--muted); }
+
 .chart { width: calc(100% - 40px); height: 460px; margin: 16px 20px; background: var(--panel); border-radius: 6px; }
 .chart-tall { height: 620px; }
 

@@ -94,7 +94,15 @@ class FakeInstrument:
         self.raw_symbol = str(instrument_id).removesuffix(".QMT")
         self.lot_size = Decimal(str(lot_size))
         self.price_increment = Decimal(str(price_increment))
-        self.info = {"fields": fields or {}}
+        self.info = {
+            "fields": fields or {},
+            "limit_order_quantity_rules": {
+                "min_quantity": 100,
+                "max_quantity": 1000000,
+                "quantity_increment": 100,
+                "allow_odd_lot_sell": True,
+            },
+        }
 
     def make_qty(self, value):
         return Decimal(str(value))
@@ -332,6 +340,8 @@ class TestableTargetQuantityStrategy:
     _free_cash = TargetQuantityStrategy._free_cash
     _nautilus_free_cash = TargetQuantityStrategy._nautilus_free_cash
     _log_account_sizing_snapshot = TargetQuantityStrategy._log_account_sizing_snapshot
+    _broker_total_asset_from_components = TargetQuantityStrategy._broker_total_asset_from_components
+    _info_decimal = staticmethod(TargetQuantityStrategy._info_decimal)
     _broker_account_decimal = TargetQuantityStrategy._broker_account_decimal
     _broker_accounts = TargetQuantityStrategy._broker_accounts
     _account_info = staticmethod(TargetQuantityStrategy._account_info)
@@ -1084,6 +1094,117 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(intent.side, OrderSide.BUY)
         self.assertEqual(intent.quantity, Decimal("2500"))
         self.assertEqual(strategy._estimated_buy_cost(str(INST_A), Decimal("10000")), Decimal("25000.0"))
+
+    def make_star_strategy(self, **kwargs) -> TestableTargetQuantityStrategy:
+        strategy = self.make_strategy(**kwargs)
+        # Keep the same symbol and native lot size to prove execution reads reference metadata.
+        strategy.cache.instruments[INST_A].info["limit_order_quantity_rules"] = {
+            "min_quantity": 200,
+            "max_quantity": 100000,
+            "quantity_increment": 1,
+            "allow_odd_lot_sell": True,
+        }
+        return strategy
+
+    def test_star_buy_slices_redistribute_small_tail(self) -> None:
+        strategy = self.make_star_strategy(
+            free_cash="1000000", prices={INST_A: 400.0}, order_slice_notional="280000",
+        )
+
+        strategy.update_target_quantities({INST_A: 2200}, date(2026, 7, 2), "star")
+
+        quantities = [order.quantity for order in strategy.submitted_orders]
+        self.assertEqual(sum(quantities), Decimal("2200"))
+        self.assertTrue(all(200 <= quantity <= 100000 for quantity in quantities))
+        self.assertNotIn(Decimal("100"), quantities)
+        self.assertTrue(all(order.quantity * order.price <= 280000 for order in strategy.submitted_orders))
+
+    def test_star_buy_remainder_below_minimum_is_not_resubmitted(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_star_strategy(
+            positions={INST_A: Decimal("2100")}, prices={INST_A: 400.0},
+        )
+        strategy._deferred_buys[str(INST_A)] = Decimal("2200")
+
+        strategy.update_target_quantities({INST_A: 2200}, trading_date, "star")
+        strategy._converge_to_target(trading_date, "timer")
+
+        self.assertEqual(strategy.submitted_orders, [])
+        self.assertEqual(strategy._deferred_buys, {})
+        self.assertEqual(strategy.order_events[-1].reason, "no_legal_order_quantity")
+        context = strategy.order_events[-1].extra["intent_context"]
+        self.assertEqual(context["min_order_quantity"], Decimal("200"))
+        self.assertEqual(context["untradeable_quantity"], Decimal("100"))
+        self.assertFalse(strategy._target_achieved())
+
+    def test_star_buy_accepts_single_share_increments_above_minimum(self) -> None:
+        strategy = self.make_star_strategy(prices={INST_A: 400.0})
+
+        strategy.update_target_quantities({INST_A: 201}, date(2026, 7, 2), "star")
+
+        self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("201")])
+
+    def test_submission_rechecks_quantity_even_when_splitter_is_bypassed(self) -> None:
+        strategy = self.make_star_strategy(prices={INST_A: 400.0})
+        intent = strategy._target_order_intent(str(INST_A), Decimal("2200"))
+
+        for quantity in ("100", "100001", "201.5"):
+            with self.subTest(quantity=quantity):
+                submitted = strategy._submit_order_quantity(
+                    date(2026, 7, 2), intent, Decimal(quantity), "invalid_slice",
+                )
+
+                self.assertFalse(submitted)
+                self.assertEqual(strategy.submitted_orders, [])
+                self.assertEqual(strategy.order_events[-1].reason, "invalid_order_quantity")
+
+    def test_star_liquidation_can_sell_entire_subminimum_balance(self) -> None:
+        strategy = self.make_star_strategy(
+            positions={INST_A: Decimal("100")}, prices={INST_A: 400.0},
+        )
+
+        strategy.update_target_quantities({INST_A: 0}, date(2026, 7, 2), "liquidate")
+
+        self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("100")])
+        self.assertEqual(strategy.submitted_orders[0].side, OrderSide.SELL)
+
+    def test_star_partial_sell_cannot_use_small_balance_exception(self) -> None:
+        strategy = self.make_star_strategy(
+            positions={INST_A: Decimal("300")}, prices={INST_A: 400.0},
+        )
+
+        strategy.update_target_quantities({INST_A: 200}, date(2026, 7, 2), "partial_sell")
+
+        self.assertEqual(strategy.submitted_orders, [])
+        self.assertEqual(strategy.order_events[-1].reason, "no_legal_order_quantity")
+
+    def test_sellable_clamp_can_leave_one_legal_small_balance_order(self) -> None:
+        strategy = self.make_star_strategy(
+            positions={INST_A: Decimal("300")}, prices={INST_A: 400.0},
+        )
+        strategy._execution_state_reconciler.update_from_mass_status(
+            type("MassStatus", (), {"position_reports": {
+                INST_A: type("PositionReport", (), {
+                    "instrument_id": INST_A, "can_use_volume": Decimal("100"),
+                })(),
+            }})(),
+        )
+
+        strategy.update_target_quantities({INST_A: 0}, date(2026, 7, 2), "clamp")
+
+        self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("100")])
+
+    def test_liquidation_sells_odd_balance_after_regular_slices(self) -> None:
+        strategy = self.make_strategy(
+            positions={INST_A: Decimal("1050")}, prices={INST_A: 10.0},
+            order_slice_notional="10000",
+        )
+
+        strategy.update_target_quantities({INST_A: 0}, date(2026, 7, 2), "liquidate")
+
+        self.assertEqual([order.quantity for order in strategy.submitted_orders], [
+            Decimal("900"), Decimal("150"),
+        ])
 
     def test_convergence_reuses_prebuilt_intent_for_submission(self) -> None:
         strategy = self.make_strategy(

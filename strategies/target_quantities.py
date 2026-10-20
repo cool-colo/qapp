@@ -36,10 +36,11 @@ from nautilus_trader.trading.strategy import Strategy
 
 from strategies.async_scheduling import AsyncAwaitableScheduler
 from strategies.execution_reconciliation import ExecutionStateReconciler
+from strategies.order_splitter import LimitOrderQuantityRules
+from strategies.order_splitter import NotionalOrderSplitter
 from strategies.pricing import OpenOffsetBuyPriceStrategy
 from strategies.pricing import OpenOffsetSellPriceStrategy
 from strategies.pricing import PriceContext
-from strategies.order_splitter import NotionalOrderSplitter
 from strategies.trading_control import TradingController
 
 # QMT repurposes the full-tick ``open_int`` field as a real-time market-status code
@@ -2000,6 +2001,17 @@ class TargetQuantityStrategy(Strategy):
             intent.context.record(slice_count=len(slices))
             if not slices:
                 intent.context.record(cash_gate="skipped", skip_reason="no_order_slices")
+                self._deferred_buys.pop(instrument_id, None)
+                self._record_order(
+                    trading_date,
+                    instrument_id,
+                    "buy",
+                    0,
+                    target_qty,
+                    "skipped",
+                    "no_legal_order_quantity",
+                    intent_context=intent.context,
+                )
                 continue
             submitted_any = False
             for slice_index, quantity in enumerate(slices):
@@ -2031,7 +2043,7 @@ class TargetQuantityStrategy(Strategy):
                     break
                 if not submitted_any:
                     self._record_target(trading_date, instrument_id, target_qty, reason, intent.context)
-                self._submit_order_quantity(
+                submitted = self._submit_order_quantity(
                     trading_date=trading_date,
                     intent=intent,
                     quantity=quantity,
@@ -2039,6 +2051,8 @@ class TargetQuantityStrategy(Strategy):
                     slice_index=slice_index,
                     slice_count=len(slices),
                 )
+                if not submitted:
+                    break
                 submitted_any = True
                 free_cash -= est_cost
                 intent.context.record(
@@ -2100,11 +2114,21 @@ class TargetQuantityStrategy(Strategy):
         return TargetOrderIntent(instrument_id, instrument, side, quantity, price, context)
 
     def _order_slices(self, intent: TargetOrderIntent) -> list[Decimal]:
-        return self._order_splitter.split(
+        rules = LimitOrderQuantityRules.from_instrument(intent.instrument)
+        quantity = Decimal(str(intent.quantity))
+        slices = self._order_splitter.split(
             instrument=intent.instrument,
-            quantity=Decimal(str(intent.quantity)),
+            quantity=quantity,
             price=Decimal(str(intent.price)),
+            allow_odd_lot=intent.side == OrderSide.SELL and quantity == intent.context.current_qty,
         )
+        intent.context.record(
+            min_order_quantity=rules.min_quantity,
+            max_order_quantity=rules.max_quantity,
+            order_quantity_increment=rules.quantity_increment,
+            untradeable_quantity=quantity - sum(slices, Decimal("0")),
+        )
+        return slices
 
     def _intent_context_from_order(self, order: Any, target_qty: Decimal) -> IntentContext:
         instrument_id = getattr(order, "instrument_id")
@@ -2181,8 +2205,21 @@ class TargetQuantityStrategy(Strategy):
             trading_date=trading_date,
             slice_count=len(slices),
         )
+        if not slices:
+            self._record_order(
+                trading_date,
+                instrument_id_text,
+                intent.side.name.lower(),
+                0,
+                target_qty,
+                "skipped",
+                "no_legal_order_quantity",
+                intent_context=intent.context,
+            )
+            return False
+        submitted_any = False
         for slice_index, quantity in enumerate(slices):
-            self._submit_order_quantity(
+            submitted = self._submit_order_quantity(
                 trading_date=trading_date,
                 intent=intent,
                 quantity=quantity,
@@ -2190,7 +2227,8 @@ class TargetQuantityStrategy(Strategy):
                 slice_index=slice_index,
                 slice_count=len(slices),
             )
-        return True
+            submitted_any = submitted_any or submitted
+        return submitted_any
 
     def _submit_order_quantity(
         self,
@@ -2223,6 +2261,24 @@ class TargetQuantityStrategy(Strategy):
             quantity = clamped_quantity
         else:
             intent.context.record(clamped_quantity=quantity)
+        rules = LimitOrderQuantityRules.from_instrument(intent.instrument)
+        allow_odd_lot = (
+            intent.side == OrderSide.SELL
+            and quantity == intent.context.details["sellable_qty"]
+        )
+        if not rules.is_valid(quantity, allow_odd_lot=allow_odd_lot):
+            intent.context.record(skip_reason="invalid_order_quantity")
+            self._record_order(
+                trading_date,
+                str(intent.instrument_id),
+                intent.side.name.lower(),
+                0,
+                target_qty,
+                "skipped",
+                "invalid_order_quantity",
+                intent_context=intent.context,
+            )
+            return False
         if intent.price is None:
             self.log.error(
                 f"Cannot submit order for {intent.instrument_id}: missing limit price "

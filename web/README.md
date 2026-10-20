@@ -23,6 +23,16 @@ Every table goes through one shared renderer, which prefixes a leading **序号*
 row-number column: it numbers the *visible* rows, so it follows the current sort/filter
 and stays pinned to the left edge while a wide table scrolls sideways.
 
+Hover over a **stock name for 300 ms** to open its information panel: 总市值、
+流通市值、换手率、自由流通换手率、市盈率 TTM、市净率、量比、成交额、成交量、
+OHLC prices, industry, market and listing date. It reads daily metrics from
+ClickHouse `dws_stock_factor_wide` and basic details from `stock_basic`, and displays
+the actual data date. Historical rows use the latest daily record on or before the
+row/snapshot date; live tables use the latest daily record available. Moving away
+before 300 ms cancels the panel and the query. Moving into an open panel keeps
+it visible; leaving it or pressing Escape closes it. Stock-name clicks still open
+信号 R 线.
+
 It is a self-contained consumer — nothing here is imported by the strategy / backtest
 / live trading code.
 
@@ -81,6 +91,7 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/returns` | `source, account, trader, start, end, instrument_suffix?` |
 | `GET /api/signal_quality` | `account, trader, start, end, holding_days=3, predictions_table?` |
 | `GET /api/kline` | `stock_code, start, end` |
+| `GET /api/stock_info` | `stock_code, date?` (latest daily metrics on/before date; default today) |
 | `GET /api/kline_with_trades` | `source, account, trader, stock_code, start, end` |
 | `GET /api/realtime/positions` | `account, trader` |
 | `GET /api/strategy/targets` | `account, trader` |

@@ -470,6 +470,24 @@ def get_signal_quality(
 # ---- ClickHouse k-line -----------------------------------------------------
 
 
+@app.get("/api/stock_info")
+def get_stock_info(
+    stock_code: str = Query(..., pattern=r"^[0-9]{6}\.(SH|SZ|BJ)$"),
+    as_of: date | None = Query(None, alias="date"),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Daily metrics for the stock-name hover panel; historical views stay as-of."""
+    day = (as_of or date.today()).isoformat()
+    sql = data.clickhouse.stock_info_query(stock_code, day)
+    try:
+        rows = data.clickhouse.query(sql)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail="Stock information is unavailable") from exc
+    if not rows:
+        raise HTTPException(status_code=404, detail="Unknown stock")
+    return {"stock_code": stock_code, "as_of": day, **jsonable_rows(rows)[0]}
+
+
 def _todays_tick_bar(mysql: MySqlSource, stock_code: str, day: str) -> dict[str, Any] | None:
     """Build a daily bar for ``day`` from live_stock_tick_snapshot (MySQL).
 
@@ -1159,7 +1177,7 @@ def index() -> HTMLResponse:
     # Inject a cache-busting ?v=<mtime> onto the local JS/CSS so a browser never
     # serves a stale bundle after a deploy (index.html itself is returned no-store).
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    for asset in ("app.js", "style.css"):
+    for asset in ("app.js", "stock_hover.js", "style.css"):
         try:
             ver = int((STATIC_DIR / asset).stat().st_mtime)
         except OSError:

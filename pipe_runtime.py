@@ -8,8 +8,8 @@ from pathlib import Path
 
 def configure_runtime_paths(project_root: Path) -> None:
     parent = project_root.parent
-    nautilus = Path(os.environ.get("NAUTILUS_TRADER_PATH", parent / "nautilus_trader_pipe")).resolve()
-    client = Path(os.environ.get("BIGQMT_CLIENT_PATH", parent / "xtquant_big_convert_dev")).resolve()
+    nautilus = Path(os.environ.get("NAUTILUS_TRADER_PATH", parent / "nautilus_trader")).resolve()
+    client = Path(os.environ.get("BIGQMT_CLIENT_PATH", parent / "xtquant_big_convert")).resolve()
     if not (nautilus / "nautilus_trader" / "__init__.py").is_file():
         raise RuntimeError(f"Nautilus worktree is missing: {nautilus}")
     if not (client / "src" / "bigqmt_signal_trader" / "xtquant_compat.py").is_file():

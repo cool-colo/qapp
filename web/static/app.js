@@ -488,7 +488,8 @@ function renderTable(container, rows, opts = {}) {
       if (c === "stock_code") {
         disp = `<a class="klink" data-code="${row.stock_code}">${disp || row.stock_code}</a>`;
       } else if (c === "stock_name" || c === "name") {
-        disp = `<a class="rlink" data-code="${row.stock_code}">${disp || row.stock_code}</a>`;
+        const stockDate = String(opts.stockInfoDate || row.trade_date || "").slice(0, 10);
+        disp = `<a class="rlink stock-hover-trigger" data-code="${row.stock_code}" data-stock-date="${stockDate}">${disp || row.stock_code}</a>`;
       }
     }
     return `<td class="${cls}">${disp}</td>`;
@@ -749,10 +750,10 @@ async function loadSnapshot() {
       api("/api/trades", { ...base, date }),
     ]);
     renderTable("#snap-asset", asset.rows);
-    renderTable("#snap-positions", pos.rows, { linkStock: true });
-    renderTable("#snap-target", tgt.rows, { linkStock: true });
-    renderTable("#snap-orders", orders.rows, { linkStock: true });
-    renderTable("#snap-trades", trades.rows, { linkStock: true });
+    renderTable("#snap-positions", pos.rows, { linkStock: true, stockInfoDate: date });
+    renderTable("#snap-target", tgt.rows, { linkStock: true, stockInfoDate: date });
+    renderTable("#snap-orders", orders.rows, { linkStock: true, stockInfoDate: date });
+    renderTable("#snap-trades", trades.rows, { linkStock: true, stockInfoDate: date });
   } catch (e) { toast(e.message); }
   // 信号: the historical ranked signal cross-section for the selected date, read from the
   // ClickHouse warehouse (needs a live node only to resolve the table name). Loaded
@@ -766,7 +767,7 @@ async function loadSnapshot() {
       intCols: new Set(["rank"]),
       rateCols: new Set(["pred_return_live"]),
       signCols: new Set(["pred_return_live"]),
-      linkStock: true,
+      linkStock: true, stockInfoDate: date,
     });
   } catch (e) { $("#snap-signals").innerHTML = '<div class="empty">获取失败</div>'; }
 }
