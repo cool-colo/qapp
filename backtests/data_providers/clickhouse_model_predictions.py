@@ -51,6 +51,7 @@ class ClickHouseModelPredictionDataProvider(ModelPredictionDataProvider):
         stock_codes = self._requested_stock_codes(request)
 
         predictions = self._predictions(
+            database=request.predictions_database,
             table=request.predictions_table,
             start_date=query_start,
             end_date=query_end,
@@ -58,7 +59,7 @@ class ClickHouseModelPredictionDataProvider(ModelPredictionDataProvider):
         )
         if predictions.empty:
             raise RuntimeError(
-                f"No predictions found in {request.predictions_table} for {query_start}~{query_end}",
+                f"No predictions found in {self._qualified_table(request.predictions_database, request.predictions_table)} for {query_start}~{query_end}",
             )
 
         excluded = {normalize_stock_code(code) for code in (request.excluded_stock_codes or set())}
@@ -101,7 +102,13 @@ class ClickHouseModelPredictionDataProvider(ModelPredictionDataProvider):
         stock_codes = self._requested_stock_codes(request)
         start = pd.Timestamp(request.start_date).date()
         end = pd.Timestamp(request.end_date).date()
-        return self._prediction_sql(request.predictions_table, start, end, stock_codes)
+        return self._prediction_sql(
+            database=request.predictions_database,
+            table=request.predictions_table,
+            start_date=start,
+            end_date=end,
+            stock_codes=stock_codes,
+        )
 
     def _requested_stock_codes(self, request: ModelPredictionDataRequest) -> list[str] | None:
         if request.all_stocks:
@@ -146,17 +153,19 @@ LIMIT {history_days:d}
 
     def _predictions(
         self,
+        database: str | None,
         table: str,
         start_date: date,
         end_date: date,
         stock_codes: list[str] | None,
     ) -> pd.DataFrame:
-        sql = self._prediction_sql(table, start_date, end_date, stock_codes)
+        sql = self._prediction_sql(database, table, start_date, end_date, stock_codes)
         rows = self._fetch(sql)
         return normalize_prediction_frame(pd.DataFrame(rows))
 
     def _prediction_sql(
         self,
+        database: str | None,
         table: str,
         start_date: date,
         end_date: date,
@@ -171,11 +180,19 @@ LIMIT {history_days:d}
             where.insert(0, f"stock_code IN ({values})")
         sql = f"""
 SELECT stock_code, pred_date AS date, score,  pred_return_live
-FROM {quote_identifier(table)}
+FROM {self._qualified_table(database, table)}
 WHERE {" AND ".join(where)}
 ORDER BY date, score DESC
 """
         return ensure_json_each_row(sql)
+
+    @staticmethod
+    def _qualified_table(database: str | None, table: str) -> str:
+        if database is None:
+            return quote_identifier(table)
+        if "." in table:
+            raise ValueError("table must not be database-qualified when database is specified separately")
+        return f"{quote_identifier(database)}.{quote_identifier(table)}"
 
     def _instrument_metadata(
         self,

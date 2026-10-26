@@ -958,7 +958,7 @@ async function loadSignalQuality() {
     const { columns, rows } = res;
     const hint = $("#sq-hint");
     if (hint) {
-      hint.textContent = `预测表 ${res.predictions_table || "?"}｜窗口 ${res.holding_days} 日｜`
+      hint.textContent = `预测库 ${res.predictions_database || "?"}.${res.predictions_table || "?"}｜窗口 ${res.holding_days} 日｜`
         + "标签=复权开盘价 t+1→t+(N+1)，基准=中证全指；"
         + "近端信号无完整未来窗口时，用 T+1 持有至今(复权开→现价)或实时(现价/开)近似，见「标签来源」列";
     }
@@ -1833,7 +1833,7 @@ const SNAP_SIGNAL_HEADERS = {
 };
 const SI_INFO_LABELS = {
   risk_model_id: "风险模型 ID", alpha_model_id: "Alpha 模型 ID",
-  risk_manager_mode: "风控模式", predictions_table: "预测表",
+  risk_manager_mode: "风控模式", predictions_database: "预测库", predictions_table: "预测表",
   max_positions: "最大持仓数",
 };
 
@@ -1965,7 +1965,7 @@ async function loadStratInfo() {
   try {
     const sig = await api("/api/strategy/signals", params);
     $("#si-meta").textContent =
-      `预测表：${sig.predictions_table || "—"} · 信号日期：${sig.signal_date || "—"} · 共 ${sig.count || 0} 条`;
+      `预测库：${sig.predictions_database || "—"}.${sig.predictions_table || "—"} · 信号日期：${sig.signal_date || "—"} · 共 ${sig.count || 0} 条`;
     renderSignalSummary(sig.signals || []);
     renderTable("#si-signals", sig.signals || [], {
       columns: SI_SIGNAL_COLS, headers: SI_SIGNAL_HEADERS,

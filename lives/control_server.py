@@ -665,6 +665,7 @@ class LiveControlServer:
             "risk_model_id": config.risk_manager_risk_model_id,
             "alpha_model_id": config.alpha_model_id,
             "risk_manager_mode": config.risk_manager_mode,
+            "predictions_database": config.predictions_database,
             "predictions_table": config.predictions_table,
             "max_positions": config.max_positions,
         }
@@ -742,6 +743,7 @@ class LiveControlServer:
                     },
                 )
         return {
+            "predictions_database": self._strategy.config.predictions_database,
             "predictions_table": self._strategy.config.predictions_table,
             "signal_date": None if signal_date is None else str(signal_date),
             "count": len(rows),

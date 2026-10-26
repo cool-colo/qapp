@@ -4,7 +4,8 @@ This is a ClickHouse SQL port of the **daily cross-section + TopN-label block** 
 reference implementation
 ``/nfs_data/wangzichao/workspace/quant_data_ana_service/scripts/compute_universal_offline_metrics_20260820.py``.
 It measures how well a model's per-day ``score`` predicts a realized forward return
-(the *label*) for the predictions table that a live node reports via ``/strategy/info``.
+(the *label*) for the predictions database/table that a live node reports via
+``/strategy/info``.
 
 The label and every metric are defined to match that reference EXACTLY:
 
@@ -45,7 +46,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from web.db import ClickHouseClient, quote_identifier, quote_literal
+from web.db import ClickHouseClient, quote_identifier, quote_literal, quote_qualified_table
 
 # Benchmark index for the excess-return columns (中证全指).
 BENCHMARK_TS_CODE = "000985.CSI"
@@ -121,6 +122,7 @@ def _realtime_values_sql(rows: list[tuple[str, float, float]]) -> str:
 
 
 def build_signal_quality_sql(
+    database: str | None,
     table: str,
     start_date: str,
     end_date: str,
@@ -129,8 +131,8 @@ def build_signal_quality_sql(
 ) -> str:
     """Build the per-day signal-quality ClickHouse SQL.
 
-    ``table`` is untrusted (it comes from a live node) and is quoted via
-    ``quote_identifier``; ``start_date``/``end_date`` via ``quote_literal``.
+    ``database``/``table`` are untrusted (they come from a live node) and are quoted
+    via ``quote_qualified_table``; ``start_date``/``end_date`` via ``quote_literal``.
     ``holding_days`` MUST already be validated as one of ``ALLOWED_HOLDING_DAYS`` — it is
     inlined as an int (offsets ``1`` and ``h+1``, frame ``h+1``, gate ``h+2``).
 
@@ -146,7 +148,7 @@ def build_signal_quality_sql(
     if holding_days not in ALLOWED_HOLDING_DAYS:
         raise ValueError(f"holding_days must be one of {ALLOWED_HOLDING_DAYS}: {holding_days!r}")
 
-    tbl = quote_identifier(table)
+    tbl = quote_qualified_table(database, table)
     start = quote_literal(start_date)
     end = quote_literal(end_date)
     bench = quote_literal(BENCHMARK_TS_CODE)
@@ -469,6 +471,7 @@ ORDER BY trade_date
 def query_signal_quality(
     clickhouse: ClickHouseClient,
     *,
+    database: str | None,
     table: str,
     start_date: str,
     end_date: str,
@@ -477,6 +480,11 @@ def query_signal_quality(
 ) -> list[dict[str, Any]]:
     """Run the signal-quality SQL and return per-day rows (already JSON-native)."""
     sql = build_signal_quality_sql(
-        table, start_date, end_date, holding_days, realtime_ticks=realtime_ticks
+        database,
+        table,
+        start_date,
+        end_date,
+        holding_days,
+        realtime_ticks=realtime_ticks,
     )
     return clickhouse.query(sql)

@@ -91,6 +91,35 @@ def _node_api(data: DataAccess, account: str, trader: str) -> NodeApiClient:
     return client
 
 
+def _prediction_table(
+    data: DataAccess,
+    account: str,
+    trader: str,
+    table_override: str | None,
+    database_override: str | None,
+) -> tuple[str, str, NodeApiClient | None]:
+    if table_override:
+        if not database_override:
+            raise HTTPException(
+                status_code=400,
+                detail="predictions_database is required when predictions_table is overridden",
+            )
+        return table_override, database_override, None
+
+    client = _node_api(data, account, trader)
+    try:
+        info = client.get("/strategy/info")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    table = info.get("predictions_table")
+    database = info.get("predictions_database")
+    if not table:
+        raise HTTPException(status_code=502, detail="live node did not report a predictions_table")
+    if not database:
+        raise HTTPException(status_code=502, detail="live node did not report a predictions_database")
+    return table, database, client
+
+
 def _fetch_realtime_ticks(client: NodeApiClient) -> dict[str, Any] | None:
     """Best-effort node whole-market snapshot for the signal-quality rule-2 fallback.
 
@@ -416,41 +445,38 @@ def get_signal_quality(
     end: str,
     holding_days: int = Query(3),
     predictions_table: str | None = Query(None),
+    predictions_database: str | None = Query(None),
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
     """Per-day signal-quality metrics for an account's predictions table (ClickHouse).
 
-    The predictions table is per-account: unless overridden via ``predictions_table``,
-    it is read from the account's live node (``/strategy/info`` → ``predictions_table``),
-    the same source the 策略信息/策略 view uses.
+    The predictions database and table are per-account: unless overridden, they are read
+    from the account's live node (``/strategy/info`` → ``predictions_database`` /
+    ``predictions_table``), the same source the 策略信息/策略 view uses.
     """
     if holding_days not in ALLOWED_HOLDING_DAYS:
         raise HTTPException(
             status_code=400,
             detail=f"holding_days must be one of {list(ALLOWED_HOLDING_DAYS)}",
         )
-    table = predictions_table
+    table, database, node_client = _prediction_table(
+        data,
+        account,
+        trader,
+        predictions_table,
+        predictions_database,
+    )
     realtime_ticks: dict[str, Any] | None = None
-    if not table:
-        client = _node_api(data, account, trader)
-        try:
-            info = client.get("/strategy/info")
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        table = info.get("predictions_table")
-        if not table:
-            raise HTTPException(
-                status_code=502,
-                detail="live node did not report a predictions_table",
-            )
+    if node_client is not None:
         # Rule-2 fallback: best-effort fetch of the node's whole-market snapshot so
         # yesterday's/today's signal date (no offline T+1 row yet) gets an approximate
         # intraday label. Node errors are non-fatal — the report still renders normal
         # + T+1 rows. Skipped on the predictions_table override path (no node).
-        realtime_ticks = _fetch_realtime_ticks(client)
+        realtime_ticks = _fetch_realtime_ticks(node_client)
     try:
         rows = query_signal_quality(
             data.clickhouse,
+            database=database,
             table=table,
             start_date=start,
             end_date=end,
@@ -462,6 +488,7 @@ def get_signal_quality(
     return {
         "columns": SIGNAL_QUALITY_COLUMNS,
         "rows": rows,
+        "predictions_database": database,
         "predictions_table": table,
         "holding_days": holding_days,
     }
@@ -606,31 +633,29 @@ def get_signal_series(
     end: str,
     source: str | None = Query(None),
     predictions_table: str | None = Query(None),
+    predictions_database: str | None = Query(None),
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
     """A stock's daily signal rank/score series (ClickHouse) + its buy/sell fills (MySQL).
 
-    The predictions table is per-account: unless overridden via ``predictions_table``, it is
-    read from the account's live node (``/strategy/info`` → ``predictions_table``), the same
-    source the 策略信息/信号质量 views use. ``rank`` is the per-day cross-section rank by score.
+    The predictions database and table are per-account: unless overridden, they are read
+    from the account's live node (``/strategy/info`` → ``predictions_database`` /
+    ``predictions_table``), the same source the 策略信息/信号质量 views use. ``rank`` is
+    the per-day cross-section rank by score.
     Buy/sell fills come from ``live_trade`` for the same account/stock/window (as 个股K线 does),
     so they overlay the signal line as markers.
     """
-    table = predictions_table
-    if not table:
-        client = _node_api(data, account, trader)
-        try:
-            info = client.get("/strategy/info")
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        table = info.get("predictions_table")
-        if not table:
-            raise HTTPException(
-                status_code=502,
-                detail="live node did not report a predictions_table",
-            )
+    table, database, _ = _prediction_table(
+        data,
+        account,
+        trader,
+        predictions_table,
+        predictions_database,
+    )
     try:
-        series = data.clickhouse.query(build_signal_series_sql(table, stock_code, start, end))
+        series = data.clickhouse.query(
+            build_signal_series_sql(database, table, stock_code, start, end),
+        )
     except Exception as exc:  # noqa: BLE001 — surface DB errors as 500 with a message
         raise HTTPException(status_code=500, detail=f"signal_series query failed: {exc}") from exc
 
@@ -658,6 +683,7 @@ def get_signal_series(
         "series": jsonable_rows(series),
         "trades": jsonable_rows(trades),
         "stock_name": data.resolve_names([stock_code]).get(stock_code, ""),
+        "predictions_database": database,
         "predictions_table": table,
     }
 
@@ -668,34 +694,31 @@ def get_snapshot_signals(
     trader: str,
     date: str,
     predictions_table: str | None = Query(None),
+    predictions_database: str | None = Query(None),
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
     """Historical ranked signal cross-section for one date (ClickHouse warehouse).
 
     Backs 按日快照 → 信号. Unlike ``/api/strategy/signals`` (the live node's in-memory
     top-N), this reads the per-account predictions table by ``pred_date``, so it works for
-    any past date. The table name comes from the account's live node (``/strategy/info`` →
-    ``predictions_table``) unless overridden.
+    any past date. The database and table name come from the account's live node
+    (``/strategy/info`` → ``predictions_database`` / ``predictions_table``) unless
+    overridden.
     """
-    table = predictions_table
-    if not table:
-        client = _node_api(data, account, trader)
-        try:
-            info = client.get("/strategy/info")
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        table = info.get("predictions_table")
-        if not table:
-            raise HTTPException(
-                status_code=502,
-                detail="live node did not report a predictions_table",
-            )
+    table, database, _ = _prediction_table(
+        data,
+        account,
+        trader,
+        predictions_table,
+        predictions_database,
+    )
     try:
-        rows = data.clickhouse.query(build_snapshot_signals_sql(table, date))
+        rows = data.clickhouse.query(build_snapshot_signals_sql(database, table, date))
     except Exception as exc:  # noqa: BLE001 — surface DB errors as 500 with a message
         raise HTTPException(status_code=500, detail=f"snapshot_signals query failed: {exc}") from exc
     return {
         "signals": data.attach_names(jsonable_rows(rows)),
+        "predictions_database": database,
         "predictions_table": table,
         "date": date,
     }

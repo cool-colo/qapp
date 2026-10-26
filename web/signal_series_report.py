@@ -7,16 +7,17 @@ ASC)``, matching how the offline ranking and ``signal_quality_report`` derive it
 therefore runs over the FULL daily cross-section first, and only then filters to the target
 stock (a single stock cannot be ranked in isolation).
 
-The predictions table is per-account and comes from a live node (``/strategy/info`` →
-``predictions_table``); it is untrusted and quoted via ``quote_identifier``. Dates are
-quoted via ``quote_literal``. The table stores ``stock_code`` in exchange-prefix form
+The predictions database and table are per-account and come from a live node
+(``/strategy/info`` → ``predictions_database`` / ``predictions_table``); they are
+untrusted and quoted via ``quote_qualified_table``. Dates are quoted via
+``quote_literal``. The table stores ``stock_code`` in exchange-prefix form
 (``SZ302132``); it is converted to factor form (``302132.SZ``) in-SQL exactly as
 ``signal_quality_report`` does, and the target stock is matched against that factor form.
 """
 
 from __future__ import annotations
 
-from web.db import quote_identifier, quote_literal
+from web.db import quote_qualified_table, quote_literal
 
 # Per-row column order returned by build_signal_series_sql.
 SIGNAL_SERIES_COLUMNS = ["date", "rank", "score"]
@@ -25,15 +26,22 @@ SIGNAL_SERIES_COLUMNS = ["date", "rank", "score"]
 SNAPSHOT_SIGNALS_COLUMNS = ["rank", "stock_code", "score", "pred_return_live"]
 
 
-def build_signal_series_sql(table: str, stock_code: str, start: str, end: str) -> str:
+def build_signal_series_sql(
+    database: str | None,
+    table: str,
+    stock_code: str,
+    start: str,
+    end: str,
+) -> str:
     """Build the per-stock rank/score time-series ClickHouse SQL.
 
-    ``table`` is untrusted (from a live node) and quoted via ``quote_identifier``;
+    ``database``/``table`` are untrusted (from a live node) and quoted via
+    ``quote_qualified_table``;
     ``start``/``end``/``stock_code`` via ``quote_literal``. ``stock_code`` is the factor
     form (``000001.SZ``) as used elsewhere in the dashboard — matched against the in-SQL
     conversion of the table's exch-prefix ``stock_code``.
     """
-    tbl = quote_identifier(table)
+    tbl = quote_qualified_table(database, table)
     return f"""
 WITH ranked AS (
     SELECT
@@ -51,17 +59,17 @@ ORDER BY date
 """.strip()
 
 
-def build_snapshot_signals_sql(table: str, date: str) -> str:
+def build_snapshot_signals_sql(database: str | None, table: str, date: str) -> str:
     """Build the ranked signal cross-section for a single ``pred_date`` (ClickHouse).
 
     Returns every stock's ``rank`` (by score within that day), factor-form ``stock_code``,
     ``score`` and ``pred_return_live`` for the given date, ordered by rank. This is the
     historical warehouse view behind 按日快照 → 信号 (not the live node's in-memory signals).
 
-    ``table`` is untrusted (from a live node) and quoted via ``quote_identifier``; ``date``
-    via ``quote_literal``.
+    ``database``/``table`` are untrusted (from a live node) and quoted via
+    ``quote_qualified_table``; ``date`` via ``quote_literal``.
     """
-    tbl = quote_identifier(table)
+    tbl = quote_qualified_table(database, table)
     return f"""
 SELECT
     row_number() OVER (ORDER BY score DESC, stock_code ASC) AS rank,

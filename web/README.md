@@ -89,7 +89,7 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/orders` | `source, account, trader, date?, stock_code?` |
 | `GET /api/trades` | `source, account, trader, date?, stock_code?` |
 | `GET /api/returns` | `source, account, trader, start, end, instrument_suffix?` |
-| `GET /api/signal_quality` | `account, trader, start, end, holding_days=3, predictions_table?` |
+| `GET /api/signal_quality` | `account, trader, start, end, holding_days=3, predictions_database?, predictions_table?` |
 | `GET /api/kline` | `stock_code, start, end` |
 | `GET /api/stock_info` | `stock_code, date?` (latest daily metrics on/before date; default today) |
 | `GET /api/kline_with_trades` | `source, account, trader, stock_code, start, end` |
@@ -116,6 +116,9 @@ accounts that have a node configured.
 last_price, last_close`) best-effort, to approximate the label for the newest signal
 date that has no offline forward window yet (`label_source = realtime_intraday`); a node
 error just drops those live rows. Skipped when `predictions_table` is overridden.
+Prediction-table endpoints resolve `predictions_database` and `predictions_table` from
+the live node's `/strategy/info`; an explicit table override must also provide its
+database.
 
 **Selling is opt-in.** `sell_enabled` in the config (**default false**, also settable as
 `WEB_SELL_ENABLED=true`) gates every sell action: `GET /api/config` exposes the flag so

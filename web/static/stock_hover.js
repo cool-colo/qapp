@@ -42,12 +42,26 @@
   function position() {
     if (!anchor || panel.hidden) return;
     const rect = anchor.getBoundingClientRect();
-    const gap = 8, margin = 12;
+    const gap = 8, margin = 12, horizontalOffset = 16;
     const width = panel.offsetWidth, height = panel.offsetHeight;
-    let top = rect.bottom + gap;
-    if (top + height > window.innerHeight - margin) top = rect.top - height - gap;
-    panel.style.left = `${Math.max(margin, Math.min(rect.left, window.innerWidth - width - margin))}px`;
-    panel.style.top = `${Math.max(margin, Math.min(top, window.innerHeight - height - margin))}px`;
+    const belowTop = rect.bottom + gap;
+    const aboveTop = rect.top - height - gap;
+    const rightLeft = rect.right + gap;
+    const leftLeft = rect.left - width - gap;
+
+    if (belowTop + height <= window.innerHeight - margin) {
+      panel.style.left = `${Math.max(margin, Math.min(rect.left + horizontalOffset, window.innerWidth - width - margin))}px`;
+      panel.style.top = `${belowTop}px`;
+    } else if (aboveTop >= margin) {
+      panel.style.left = `${Math.max(margin, Math.min(rect.left + horizontalOffset, window.innerWidth - width - margin))}px`;
+      panel.style.top = `${aboveTop}px`;
+    } else if (rightLeft + width <= window.innerWidth - margin) {
+      panel.style.left = `${rightLeft}px`;
+      panel.style.top = `${Math.max(margin, Math.min(rect.top, window.innerHeight - height - margin))}px`;
+    } else {
+      panel.style.left = `${Math.max(margin, leftLeft)}px`;
+      panel.style.top = `${Math.max(margin, Math.min(rect.top, window.innerHeight - height - margin))}px`;
+    }
   }
 
   function heading(name, code) {

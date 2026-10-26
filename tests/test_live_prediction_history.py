@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 from backtests.data_providers import ClickHouseConnectionConfig
 from backtests.data_providers import ModelPredictionDataRequest
@@ -80,6 +81,37 @@ def test_prediction_bundle_keeps_rank_for_stock_outside_candidate_cutoff() -> No
     assert bundle.prediction_ranks_by_date[signal_date]["000419.SZ"] == 2
 
 
+def test_prediction_sql_qualifies_database_and_table() -> None:
+    provider = ClickHouseModelPredictionDataProvider(
+        ClickHouseConnectionConfig(),
+    )
+
+    sql = provider._prediction_sql(
+        database="quant_models",
+        table="daily_model_predictions",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 31),
+        stock_codes=None,
+    )
+
+    assert "FROM `quant_models`.`daily_model_predictions`" in sql
+
+
+def test_prediction_sql_rejects_database_qualified_table_with_database() -> None:
+    provider = ClickHouseModelPredictionDataProvider(
+        ClickHouseConnectionConfig(),
+    )
+
+    with pytest.raises(ValueError, match="database-qualified"):
+        provider._prediction_sql(
+            database="quant_models",
+            table="other_db.daily_model_predictions",
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 31),
+            stock_codes=None,
+        )
+
+
 def test_live_loader_carries_daily_history_and_derives_latest_close() -> None:
     signal_date = date(2026, 7, 7)
     trading_date = date(2026, 7, 8)
@@ -104,6 +136,7 @@ def test_live_loader_carries_daily_history_and_derives_latest_close() -> None:
     )
     loader = LivePredictionDataLoader.__new__(LivePredictionDataLoader)
     loader.args = SimpleNamespace(
+        predictions_database="quant_models",
         predictions_table="daily_model_predictions",
         stock_codes="000001.SZ",
         all_stocks=False,
@@ -132,6 +165,7 @@ def test_live_loader_carries_daily_history_and_derives_latest_close() -> None:
 
     request = loader.prediction_provider.load.call_args.args[0]
     assert request.trading_history_days == 2
+    assert request.predictions_database == "quant_models"
     loader.daily_data_provider.load.assert_called_once_with(
         stock_codes=["000001.SZ"],
         start_date=date(2026, 7, 4),

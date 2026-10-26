@@ -13,6 +13,7 @@ import pandas as pd
 class ModelPredictionDataRequest:
     start_date: str
     end_date: str
+    predictions_database: str | None = None
     predictions_table: str = "model_predictions"
     stock_codes: list[str] | None = None
     all_stocks: bool = False

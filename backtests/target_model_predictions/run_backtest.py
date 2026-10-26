@@ -182,6 +182,10 @@ def parse_args() -> argparse.Namespace:
         "--predictions-table",
         default=env("TARGET_MODEL_PREDICTIONS_TABLE", "daily_model_predictions"),
     )
+    parser.add_argument(
+        "--predictions-database",
+        default=env("TARGET_MODEL_PREDICTIONS_DATABASE"),
+    )
     parser.add_argument("--stock-codes", default=",".join(env_list("MODEL_STOCK_CODES", "000001.SZ,000002.SZ")))
     parser.add_argument("--all-stocks", action="store_true", default=env_bool("MODEL_ALL_STOCKS", False))
     parser.add_argument("--excluded-stock-codes", default=",".join(env_list("MODEL_EXCLUDED_STOCK_CODES", "")))
@@ -233,6 +237,7 @@ def build_prediction_request(
     return ModelPredictionDataRequest(
         start_date=args.start,
         end_date=args.end,
+        predictions_database=args.predictions_database,
         predictions_table=args.predictions_table,
         stock_codes=env_list_from_value(args.stock_codes),
         all_stocks=args.all_stocks,

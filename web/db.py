@@ -79,6 +79,15 @@ def quote_identifier(identifier: str) -> str:
     return ".".join(f"`{part}`" for part in parts)
 
 
+def quote_qualified_table(database: str | None, table: str) -> str:
+    """Quote a ClickHouse table, with its database supplied separately."""
+    if not database:
+        return quote_identifier(table)
+    if "." in table:
+        raise ValueError("table must not be database-qualified when database is supplied separately")
+    return f"{quote_identifier(database)}.{quote_identifier(table)}"
+
+
 def quote_literal(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace("'", "\\'")
     return f"'{escaped}'"
