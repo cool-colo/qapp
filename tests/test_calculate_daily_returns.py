@@ -94,6 +94,49 @@ class DailyReturnCalculationTests(unittest.TestCase):
         self.assertEqual(summary["reference_amount"], Decimal("10000.0000"))
         self.assertEqual(summary["return_rate"], Decimal("0.01500000"))
 
+    def test_summary_can_be_forced_to_use_positions_and_trades(self) -> None:
+        position = {
+            "account_id": "account", "trader_id": "trader", "instrument_id": "600000.SH",
+            "stock_code": "600000.SH", "volume": 100,
+        }
+        rows = calculate_records(
+            "2026-07-27", trades=[], before_positions=[position], after_positions=[position],
+            ticks=[{"stock_code": "600000.SH", "last_price": "11", "last_close": "10"}],
+            current_asset=self._asset("1100", "8850", "200"),
+            previous_asset=self._asset("1000", "8900", "100"),
+            account_return_method="positions-and-trades",
+        )
+
+        summary = rows[-1]
+        self.assertEqual(summary["stock_code"], "summary")
+        self.assertEqual(summary["return_amount"], Decimal("100.0000"))
+        self.assertEqual(summary["reference_amount"], Decimal("1000.0000"))
+        self.assertEqual(summary["return_rate"], Decimal("0.10000000"))
+
+    @patch("scripts.calculate_daily_returns.load_env")
+    @patch("scripts.calculate_daily_returns.calculate_records_by_account", return_value=({}, {}))
+    @patch("scripts.calculate_daily_returns.fetch_mysql_inputs", return_value=([], [], [], [], [], []))
+    @patch("scripts.calculate_daily_returns._connect_mysql")
+    def test_main_passes_configured_account_return_method(
+        self,
+        connect_mysql: MagicMock,
+        _fetch_inputs: MagicMock,
+        calculate_by_account: MagicMock,
+        _load_env: MagicMock,
+    ) -> None:
+        result = main([
+            "--trade-date", "2026-07-27",
+            "--no-create-table",
+            "--account-return-method", "positions-and-trades",
+        ])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            calculate_by_account.call_args.kwargs["account_return_method"],
+            "positions-and-trades",
+        )
+        connect_mysql.return_value.close.assert_called_once_with()
+
     def test_summary_falls_back_when_either_asset_day_is_missing(self) -> None:
         position = {
             "account_id": "account", "trader_id": "trader", "instrument_id": "600000.SH",

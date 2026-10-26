@@ -20,11 +20,13 @@ today (``after_trading volume - today's buy volume``).  It is reconciled with
 ``before_trading volume - today's sell volume``; a discrepancy fails loudly so
 that a partial/missing snapshot is not silently reported as P&L.
 
-The portfolio ``summary`` uses the change in after-trading net value from the
-previous trading day: ``net value = market_value + cash + frozen_cash`` from
-``live_asset_snapshot``. Its return rate is the change divided by the previous
-net value. If either day's asset snapshot is missing, the summary falls back to
-the sum of the per-stock returns above.
+By default, the portfolio ``summary`` uses the change in after-trading net value
+from the previous trading day: ``net value = market_value + cash + frozen_cash``
+from ``live_asset_snapshot``. Its return rate is the change divided by the
+previous net value. If either day's asset snapshot is missing, the summary falls
+back to the sum of the per-stock returns above. Pass
+``--account-return-method positions-and-trades`` to always calculate the summary
+from positions and trades instead.
 
 Usage::
 
@@ -61,6 +63,9 @@ STAMP_TAX_RATE = Decimal("0.00005")  # 万 5
 MONEY_QUANTUM = Decimal("0.0001")
 RATE_QUANTUM = Decimal("0.00000001")
 TRADE_CALENDAR_TABLE = "trade_calendar"
+ASSET_SNAPSHOT_METHOD = "asset-snapshot"
+POSITIONS_AND_TRADES_METHOD = "positions-and-trades"
+ACCOUNT_RETURN_METHODS = (ASSET_SNAPSHOT_METHOD, POSITIONS_AND_TRADES_METHOD)
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -166,12 +171,18 @@ def calculate_records(
     *,
     current_asset: dict[str, Any] | None = None,
     previous_asset: dict[str, Any] | None = None,
+    account_return_method: str = ASSET_SNAPSHOT_METHOD,
 ) -> list[dict[str, Any]]:
     """Build detail and summary rows without database side effects.
 
     This public, pure function is also the calculation boundary for tests and
     makes the financial convention explicit independently of the SQL readers.
     """
+    if account_return_method not in ACCOUNT_RETURN_METHODS:
+        raise ValueError(
+            f"unsupported account return method: {account_return_method!r}; "
+            f"expected one of {ACCOUNT_RETURN_METHODS}",
+        )
     trade_date_text = str(trade_date)
     before_by_key = {_row_key(row): row for row in before_positions}
     after_by_key = {_row_key(row): row for row in after_positions}
@@ -279,7 +290,11 @@ def calculate_records(
             by_account[(row["account_id"], row["trader_id"])].append(row)
     summary_keys = set(by_account)
     asset_key = None
-    if current_asset is not None and previous_asset is not None:
+    if (
+        account_return_method == ASSET_SNAPSHOT_METHOD
+        and current_asset is not None
+        and previous_asset is not None
+    ):
         asset_key = (str(current_asset["account_id"]), str(current_asset["trader_id"]))
         previous_key = (str(previous_asset["account_id"]), str(previous_asset["trader_id"]))
         if asset_key != previous_key:
@@ -319,6 +334,7 @@ def calculate_records_by_account(
     *,
     current_assets: list[dict[str, Any]] | None = None,
     previous_assets: list[dict[str, Any]] | None = None,
+    account_return_method: str = ASSET_SNAPSHOT_METHOD,
 ) -> tuple[
     dict[tuple[str, str], list[dict[str, Any]]],
     dict[tuple[str, str], Exception],
@@ -359,6 +375,7 @@ def calculate_records_by_account(
                 ticks,
                 current_asset=current_assets_by_account.get(key),
                 previous_asset=previous_assets_by_account.get(key),
+                account_return_method=account_return_method,
             )
         except Exception as exc:
             failures[key] = exc
@@ -377,6 +394,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mysql-password", default=_env("MYSQL_PASSWORD", ""))
     parser.add_argument("--mysql-database", default=_env("MYSQL_DATABASE", "backtest"))
     parser.add_argument("--mysql-result-table", default=_env("DAILY_RETURN_MYSQL_TABLE", "live_daily_stock_return"))
+    parser.add_argument(
+        "--account-return-method",
+        choices=ACCOUNT_RETURN_METHODS,
+        default=_env("DAILY_RETURN_ACCOUNT_RETURN_METHOD", ASSET_SNAPSHOT_METHOD),
+        help=(
+            "Portfolio summary calculation: asset-snapshot (default, change in after-trading net value) "
+            "or positions-and-trades (sum of per-stock position/trade returns)."
+        ),
+    )
     parser.add_argument("--no-create-table", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--log-level", default=_env("QMT_LOG_LEVEL", "INFO"))
@@ -543,6 +569,7 @@ def main(argv: list[str] | None = None) -> int:
             ticks,
             current_assets=current_assets,
             previous_assets=previous_assets,
+            account_return_method=args.account_return_method,
         )
         for (account_id, trader_id), exc in failures.items():
             LOGGER.error(
