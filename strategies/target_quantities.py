@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import Any
 from typing import Callable
 from typing import Mapping
+from typing import Sequence
 
 import pandas as pd
 
@@ -274,11 +275,14 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     # Whole-market (京沪深A) full-tick snapshot cadence. Intraday it is kept only in
     # memory (latest-wins, mirroring ``_market_status``); the recorder persists the
     # final snapshot once after market close. Fetched once at startup, at
-    # ``whole_market_full_tick_time`` daily, then every ``..._interval_secs`` while the
-    # trading window is open.
+    # ``whole_market_full_tick_time`` daily, then every ``..._interval_secs`` while
+    # the whole-market refresh window is open. A final refresh runs after trading
+    # stops and before the recorder exports.
     whole_market_full_tick_enabled: bool = True
     whole_market_full_tick_time: str | None = "09:26"
     whole_market_full_tick_interval_secs: float = 600.0
+    whole_market_refresh_windows: str = "09:26-11:30,13:00-15:00"
+    whole_market_final_refresh_time: str | None = "15:01"
 
 
 class TargetQuantityStrategy(Strategy):
@@ -305,6 +309,7 @@ class TargetQuantityStrategy(Strategy):
     _FULL_TICK_PREFETCH_ALERT = "TARGET-WEIGHT-FULL-TICK-PREFETCH"
     _WHOLE_MARKET_REFRESH_TIMER = "WHOLE-MARKET-FULL-TICK-REFRESH"
     _WHOLE_MARKET_PREFETCH_ALERT = "WHOLE-MARKET-FULL-TICK-PREFETCH"
+    _WHOLE_MARKET_FINAL_REFRESH_ALERT = "WHOLE-MARKET-FULL-TICK-FINAL"
     _TERMINAL_ORDER_STATUSES = {
         OrderStatus.DENIED,
         OrderStatus.REJECTED,
@@ -416,6 +421,13 @@ class TargetQuantityStrategy(Strategy):
         self._whole_market_full_tick_task: (
             asyncio.Future[Any] | ConcurrentFuture[Any] | None
         ) = None
+        self._whole_market_final_refresh_time: tuple[int, int] | None = self._parse_hh_mm(
+            config.whole_market_final_refresh_time,
+        )
+        self._whole_market_final_success_dates: set[date] = set()
+        self._whole_market_fetch_observers: list[
+            Callable[[str, dict[str, Any]], None]
+        ] = []
         self._sellable_exhausted: dict[str, date] = {}
         # ts_event (ns) of this strategy's most recent SELL cancel, per instrument.
         # Used to recognise a broker sellable-position denial that races the
@@ -643,6 +655,8 @@ class TargetQuantityStrategy(Strategy):
             )
         if self._whole_market_full_tick_time is not None:
             self._schedule_whole_market_prefetch()
+        if self._whole_market_final_refresh_time is not None:
+            self._schedule_whole_market_final_refresh()
         # Prime once immediately at startup (e.g. mid-session restart).
         self._run_whole_market_full_tick_fetch(trigger="start")
 
@@ -666,17 +680,66 @@ class TargetQuantityStrategy(Strategy):
         self._run_whole_market_full_tick_fetch(trigger="prefetch")
 
     def _on_whole_market_refresh_timer(self, _event: Any) -> None:
-        if not self._within_trading_window():
+        if not self._within_whole_market_refresh_window():
             return
         self._run_whole_market_full_tick_fetch(trigger="refresh")
 
-    def _run_whole_market_full_tick_fetch(self, trigger: str) -> None:
+    def _schedule_whole_market_final_refresh(self) -> None:
+        alert_time = self._next_daily_time(self._whole_market_final_refresh_time)
+        self.clock.set_time_alert(
+            name=self._WHOLE_MARKET_FINAL_REFRESH_ALERT,
+            alert_time=alert_time,
+            callback=self._on_whole_market_final_refresh_timer,
+            override=True,
+        )
+        self.log.info(
+            f"Next whole-market final full-tick refresh scheduled for {alert_time.isoformat()} "
+            f"({self.config.timezone_name})",
+            color=LogColor.BLUE,
+        )
+
+    def _on_whole_market_final_refresh_timer(self, _event: Any) -> None:
+        if self._whole_market_final_refresh_time is not None:
+            self._schedule_whole_market_final_refresh()
+        self._run_whole_market_full_tick_fetch(trigger="final")
+
+    def _within_whole_market_refresh_window(self) -> bool:
+        try:
+            now = pd.Timestamp(self.clock.utc_now()).tz_convert(
+                self.config.timezone_name,
+            ).time()
+        except Exception:
+            return False
+        return self._time_in_windows(
+            now,
+            self.config.whole_market_refresh_windows,
+        )
+
+    def request_whole_market_full_tick_refresh(
+        self,
+        trigger: str,
+        on_complete: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
+        """Request one fresh whole-market snapshot and report fetch completion."""
+        self._run_whole_market_full_tick_fetch(trigger, on_complete=on_complete)
+
+    def _run_whole_market_full_tick_fetch(
+        self,
+        trigger: str,
+        on_complete: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         """Fetch the whole-market full tick once (single batched call) and apply it.
 
         Guards against overlapping runs (a slow whole-market call must not stack on
         the 10-minute cadence). Timing is measured around the source call and logged.
         """
         if self._whole_market_full_tick_source is None:
+            if on_complete is not None:
+                self._notify_whole_market_completion(
+                    on_complete,
+                    "failed",
+                    {"error": "whole-market full-tick source is not configured"},
+                )
             return
         if (
             self._whole_market_full_tick_task is not None
@@ -686,6 +749,8 @@ class TargetQuantityStrategy(Strategy):
                 f"whole-market full-tick fetch skipped ({trigger}): "
                 "previous fetch is still running",
             )
+            if on_complete is not None:
+                self._whole_market_fetch_observers.append(on_complete)
             return
         started = time.monotonic()
         task = self._schedule_fetch(self._whole_market_full_tick_source)
@@ -694,10 +759,21 @@ class TargetQuantityStrategy(Strategy):
                 f"whole-market full-tick fetch failed to start ({trigger}): "
                 "no executor or loop available",
             )
+            if on_complete is not None:
+                self._notify_whole_market_completion(
+                    on_complete,
+                    "failed",
+                    {"error": "no executor or loop available"},
+                )
             return
         self._whole_market_full_tick_task = task
         task.add_done_callback(
-            lambda t: self._on_whole_market_full_tick_done(t, trigger, started),
+            lambda t: self._on_whole_market_full_tick_done(
+                t,
+                trigger,
+                started,
+                on_complete,
+            ),
         )
 
     def _on_whole_market_full_tick_done(
@@ -705,18 +781,73 @@ class TargetQuantityStrategy(Strategy):
         task: asyncio.Future[Any],
         trigger: str,
         started: float,
+        requested_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._whole_market_full_tick_task = None
+        observers = list(self._whole_market_fetch_observers)
+        self._whole_market_fetch_observers.clear()
+        if requested_callback is not None:
+            observers.append(requested_callback)
         try:
             result = task.result()
         except Exception as exc:
             self.log.warning(f"whole-market full-tick fetch failed ({trigger}): {exc}")
+            self._run_on_loop(
+                lambda: self._notify_whole_market_observers(
+                    observers,
+                    "failed",
+                    {"error": str(exc)},
+                ),
+            )
             return
         # The done-callback fires on the fetch worker thread; marshal the state-
-        # mutating apply back onto the node loop so it stays single-threaded.
+        # mutating apply and ordered completion notification back onto the node loop.
         self._run_on_loop(
-            lambda: self._apply_whole_market_full_tick(result, trigger, started),
+            lambda: self._apply_whole_market_full_tick_and_notify(
+                result,
+                trigger,
+                started,
+                observers,
+            ),
         )
+
+    def _apply_whole_market_full_tick_and_notify(
+        self,
+        snapshot: Any,
+        trigger: str,
+        started: float,
+        observers: Sequence[Callable[[str, dict[str, Any]], None]],
+    ) -> None:
+        self._apply_whole_market_full_tick(snapshot, trigger, started)
+        valid = isinstance(snapshot, dict) and bool(snapshot)
+        self._notify_whole_market_observers(
+            observers,
+            "success" if valid else "failed",
+            {
+                "instruments": len(snapshot) if isinstance(snapshot, dict) else 0,
+                "error": None if valid else "whole-market snapshot is empty or invalid",
+            },
+        )
+
+    def _notify_whole_market_observers(
+        self,
+        observers: Sequence[Callable[[str, dict[str, Any]], None]],
+        status: str,
+        details: dict[str, Any],
+    ) -> None:
+        for observer in observers:
+            self._notify_whole_market_completion(observer, status, details)
+
+    def _notify_whole_market_completion(
+        self,
+        callback: Callable[[str, dict[str, Any]], None],
+        status: str,
+        details: dict[str, Any],
+    ) -> None:
+        try:
+            callback(status, details)
+        except Exception as exc:
+            self.log.warning(f"whole-market completion callback failed: {exc}")
 
     def _apply_whole_market_full_tick(
         self,
@@ -745,6 +876,17 @@ class TargetQuantityStrategy(Strategy):
         # Latest-wins: replace the map wholesale so a concurrent reader never sees a
         # half-updated dict (timer callbacks may run on a separate thread).
         self._whole_market_status = status
+        if self._whole_market_final_refresh_time is not None:
+            try:
+                now = pd.Timestamp(self.clock.utc_now()).tz_convert(
+                    self.config.timezone_name,
+                ).time()
+                hour, minute = self._whole_market_final_refresh_time
+                final_time = pd.Timestamp(f"{hour:02d}:{minute:02d}").time()
+                if now >= final_time:
+                    self._whole_market_final_success_dates.add(trading_date)
+            except Exception:
+                self.log.warning("whole-market final refresh time check failed")
         self.log.info(
             f"whole-market full-tick fetch ({trigger}): {len(status)} instruments "
             f"in {elapsed_ms:.0f} ms date={trading_date}",
@@ -911,6 +1053,10 @@ class TargetQuantityStrategy(Strategy):
         snapshot after market close. Empty until the first fetch completes.
         """
         return dict(self._whole_market_status)
+
+    def whole_market_final_refresh_succeeded(self, trading_date: date) -> bool:
+        """Whether the current date has a successful post-close whole-market fetch."""
+        return trading_date in self._whole_market_final_success_dates
 
     def _is_suspended_status(self, instrument_id: str) -> bool:
         """True when the instrument's latest full-tick status is SUSPEND (停牌)."""
@@ -1890,7 +2036,7 @@ class TargetQuantityStrategy(Strategy):
                     continue
             except Exception:
                 pass
-            submit_ts = int(order.ts_last)
+            submit_ts = self._unfilled_timeout_anchor_ts(order)
             if now - submit_ts < timeout_ns:
                 continue
             if self._at_price_limit(order):
@@ -1899,6 +2045,16 @@ class TargetQuantityStrategy(Strategy):
             # market comes back down; do not cancel it (so its cancel count never
             # grows and the price never escalates past the cap).
             if self._at_buy_price_cap(order):
+                continue
+            if self._partial_buy_has_untradeable_remainder(order):
+                self.log.warning(
+                    "Keeping partially filled BUY open because its replacement "
+                    "quantity would be invalid: "
+                    f"client_order_id={client_order_id}, "
+                    f"instrument_id={instrument_id_text}, "
+                    f"filled_qty={order.filled_qty}, "
+                    f"leaves_qty={order.leaves_qty}",
+                )
                 continue
             try:
                 self.cancel_order(order)
@@ -1935,6 +2091,33 @@ class TargetQuantityStrategy(Strategy):
                 order_id=client_order_id,
                 intent_context=intent_context,
             )
+
+    @staticmethod
+    def _unfilled_timeout_anchor_ts(order: Any) -> int:
+        fill_timestamps = [
+            int(event.ts_event)
+            for event in order.events
+            if isinstance(event, OrderFilled)
+        ]
+        if fill_timestamps:
+            return max(fill_timestamps)
+        return int(order.ts_last)
+
+    def _partial_buy_has_untradeable_remainder(self, order: Any) -> bool:
+        if order.side != OrderSide.BUY:
+            return False
+        filled_qty = self._decimal_quantity(order.filled_qty)
+        leaves_qty = self._decimal_quantity(order.leaves_qty)
+        if filled_qty <= 0 or leaves_qty <= 0:
+            return False
+        instrument = self.cache.instrument(order.instrument_id)
+        if instrument is None:
+            raise ValueError(
+                f"Missing instrument for open order {order.client_order_id}: "
+                f"{order.instrument_id}",
+            )
+        rules = LimitOrderQuantityRules.from_instrument(instrument)
+        return not rules.is_valid(leaves_qty)
 
     def _submit_buys_within_cash(
         self,

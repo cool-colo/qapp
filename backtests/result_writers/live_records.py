@@ -19,6 +19,7 @@ AFTER_TRADING = "after_trading"
 # Shares live_stock_tick_snapshot with AFTER_TRADING but keyed by its own
 # snapshot_type so the two never collide on (trade_date, snapshot_type, instrument_id).
 WHOLE_MARKET = "whole_market"
+WHOLE_MARKET_SCHEMA_VERSION = 2
 
 # `source` marks whether a snapshot was captured at its natural time (``live``) or
 # reconstructed from intraday state because the process started after the window
@@ -107,6 +108,14 @@ class LiveStockTickSnapshotRecord:
     last_settlement_price: Decimal | None = None
     created_at: datetime | None = None
     schema_version: int = 1
+
+
+@dataclass(frozen=True)
+class LiveWholeMarketSnapshotSummary:
+    row_count: int
+    valid_last_price_count: int
+    min_schema_version: int | None
+    max_write_time: datetime | None
 
 
 @dataclass(frozen=True)

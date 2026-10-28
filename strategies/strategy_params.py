@@ -93,11 +93,13 @@ class StrategyParams:
 
     # Whole-market (京沪深A) full-tick snapshot: fetched once at startup, at
     # whole_market_full_tick_time daily, then every whole_market_full_tick_interval_secs
-    # while the trading window is open. Kept in memory intraday (latest-wins); the
-    # recorder persists the final snapshot once after market close.
+    # while the whole-market refresh window is open. The final refresh deliberately
+    # runs after the trading window ends; the recorder exports only after it succeeds.
     whole_market_full_tick_enabled: bool = True
     whole_market_full_tick_time: str = "09:26"
     whole_market_full_tick_interval_secs: float = 600.0
+    whole_market_refresh_windows: str = "09:26-11:30,13:00-15:00"
+    whole_market_final_refresh_time: str = "15:01"
 
     # Order tagging (live)
     order_id_tag: str = "001"

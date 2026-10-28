@@ -71,7 +71,7 @@ def _apply_snapshot_args(args: Any) -> None:
     """
     env = os.environ.get
     args.snapshot_before_time = env("MODEL_SNAPSHOT_BEFORE_TIME", "09:27")
-    args.snapshot_after_time = env("MODEL_SNAPSHOT_AFTER_TIME", "15:02")
+    args.snapshot_after_time = env("MODEL_SNAPSHOT_AFTER_TIME", "15:03")
     args.mysql_host = env("MYSQL_HOST", "127.0.0.1")
     args.mysql_port = int(env("MYSQL_PORT", "3306"))
     args.mysql_user = env("MYSQL_USER", "root")

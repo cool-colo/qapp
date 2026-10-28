@@ -25,6 +25,9 @@ from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
+from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
+from backtests.result_writers.live_records import WHOLE_MARKET
+from backtests.result_writers.live_records import WHOLE_MARKET_SCHEMA_VERSION
 from backtests.result_writers.live_writer import LiveSnapshotWriter
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.enums import MarketStatusAction
@@ -390,6 +393,8 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
         self.assertEqual(config.full_tick_refresh_secs, 1.0)
         self.assertEqual(config.full_tick_prefetch_time, "09:27")
+        self.assertEqual(config.whole_market_refresh_windows, "09:26-11:30,13:00-15:00")
+        self.assertEqual(config.whole_market_final_refresh_time, "15:01")
 
     def test_model_targets_timer_uses_dedicated_callback(self) -> None:
         class TargetTimerStub:
@@ -567,7 +572,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder._run_after_trading.assert_not_called()
 
     def test_snapshot_recorder_post_close_start_uses_continuous_then_after(self) -> None:
-        # Start after the configured after_time (default 23:00, once QMT has settled).
+        # Start after the configured after_time, still inside the same-day retry cutoff.
         recorder = self._make_snapshot_recorder_stub("2026-07-08 23:01:00")
 
         SnapshotRecorder._catch_up_on_start(recorder)
@@ -577,7 +582,22 @@ class TargetLiveConfigTest(unittest.TestCase):
             recorder._run_continuous_trading.call_args_list,
             [call(date(2026, 7, 8), allow_fallback=True)],
         )
-        recorder._run_after_trading.assert_called_once_with(date(2026, 7, 8), allow_fallback=True)
+        recorder._run_after_trading.assert_called_once_with(
+            date(2026, 7, 8),
+            allow_fallback=True,
+            retry_whole_market=True,
+        )
+
+    def test_snapshot_recorder_post_close_restart_retry_stops_after_cutoff(self) -> None:
+        recorder = self._make_snapshot_recorder_stub("2026-07-08 23:59:30")
+
+        SnapshotRecorder._catch_up_on_start(recorder)
+
+        recorder._run_after_trading.assert_called_once_with(
+            date(2026, 7, 8),
+            allow_fallback=True,
+            retry_whole_market=False,
+        )
 
     def test_snapshot_fixed_timers_enable_per_task_reporting(self) -> None:
         recorder = self._make_snapshot_recorder_stub("2026-07-08 09:27:00")
@@ -939,6 +959,60 @@ class TargetLiveConfigTest(unittest.TestCase):
             writer._upsert_many.call_args.kwargs["key_columns"],
             ("trade_date", "snapshot_type", "instrument_id"),
         )
+
+    def test_writer_loads_whole_market_snapshot_summary(self) -> None:
+        cursor = MagicMock()
+        write_time = datetime(2026, 7, 10, 15, 3)
+        cursor.fetchall.return_value = [(2, 2, 2, write_time)]
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        writer = LiveSnapshotWriter.for_testing(connection=connection)
+
+        summary = writer.load_whole_market_snapshot_summary(date(2026, 7, 10))
+
+        self.assertEqual(
+            summary,
+            LiveWholeMarketSnapshotSummary(
+                row_count=2,
+                valid_last_price_count=2,
+                min_schema_version=2,
+                max_write_time=write_time,
+            ),
+        )
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("COUNT(*)", sql)
+        self.assertIn("MIN(`schema_version`)", sql)
+        self.assertEqual(params, (date(2026, 7, 10), WHOLE_MARKET))
+
+    def test_writer_replaces_whole_market_snapshot_atomically(self) -> None:
+        cursor = MagicMock()
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=True)
+        record = LiveStockTickSnapshotRecord(
+            trade_date=date(2026, 7, 10),
+            write_time=datetime(2026, 7, 10, 15, 3),
+            snapshot_type=WHOLE_MARKET,
+            instrument_id="000001.SZ.QMT",
+            stock_code="000001.SZ",
+            last_price=Decimal("10.77"),
+            schema_version=WHOLE_MARKET_SCHEMA_VERSION,
+        )
+
+        writer.replace_whole_market_tick_snapshots([record])
+
+        delete_sql, delete_params = cursor.execute.call_args.args
+        self.assertIn("DELETE FROM `live_stock_tick_snapshot`", delete_sql)
+        self.assertIn("`instrument_id` IN (%s)", delete_sql)
+        self.assertEqual(
+            delete_params,
+            (date(2026, 7, 10), WHOLE_MARKET, "000001.SZ.QMT"),
+        )
+        insert_sql, insert_params = cursor.executemany.call_args.args
+        self.assertIn("INSERT INTO `live_stock_tick_snapshot`", insert_sql)
+        self.assertIn("ON DUPLICATE KEY UPDATE", insert_sql)
+        self.assertEqual(insert_params[0][0], date(2026, 7, 10))
+        connection.commit.assert_called_once_with()
 
     def test_snapshot_recorder_persists_target_info_rows(self) -> None:
         trading_date = date(2026, 7, 10)
@@ -1313,6 +1387,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             _record_positions=MagicMock(),
             _backfill_orders=MagicMock(),
             _backfill_trades=MagicMock(),
+            _record_whole_market_ticks_after_close=MagicMock(),
         )
         trading_date = date(2026, 7, 8)
 
@@ -1325,6 +1400,10 @@ class TargetLiveConfigTest(unittest.TestCase):
         sample = {"000001.SZ.QMT": {"open": 10.85}}
         kwargs["on_applied"](sample)
         recorder._record_stock_ticks.assert_called_once_with(trading_date, sample)
+        recorder._record_whole_market_ticks_after_close.assert_called_once_with(
+            trading_date,
+            on_complete=None,
+        )
 
     def test_after_trading_reports_each_synced_table_with_row_count(self) -> None:
         reporter = MagicMock()
@@ -1397,6 +1476,13 @@ class TargetLiveConfigTest(unittest.TestCase):
                 {"source_rows": 5, "failed_rows": 0},
             ),
         )
+        recorder._record_whole_market_ticks_after_close = MagicMock(
+            side_effect=lambda trading_date, on_complete: on_complete(
+                "success",
+                2,
+                {"source_instruments": 2},
+            ),
+        )
 
         SnapshotRecorder._run_after_trading(
             recorder,
@@ -1405,7 +1491,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             report_tasks=True,
         )
 
-        self.assertEqual(reporter.call_count, 5)
+        self.assertEqual(reporter.call_count, 6)
         self.assertEqual(
             {item.args[0] for item in reporter.call_args_list},
             {
@@ -1423,12 +1509,186 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(
             reports,
             {
-                "live_stock_tick_snapshot": ("success", 1),
+                "live_stock_tick_snapshot": ("success", 2),
                 "live_asset_snapshot": ("success", 1),
                 "live_position_snapshot": ("success", 3),
                 "live_order": ("success", 4),
                 "live_trade": ("success", 5),
             },
+        )
+
+    def test_whole_market_after_close_uses_final_success_without_refetch(self) -> None:
+        trading_date = date(2026, 7, 8)
+        strategy = SimpleNamespace(
+            config=SimpleNamespace(whole_market_full_tick_enabled=True),
+            whole_market_final_refresh_succeeded=MagicMock(return_value=True),
+            request_whole_market_full_tick_refresh=MagicMock(),
+        )
+        recorder = SimpleNamespace(
+            _strategy=strategy,
+            _record_whole_market_ticks=MagicMock(),
+            log=MagicMock(),
+        )
+
+        SnapshotRecorder._record_whole_market_ticks_after_close(
+            recorder,
+            trading_date,
+        )
+
+        strategy.request_whole_market_full_tick_refresh.assert_not_called()
+        recorder._record_whole_market_ticks.assert_called_once_with(
+            trading_date,
+            on_complete=None,
+        )
+
+    def test_whole_market_after_close_refetches_before_export(self) -> None:
+        trading_date = date(2026, 7, 8)
+        strategy = SimpleNamespace(
+            config=SimpleNamespace(whole_market_full_tick_enabled=True),
+            whole_market_final_refresh_succeeded=MagicMock(return_value=False),
+            request_whole_market_full_tick_refresh=MagicMock(
+                side_effect=lambda trigger, on_complete: on_complete(
+                    "success",
+                    {"instruments": 2, "error": None},
+                ),
+            ),
+        )
+        recorder = SimpleNamespace(
+            _strategy=strategy,
+            _record_whole_market_ticks=MagicMock(),
+            log=MagicMock(),
+        )
+
+        SnapshotRecorder._record_whole_market_ticks_after_close(
+            recorder,
+            trading_date,
+        )
+
+        strategy.request_whole_market_full_tick_refresh.assert_called_once()
+        recorder._record_whole_market_ticks.assert_called_once_with(
+            trading_date,
+            on_complete=None,
+        )
+
+    def test_whole_market_after_close_skips_export_when_final_refetch_fails(self) -> None:
+        trading_date = date(2026, 7, 8)
+        strategy = SimpleNamespace(
+            config=SimpleNamespace(whole_market_full_tick_enabled=True),
+            whole_market_final_refresh_succeeded=MagicMock(return_value=False),
+            request_whole_market_full_tick_refresh=MagicMock(
+                side_effect=lambda trigger, on_complete: on_complete(
+                    "failed",
+                    {"instruments": 0, "error": "rpc timeout"},
+                ),
+            ),
+        )
+        recorder = SimpleNamespace(
+            _strategy=strategy,
+            _record_whole_market_ticks=MagicMock(),
+            log=MagicMock(),
+        )
+        completed = MagicMock()
+
+        SnapshotRecorder._record_whole_market_ticks_after_close(
+            recorder,
+            trading_date,
+            on_complete=completed,
+        )
+
+        recorder._record_whole_market_ticks.assert_not_called()
+        completed.assert_called_once_with("failed", 0, {"error": "rpc timeout"})
+
+    def test_whole_market_export_skips_current_schema_v2_rows(self) -> None:
+        trading_date = date(2026, 7, 8)
+        snapshot = {"000001.SZ.QMT": TickSnapshot(last_price=10.2)}
+        strategy = SimpleNamespace(whole_market_snapshot=MagicMock(return_value=snapshot))
+        writer = SimpleNamespace(
+            load_whole_market_snapshot_summary=MagicMock(
+                return_value=LiveWholeMarketSnapshotSummary(
+                    row_count=1,
+                    valid_last_price_count=1,
+                    min_schema_version=WHOLE_MARKET_SCHEMA_VERSION,
+                    max_write_time=datetime(2026, 7, 8, 15, 3),
+                ),
+            ),
+        )
+        recorder = SimpleNamespace(
+            _strategy=strategy,
+            _writer=writer,
+            _record_stock_ticks=MagicMock(),
+            _whole_market_snapshot_is_current=lambda summary, expected, expected_valid: SnapshotRecorder._whole_market_snapshot_is_current(
+                recorder,
+                summary,
+                expected,
+                expected_valid,
+            ),
+            _valid_whole_market_last_price_count=lambda snapshot: SnapshotRecorder._valid_whole_market_last_price_count(
+                recorder,
+                snapshot,
+            ),
+            log=MagicMock(),
+        )
+        completed = MagicMock()
+
+        SnapshotRecorder._record_whole_market_ticks(
+            recorder,
+            trading_date,
+            on_complete=completed,
+        )
+
+        recorder._record_stock_ticks.assert_not_called()
+        completed.assert_called_once_with(
+            "skipped",
+            0,
+            {
+                "reason": "whole-market snapshot already current",
+                "row_count": 1,
+                "valid_last_price_count": 1,
+            },
+        )
+
+    def test_whole_market_export_rewrites_partial_old_schema_rows(self) -> None:
+        trading_date = date(2026, 7, 8)
+        snapshot = {"000001.SZ.QMT": TickSnapshot(last_price=10.2)}
+        strategy = SimpleNamespace(whole_market_snapshot=MagicMock(return_value=snapshot))
+        writer = SimpleNamespace(
+            load_whole_market_snapshot_summary=MagicMock(
+                return_value=LiveWholeMarketSnapshotSummary(
+                    row_count=1,
+                    valid_last_price_count=1,
+                    min_schema_version=1,
+                    max_write_time=datetime(2026, 7, 8, 15, 2),
+                ),
+            ),
+        )
+        recorder = SimpleNamespace(
+            _strategy=strategy,
+            _writer=writer,
+            _record_stock_ticks=MagicMock(),
+            _whole_market_snapshot_is_current=lambda summary, expected, expected_valid: SnapshotRecorder._whole_market_snapshot_is_current(
+                recorder,
+                summary,
+                expected,
+                expected_valid,
+            ),
+            _valid_whole_market_last_price_count=lambda snapshot: SnapshotRecorder._valid_whole_market_last_price_count(
+                recorder,
+                snapshot,
+            ),
+            log=MagicMock(),
+        )
+
+        SnapshotRecorder._record_whole_market_ticks(recorder, trading_date)
+
+        synthetic_snapshot = {"000001.SZ.QMT": None}
+        recorder._record_stock_ticks.assert_called_once_with(
+            trading_date,
+            synthetic_snapshot,
+            on_complete=None,
+            snapshot_type=WHOLE_MARKET,
+            tick_lookup=snapshot.get,
+            schema_version=WHOLE_MARKET_SCHEMA_VERSION,
+            replace_existing=True,
         )
 
     def test_record_stock_ticks_writes_all_snapshot_instruments(self) -> None:
@@ -1742,6 +2002,10 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder._in_range = lambda current, start, end: SnapshotRecorder._in_range(recorder, current, start, end)
         recorder._past_time = lambda current, boundary: SnapshotRecorder._past_time(current, boundary)
         recorder._within_trading_window = lambda: SnapshotRecorder._within_trading_window(recorder)
+        recorder._within_whole_market_restart_retry_window = lambda current: SnapshotRecorder._within_whole_market_restart_retry_window(
+            recorder,
+            current,
+        )
         recorder._strategy = SimpleNamespace(_trading_dates=[pd.Timestamp(now_text).date()])
         return recorder
 

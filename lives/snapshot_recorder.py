@@ -47,12 +47,14 @@ from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import SOURCE_FALLBACK
 from backtests.result_writers.live_records import SOURCE_LIVE
 from backtests.result_writers.live_records import WHOLE_MARKET
+from backtests.result_writers.live_records import WHOLE_MARKET_SCHEMA_VERSION
 from backtests.result_writers.live_records import LiveAssetSnapshotRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
 from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveTradeRecord
+from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
 
 
 SyncTaskCallback = Callable[[str, int, dict[str, Any]], None]
@@ -75,13 +77,16 @@ class SnapshotRecorderConfig(ActorConfig, frozen=True):
     timezone_name: str = "Asia/Shanghai"
     before_time: str = "09:27"
     # After-trading snapshot fires shortly after market close (15:00). Note QMT may not
-    # have finished end-of-day settlement yet at 15:02: frozen cash can still be locked
+    # have finished end-of-day settlement yet at 15:03: frozen cash can still be locked
     # and same-day sells unsettled (T+1 在途), so total_asset may not reconcile against
     # market_value+cash+frozen and the figures may not match the settled QMT UI. The
     # reconciliation check below downgrades to a warning rather than blocking the write.
     # If the process starts after this time and the after-trading snapshot is missing,
     # `_catch_up_on_start` backfills one.
-    after_time: str = "15:02"
+    after_time: str = "15:03"
+    # Same-day post-close restart window for retrying a missing/partial whole-market
+    # export. The retry always performs a fresh broker fetch before writing.
+    whole_market_restart_retry_end: str = "23:59"
     trading_windows: str = "09:30-11:30,13:00-14:55"
     # The before-trading catch-up window: a start within this HH:MM range (inclusive)
     # still runs the before-trading phase even if before_time already passed.
@@ -167,7 +172,12 @@ class SnapshotRecorder(Actor):
             # (e.g. by the timer before a restart) is not duplicated — only a missing
             # after-trading snapshot gets written.
             self._run_continuous_trading(today, allow_fallback=True)
-            self._run_after_trading(today, allow_fallback=True)
+            retry_whole_market = self._within_whole_market_restart_retry_window(current)
+            self._run_after_trading(
+                today,
+                allow_fallback=True,
+                retry_whole_market=retry_whole_market,
+            )
             return
         if in_before:
             self._run_before_trading(today, allow_fallback=False)
@@ -203,7 +213,12 @@ class SnapshotRecorder(Actor):
         if today not in self._strategy._trading_dates:
             return
         try:
-            self._run_after_trading(today, allow_fallback=False, report_tasks=True)
+            self._run_after_trading(
+                today,
+                allow_fallback=False,
+                report_tasks=True,
+                retry_whole_market=True,
+            )
         except Exception as exc:
             self._report_event(
                 self._AFTER_ALERT,
@@ -312,6 +327,7 @@ class SnapshotRecorder(Actor):
         trading_date: date,
         allow_fallback: bool,
         report_tasks: bool = False,
+        retry_whole_market: bool = True,
     ) -> None:
         source = SOURCE_FALLBACK if allow_fallback else SOURCE_LIVE
         callback = lambda table: (
@@ -376,13 +392,62 @@ class SnapshotRecorder(Actor):
             trading_date,
             on_complete=callback("live_trade"),
         )
-        # Persist the whole-market (京沪深A) full-tick snapshot captured intraday by the
-        # strategy timer. Written once, after close, under its own snapshot_type so it
-        # never collides with the AFTER_TRADING universe rows on the unique key.
-        self._record_whole_market_ticks(
-            trading_date,
-            on_complete=callback("live_stock_tick_snapshot"),
-        )
+        if retry_whole_market:
+            self._record_whole_market_ticks_after_close(
+                trading_date,
+                on_complete=callback("live_stock_tick_snapshot"),
+            )
+
+    def _within_whole_market_restart_retry_window(self, current: Any) -> bool:
+        try:
+            cutoff = pd.Timestamp(
+                self.config.whole_market_restart_retry_end,
+            ).time()
+        except Exception:
+            return False
+        return current <= cutoff
+
+    def _record_whole_market_ticks_after_close(
+        self,
+        trading_date: date,
+        on_complete: SyncTaskCallback | None = None,
+    ) -> None:
+        if not self._strategy.config.whole_market_full_tick_enabled:
+            if on_complete is not None:
+                on_complete(
+                    "skipped",
+                    0,
+                    {"reason": "whole-market full-tick disabled"},
+                )
+            return
+        if self._strategy.whole_market_final_refresh_succeeded(trading_date):
+            self._record_whole_market_ticks(trading_date, on_complete=on_complete)
+            return
+
+        def _on_refresh_complete(status: str, details: dict[str, Any]) -> None:
+            if status != "success":
+                error = str(details.get("error") or "whole-market final refresh failed")
+                self.log.warning(
+                    "after-trading whole-market snapshot export skipped: "
+                    f"final refresh failed ({error})",
+                )
+                if on_complete is not None:
+                    on_complete("failed", 0, {"error": error})
+                return
+            self._record_whole_market_ticks(trading_date, on_complete=on_complete)
+
+        try:
+            self._strategy.request_whole_market_full_tick_refresh(
+                trigger="after_trading_final",
+                on_complete=_on_refresh_complete,
+            )
+        except Exception as exc:
+            self.log.warning(
+                "after-trading whole-market final refresh failed to start: "
+                f"{exc}",
+            )
+            if on_complete is not None:
+                on_complete("failed", 0, {"error": str(exc)})
 
     def _record_whole_market_ticks(
         self,
@@ -397,6 +462,35 @@ class SnapshotRecorder(Actor):
             if on_complete is not None:
                 on_complete("skipped", 0, {"reason": "whole-market snapshot empty"})
             return
+        try:
+            summary = self._writer.load_whole_market_snapshot_summary(
+                trading_date,
+                instrument_ids=sorted(snapshot),
+            )
+        except Exception as exc:
+            self.log.warning(
+                f"whole-market snapshot summary check failed; rewriting: {exc}",
+            )
+            summary = None
+        expected_valid_prices = self._valid_whole_market_last_price_count(snapshot)
+        if self._whole_market_snapshot_is_current(
+            summary,
+            len(snapshot),
+            expected_valid_prices,
+        ):
+            if on_complete is not None:
+                on_complete(
+                    "skipped",
+                    0,
+                    {
+                        "reason": "whole-market snapshot already current",
+                        "row_count": summary.row_count if summary else 0,
+                        "valid_last_price_count": (
+                            summary.valid_last_price_count if summary else 0
+                        ),
+                    },
+                )
+            return
         # ``snapshot`` already holds normalized TickSnapshots keyed by instrument-id,
         # so the lookup is a direct dict read rather than the strategy's traded-universe
         # map. Pass a synthetic ``{id: None}`` payload as the id set to iterate.
@@ -406,6 +500,31 @@ class SnapshotRecorder(Actor):
             on_complete=on_complete,
             snapshot_type=WHOLE_MARKET,
             tick_lookup=snapshot.get,
+            schema_version=WHOLE_MARKET_SCHEMA_VERSION,
+            replace_existing=True,
+        )
+
+    def _whole_market_snapshot_is_current(
+        self,
+        summary: LiveWholeMarketSnapshotSummary | None,
+        expected_instruments: int,
+        expected_valid_last_prices: int,
+    ) -> bool:
+        return (
+            summary is not None
+            and summary.min_schema_version == WHOLE_MARKET_SCHEMA_VERSION
+            and summary.row_count >= expected_instruments
+            and summary.valid_last_price_count >= expected_valid_last_prices
+        )
+
+    def _valid_whole_market_last_price_count(
+        self,
+        snapshot: dict[str, Any],
+    ) -> int:
+        return sum(
+            1
+            for tick in snapshot.values()
+            if tick.last_price is not None and tick.last_price > 0
         )
 
     # ---- asset snapshot ------------------------------------------------------
@@ -1650,6 +1769,8 @@ class SnapshotRecorder(Actor):
         on_complete: SyncTaskCallback | None = None,
         snapshot_type: str = AFTER_TRADING,
         tick_lookup: Callable[[str], Any] | None = None,
+        schema_version: int = 1,
+        replace_existing: bool = False,
     ) -> None:
         now = self._now_naive()
         records: list[LiveStockTickSnapshotRecord] = []
@@ -1694,6 +1815,7 @@ class SnapshotRecorder(Actor):
                         tick.last_settlement_price,
                     ),
                     created_at=now,
+                    schema_version=schema_version,
                 ),
             )
         if not records:
@@ -1708,7 +1830,10 @@ class SnapshotRecorder(Actor):
                 )
             return
         try:
-            self._writer.write_stock_tick_snapshots(records)
+            if replace_existing:
+                self._writer.replace_whole_market_tick_snapshots(records)
+            else:
+                self._writer.write_stock_tick_snapshots(records)
             if on_complete is not None:
                 on_complete(
                     "success",

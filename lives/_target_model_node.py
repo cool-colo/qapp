@@ -466,6 +466,8 @@ def build_target_model_node(
             whole_market_full_tick_enabled=params.whole_market_full_tick_enabled,
             whole_market_full_tick_time=params.whole_market_full_tick_time,
             whole_market_full_tick_interval_secs=params.whole_market_full_tick_interval_secs,
+            whole_market_refresh_windows=params.whole_market_refresh_windows,
+            whole_market_final_refresh_time=params.whole_market_final_refresh_time,
             process_targets_on_timer=True,
             process_targets_interval_secs=params.resubmit_interval_secs,
         ),

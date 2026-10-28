@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import threading
 import unittest
+from concurrent.futures import Future
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import date
 from decimal import Decimal
+from unittest.mock import MagicMock
 
 import pandas as pd
 
@@ -14,6 +16,7 @@ from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 
 from strategies.async_scheduling import AsyncAwaitableScheduler
@@ -129,8 +132,14 @@ class FakeOrder:
     status: OrderStatus = OrderStatus.INITIALIZED
     is_pending_cancel: bool = False
     ts_last: int = 0
+    filled_qty: Decimal = Decimal("0")
+    leaves_qty: Decimal | None = None
     events: list = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.leaves_qty is None:
+            self.leaves_qty = self.quantity
 
 
 @dataclass(frozen=True)
@@ -307,6 +316,12 @@ class TestableTargetQuantityStrategy:
     _price_limit_reason = TargetQuantityStrategy._price_limit_reason
     _target_achieved = TargetQuantityStrategy._target_achieved
     _reconcile_unfilled_orders = TargetQuantityStrategy._reconcile_unfilled_orders
+    _unfilled_timeout_anchor_ts = staticmethod(
+        TargetQuantityStrategy._unfilled_timeout_anchor_ts,
+    )
+    _partial_buy_has_untradeable_remainder = (
+        TargetQuantityStrategy._partial_buy_has_untradeable_remainder
+    )
     _intent_context_from_order = TargetQuantityStrategy._intent_context_from_order
     _submit_buys_within_cash = TargetQuantityStrategy._submit_buys_within_cash
     _target_order_intent = TargetQuantityStrategy._target_order_intent
@@ -392,6 +407,21 @@ class TestableTargetQuantityStrategy:
     _schedule_fetch = TargetQuantityStrategy._schedule_fetch
     _resolve_fetch_source = staticmethod(TargetQuantityStrategy._resolve_fetch_source)
     _start_whole_market_full_tick_refresh = TargetQuantityStrategy._start_whole_market_full_tick_refresh
+    _schedule_whole_market_prefetch = TargetQuantityStrategy._schedule_whole_market_prefetch
+    _on_whole_market_prefetch_timer = TargetQuantityStrategy._on_whole_market_prefetch_timer
+    _on_whole_market_refresh_timer = TargetQuantityStrategy._on_whole_market_refresh_timer
+    _schedule_whole_market_final_refresh = TargetQuantityStrategy._schedule_whole_market_final_refresh
+    _on_whole_market_final_refresh_timer = TargetQuantityStrategy._on_whole_market_final_refresh_timer
+    _within_whole_market_refresh_window = TargetQuantityStrategy._within_whole_market_refresh_window
+    request_whole_market_full_tick_refresh = TargetQuantityStrategy.request_whole_market_full_tick_refresh
+    _run_whole_market_full_tick_fetch = TargetQuantityStrategy._run_whole_market_full_tick_fetch
+    _on_whole_market_full_tick_done = TargetQuantityStrategy._on_whole_market_full_tick_done
+    _apply_whole_market_full_tick_and_notify = TargetQuantityStrategy._apply_whole_market_full_tick_and_notify
+    _notify_whole_market_observers = TargetQuantityStrategy._notify_whole_market_observers
+    _notify_whole_market_completion = TargetQuantityStrategy._notify_whole_market_completion
+    _apply_whole_market_full_tick = TargetQuantityStrategy._apply_whole_market_full_tick
+    whole_market_snapshot = TargetQuantityStrategy.whole_market_snapshot
+    whole_market_final_refresh_succeeded = TargetQuantityStrategy.whole_market_final_refresh_succeeded
 
     def request_instrument(self, instrument_id) -> None:
         self.requested_instruments.append(instrument_id)
@@ -518,6 +548,11 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             strategy.config.whole_market_full_tick_time,
         )
         strategy._whole_market_full_tick_task = None
+        strategy._whole_market_final_refresh_time = TargetQuantityStrategy._parse_hh_mm(
+            strategy.config.whole_market_final_refresh_time,
+        )
+        strategy._whole_market_final_success_dates = set()
+        strategy._whole_market_fetch_observers = []
         strategy._depth_books = {}
         strategy._subscribed_order_book_depth_instruments = set()
         strategy._sleep_calls = []
@@ -1860,6 +1895,90 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(strategy._today_open[str(INST_A)], 53.09)
         self.assertIn(str(INST_A), strategy._authoritative_open)
 
+    def test_whole_market_refresh_continues_after_trading_stop(self) -> None:
+        strategy = self.make_strategy()
+        strategy.clock.now = pd.Timestamp("2026-07-02 06:56:00", tz="UTC")
+        strategy._run_whole_market_full_tick_fetch = MagicMock()
+
+        strategy._on_whole_market_refresh_timer(None)
+
+        strategy._run_whole_market_full_tick_fetch.assert_called_once_with(
+            trigger="refresh",
+        )
+
+    def test_whole_market_final_refresh_timer_fetches(self) -> None:
+        strategy = self.make_strategy()
+        strategy._schedule_whole_market_final_refresh = MagicMock()
+        strategy._run_whole_market_full_tick_fetch = MagicMock()
+
+        strategy._on_whole_market_final_refresh_timer(None)
+
+        strategy._schedule_whole_market_final_refresh.assert_called_once_with()
+        strategy._run_whole_market_full_tick_fetch.assert_called_once_with(
+            trigger="final",
+        )
+
+    def test_whole_market_final_success_is_set_only_after_final_time(self) -> None:
+        strategy = self.make_strategy()
+        trading_date = date(2026, 7, 2)
+        strategy.clock.now = pd.Timestamp("2026-07-02 07:01:00", tz="UTC")
+        strategy._trading_day = trading_date
+
+        strategy._apply_whole_market_full_tick(
+            {str(INST_A): {"last_price": 10.2}},
+            "final",
+            0.0,
+        )
+
+        self.assertTrue(strategy.whole_market_final_refresh_succeeded(trading_date))
+        self.assertEqual(strategy.whole_market_snapshot()[str(INST_A)].last_price, 10.2)
+
+    def test_whole_market_request_notifies_after_snapshot_applied(self) -> None:
+        strategy = self.make_strategy()
+        strategy.clock.now = pd.Timestamp("2026-07-02 07:01:00", tz="UTC")
+        strategy._trading_day = date(2026, 7, 2)
+        snapshot = {str(INST_A): {"last_price": 10.2}}
+        future = Future()
+        future.set_result(snapshot)
+        strategy._whole_market_full_tick_source = MagicMock(return_value=snapshot)
+        strategy._schedule_fetch = MagicMock(return_value=future)
+        strategy._run_on_loop = MagicMock(side_effect=lambda fn: fn())
+        completed = MagicMock()
+
+        strategy.request_whole_market_full_tick_refresh(
+            "after_trading_final",
+            on_complete=completed,
+        )
+
+        completed.assert_called_once_with(
+            "success",
+            {"instruments": 1, "error": None},
+        )
+        self.assertEqual(strategy.whole_market_snapshot()[str(INST_A)].last_price, 10.2)
+
+    def test_whole_market_request_attaches_to_in_flight_fetch(self) -> None:
+        strategy = self.make_strategy()
+        strategy.clock.now = pd.Timestamp("2026-07-02 07:01:00", tz="UTC")
+        strategy._trading_day = date(2026, 7, 2)
+        snapshot = {str(INST_A): {"last_price": 10.2}}
+        future = Future()
+        strategy._whole_market_full_tick_source = MagicMock(return_value=snapshot)
+        strategy._schedule_fetch = MagicMock(return_value=future)
+        strategy._run_on_loop = MagicMock(side_effect=lambda fn: fn())
+        completed = MagicMock()
+
+        strategy._run_whole_market_full_tick_fetch("refresh")
+        strategy.request_whole_market_full_tick_refresh(
+            "after_trading_final",
+            on_complete=completed,
+        )
+        future.set_result(snapshot)
+
+        completed.assert_called_once_with(
+            "success",
+            {"instruments": 1, "error": None},
+        )
+
     def test_full_tick_update_does_not_trigger_convergence(self) -> None:
         strategy = self.make_strategy(
             free_cash="1000000",
@@ -2090,6 +2209,61 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         self.assertEqual(strategy.canceled_orders, [])
         self.assertEqual(strategy._cancel_count_buy, {})
+
+    def test_reconcile_timeout_starts_from_latest_partial_fill(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_star_strategy(prices={INST_A: 10.0})
+        strategy._today_open = {str(INST_A): 10.0}
+        fill_event = MagicMock(spec=OrderFilled)
+        fill_event.ts_event = 900_000_000
+        order = FakeOrder(
+            client_order_id="B-1",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("1288"),
+            price=Decimal("10.00"),
+            status=OrderStatus.ACCEPTED,
+            ts_last=1,
+            filled_qty=Decimal("1088"),
+            leaves_qty=Decimal("200"),
+            events=[fill_event],
+        )
+        strategy.cache.open_orders.append(order)
+
+        strategy.clock.ts = 0
+        strategy._reconcile_unfilled_orders(trading_date)
+        self.assertEqual(strategy.canceled_orders, [])
+
+        strategy.clock.ts = 2_000_000_000
+        strategy._reconcile_unfilled_orders(trading_date)
+        self.assertEqual(strategy.canceled_orders, [order])
+
+    def test_reconcile_keeps_partial_star_buy_below_minimum_open(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_star_strategy(prices={INST_A: 10.0})
+        strategy._today_open = {str(INST_A): 10.0}
+        order = FakeOrder(
+            client_order_id="B-1",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("1200"),
+            price=Decimal("10.00"),
+            status=OrderStatus.ACCEPTED,
+            ts_last=1,
+            filled_qty=Decimal("1088"),
+            leaves_qty=Decimal("112"),
+        )
+        strategy.cache.open_orders.append(order)
+        strategy.clock.ts = 2_000_000_000
+
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [])
+        self.assertEqual(strategy._cancel_count_buy, {})
+        self.assertIn(
+            "replacement quantity would be invalid",
+            strategy.log.warnings[0][0][0],
+        )
 
     def test_order_fill_resets_filled_side_cancel_count(self) -> None:
         strategy = self.make_strategy()

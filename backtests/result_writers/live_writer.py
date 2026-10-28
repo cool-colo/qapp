@@ -18,6 +18,8 @@ from backtests.result_writers.live_records import LivePositionSnapshotRecord
 from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveTradeRecord
+from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
+from backtests.result_writers.live_records import WHOLE_MARKET
 
 
 def _json_default(value: Any) -> Any:
@@ -675,6 +677,49 @@ class LiveSnapshotWriter:
             preserve_columns=("created_at",),
         )
 
+    def replace_whole_market_tick_snapshots(
+        self,
+        records: Sequence[LiveStockTickSnapshotRecord],
+    ) -> None:
+        """Atomically replace this snapshot's whole-market rows for one date."""
+        if not records:
+            return
+        trade_date = records[0].trade_date
+        instrument_ids = sorted({record.instrument_id for record in records})
+        rows = [self._stock_tick_row(record) for record in records]
+        columns = list(rows[0].keys())
+        sql = (
+            "INSERT INTO `live_stock_tick_snapshot` "
+            f"({', '.join(self._quote_identifier(column) for column in columns)}) "
+            f"VALUES ({', '.join(['%s'] * len(columns))}) "
+            "ON DUPLICATE KEY UPDATE "
+            + ", ".join(
+                f"{self._quote_identifier(column)} = VALUES({self._quote_identifier(column)})"
+                for column in columns
+                if column not in ("trade_date", "snapshot_type", "instrument_id", "created_at")
+            )
+        )
+        params = [tuple(row[column] for column in columns) for row in rows]
+        connection = self._engine.raw_connection()
+        try:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    "DELETE FROM `live_stock_tick_snapshot` "
+                    "WHERE `trade_date`=%s AND `snapshot_type`=%s "
+                    f"AND `instrument_id` IN ({', '.join(['%s'] * len(instrument_ids))})",
+                    (trade_date, WHOLE_MARKET, *instrument_ids),
+                )
+                cursor.executemany(sql, params)
+                self._commit_if_needed(connection)
+            except Exception:
+                self._rollback_if_needed(connection)
+                raise
+            finally:
+                self._close_cursor(cursor)
+        finally:
+            connection.close()
+
     def write_target_portfolios(self, records: Sequence[LiveTargetRecord]) -> None:
         self._upsert_many(
             self._target_portfolio_table,
@@ -783,6 +828,43 @@ class LiveSnapshotWriter:
         )
         rows = self._query(sql, (account_id, trader_id, trade_date))
         return sorted({str(row[0]).strip() for row in rows if row and str(row[0]).strip()})
+
+    def load_whole_market_snapshot_summary(
+        self,
+        trade_date: date,
+        instrument_ids: Sequence[str] | None = None,
+    ) -> LiveWholeMarketSnapshotSummary:
+        if instrument_ids is None:
+            sql = (
+                "SELECT COUNT(*), "
+                "SUM(`last_price` IS NOT NULL AND `last_price` > 0), "
+                "MIN(`schema_version`), MAX(`write_time`) "
+                "FROM `live_stock_tick_snapshot` "
+                "WHERE `trade_date`=%s AND `snapshot_type`=%s"
+            )
+            params: tuple[Any, ...] = (trade_date, WHOLE_MARKET)
+        else:
+            ids = sorted(set(instrument_ids))
+            if not ids:
+                return LiveWholeMarketSnapshotSummary(0, 0, None, None)
+            placeholders = ", ".join(["%s"] * len(ids))
+            sql = (
+                "SELECT COUNT(*), "
+                "SUM(`last_price` IS NOT NULL AND `last_price` > 0), "
+                "MIN(`schema_version`), MAX(`write_time`) "
+                "FROM `live_stock_tick_snapshot` "
+                "WHERE `trade_date`=%s AND `snapshot_type`=%s "
+                f"AND `instrument_id` IN ({placeholders})"
+            )
+            params = (trade_date, WHOLE_MARKET, *ids)
+        rows = self._query(sql, params)
+        row = rows[0] if rows else (0, 0, None, None)
+        return LiveWholeMarketSnapshotSummary(
+            row_count=int(row[0] or 0),
+            valid_last_price_count=int(row[1] or 0),
+            min_schema_version=None if row[2] is None else int(row[2]),
+            max_write_time=row[3],
+        )
 
     def load_held_stock_codes_for_seeding(
         self,
