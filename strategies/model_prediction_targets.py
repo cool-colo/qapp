@@ -308,12 +308,13 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
     def _process_trading_day(self, trading_date: date) -> None:
         loaded_target = self._live_target_portfolio_target(trading_date)
         if loaded_target is not None:
-            quantities, reason, version = loaded_target
+            quantities, reason, version, signal_date = loaded_target
             self.update_target_quantities(
                 quantities=quantities,
                 target_date=trading_date,
                 reason=reason,
                 version=version,
+                signal_date=signal_date,
             )
             return
         plan = self.compute_daily_target_plan(trading_date)
@@ -337,12 +338,13 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             target_date=trading_date,
             reason=plan.reason,
             version=self._plan_version(plan),
+            signal_date=plan.signal_date,
         )
 
     def _live_target_portfolio_target(
         self,
         trading_date: date,
-    ) -> tuple[dict[str, int], str, str | None] | None:
+    ) -> tuple[dict[str, int], str, str | None, date | None] | None:
         loader = self._live_target_portfolio_loader
         if loader is None:
             self._log_live_target_portfolio_info(
@@ -362,7 +364,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             f"frozen_qty={len(quantities)} version={version}",
             color=LogColor.GREEN,
         )
-        return quantities, reason, version
+        return quantities, reason, version, signal_date
 
     def _log_live_target_portfolio_info(
         self,

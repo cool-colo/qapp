@@ -30,6 +30,7 @@ from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue
@@ -330,6 +331,7 @@ class TargetQuantityStrategy(Strategy):
         self._target_date: date | None = None
         self._target_reason = "target_quantity"
         self._target_version = ""
+        self._target_signal_date: date | None = None
         self._achieved_versions: set[str] = set()
         self._frozen_instruments: dict[str, str] = {}
         self._deferred_buys: dict[str, Decimal] = {}
@@ -341,6 +343,7 @@ class TargetQuantityStrategy(Strategy):
         # events as live) so behaviour is unchanged before on_start runs.
         self._startup_ts_ns: int = -1
         self._order_target_versions: dict[str, str] = {}
+        self._order_signal_dates: dict[str, date] = {}
         self._order_intent_contexts: dict[str, IntentContext] = {}
         self._order_splitter = NotionalOrderSplitter(config.order_slice_notional)
         self._buy_pricer = OpenOffsetBuyPriceStrategy(
@@ -1206,6 +1209,7 @@ class TargetQuantityStrategy(Strategy):
             reason=reason,
             version=target_version(target_date, targets, reason),
             bypass_pause=True,
+            signal_date=None,
         )
 
     def control_force_converge(self, current_date: date, trigger: str) -> None:
@@ -1290,6 +1294,7 @@ class TargetQuantityStrategy(Strategy):
         reason: str,
         version: str | None = None,
         bypass_pause: bool = False,
+        signal_date: date | None = None,
     ) -> None:
         """
         Accept the day's per-instrument target share counts (固定目标股数).
@@ -1312,6 +1317,7 @@ class TargetQuantityStrategy(Strategy):
                 color=LogColor.YELLOW,
             )
             return
+        self._target_signal_date = signal_date
         normalized: dict[str, Decimal] = {}
         for instrument_id, quantity in quantities.items():
             instrument_id_text = str(instrument_id)
@@ -2036,8 +2042,8 @@ class TargetQuantityStrategy(Strategy):
                     continue
             except Exception:
                 pass
-            submit_ts = self._unfilled_timeout_anchor_ts(order)
-            if now - submit_ts < timeout_ns:
+            anchor_ts = self._unfilled_timeout_anchor_ts(order)
+            if anchor_ts is None or now - anchor_ts < timeout_ns:
                 continue
             if self._at_price_limit(order):
                 continue
@@ -2093,15 +2099,25 @@ class TargetQuantityStrategy(Strategy):
             )
 
     @staticmethod
-    def _unfilled_timeout_anchor_ts(order: Any) -> int:
-        fill_timestamps = [
-            int(event.ts_event)
+    def _unfilled_timeout_anchor_ts(order: Any) -> int | None:
+        # Use locally generated wall-clock ``ts_init`` values rather than venue
+        # ``ts_event`` values. BigQMT/QMT clocks can lag the local machine, and a
+        # stale venue timestamp can make a newly accepted order appear timed out.
+        #
+        # Shortage: ``ts_init`` is generated after the venue event reaches this
+        # process, so this measures a conservative lower bound of venue-side order
+        # age. The order may remain open slightly longer than the configured
+        # timeout. For exact venue age, BigQMT must expose a queryable current
+        # venue clock/order timestamp so the offset can be calibrated; otherwise a
+        # conservative latency allowance can bound the extra wait.
+        activity_timestamps = [
+            int(event.ts_init)
             for event in order.events
-            if isinstance(event, OrderFilled)
+            if isinstance(event, (OrderAccepted, OrderFilled))
         ]
-        if fill_timestamps:
-            return max(fill_timestamps)
-        return int(order.ts_last)
+        if not activity_timestamps:
+            return None
+        return max(activity_timestamps)
 
     def _partial_buy_has_untradeable_remainder(self, order: Any) -> bool:
         if order.side != OrderSide.BUY:
@@ -2723,10 +2739,12 @@ class TargetQuantityStrategy(Strategy):
     def _track_submitted_order(self, order: Any, intent_context: IntentContext) -> None:
         client_order_id = str(order.client_order_id)
         self._order_target_versions[client_order_id] = self._target_version
+        self._order_signal_dates[client_order_id] = self._target_signal_date
         self._order_intent_contexts[client_order_id] = intent_context
 
     def _forget_submitted_order(self, client_order_id: str) -> None:
         self._order_target_versions.pop(client_order_id, None)
+        self._order_signal_dates.pop(client_order_id, None)
         self._order_intent_contexts.pop(client_order_id, None)
 
     def _active_orders(

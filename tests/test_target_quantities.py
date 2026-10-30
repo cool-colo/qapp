@@ -16,6 +16,7 @@ from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 
@@ -510,12 +511,14 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._target_date = None
         strategy._target_reason = "target_quantity"
         strategy._target_version = ""
+        strategy._target_signal_date = None
         strategy._achieved_versions = set()
         strategy._frozen_instruments = {}
         strategy._deferred_buys = {}
         strategy._rejected_order_ids = set()
         strategy._insufficient_funds = set()
         strategy._order_target_versions = {}
+        strategy._order_signal_dates = {}
         strategy._order_intent_contexts = {}
         strategy._order_splitter = NotionalOrderSplitter(Decimal(str(order_slice_notional)))
         strategy._buy_pricer = OpenOffsetBuyPriceStrategy(
@@ -1428,6 +1431,21 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("1200"))
         self.assertEqual(strategy._open_order_instruments(), {str(INST_A)})
 
+    def test_five_second_convergence_does_not_resubmit_unresolved_order(self) -> None:
+        trading_date = date(2026, 10, 30)
+        strategy = self.make_strategy(
+            free_cash="1000000",
+            equity="1000000",
+            prices={INST_A: 56.83},
+        )
+
+        strategy.update_target_quantities({INST_A: 3200}, trading_date, "incident-152")
+        for _ in range(37):  # 185 seconds, matching the observed late callback window
+            strategy._converge_to_target(trading_date, "five_second_timer")
+
+        self.assertEqual(len(strategy.submitted_orders), 1)
+        self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("3200"))
+
     def test_converge_to_target_skips_outside_trading_window(self) -> None:
         trading_date = date(2026, 7, 2)
         strategy = self.make_strategy(
@@ -2180,6 +2198,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             price=Decimal("9.99"),
             status=OrderStatus.ACCEPTED,
             ts_last=1,
+            events=[MagicMock(spec=OrderAccepted, ts_init=1)],
         )
         strategy.cache.open_orders.append(order)
 
@@ -2202,6 +2221,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             price=Decimal("10.10"),
             status=OrderStatus.ACCEPTED,
             ts_last=1,
+            events=[MagicMock(spec=OrderAccepted, ts_init=1)],
         )
         strategy.cache.open_orders.append(order)
 
@@ -2214,8 +2234,11 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         trading_date = date(2026, 7, 2)
         strategy = self.make_star_strategy(prices={INST_A: 10.0})
         strategy._today_open = {str(INST_A): 10.0}
+        accepted_event = MagicMock(spec=OrderAccepted)
+        accepted_event.ts_init = 800_000_000
         fill_event = MagicMock(spec=OrderFilled)
-        fill_event.ts_event = 900_000_000
+        fill_event.ts_init = 900_000_000
+        fill_event.ts_event = 1
         order = FakeOrder(
             client_order_id="B-1",
             instrument_id=INST_A,
@@ -2226,7 +2249,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             ts_last=1,
             filled_qty=Decimal("1088"),
             leaves_qty=Decimal("200"),
-            events=[fill_event],
+            events=[accepted_event, fill_event],
         )
         strategy.cache.open_orders.append(order)
 
@@ -2237,6 +2260,26 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy.clock.ts = 2_000_000_000
         strategy._reconcile_unfilled_orders(trading_date)
         self.assertEqual(strategy.canceled_orders, [order])
+
+    def test_reconcile_does_not_timeout_order_without_local_acceptance(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy._today_open = {str(INST_A): 10.0}
+        order = FakeOrder(
+            client_order_id="B-1",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("100"),
+            price=Decimal("10.00"),
+            status=OrderStatus.SUBMITTED,
+            ts_last=1,
+        )
+        strategy.cache.open_orders.append(order)
+        strategy.clock.ts = 2_000_000_000
+
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [])
 
     def test_reconcile_keeps_partial_star_buy_below_minimum_open(self) -> None:
         trading_date = date(2026, 7, 2)
@@ -2252,6 +2295,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             ts_last=1,
             filled_qty=Decimal("1088"),
             leaves_qty=Decimal("112"),
+            events=[MagicMock(spec=OrderAccepted, ts_init=1)],
         )
         strategy.cache.open_orders.append(order)
         strategy.clock.ts = 2_000_000_000

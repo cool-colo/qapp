@@ -158,6 +158,9 @@ class LiveOrderRecord:
     client_order_id: str
     instrument_id: str
     status: str
+    # Signal date that drove the target when the order was submitted. Null for
+    # historical rows and orders without model-signal lineage.
+    signal_date: date | None = None
     venue_order_id: str | None = None
     stock_code: str | None = None
     side: str | None = None

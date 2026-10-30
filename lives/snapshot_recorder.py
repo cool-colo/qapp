@@ -775,7 +775,7 @@ class SnapshotRecorder(Actor):
         # continuous-trading start.
         loaded = self._load_target(trading_date, signal_date)
         if loaded:
-            self._apply_loaded_target(trading_date, loaded)
+            self._apply_loaded_target(trading_date, loaded, signal_date)
             self._applied_target_dates.add(trading_date)
             if on_complete is not None:
                 on_complete(
@@ -819,6 +819,7 @@ class SnapshotRecorder(Actor):
                 },
                 plan.reason,
                 version,
+                plan.signal_date,
             )
             message = (
                 f"applied transient daily target without persistence: "
@@ -972,7 +973,7 @@ class SnapshotRecorder(Actor):
             if on_complete is not None:
                 on_complete("success", 0, {"signal_date": plan_signal_date})
         if apply_target:
-            self._apply_target(trading_date, target_qty, plan.reason, version)
+            self._apply_target(trading_date, target_qty, plan.reason, version, plan_signal_date)
         if persisted:
             self.log.info(
                 f"generated & persisted daily target: date={trading_date} signal_date={plan_signal_date} "
@@ -1017,7 +1018,12 @@ class SnapshotRecorder(Actor):
         prev = [value for value in dates if value < trading_date]
         return max(prev) if prev else None
 
-    def _apply_loaded_target(self, trading_date: date, rows: list[dict[str, Any]]) -> None:
+    def _apply_loaded_target(
+        self,
+        trading_date: date,
+        rows: list[dict[str, Any]],
+        signal_date: date | None,
+    ) -> None:
         target_qty: dict[str, int] = {}
         version: str | None = None
         reason = "loaded_target"
@@ -1032,7 +1038,7 @@ class SnapshotRecorder(Actor):
                 reason = str(row.get("reason"))
         if not target_qty:
             return
-        self._apply_target(trading_date, target_qty, reason, version)
+        self._apply_target(trading_date, target_qty, reason, version, signal_date)
         self.log.info(
             f"loaded persisted daily target: date={trading_date} "
             f"frozen_qty={len(target_qty)} version={version}",
@@ -1045,6 +1051,7 @@ class SnapshotRecorder(Actor):
         target_qty: dict[str, Any],
         reason: str,
         version: str | None,
+        signal_date: date | None = None,
     ) -> None:
         try:
             self._strategy.update_target_quantities(
@@ -1052,6 +1059,7 @@ class SnapshotRecorder(Actor):
                 target_date=trading_date,
                 reason=reason,
                 version=version,
+                signal_date=signal_date,
             )
         except Exception as exc:
             self.log.warning(f"update_target_quantities failed: {exc}")
@@ -1069,6 +1077,17 @@ class SnapshotRecorder(Actor):
         except Exception as exc:
             self.log.warning(f"target load failed: {exc}")
             return []
+
+    def _load_target_signal_dates(self, trading_date: date) -> dict[str, date]:
+        try:
+            return self._writer.target_signal_dates_for_date(
+                self.config.account_id,
+                self.config.trader_id,
+                trading_date,
+            )
+        except Exception as exc:
+            self.log.warning(f"target signal-date load failed for order backfill: {exc}")
+            return {}
 
     # ---- order / trade events ------------------------------------------------
 
@@ -1127,6 +1146,7 @@ class SnapshotRecorder(Actor):
             filled_qty=self._int_or_none(getattr(order, "filled_qty", None)) or 0 if order else 0,
             avg_fill_price=self._decimal_or_none(getattr(order, "avg_px", None)) if order else None,
             status=self._order_status_text(order, event),
+            signal_date=self._order_signal_date(client_order_id),
             target_qty=self._order_target_qty(client_order_id),
             target_version=self._order_target_version(client_order_id),
             open_price=self._order_open_price(instrument_id_text),
@@ -1483,11 +1503,17 @@ class SnapshotRecorder(Actor):
         # the full order list is known (authoritative full-tick open per instrument, no
         # universe coverage gap, no reliance on the async _today_open).
         open_prices = self._backfill_open_prices(rows)
+        target_signal_dates = self._load_target_signal_dates(trading_date)
         count = 0
         skipped = 0
         failed = 0
         for row in rows:
-            record = self._order_record_from_broker(trading_date, row, open_prices)
+            record = self._order_record_from_broker(
+                trading_date,
+                row,
+                open_prices,
+                target_signal_dates,
+            )
             if record is None:
                 skipped += 1
                 continue
@@ -1542,6 +1568,7 @@ class SnapshotRecorder(Actor):
         trading_date: date,
         row: Any,
         open_prices: dict[str, Decimal],
+        target_signal_dates: dict[str, date] | None = None,
     ) -> LiveOrderRecord | None:
         if not isinstance(row, dict):
             return None
@@ -1553,6 +1580,9 @@ class SnapshotRecorder(Actor):
         instrument_id_text = str(row.get("instrument_id") or "")
         stock_code = self._maybe_str(row.get("stock_code")) or self._stock_code(instrument_id_text)
         status = self._maybe_str(row.get("lifecycle_status"))
+        signal_date = self._order_signal_date(client_order_id)
+        if signal_date is None and stock_code and target_signal_dates is not None:
+            signal_date = target_signal_dates.get(stock_code)
         return LiveOrderRecord(
             trade_date=trading_date,
             write_time=self._now_naive(),
@@ -1570,9 +1600,12 @@ class SnapshotRecorder(Actor):
             filled_qty=self._int_or_none(row.get("traded_volume")) or 0,
             avg_fill_price=self._decimal_or_none(row.get("traded_price")),
             status=(status.lower() if status else "unknown"),
+            signal_date=signal_date,
             # QMT reports no open, so open_price is resolved synchronously from full-tick
             # for the stocks in these orders (see _backfill_open_prices). target_qty /
             # target_version / book_snapshot stay null — strategy-only, unknown to QMT.
+            # signal_date is lineage-only: prefer the live strategy mapping, then an
+            # unambiguous persisted target date for restart/backfill-only rows.
             open_price=open_prices.get(instrument_id_text),
             reason=self._bounded_order_reason(row.get("status_msg")),
             order_time=self._qmt_time_to_naive(row, "order_at", "order_time_ms"),
@@ -2026,6 +2059,9 @@ class SnapshotRecorder(Actor):
         if isinstance(versions, dict):
             return versions.get(client_order_id)
         return None
+
+    def _order_signal_date(self, client_order_id: str) -> date | None:
+        return self._strategy._order_signal_dates.get(client_order_id)
 
     def _order_open_price(self, instrument_id_text: str) -> Decimal | None:
         opens = getattr(self._strategy, "_today_open", None)

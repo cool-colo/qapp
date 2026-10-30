@@ -24,6 +24,7 @@ from backtests.result_writers.live_records import AFTER_TRADING
 from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveTargetRecord
+from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
 from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
 from backtests.result_writers.live_records import WHOLE_MARKET
@@ -104,6 +105,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             target_date=trading_date,
             reason="risk_manager_optimize",
             version="ver-1",
+            signal_date=signal_date,
         )
         strategy._live_target_plan_persister.assert_not_called()
 
@@ -142,6 +144,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             target_date=trading_date,
             reason="computed",
             version="computed-ver",
+            signal_date=date(2026, 7, 7),
         )
         strategy._live_target_plan_persister.assert_called_once_with(plan)
 
@@ -242,6 +245,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             target_date=trading_date,
             reason="local_exit_missing_signal_data",
             version="transient-ver",
+            signal_date=date(2026, 7, 7),
         )
 
     def test_recorder_persists_timer_plan_as_continuous_when_missing(self) -> None:
@@ -1207,7 +1211,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             ],
         )
 
-    def test_writer_ensure_order_columns_adds_target_qty_open_price_and_book_snapshot(self) -> None:
+    def test_writer_ensure_order_columns_adds_signal_date_target_qty_open_price_and_book_snapshot(self) -> None:
         writer = object.__new__(LiveSnapshotWriter)
         writer._query = MagicMock(
             return_value=[
@@ -1215,6 +1219,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                 ("trade_date",),
                 ("client_order_id",),
                 ("source",),
+                ("order_time",),
             ],
         )
         writer._execute = MagicMock()
@@ -1224,6 +1229,10 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(
             writer._execute.call_args_list,
             [
+                call(
+                    "ALTER TABLE `live_order` ADD COLUMN `signal_date` DATE NULL",
+                    (),
+                ),
                 call(
                     "ALTER TABLE `live_order` ADD COLUMN `target_qty` BIGINT NULL",
                     (),
@@ -1277,6 +1286,7 @@ class TargetLiveConfigTest(unittest.TestCase):
                 ("open_price",),
                 ("book_snapshot",),
                 ("source",),
+                ("order_time",),
             ],
         )
         writer._execute = MagicMock()
@@ -1290,8 +1300,117 @@ class TargetLiveConfigTest(unittest.TestCase):
                     "ALTER TABLE `live_order` CHANGE COLUMN `target_weight` `target_qty` BIGINT NULL",
                     (),
                 ),
+                call(
+                    "ALTER TABLE `live_order` ADD COLUMN `signal_date` DATE NULL",
+                    (),
+                ),
             ],
         )
+
+    def test_order_upsert_preserves_existing_signal_date_for_qmt_backfill(self) -> None:
+        cursor = MagicMock()
+        connection = SimpleNamespace(
+            cursor=MagicMock(return_value=cursor),
+            commit=MagicMock(),
+            rollback=MagicMock(),
+        )
+        writer = LiveSnapshotWriter.for_testing(connection)
+        record = LiveOrderRecord(
+            trade_date=date(2026, 7, 9),
+            write_time=datetime(2026, 7, 9, 15, 10),
+            account_id="ACC",
+            trader_id="TRADER",
+            client_order_id="O-1",
+            instrument_id="000001.SZ.QMT",
+            status="filled",
+            source="fallback",
+            signal_date=None,
+        )
+
+        writer.upsert_order(record)
+
+        sql = cursor.executemany.call_args.args[0]
+        self.assertIn("COALESCE(VALUES(`signal_date`), `signal_date`)", sql)
+
+    def test_target_signal_dates_for_date_keeps_only_unambiguous_stocks(self) -> None:
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            ("000001.SZ", date(2026, 7, 8)),
+            ("000002.SZ", date(2026, 7, 8)),
+            ("000003.SZ", date(2026, 7, 7)),
+            ("000003.SZ", date(2026, 7, 8)),
+        ]
+        connection = SimpleNamespace(cursor=MagicMock(return_value=cursor))
+        writer = LiveSnapshotWriter.for_testing(connection)
+
+        result = writer.target_signal_dates_for_date("ACC", "TRADER", date(2026, 7, 9))
+
+        self.assertEqual(
+            result,
+            {
+                "000001.SZ": date(2026, 7, 8),
+                "000002.SZ": date(2026, 7, 8),
+            },
+        )
+
+    def test_backfilled_order_uses_persisted_target_signal_date(self) -> None:
+        writer = MagicMock()
+        recorder = SimpleNamespace()
+        recorder.config = SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER")
+        recorder._writer = writer
+        recorder.log = MagicMock()
+        recorder._strategy = SimpleNamespace(_order_signal_dates={})
+        recorder._now_naive = MagicMock(return_value=datetime(2026, 7, 9, 15, 3))
+        recorder._backfill_open_prices = lambda rows: {}
+        recorder._load_target_signal_dates = lambda trading_date: {
+            "000001.SZ": date(2026, 7, 8)
+        }
+        recorder._maybe_str = SnapshotRecorder._maybe_str
+        recorder._stock_code = lambda instrument_id: SnapshotRecorder._stock_code(
+            recorder,
+            instrument_id,
+        )
+        recorder._order_signal_date = lambda client_order_id: SnapshotRecorder._order_signal_date(
+            recorder,
+            client_order_id,
+        )
+        recorder._qmt_side = SnapshotRecorder._qmt_side
+        recorder._qmt_order_type = SnapshotRecorder._qmt_order_type
+        recorder._decimal_or_none = SnapshotRecorder._decimal_or_none
+        recorder._int_or_none = SnapshotRecorder._int_or_none
+        recorder._bounded_order_reason = SnapshotRecorder._bounded_order_reason
+        recorder._qmt_time_to_naive = SnapshotRecorder._qmt_time_to_naive
+        recorder._jsonable = SnapshotRecorder._jsonable
+        recorder._order_record_from_broker = (
+            lambda trading_date, row, open_prices, target_signal_dates: (
+                SnapshotRecorder._order_record_from_broker(
+                    recorder,
+                    trading_date,
+                    row,
+                    open_prices,
+                    target_signal_dates,
+                )
+            )
+        )
+        row = {
+            "client_order_id": "O-1",
+            "instrument_id": "000001.SZ.QMT",
+            "stock_code": "000001.SZ",
+            "lifecycle_status": "filled",
+            "order_type": 23,
+            "price_type": 11,
+            "order_volume": 100,
+        }
+
+        stats = SnapshotRecorder._write_backfilled_orders(
+            recorder,
+            date(2026, 7, 9),
+            [row],
+        )
+
+        record = writer.upsert_order.call_args.args[0]
+        self.assertEqual(record.signal_date, date(2026, 7, 8))
+        self.assertEqual(stats["written_rows"], 1)
 
     def test_position_snapshot_uses_qmt_market_value_for_unprefixed_columns(self) -> None:
         writer = SimpleNamespace(
@@ -1878,6 +1997,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             _order_target_weights={},
             _order_target_qty={"O-1": Decimal("20000")},
             _order_target_versions={},
+            _order_signal_dates={"O-1": date(2026, 7, 8)},
         )
         recorder.cache = SimpleNamespace(order=MagicMock(return_value=None))
         recorder._now_naive = MagicMock(return_value=datetime(2026, 7, 9, 13, 21, 43))
@@ -1888,6 +2008,10 @@ class TargetLiveConfigTest(unittest.TestCase):
             client_order_id,
         )
         recorder._order_target_version = lambda client_order_id: SnapshotRecorder._order_target_version(
+            recorder,
+            client_order_id,
+        )
+        recorder._order_signal_date = lambda client_order_id: SnapshotRecorder._order_signal_date(
             recorder,
             client_order_id,
         )
@@ -1908,6 +2032,8 @@ class TargetLiveConfigTest(unittest.TestCase):
             instrument_id,
             instrument_id_text,
         )
+        recorder._event_info = SnapshotRecorder._event_info
+        recorder._qmt_time_to_naive = SnapshotRecorder._qmt_time_to_naive
         recorder._book_snapshot_payload = SnapshotRecorder._book_snapshot_payload
         recorder._book_side_payload = SnapshotRecorder._book_side_payload
         recorder._float_or_none = SnapshotRecorder._float_or_none
@@ -1940,6 +2066,7 @@ class TargetLiveConfigTest(unittest.TestCase):
 
         record = writer.upsert_order.call_args.args[0]
         self.assertEqual(record.client_order_id, "O-1")
+        self.assertEqual(record.signal_date, date(2026, 7, 8))
         self.assertEqual(record.target_qty, 20000)
         self.assertEqual(len(record.reason), SnapshotRecorder._LIVE_ORDER_REASON_MAX_LEN)
         self.assertTrue(record.reason.endswith("..."))

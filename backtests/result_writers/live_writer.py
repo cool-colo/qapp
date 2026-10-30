@@ -214,6 +214,7 @@ CREATE TABLE IF NOT EXISTS `live_order` (
   `client_order_id` VARCHAR(64) NOT NULL,
   `venue_order_id`  VARCHAR(64) NULL,
   `instrument_id` VARCHAR(32)  NOT NULL,
+  `signal_date`   DATE         NULL,
   `stock_code`    VARCHAR(16)  NULL,
   `side`          VARCHAR(8)   NULL,
   `source`        VARCHAR(16)  NOT NULL DEFAULT 'live',
@@ -523,6 +524,7 @@ class LiveSnapshotWriter:
         Failures only warn implicitly via the caller's best-effort behavior.
         """
         additions = {
+            "signal_date": "DATE NULL",
             "target_qty": "BIGINT NULL",
             "open_price": "DECIMAL(20,4) NULL",
             "book_snapshot": "JSON NULL",
@@ -741,6 +743,7 @@ class LiveSnapshotWriter:
             [self._order_row(record)],
             key_columns=("account_id", "trader_id", "client_order_id"),
             preserve_columns=("created_at",),
+            coalesce_columns=("signal_date",),
         )
 
     def upsert_trade(self, record: LiveTradeRecord) -> None:
@@ -828,6 +831,33 @@ class LiveSnapshotWriter:
         )
         rows = self._query(sql, (account_id, trader_id, trade_date))
         return sorted({str(row[0]).strip() for row in rows if row and str(row[0]).strip()})
+
+    def target_signal_dates_for_date(
+        self,
+        account_id: str,
+        trader_id: str,
+        trade_date: date,
+    ) -> dict[str, date]:
+        """Return unambiguous per-stock target signal dates for one trading day."""
+        rows = self._query(
+            f"""
+            SELECT `stock_code`, `signal_date`
+            FROM {self._target_table_sql}
+            WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s
+              AND `signal_date` IS NOT NULL
+            """,
+            (account_id, trader_id, trade_date),
+        )
+        dates_by_stock: dict[str, set[date]] = {}
+        for stock_code, signal_date in rows:
+            if not stock_code or signal_date is None:
+                continue
+            dates_by_stock.setdefault(str(stock_code), set()).add(signal_date)
+        return {
+            stock_code: next(iter(dates))
+            for stock_code, dates in dates_by_stock.items()
+            if len(dates) == 1
+        }
 
     def load_whole_market_snapshot_summary(
         self,
@@ -1303,6 +1333,7 @@ class LiveSnapshotWriter:
             "client_order_id": record.client_order_id,
             "venue_order_id": record.venue_order_id,
             "instrument_id": record.instrument_id,
+            "signal_date": record.signal_date,
             "stock_code": record.stock_code,
             "side": record.side,
             "source": record.source,
@@ -1356,15 +1387,23 @@ class LiveSnapshotWriter:
         rows: Sequence[Mapping[str, Any]],
         key_columns: Sequence[str],
         preserve_columns: Sequence[str] = (),
+        coalesce_columns: Sequence[str] = (),
     ) -> None:
         if not rows:
             return
         columns = list(rows[0].keys())
-        updates = [
-            f"{self._quote_identifier(column)} = VALUES({self._quote_identifier(column)})"
-            for column in columns
-            if column not in set(key_columns).union(preserve_columns)
-        ]
+        updates = []
+        skipped_columns = set(key_columns).union(preserve_columns)
+        for column in columns:
+            if column in skipped_columns:
+                continue
+            quoted_column = self._quote_identifier(column)
+            if column in coalesce_columns:
+                updates.append(
+                    f"{quoted_column} = COALESCE(VALUES({quoted_column}), {quoted_column})"
+                )
+            else:
+                updates.append(f"{quoted_column} = VALUES({quoted_column})")
         sql = (
             f"INSERT INTO {self._quote_identifier(table)} "
             f"({', '.join(self._quote_identifier(column) for column in columns)}) "

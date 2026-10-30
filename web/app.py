@@ -33,6 +33,7 @@ from web.signal_quality_report import (
 from web.signal_series_report import (
     build_signal_series_sql,
     build_snapshot_signals_sql,
+    resolve_trade_signal_relations,
 )
 from web import dqc_report
 
@@ -642,8 +643,13 @@ def get_signal_series(
     from the account's live node (``/strategy/info`` → ``predictions_database`` /
     ``predictions_table``), the same source the 策略信息/信号质量 views use. ``rank`` is
     the per-day cross-section rank by score.
-    Buy/sell fills come from ``live_trade`` for the same account/stock/window (as 个股K线 does),
-    so they overlay the signal line as markers.
+    Series rows are indexed by the next open trading date after each prediction
+    (the date the signal takes effect) and retain ``signal_date`` separately. Buy/sell
+    fills come from ``live_trade`` for the same account/stock/window (as 个股K线 does),
+    so they overlay the effective-date line as markers. Each trade also carries its
+    driving ``signal_date``/``effect_date`` when known: explicit order lineage is
+    preferred, then an unambiguous persisted target mapping, then a clearly-labeled
+    historical inference.
     """
     table, database, _ = _prediction_table(
         data,
@@ -660,16 +666,24 @@ def get_signal_series(
         raise HTTPException(status_code=500, detail=f"signal_series query failed: {exc}") from exc
 
     trades: list[dict[str, Any]] = []
+    target_rows: list[dict[str, Any]] = []
     if source:
         mysql = _mysql(data, source)
         trades = mysql.query(
             f"""
-            SELECT trade_date, side, price, quantity, amount, trade_time
-            FROM live_trade
-            WHERE {_ACCOUNT_KEYS}
-              AND stock_code = %(stock_code)s
-              AND trade_date BETWEEN %(start)s AND %(end)s
-            ORDER BY trade_time
+            SELECT t.trade_date, t.stock_code, t.side, t.price, t.quantity,
+                   t.amount, t.trade_time, o.signal_date AS order_signal_date,
+                   o.target_version
+            FROM live_trade t
+            LEFT JOIN live_order o
+              ON o.account_id = t.account_id
+             AND o.trader_id = t.trader_id
+             AND o.client_order_id = t.client_order_id
+            WHERE t.account_id = %(account_id)s
+              AND t.trader_id = %(trader_id)s
+              AND t.stock_code = %(stock_code)s
+              AND t.trade_date BETWEEN %(start)s AND %(end)s
+            ORDER BY t.trade_time
             """,
             {
                 "account_id": account,
@@ -679,6 +693,27 @@ def get_signal_series(
                 "end": end,
             },
         )
+        target_rows = mysql.query(
+            f"""
+            SELECT trade_date, stock_code, signal_date, target_version
+            FROM live_target_portfolio
+            WHERE {_ACCOUNT_KEYS}
+              AND stock_code = %(stock_code)s
+              AND trade_date BETWEEN %(start)s AND %(end)s
+            """,
+            {
+                "account_id": account,
+                "trader_id": trader,
+                "stock_code": stock_code,
+                "start": start,
+                "end": end,
+            },
+        )
+    trades = resolve_trade_signal_relations(
+        jsonable_rows(trades),
+        jsonable_rows(series),
+        jsonable_rows(target_rows),
+    )
     return {
         "series": jsonable_rows(series),
         "trades": jsonable_rows(trades),

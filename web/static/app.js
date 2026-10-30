@@ -158,6 +158,12 @@ function dqcSeverityClass(s) {
 // State
 // ---------------------------------------------------------------------------
 const state = { source: null, accounts: [], account: null, sellEnabled: false, pinRequired: false };
+const SIGNAL_RELATION_LABELS = {
+  explicit: "订单记录",
+  target: "目标组合",
+  inferred: "历史推断",
+  unlinked: "未关联",
+};
 // Sell gating is a backend decision (web/config.yaml: sell_enabled). It starts off so
 // the UI never offers a sell action before /api/config has answered.
 const SELL_OFF_HINT = "卖出功能未启用（web/config.yaml: sell_enabled）";
@@ -1528,46 +1534,88 @@ async function plotRline(auto = false) {
     const score = series.map((r) => (r.score == null ? null : Number(r.score)));
     const rankByDate = {};
     series.forEach((r, i) => { rankByDate[dates[i]] = rank[i]; });
+    const effectDateBySignal = {};
+    series.forEach((r, i) => {
+      const signalDate = r.signal_date ? String(r.signal_date).slice(0, 10) : null;
+      if (signalDate) effectDateBySignal[signalDate] = dates[i];
+    });
 
-    // Aggregate fills per day (for the tooltip), like 个股K线.
+    // Aggregate fills by the date their driving signal takes effect. The x-axis is
+    // effective time, while each tooltip/marker also carries the prediction date.
     const dayFills = {};
     trades.forEach((t) => {
-      const dd = String(t.trade_date).slice(0, 10);
+      const dd = t.signal_date ? String(t.signal_date).slice(0, 10) : null;
+      const effectDate = t.effect_date
+        ? String(t.effect_date).slice(0, 10)
+        : (dd ? effectDateBySignal[dd] : null);
+      if (!effectDate) return;
       const px = Number(t.price) || 0, qty = Number(t.quantity) || 0;
       const amt = Number(t.amount) != null && !isNaN(Number(t.amount)) && Number(t.amount) !== 0
         ? Number(t.amount) : px * qty;
       const side = String(t.side).toLowerCase() === "buy" ? "buy" : "sell";
-      const day = dayFills[dd] || (dayFills[dd] = {
+      const day = dayFills[effectDate] || (dayFills[effectDate] = {
         buy: { qty: 0, pxQty: 0, amt: 0 }, sell: { qty: 0, pxQty: 0, amt: 0 },
+        actions: new Map(),
       });
       day[side].qty += qty; day[side].pxQty += px * qty; day[side].amt += amt;
+      const action = {
+        signal_date: dd,
+        effect_date: effectDate,
+        trade_date: String(t.trade_date).slice(0, 10),
+        relation_status: t.relation_status,
+      };
+      day.actions.set(
+        `${action.signal_date || "-"}|${action.trade_date}|${action.relation_status || "unlinked"}`,
+        action,
+      );
     });
 
     // Buy/sell markers anchored on the rank line (blue up-arrow / orange down-pin),
     // mirroring 个股K线. The rank axis is inverted, so "up" (toward rank 1) is a
     // positive y-offset in pixels; "down" is negative.
     const SYM = 16, GAP = 6;
-    const markData = trades.map((t) => {
-      const dd = String(t.trade_date).slice(0, 10);
-      const isBuy = String(t.side).toLowerCase() === "buy";
-      const anchor = rankByDate[dd];
-      if (anchor == null) return null;
-      const yOffset = isBuy ? (SYM / 2 + GAP) : -(SYM / 2 + GAP);
-      return {
-        name: isBuy ? "买" : "卖", coord: [dd, anchor],
-        value: `${isBuy ? "买" : "卖"} ${fmt(t.quantity)}@${fmt(t.price)}`,
-        symbol: isBuy ? "arrow" : "pin", symbolRotate: isBuy ? 0 : 180,
-        symbolSize: SYM, symbolOffset: [0, yOffset],
-        itemStyle: { color: isBuy ? "#4c8dff" : "#ffa726", borderColor: "#fff", borderWidth: 1 },
-        label: {
-          show: true, formatter: isBuy ? "买" : "卖", color: "#fff",
-          fontSize: 9, position: isBuy ? "top" : "bottom",
-          distance: 3, backgroundColor: "transparent",
-        },
-      };
-    }).filter(Boolean);
+    const markData = Object.entries(dayFills).flatMap(([effectDate, day]) => {
+      const anchor = rankByDate[effectDate];
+      if (anchor == null) return [];
+      return ["buy", "sell"].map((side) => {
+        const totals = day[side];
+        if (!totals.qty) return null;
+        const actions = [...day.actions.values()];
+        const tradeDates = [...new Set(actions.map((a) => a.trade_date))];
+        const signalDates = [...new Set(actions.map((a) => a.signal_date).filter(Boolean))];
+        const relationNames = [
+          ...new Set(actions.map((a) => String(a.relation_status || "unlinked"))),
+        ];
+        const isBuy = side === "buy";
+        const tradeDateText = tradeDates.length === 1
+          ? tradeDates[0] : `${tradeDates[0]} 等${tradeDates.length}日`;
+        const signalDateText = signalDates.length === 1
+          ? signalDates[0] : `${signalDates[0]} 等${signalDates.length}日`;
+        const relationText = relationNames.length === 1
+          ? (SIGNAL_RELATION_LABELS[relationNames[0]] || relationNames[0])
+          : `多种(${relationNames.length})`;
+        const yOffset = isBuy ? (SYM / 2 + GAP) : -(SYM / 2 + GAP);
+        return {
+          name: isBuy ? "买" : "卖", coord: [effectDate, anchor],
+          value: `${isBuy ? "买" : "卖"} ${fmt(totals.qty)}@${fmt(totals.pxQty / totals.qty)} · 信号日 ${signalDateText} · 生效日 ${effectDate} · 交易日 ${tradeDateText} · 关系 ${relationText}`,
+          symbol: isBuy ? "arrow" : "pin", symbolRotate: isBuy ? 0 : 180,
+          symbolSize: SYM, symbolOffset: [0, yOffset],
+          itemStyle: {
+            color: isBuy ? "#4c8dff" : "#ffa726", borderColor: "#fff", borderWidth: 1,
+            opacity: relationNames.includes("inferred") && relationNames.length === 1 ? 0.7 : 1,
+          },
+          label: {
+            show: true, formatter: isBuy ? "买" : "卖", color: "#fff",
+            fontSize: 9, position: isBuy ? "top" : "bottom",
+            distance: 3, backgroundColor: "transparent",
+          },
+        };
+      }).filter(Boolean);
+    });
 
-    const title = name ? `${code} ${name} 信号R线` : `${code} 信号R线`;
+    const unlinkedCount = trades.filter((t) => !t.signal_date).length;
+    const baseTitle = name ? `${code} ${name} 信号R线` : `${code} 信号R线`;
+    const title = unlinkedCount ? `${baseTitle}（${unlinkedCount}笔成交未关联信号）` : baseTitle;
     const tipHtml = (ps) => {
       const i = ps[0].dataIndex;
       const rows = [`<b>${ps[0].axisValue}</b>`];
@@ -1578,6 +1626,11 @@ async function plotRline(auto = false) {
         const parts = [];
         if (day.buy.qty) parts.push(`<span style="color:#4c8dff">买 均价 ${fmt(day.buy.pxQty / day.buy.qty)}　量 ${fmt(day.buy.qty)}　额 ${fmt(day.buy.amt)}</span>`);
         if (day.sell.qty) parts.push(`<span style="color:#ffa726">卖 均价 ${fmt(day.sell.pxQty / day.sell.qty)}　量 ${fmt(day.sell.qty)}　额 ${fmt(day.sell.amt)}</span>`);
+        [...day.actions.values()].forEach((action) => {
+          const relation = String(action.relation_status || "unlinked");
+          const label = SIGNAL_RELATION_LABELS[relation] || relation;
+          parts.push(`<span style="color:#8a94a8">信号日 ${action.signal_date || "—"} · 交易日 ${action.trade_date} · 关系 ${label}</span>`);
+        });
         if (parts.length) rows.push('<div style="border-top:1px dashed #4c5468;margin:4px 0 2px"></div>' + parts.join("<br/>"));
       }
       return rows.join("<br/>");
@@ -1589,7 +1642,7 @@ async function plotRline(auto = false) {
       tooltip: { trigger: "axis", axisPointer: { type: "cross" }, formatter: tipHtml, confine: true },
       legend: { data: ["排名", "分数"], textStyle: { color: "#8a94a8" }, left: 10, top: 26 },
       grid: { left: 66, right: 66, top: 74, bottom: 60 },
-      xAxis: { type: "category", data: dates, axisLabel: { color: "#8a94a8" } },
+      xAxis: { type: "category", name: "生效日", data: dates, axisLabel: { color: "#8a94a8" } },
       yAxis: [
         // Rank: 1 is best → put it on top (inverse), start at 1.
         { name: "排名", inverse: true, min: 1, axisLabel: { color: "#8a94a8" },
