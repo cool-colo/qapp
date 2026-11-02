@@ -61,7 +61,41 @@ before_market AS (
     GROUP BY trade_date
 ),
 
--- ========== 4. 盘后市值 ==========
+-- ========== 4. 盘后净值（市值 + 现金 + 冻结） ==========
+asset_nav_history AS (
+    SELECT
+        trade_date,
+        market_value,
+        market_value + cash + frozen_cash AS net_value
+    FROM live_asset_snapshot
+    WHERE snapshot_type = 'after_trading'
+        AND account_id = @account_id
+        AND trader_id = @trader_id
+        AND trade_date BETWEEN COALESCE(
+            (
+                SELECT MAX(previous.trade_date)
+                FROM live_asset_snapshot previous
+                WHERE previous.snapshot_type = 'after_trading'
+                    AND previous.account_id = @account_id
+                    AND previous.trader_id = @trader_id
+                    AND previous.trade_date < @start_date
+            ),
+            @start_date
+        ) AND @end_date
+        AND market_value IS NOT NULL
+        AND cash IS NOT NULL
+        AND frozen_cash IS NOT NULL
+),
+asset_nav AS (
+    SELECT
+        trade_date,
+        market_value,
+        net_value,
+        LAG(net_value) OVER (ORDER BY trade_date) AS previous_net_value
+    FROM asset_nav_history
+),
+
+-- ========== 5. 盘后市值 ==========
 after_market AS (
     SELECT
         p.trade_date,
@@ -77,7 +111,7 @@ after_market AS (
     GROUP BY p.trade_date
 ),
 
--- ========== 5. 日收益（汇总） ==========
+-- ========== 6. 日收益（汇总） ==========
 daily_return AS (
     SELECT
         trade_date,
@@ -88,7 +122,7 @@ daily_return AS (
         AND account_id = @account_id
 ),
 
--- ========== 6. 中证全指 000985.CSI（暴露收盘/昨收，用于端点式周累计；仅用于中间计算，不再输出） ==========
+-- ========== 7. 中证全指 000985.CSI（暴露收盘/昨收，用于端点式周累计；仅用于中间计算，不再输出） ==========
 csi_all AS (
     SELECT
         trade_date,
@@ -100,7 +134,7 @@ csi_all AS (
         AND trade_date BETWEEN @start_date AND @end_date
 ),
 
--- ========== 7. 中证1000 399852.SZ（暴露收盘/昨收，用于端点式周累计；目前暂无数据） ==========
+-- ========== 8. 中证1000 399852.SZ（暴露收盘/昨收，用于端点式周累计；目前暂无数据） ==========
 csi1000 AS (
     SELECT
         trade_date,
@@ -114,17 +148,18 @@ csi1000 AS (
     GROUP BY trade_date
 ),
 
--- ========== 8. 所有出现过的日期 ==========
+-- ========== 9. 所有出现过的日期 ==========
 all_dates AS (
     SELECT trade_date FROM daily_slippage
     UNION SELECT trade_date FROM before_market
     UNION SELECT trade_date FROM after_market
+    UNION SELECT trade_date FROM asset_nav
     UNION SELECT trade_date FROM daily_return
     UNION SELECT trade_date FROM csi_all
     UNION SELECT trade_date FROM csi1000
 ),
 
--- ========== 9. 合并每日指标 ==========
+-- ========== 10. 合并每日指标 ==========
 combined AS (
     SELECT
         d.trade_date,
@@ -132,8 +167,10 @@ combined AS (
         bm.before_market_value,
         am.after_market_value,
         r.return_amount,
-        -- 日收益率：纯持仓盈亏 / (盘后市值 − 当日收益)
-        r.return_amount / NULLIF(am.after_market_value - r.return_amount, 0) AS strat_daily_rate,
+        an.net_value,
+        an.previous_net_value,
+        -- 日收益率：日收益 / 上一交易日盘后净值（市值 + 现金 + 冻结）
+        r.return_amount / NULLIF(an.previous_net_value, 0) AS strat_daily_rate,
         s.buy_slippage_amount,
         s.buy_trade_amount,
         s.sell_slippage_amount,
@@ -149,20 +186,24 @@ combined AS (
     FROM all_dates d
     LEFT JOIN before_market bm ON d.trade_date = bm.trade_date
     LEFT JOIN after_market  am ON d.trade_date = am.trade_date
+    LEFT JOIN asset_nav     an ON d.trade_date = an.trade_date
     LEFT JOIN daily_return  r  ON d.trade_date = r.trade_date
     LEFT JOIN daily_slippage s ON d.trade_date = s.trade_date
     LEFT JOIN csi_all       ca ON d.trade_date = ca.trade_date
     LEFT JOIN csi1000       ck ON d.trade_date = ck.trade_date
+    WHERE an.net_value IS NOT NULL
+      AND an.previous_net_value IS NOT NULL
+      AND r.return_amount IS NOT NULL
 ),
 
--- ========== 10. 周累计 ==========
+-- ========== 11. 周累计 ==========
 windowed AS (
     SELECT
         c.*,
-        -- 策略周累计收益金额（金额求和）
-        SUM(return_amount) OVER w AS week_cum_return_amount,
-        -- 策略周累计收益率：日收益率复利（时间加权，不受入金影响）
-        EXP(SUM(LN(1 + strat_daily_rate)) OVER w) - 1 AS week_cum_strat_rate,
+        -- 策略周累计收益金额/收益率：当日盘后净值相对本周首日前一交易日盘后净值
+        net_value - FIRST_VALUE(previous_net_value) OVER w AS week_cum_return_amount,
+        net_value / NULLIF(FIRST_VALUE(previous_net_value) OVER w, 0) - 1
+            AS week_cum_strat_rate,
         -- 中证全指周累计收益率：(当日收盘 − 本周首日昨收) / 本周首日昨收
         (csi_all_close - FIRST_VALUE(csi_all_preclose) OVER w)
             / NULLIF(FIRST_VALUE(csi_all_preclose) OVER w, 0) AS week_cum_csi_all_rate,
@@ -187,7 +228,7 @@ windowed AS (
         )
 )
 
--- ========== 11. 最终输出 ==========
+-- ========== 12. 最终输出 ==========
 SELECT
     w.trade_date AS 日期,
     @account_id   AS 账号ID,

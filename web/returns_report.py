@@ -9,12 +9,14 @@ changes are:
     pymysql named parameters (%(start_date)s ...);
   * the final SELECT emits raw NUMERIC columns with english names instead of the
     Chinese percent-string presentation columns, so the values can be charted;
-  * the ``combined`` CTE has a WHERE that drops a date when it has NEITHER a 盘前
-    nor a 盘后 market value, OR has no daily return (return_amount). This is a
-    web-only divergence from the .sql: the filter runs before the windowed
-    cumulatives so the displayed week_cum_* values stay consistent with the rows
-    actually shown. (Previously this filter lived in the frontend, applied AFTER
-    the query, which desynced the weekly totals.)
+  * strategy returns use the previous trading day's after-trading net value
+    (``market_value + cash + frozen_cash``) as the denominator;
+  * the ``combined`` CTE has a WHERE that requires an after-trading asset snapshot,
+    its previous net value, and a daily return. This is a web-only divergence from
+    the .sql: the filter runs before the windowed cumulatives so the displayed
+    week_cum_* values stay consistent with the rows actually shown;
+  * the API also returns a period summary computed from the first and last
+    after-trading net values in the requested date range.
 
 IF YOU CHANGE THE REPORT LOGIC, UPDATE BOTH THIS FILE AND THE .sql IN LOCKSTEP
 (except the ``combined`` WHERE filter noted above, which is web-only).
@@ -107,6 +109,38 @@ before_market AS (
         AND can_use_volume IS NOT NULL
     GROUP BY trade_date
 ),
+asset_nav_history AS (
+    SELECT
+        trade_date,
+        market_value,
+        market_value + cash + frozen_cash AS net_value
+    FROM live_asset_snapshot
+    WHERE snapshot_type = 'after_trading'
+        AND account_id = %(account_id)s
+        AND trader_id = %(trader_id)s
+        AND trade_date BETWEEN COALESCE(
+            (
+                SELECT MAX(previous.trade_date)
+                FROM live_asset_snapshot previous
+                WHERE previous.snapshot_type = 'after_trading'
+                    AND previous.account_id = %(account_id)s
+                    AND previous.trader_id = %(trader_id)s
+                    AND previous.trade_date < %(start_date)s
+            ),
+            %(start_date)s
+        ) AND %(end_date)s
+        AND market_value IS NOT NULL
+        AND cash IS NOT NULL
+        AND frozen_cash IS NOT NULL
+),
+asset_nav AS (
+    SELECT
+        trade_date,
+        market_value,
+        net_value,
+        LAG(net_value) OVER (ORDER BY trade_date) AS previous_net_value
+    FROM asset_nav_history
+),
 after_market AS (
     SELECT
         p.trade_date,
@@ -156,6 +190,7 @@ all_dates AS (
     SELECT trade_date FROM daily_slippage
     UNION SELECT trade_date FROM before_market
     UNION SELECT trade_date FROM after_market
+    UNION SELECT trade_date FROM asset_nav
     UNION SELECT trade_date FROM daily_return
     UNION SELECT trade_date FROM csi_all
     UNION SELECT trade_date FROM csi1000
@@ -167,7 +202,9 @@ combined AS (
         bm.before_market_value,
         am.after_market_value,
         r.return_amount,
-        r.return_amount / NULLIF(am.after_market_value - r.return_amount, 0) AS strat_daily_rate,
+        r.return_amount / NULLIF(an.previous_net_value, 0) AS strat_daily_rate,
+        an.net_value,
+        an.previous_net_value,
         s.buy_slippage_amount,
         s.buy_trade_amount,
         s.sell_slippage_amount,
@@ -183,23 +220,23 @@ combined AS (
     FROM all_dates d
     LEFT JOIN before_market bm ON d.trade_date = bm.trade_date
     LEFT JOIN after_market  am ON d.trade_date = am.trade_date
+    LEFT JOIN asset_nav     an ON d.trade_date = an.trade_date
     LEFT JOIN daily_return  r  ON d.trade_date = r.trade_date
     LEFT JOIN daily_slippage s ON d.trade_date = s.trade_date
     LEFT JOIN csi_all       ca ON d.trade_date = ca.trade_date
     LEFT JOIN csi1000       ck ON d.trade_date = ck.trade_date
-    -- Drop a date when it has NEITHER a 盘前 nor a 盘后 market value, and also
-    -- drop dates that have no daily return (return_amount). Applied here (before
-    -- the windowed cumulatives) so week_cum_* stays consistent with the rows
-    -- actually returned.
-    WHERE (bm.before_market_value IS NOT NULL
-           OR am.after_market_value IS NOT NULL)
+    -- Require a complete after-to-after net-value pair plus a daily return so the
+    -- windowed values stay consistent with the rows actually returned.
+    WHERE an.net_value IS NOT NULL
+      AND an.previous_net_value IS NOT NULL
       AND r.return_amount IS NOT NULL
 ),
 windowed AS (
     SELECT
         c.*,
-        SUM(return_amount) OVER w AS week_cum_return_amount,
-        EXP(SUM(LN(1 + strat_daily_rate)) OVER w) - 1 AS week_cum_strat_rate,
+        net_value - FIRST_VALUE(previous_net_value) OVER w AS week_cum_return_amount,
+        net_value / NULLIF(FIRST_VALUE(previous_net_value) OVER w, 0) - 1
+            AS week_cum_strat_rate,
         (csi_all_close - FIRST_VALUE(csi_all_preclose) OVER w)
             / NULLIF(FIRST_VALUE(csi_all_preclose) OVER w, 0) AS week_cum_csi_all_rate,
         (csi1000_close - FIRST_VALUE(csi1000_preclose) OVER w)
@@ -227,8 +264,12 @@ SELECT
     w.before_market_value                                 AS before_market_value,
     w.after_market_value                                  AS after_market_value,
     w.return_amount                                       AS return_amount,
+    w.net_value                                           AS net_value,
+    w.previous_net_value                                  AS previous_net_value,
     w.strat_daily_rate                                    AS strat_daily_rate,
     w.csi1000_daily_rate                                  AS csi1000_daily_rate,
+    w.csi1000_close                                       AS csi1000_close,
+    w.csi1000_preclose                                    AS csi1000_preclose,
     (w.strat_daily_rate - w.csi1000_daily_rate)           AS excess_daily_rate,
     w.daily_volatility                                    AS daily_volatility,
     (w.daily_volatility * SQRT(252))                      AS annual_volatility,
@@ -299,3 +340,55 @@ def query_returns(
             "instrument_suffix": suffix,
         },
     )
+
+
+def build_return_summary(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Build the period footer from requested-range endpoint net values."""
+    if not rows:
+        return None
+
+    nav_rows = [
+        row for row in rows
+        if row.get("net_value") is not None and row.get("previous_net_value") is not None
+    ]
+    if not nav_rows:
+        return {"trade_date": "合计"}
+
+    first = nav_rows[0]
+    last = nav_rows[-1]
+    initial_net_value = first["previous_net_value"]
+    final_net_value = last["net_value"]
+    period_pnl = final_net_value - initial_net_value if initial_net_value else None
+    period_rate = (
+        final_net_value / initial_net_value - 1
+        if initial_net_value is not None and initial_net_value != 0
+        else None
+    )
+
+    benchmark_rows = [
+        row for row in rows
+        if row.get("csi1000_close") is not None and row.get("csi1000_preclose") is not None
+    ]
+    benchmark_rate = None
+    if benchmark_rows:
+        benchmark_initial = benchmark_rows[0]["csi1000_preclose"]
+        benchmark_final = benchmark_rows[-1]["csi1000_close"]
+        if benchmark_initial is not None and benchmark_initial != 0:
+            benchmark_rate = benchmark_final / benchmark_initial - 1
+    excess_rate = (
+        period_rate - benchmark_rate
+        if period_rate is not None and benchmark_rate is not None
+        else None
+    )
+
+    return {
+        "trade_date": "合计",
+        "return_amount": period_pnl,
+        "strat_daily_rate": period_rate,
+        "csi1000_daily_rate": benchmark_rate,
+        "excess_daily_rate": excess_rate,
+        "week_cum_return_amount": period_pnl,
+        "week_cum_strat_rate": period_rate,
+        "week_cum_csi1000_rate": benchmark_rate,
+        "week_cum_excess_rate": excess_rate,
+    }

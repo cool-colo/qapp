@@ -54,6 +54,11 @@ not list accounts in the config.
 `SET @var` lines (now query params) and the final presentation SELECT (now raw numeric
 columns) differ. **If you change the report logic, update both files in lockstep.**
 
+Strategy daily return is `return_amount / previous after-trading net value`, where
+net value is `market_value + cash + frozen_cash`. Weekly cumulative P&L/return and the
+report footer also use after-trading net-value endpoints. `/api/returns` returns the
+footer as `summary`; the frontend renders it without recomputing totals.
+
 ## Setup
 
 ```bash

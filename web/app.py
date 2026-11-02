@@ -22,6 +22,7 @@ from web.config import AppConfig, load_config
 from web.db import DataAccess, MySqlSource, NodeApiClient, jsonable, jsonable_rows, quote_literal
 from web.returns_report import (
     RETURN_COLUMNS,
+    build_return_summary,
     derive_instrument_suffix,
     query_returns,
 )
@@ -435,7 +436,12 @@ def get_returns(
         )
     except Exception as exc:  # noqa: BLE001 — surface DB errors as 500 with a message
         raise HTTPException(status_code=500, detail=f"returns query failed: {exc}") from exc
-    return {"columns": RETURN_COLUMNS, "rows": jsonable_rows(rows)}
+    summary = build_return_summary(rows)
+    return {
+        "columns": RETURN_COLUMNS,
+        "rows": jsonable_rows(rows),
+        "summary": jsonable_rows([summary])[0] if summary is not None else None,
+    }
 
 
 @app.get("/api/signal_quality")

@@ -818,52 +818,40 @@ const REPORT_SIGN_COLS = new Set([
   "week_cum_return_amount", "week_cum_strat_rate", "week_cum_csi1000_rate",
   "week_cum_excess_rate", "buy_slippage_bps", "sell_slippage_bps", "total_slippage_bps",
 ]);
-// Amounts shown as whole numbers (no fractional part).
-const REPORT_INT_COLS = new Set(["return_amount", "week_cum_return_amount"]);
-// Daily columns summed straight across every visible row.
-const REPORT_SUM_COLS = ["return_amount", "strat_daily_rate", "csi1000_daily_rate", "excess_daily_rate"];
-// Weekly-cumulative columns: already cumulative-to-date within a week, so sum
-// only the last row of each week (the week's full total).
-const REPORT_WEEK_SUM_COLS = [
-  "week_cum_return_amount", "week_cum_strat_rate", "week_cum_csi1000_rate", "week_cum_excess_rate",
-];
-
-// Build the bottom summary row directly from the rendered rows (not the backend).
-function buildReportSummary(rows) {
-  if (!rows || rows.length === 0) return null;
-  const sum = { trade_date: "合计" };
-  for (const c of REPORT_SUM_COLS) {
-    sum[c] = rows.reduce((acc, r) => acc + (typeof r[c] === "number" ? r[c] : 0), 0);
-  }
-  // Pick the last row per week (rows are chronological), then sum those values.
-  const lastByWeek = new Map();
-  for (const r of rows) lastByWeek.set(r.week_label, r);
-  const weekEnds = [...lastByWeek.values()];
-  for (const c of REPORT_WEEK_SUM_COLS) {
-    sum[c] = weekEnds.reduce((acc, r) => acc + (typeof r[c] === "number" ? r[c] : 0), 0);
-  }
-  return sum;
-}
+// Footer amount columns formatted with exactly two decimal places.
+const REPORT_MONEY_COLS = new Set(["return_amount", "week_cum_return_amount"]);
 async function loadReport() {
   if (!state.account) return;
   const start = $("#report-start").value;
   const end = $("#report-end").value || todayISO();
   if (!start) { toast("请设置起始日期"); return; }
   try {
-    const { columns, rows } = await api("/api/returns", { ...accountParams(), start, end });
+    const { columns, rows, summary } = await api("/api/returns", { ...accountParams(), start, end });
     // Row filtering (drop dates lacking both 盘前/盘后 market values) is done in
     // SQL so the weekly cumulative columns stay consistent with the visible rows.
     // Temporarily hide the volatility/sharpe columns (日波动率/年化波动率/日夏普/年化夏普).
     const HIDDEN_REPORT_COLS = new Set([
       "daily_volatility", "annual_volatility", "daily_sharpe", "annual_sharpe",
     ]);
+    const reportSummary = summary;
     renderTable("#report-table", rows, {
       columns: columns.filter((c) => !HIDDEN_REPORT_COLS.has(c)),
       headers: REPORT_HEADERS,
       signCols: REPORT_SIGN_COLS,
-      intCols: REPORT_INT_COLS,
       weekBandCol: "week_label",
-      footerFn: buildReportSummary,
+      footerRow: summary,
+      cellFn: (col, value, row) => {
+        if (row !== reportSummary || typeof value !== "number") return undefined;
+        if (RATE_COLS.has(col)) {
+          return `<td class="${signClass(value)}">${(value * 100).toFixed(2)}%</td>`;
+        }
+        if (REPORT_MONEY_COLS.has(col)) {
+          return `<td class="${signClass(value)}">${value.toLocaleString(
+            undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 },
+          )}</td>`;
+        }
+        return undefined;
+      },
     });
   } catch (e) { toast(e.message); }
 }
