@@ -5,6 +5,7 @@ import inspect
 import random
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -139,6 +140,14 @@ class IntentContext:
             "best_ask": ctx.best_ask,
             "bids": ctx.bids,
             "asks": ctx.asks,
+            "price_return_bps": ctx.price_return_bps,
+            "volume_confirmation": ctx.volume_confirmation,
+            "book_imbalance": ctx.book_imbalance,
+            "confirmation_score": ctx.confirmation_score,
+            "trend_bps": ctx.trend_bps,
+            "trend_severity": ctx.trend_severity,
+            "timeout_multiplier": ctx.timeout_multiplier,
+            "offset_multiplier": ctx.offset_multiplier,
         }
 
     @classmethod
@@ -171,6 +180,25 @@ class TodayFillSnapshot:
     sell_qty: Decimal
     fill_count: int
     latest_ts_event: int
+
+
+@dataclass(frozen=True)
+class PriceTrendSample:
+    ts_ns: int
+    price: float
+    volume: int | None
+
+
+@dataclass(frozen=True)
+class ExecutionTrend:
+    price_return_bps: float = 0.0
+    volume_confirmation: float | None = None
+    book_imbalance: float | None = None
+    confirmation_score: float = 0.0
+    trend_bps: float = 0.0
+    severity: float = 0.0
+    timeout_multiplier: float = 1.0
+    offset_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -239,7 +267,7 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     stop_time: str | None = "14:55"
     initial_last_closes: dict[str, float] | None = None
     unfilled_timeout_secs: float = 60.0
-    resubmit_check_interval_secs: float = 10.0
+    resubmit_check_interval_secs: float = 2.0
     # A broker sellable-position denial that lands shortly after this strategy
     # cancels its own sell for the same instrument is treated as a transient
     # freeze-release race (the broker has not yet released the shares frozen by
@@ -260,6 +288,13 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     buy_max_price_bps: float = 100.0
     buy_cancel_threshold: int = 1
     sell_cancel_threshold: int = 1
+    price_trend_window_secs: float = 10.0
+    price_trend_threshold_bps: float = 20.0
+    price_trend_max_bps: float = 40.0
+    price_trend_confirmation_strength: float = 0.5
+    price_trend_book_max_age_secs: float = 2.0
+    price_trend_min_timeout_multiplier: float = 0.3
+    price_trend_max_offset_multiplier: float = 3.0
     exit_non_targets: bool = True
     limit_stop_mode: str = "freeze_symbol"
     order_slice_notional: Decimal = Decimal("300000")
@@ -321,6 +356,7 @@ class TargetQuantityStrategy(Strategy):
 
     def __init__(self, config: TargetQuantityStrategyConfig) -> None:
         super().__init__(config)
+        self._validate_price_trend_config(config)
         self._instrument_ids = list(config.instrument_ids)
         self._bar_types = {str(key): value for key, value in config.bar_types.items()}
         self._last_close = normalize_initial_last_closes(config.initial_last_closes)
@@ -375,6 +411,8 @@ class TargetQuantityStrategy(Strategy):
         # order-book depth callback submit orders as early as possible.
         self._depth_converged_today = False
         self._depth_books: dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]] = {}
+        self._depth_book_ts_init: dict[str, int] = {}
+        self._price_trend_samples: dict[str, deque[PriceTrendSample]] = {}
         self._subscribed_order_book_depth_instruments: set[str] = set()
         self._sleep = time.sleep
         # Side-specific cancel counts per instrument; reset daily and on fill.
@@ -448,6 +486,26 @@ class TargetQuantityStrategy(Strategy):
         self._last_account_sizing_snapshot: str | None = None
         self.target_events: list[TargetQuantityTargetEvent] = []
         self.order_events: list[TargetQuantityOrderEvent] = []
+
+    @staticmethod
+    def _validate_price_trend_config(config: TargetQuantityStrategyConfig) -> None:
+        if float(config.price_trend_window_secs) <= 0:
+            raise ValueError("price_trend_window_secs must be positive")
+        threshold = float(config.price_trend_threshold_bps)
+        maximum = float(config.price_trend_max_bps)
+        if threshold < 0:
+            raise ValueError("price_trend_threshold_bps must be non-negative")
+        if maximum <= threshold:
+            raise ValueError("price_trend_max_bps must be greater than price_trend_threshold_bps")
+        if not 0.0 <= float(config.price_trend_confirmation_strength) <= 1.0:
+            raise ValueError("price_trend_confirmation_strength must be between 0 and 1")
+        if float(config.price_trend_book_max_age_secs) < 0:
+            raise ValueError("price_trend_book_max_age_secs must be non-negative")
+        timeout_multiplier = float(config.price_trend_min_timeout_multiplier)
+        if not 0.0 < timeout_multiplier <= 1.0:
+            raise ValueError("price_trend_min_timeout_multiplier must be in (0, 1]")
+        if float(config.price_trend_max_offset_multiplier) < 1.0:
+            raise ValueError("price_trend_max_offset_multiplier must be at least 1")
 
     def configure_pre_open_reconciliation(
         self,
@@ -996,6 +1054,7 @@ class TargetQuantityStrategy(Strategy):
         #     color=LogColor.BLUE,
         # )
         trading_date = self._clock_date()
+        snapshot_ts_ns = self.clock.timestamp_ns()
         updated = 0
         for instrument_id, fields in sorted_snapshot:
             # Store the market status first: a suspended stock has open==0 and would
@@ -1003,6 +1062,7 @@ class TargetQuantityStrategy(Strategy):
             self._roll_trading_day(trading_date)
             tick = TickSnapshot.from_fields(fields)
             self._market_status[str(instrument_id)] = tick
+            self._record_price_trend_sample(str(instrument_id), tick, snapshot_ts_ns)
             # Record the snapshot's last_close (previous session close) before the
             # invalid-open gate: a held name outside today's subscription universe has
             # neither an initial_last_closes seed nor a bar to feed _last_close, so the
@@ -1457,6 +1517,8 @@ class TargetQuantityStrategy(Strategy):
         self._market_status = {}
         self._whole_market_status = {}
         self._depth_books = {}
+        self._depth_book_ts_init = {}
+        self._price_trend_samples = {}
         self._depth_converged_today = False
         self._cancel_count_buy = {}
         self._cancel_count_sell = {}
@@ -1475,6 +1537,142 @@ class TargetQuantityStrategy(Strategy):
         self._roll_trading_day(trading_date)
         if last_price is not None and last_price > 0:
             self._last_close[instrument_id] = float(last_price)
+
+    def _record_price_trend_sample(
+        self,
+        instrument_id: str,
+        tick: TickSnapshot,
+        ts_ns: int,
+    ) -> None:
+        price = tick.last_price
+        if price is None or price <= 0 or ts_ns <= 0:
+            return
+        volume = tick.volume if tick.volume is not None and tick.volume >= 0 else None
+        samples = self._price_trend_samples.setdefault(instrument_id, deque())
+        sample = PriceTrendSample(ts_ns=ts_ns, price=float(price), volume=volume)
+        if samples and ts_ns < samples[-1].ts_ns:
+            return
+        if samples and ts_ns == samples[-1].ts_ns:
+            samples[-1] = sample
+        else:
+            samples.append(sample)
+        cutoff = ts_ns - int(float(self.config.price_trend_window_secs) * 1_000_000_000)
+        # Keep the newest sample at or before the window boundary so endpoint
+        # return and the first incremental-volume interval remain well-defined.
+        while len(samples) >= 2 and samples[1].ts_ns <= cutoff:
+            samples.popleft()
+
+    @staticmethod
+    def _volume_direction_confirmation(
+        samples: Sequence[PriceTrendSample],
+        price_direction: float,
+    ) -> float | None:
+        directional_volume = 0.0
+        total_volume = 0.0
+        ordered_samples = list(samples)
+        for previous, current in zip(ordered_samples, ordered_samples[1:]):
+            if previous.volume is None or current.volume is None:
+                continue
+            delta_volume = current.volume - previous.volume
+            if delta_volume <= 0:
+                continue
+            price_delta = current.price - previous.price
+            interval_direction = 1.0 if price_delta > 0 else -1.0 if price_delta < 0 else 0.0
+            directional_volume += delta_volume * interval_direction * price_direction
+            total_volume += delta_volume
+        if total_volume <= 0:
+            return None
+        return max(-1.0, min(1.0, directional_volume / total_volume))
+
+    def _five_level_book_imbalance(
+        self,
+        instrument_id: str,
+        now_ns: int,
+    ) -> float | None:
+        book = self._depth_books.get(instrument_id)
+        ts_init = self._depth_book_ts_init.get(instrument_id)
+        if book is None or ts_init is None:
+            return None
+        max_age_ns = int(float(self.config.price_trend_book_max_age_secs) * 1_000_000_000)
+        age_ns = now_ns - ts_init
+        if age_ns < 0 or age_ns > max_age_ns:
+            return None
+        bids, asks = book
+        if not bids or not asks or bids[0][0] >= asks[0][0]:
+            return None
+        bid_pressure = sum(
+            size / level
+            for level, (_price, size) in enumerate(bids[:5], start=1)
+        )
+        ask_pressure = sum(
+            size / level
+            for level, (_price, size) in enumerate(asks[:5], start=1)
+        )
+        total_pressure = bid_pressure + ask_pressure
+        if bid_pressure <= 0 or ask_pressure <= 0 or total_pressure <= 0:
+            return None
+        return max(
+            -1.0,
+            min(1.0, (bid_pressure - ask_pressure) / total_pressure),
+        )
+
+    def _execution_trend(
+        self,
+        instrument_id: str,
+        side: OrderSide,
+        now_ns: int | None = None,
+    ) -> ExecutionTrend:
+        current_ns = self.clock.timestamp_ns() if now_ns is None else int(now_ns)
+        book_imbalance = self._five_level_book_imbalance(instrument_id, current_ns)
+        samples = self._price_trend_samples.get(instrument_id)
+        if not samples or len(samples) < 2:
+            return ExecutionTrend(book_imbalance=book_imbalance)
+        window_ns = int(float(self.config.price_trend_window_secs) * 1_000_000_000)
+        if samples[-1].ts_ns - samples[0].ts_ns < window_ns:
+            return ExecutionTrend(book_imbalance=book_imbalance)
+        first = samples[0]
+        last = samples[-1]
+        price_return_bps = (last.price / first.price - 1.0) * 10_000.0
+        if price_return_bps == 0:
+            return ExecutionTrend(book_imbalance=book_imbalance)
+        price_direction = 1.0 if price_return_bps > 0 else -1.0
+        volume_confirmation = self._volume_direction_confirmation(samples, price_direction)
+        confirmations = []
+        if volume_confirmation is not None:
+            confirmations.append(volume_confirmation)
+        if book_imbalance is not None:
+            confirmations.append(price_direction * book_imbalance)
+        confirmation_score = sum(confirmations) / len(confirmations) if confirmations else 0.0
+        confirmation_factor = 1.0 + (
+            float(self.config.price_trend_confirmation_strength) * confirmation_score
+        )
+        trend_bps = price_return_bps * confirmation_factor
+        adverse = (
+            side == OrderSide.BUY and trend_bps > 0
+        ) or (
+            side == OrderSide.SELL and trend_bps < 0
+        )
+        severity = 0.0
+        if adverse:
+            threshold = float(self.config.price_trend_threshold_bps)
+            maximum = float(self.config.price_trend_max_bps)
+            severity = max(0.0, min(1.0, (abs(trend_bps) - threshold) / (maximum - threshold)))
+        timeout_multiplier = 1.0 - severity * (
+            1.0 - float(self.config.price_trend_min_timeout_multiplier)
+        )
+        offset_multiplier = 1.0 + severity * (
+            float(self.config.price_trend_max_offset_multiplier) - 1.0
+        )
+        return ExecutionTrend(
+            price_return_bps=price_return_bps,
+            volume_confirmation=volume_confirmation,
+            book_imbalance=book_imbalance,
+            confirmation_score=confirmation_score,
+            trend_bps=trend_bps,
+            severity=severity,
+            timeout_multiplier=timeout_multiplier,
+            offset_multiplier=offset_multiplier,
+        )
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         self._note_quote_tick(tick)
@@ -1512,6 +1710,7 @@ class TargetQuantityStrategy(Strategy):
         # real bars or the QMT full-tick snapshot.
         self._roll_trading_day(trading_date)
         self._depth_books[str(depth.instrument_id)] = (bids, asks)
+        self._depth_book_ts_init[str(depth.instrument_id)] = int(depth.ts_init)
         # On the first depth callback of each trading day, converge immediately so
         # orders are submitted as early as possible (priced against real depth)
         # rather than waiting for the next bar/timer. Gated on the trading window.
@@ -2027,7 +2226,6 @@ class TargetQuantityStrategy(Strategy):
         if timeout_secs <= 0:
             return
         now = self.clock.timestamp_ns()
-        timeout_ns = int(timeout_secs * 1_000_000_000)
         try:
             open_orders = self.cache.orders_open(strategy_id=self.id)
         except Exception:
@@ -2043,6 +2241,9 @@ class TargetQuantityStrategy(Strategy):
             except Exception:
                 pass
             anchor_ts = self._unfilled_timeout_anchor_ts(order)
+            trend = self._execution_trend(instrument_id_text, order.side, now_ns=now)
+            effective_timeout_secs = timeout_secs * trend.timeout_multiplier
+            timeout_ns = int(effective_timeout_secs * 1_000_000_000)
             if anchor_ts is None or now - anchor_ts < timeout_ns:
                 continue
             if self._at_price_limit(order):
@@ -2076,6 +2277,15 @@ class TargetQuantityStrategy(Strategy):
             intent_context.record(
                 cancel_reason="unfilled_timeout",
                 canceled_order_id=client_order_id,
+                price_return_bps=trend.price_return_bps,
+                volume_confirmation=trend.volume_confirmation,
+                book_imbalance=trend.book_imbalance,
+                confirmation_score=trend.confirmation_score,
+                trend_bps=trend.trend_bps,
+                trend_severity=trend.severity,
+                effective_timeout_secs=effective_timeout_secs,
+                timeout_multiplier=trend.timeout_multiplier,
+                offset_multiplier=trend.offset_multiplier,
             )
             self._forget_submitted_order(client_order_id)
             if order.side == OrderSide.BUY:
@@ -2817,6 +3027,7 @@ class TargetQuantityStrategy(Strategy):
             cancel_count = self._cancel_count_buy.get(instrument_id_text, 0)
         else:
             cancel_count = self._cancel_count_sell.get(instrument_id_text, 0)
+        trend = self._execution_trend(instrument_id_text, side)
         return PriceContext(
             instrument_id=instrument_id,
             side=side,
@@ -2829,6 +3040,14 @@ class TargetQuantityStrategy(Strategy):
             best_ask=best_ask,
             bids=bids,
             asks=asks,
+            price_return_bps=trend.price_return_bps,
+            volume_confirmation=trend.volume_confirmation,
+            book_imbalance=trend.book_imbalance,
+            confirmation_score=trend.confirmation_score,
+            trend_bps=trend.trend_bps,
+            trend_severity=trend.severity,
+            timeout_multiplier=trend.timeout_multiplier,
+            offset_multiplier=trend.offset_multiplier,
         )
 
     def _quote_snapshot(

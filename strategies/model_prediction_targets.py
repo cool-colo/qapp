@@ -971,7 +971,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         holdings_value = sum(
             holding.quantity * holding.price for holding in current_holdings
         )
-        if self._account_id_equals(86904088):
+        if self._account_id_equals(86904088000):
             investable_asset = float(holdings_value * 1.01)
         else:
             investable_asset = total_asset * (

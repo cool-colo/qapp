@@ -162,6 +162,19 @@ def _check_snapshot_type(snapshot_type: str | None) -> None:
         )
 
 
+def _position_classifications(
+    data: DataAccess,
+    rows: list[dict[str, Any]],
+    as_of: str,
+) -> dict[str, dict[str, Any]]:
+    """Best-effort bulk classifications; holdings remain usable if CH is down."""
+    codes = [str(row["stock_code"]) for row in rows if row.get("stock_code")]
+    try:
+        return data.clickhouse.stock_classifications(codes, as_of)
+    except RuntimeError:
+        return {}
+
+
 # ---- reference / discovery -------------------------------------------------
 
 
@@ -278,7 +291,12 @@ def get_positions(
         """,
         params,
     )
-    return {"rows": data.attach_names(jsonable_rows(rows))}
+    position_rows = data.attach_names(jsonable_rows(rows))
+    return {
+        "rows": position_rows,
+        "classifications": _position_classifications(data, position_rows, date),
+        "classification_date": date,
+    }
 
 
 @app.get("/api/target")
@@ -1048,7 +1066,13 @@ def realtime_positions(
     for row in positions:
         if not row.get("name"):
             row["name"] = row.get("stock_name") or ""
-    return {"positions": positions, "asset": payload.get("asset") or {}}
+    classification_date = date.today().isoformat()
+    return {
+        "positions": positions,
+        "asset": payload.get("asset") or {},
+        "classifications": _position_classifications(data, positions, classification_date),
+        "classification_date": classification_date,
+    }
 
 
 @app.get("/api/strategy/info")

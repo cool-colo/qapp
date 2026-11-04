@@ -62,7 +62,14 @@ class StrategyParams:
 
     # Order lifecycle / cash gating
     unfilled_timeout_secs: float = 60.0
-    resubmit_interval_secs: float = 10.0
+    resubmit_interval_secs: float = 2.0
+    price_trend_window_secs: float = 10.0
+    price_trend_threshold_bps: float = 20.0
+    price_trend_max_bps: float = 40.0
+    price_trend_confirmation_strength: float = 0.5
+    price_trend_book_max_age_secs: float = 2.0
+    price_trend_min_timeout_multiplier: float = 0.3
+    price_trend_max_offset_multiplier: float = 3.0
     cash_buffer_percent: float = 0.0
     target_cash_buffer_percent: float = 0.05
     order_slice_notional: Decimal = Decimal("300000")
@@ -113,6 +120,20 @@ class StrategyParams:
             raise ValueError("consecutive_up_limit_days must be non-negative")
         if not 0.0 <= float(self.max_open_gap_up) <= 1.0:
             raise ValueError("max_open_gap_up must be between 0 and 1")
+        if float(self.price_trend_window_secs) <= 0:
+            raise ValueError("price_trend_window_secs must be positive")
+        if float(self.price_trend_threshold_bps) < 0:
+            raise ValueError("price_trend_threshold_bps must be non-negative")
+        if float(self.price_trend_max_bps) <= float(self.price_trend_threshold_bps):
+            raise ValueError("price_trend_max_bps must be greater than price_trend_threshold_bps")
+        if not 0.0 <= float(self.price_trend_confirmation_strength) <= 1.0:
+            raise ValueError("price_trend_confirmation_strength must be between 0 and 1")
+        if float(self.price_trend_book_max_age_secs) < 0:
+            raise ValueError("price_trend_book_max_age_secs must be non-negative")
+        if not 0.0 < float(self.price_trend_min_timeout_multiplier) <= 1.0:
+            raise ValueError("price_trend_min_timeout_multiplier must be in (0, 1]")
+        if float(self.price_trend_max_offset_multiplier) < 1.0:
+            raise ValueError("price_trend_max_offset_multiplier must be at least 1")
 
     @property
     def exit_non_targets(self) -> bool:

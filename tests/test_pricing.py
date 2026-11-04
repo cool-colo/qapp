@@ -78,6 +78,25 @@ class SellPriceStrategyTest(unittest.TestCase):
         # open 10, offset max(10*5bps=0.005, tick 0.01)=0.01 -> 9.99
         self.assertAlmostEqual(pricer.compute(sell_ctx(cancel_count=0)), 9.99)
 
+    def test_trend_multiplier_increases_initial_offset(self) -> None:
+        pricer = OpenOffsetSellPriceStrategy(offset_bps=5.0, cancel_threshold=1, logger=LOGGER)
+        self.assertAlmostEqual(
+            pricer.compute(sell_ctx(open_price=100.0, offset_multiplier=3.0)),
+            99.85,
+        )
+
+    def test_trend_multiplier_does_not_change_post_cancel_depth_walk(self) -> None:
+        pricer = OpenOffsetSellPriceStrategy(offset_bps=5.0, cancel_threshold=1, logger=LOGGER)
+        price = pricer.compute(
+            sell_ctx(
+                open_price=100.0,
+                cancel_count=1,
+                offset_multiplier=3.0,
+                bids=[(99.90, 100.0)],
+            ),
+        )
+        self.assertAlmostEqual(price, 99.89)
+
     def test_uses_open_over_last_close(self) -> None:
         pricer = OpenOffsetSellPriceStrategy(offset_bps=5.0, cancel_threshold=1, logger=LOGGER)
         price = pricer.compute(sell_ctx(open_price=20.0, last_close=10.0, cancel_count=0))

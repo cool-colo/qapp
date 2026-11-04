@@ -397,6 +397,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
         self.assertEqual(config.full_tick_refresh_secs, 1.0)
         self.assertEqual(config.full_tick_prefetch_time, "09:27")
+        self.assertEqual(config.resubmit_check_interval_secs, 2.0)
         self.assertEqual(config.whole_market_refresh_windows, "09:26-11:30,13:00-15:00")
         self.assertEqual(config.whole_market_final_refresh_time, "15:01")
 

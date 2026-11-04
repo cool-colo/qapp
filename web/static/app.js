@@ -340,6 +340,7 @@ $$(".subtab").forEach((btn) => {
     $$(".sub-panel").forEach((p) => p.classList.remove("active"));
     btn.classList.add("active");
     $(`#snap-${btn.dataset.sub}`).classList.add("active");
+    setTimeout(resizeCharts, 0);
   });
 });
 
@@ -551,6 +552,9 @@ function renderTable(container, rows, opts = {}) {
         const extra = opts.rowClass(row);
         if (extra) rowCls += " " + extra;
       }
+      if (el._highlightCodes && el._highlightCodes.has(String(row.stock_code || ""))) {
+        rowCls += " classification-match";
+      }
       return `<tr class="${rowCls}"><td class="idx-col">${i + 1}</td>` +
         `${cols.map((c) => cellHtml(c, row[c], row, true)).join("")}</tr>`;
     }).join("");
@@ -598,6 +602,7 @@ function renderTable(container, rows, opts = {}) {
     });
   });
 
+  state.redraw = draw;
   draw();
 }
 
@@ -739,8 +744,9 @@ async function loadSnapshotDates() {
   } catch (e) { toast(e.message); }
 }
 function renderEmptySnapshot() {
-  ["#snap-asset", "#snap-positions", "#snap-target", "#snap-orders", "#snap-trades", "#snap-signals"]
+  ["#snap-asset", "#snap-position-table", "#snap-target", "#snap-orders", "#snap-trades", "#snap-signals"]
     .forEach((c) => renderTable(c, []));
+  renderHoldingClassificationCharts("snap", [], {}, "#snap-position-table");
 }
 async function loadSnapshot() {
   const date = $("#snap-date").value;
@@ -756,7 +762,10 @@ async function loadSnapshot() {
       api("/api/trades", { ...base, date }),
     ]);
     renderTable("#snap-asset", asset.rows);
-    renderTable("#snap-positions", pos.rows, { linkStock: true, stockInfoDate: date });
+    const snapTable = $("#snap-position-table");
+    snapTable._highlightCodes = null;
+    renderTable("#snap-position-table", pos.rows, { linkStock: true, stockInfoDate: date });
+    renderHoldingClassificationCharts("snap", pos.rows, pos.classifications || {}, "#snap-position-table");
     renderTable("#snap-target", tgt.rows, { linkStock: true, stockInfoDate: date });
     renderTable("#snap-orders", orders.rows, { linkStock: true, stockInfoDate: date });
     renderTable("#snap-trades", trades.rows, { linkStock: true, stockInfoDate: date });
@@ -993,6 +1002,368 @@ function disposeChart(id) {
   }
 }
 window.addEventListener("resize", resizeCharts);
+
+// ---------------------------------------------------------------------------
+// Holdings classification charts (snapshot + realtime)
+// ---------------------------------------------------------------------------
+const HOLDING_CHARTS = [
+  { suffix: "sw-l1", title: "申万一级行业", field: "sw_industry_l1", type: "pie", minPercentage: 0.03 },
+  { suffix: "sw-l2", title: "申万二级行业", field: "sw_industry_l2", type: "pie", minPercentage: 0.03 },
+  { suffix: "sw-l3", title: "申万三级行业", field: "sw_industry_l3", type: "pie", minPercentage: 0.03 },
+  { suffix: "dc-concept", title: "东财概念", field: "dc_concepts", type: "bar", minPercentage: 0.05, wide: true },
+  { suffix: "dc-member-concept", title: "东财概念板块", field: "dc_member_concepts", type: "bar", minPercentage: 0.05, wide: true, scrollable: true },
+  { suffix: "dc-member-industry", title: "东财行业板块", field: "dc_member_industries", type: "bar", minPercentage: 0.05, wide: true },
+  { suffix: "dc-member-region", title: "东财地域板块", field: "dc_member_regions", type: "bar", minPercentage: 0.05, wide: true },
+];
+
+function holdingChartValue(row) {
+  const candidates = [row.market_value, row.nt_market_value];
+  for (const candidate of candidates) {
+    const value = Number(candidate);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  const volume = Number(row.volume ?? row.nt_net_qty);
+  for (const price of [row.last_price, row.nt_last_price, row.close_price, row.avg_price]) {
+    const value = volume * Number(price);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  return 0;
+}
+
+// When "(全部)" snapshot phases are selected, one stock can occur more than once.
+// Chart the most recently written row so its position value is not double-counted.
+function latestHoldingRows(rows) {
+  const byCode = new Map();
+  for (const row of rows || []) {
+    const code = String(row.stock_code || "");
+    if (!code) continue;
+    const previous = byCode.get(code);
+    if (!previous || String(row.write_time || "") > String(previous.write_time || "")) byCode.set(code, row);
+  }
+  return Array.from(byCode.values());
+}
+
+function holdingParts(rows, classifications, field, minPercentage, histogram, totalMarketValue) {
+  const aggregated = new Map();
+  for (const row of latestHoldingRows(rows)) {
+    const code = String(row.stock_code || "");
+    const value = holdingChartValue(row);
+    if (!code || value <= 0) continue;
+    const classification = classifications[code] || {};
+    const raw = classification[field];
+    const values = Array.isArray(raw) ? raw : (raw ? [raw] : ["未分类"]);
+    for (const name of new Set(values.filter(Boolean).map(String))) {
+      const part = aggregated.get(name) || { name, value: 0, codes: new Set() };
+      part.value += value;
+      part.codes.add(code);
+      aggregated.set(name, part);
+    }
+  }
+  let parts = Array.from(aggregated.values()).sort((a, b) => b.value - a.value || a.name.localeCompare(b.name));
+  const aboveThreshold = (part) => totalMarketValue > 0 && part.value / totalMarketValue > minPercentage;
+  if (histogram) {
+    // Overlapping concept/index memberships make a rolled-up "其他" bar
+    // misleadingly large. Show every exposure above the threshold and omit the rest.
+    parts = parts.filter(aboveThreshold);
+  } else {
+    const kept = parts.filter(aboveThreshold);
+    const minor = parts.filter((part) => !aboveThreshold(part));
+    if (minor.length) {
+      const other = { name: "其他", value: 0, codes: new Set() };
+      for (const part of minor) {
+        other.value += part.value;
+        part.codes.forEach((code) => other.codes.add(code));
+      }
+      parts = kept.concat(other);
+    } else {
+      parts = kept;
+    }
+  }
+  parts = parts.map((part) => ({ ...part, codes: Array.from(part.codes) }));
+  // Histograms are explicitly ordered by exposure from high (left) to low (right).
+  if (histogram) parts.sort((a, b) => b.value - a.value || a.name.localeCompare(b.name));
+  return parts;
+}
+
+function holdingValueLabel(value) {
+  const n = Number(value) || 0;
+  if (Math.abs(n) >= 1e8) return `${(n / 1e8).toFixed(2)}亿`;
+  if (Math.abs(n) >= 1e4) return `${(n / 1e4).toFixed(1)}万`;
+  return n.toLocaleString("zh-CN", { maximumFractionDigits: 0 });
+}
+
+function focusHoldingRows(tableSelector, codes) {
+  const table = $(tableSelector);
+  if (!table) return;
+  table._highlightCodes = new Set((codes || []).map(String));
+  if (table._tableState && table._tableState.redraw) table._tableState.redraw();
+  table.tabIndex = -1;
+  table.focus({ preventScroll: true });
+  const first = table.querySelector("tbody tr.classification-match");
+  (first || table).scrollIntoView({ behavior: "smooth", block: "center" });
+  if (!first) toast("匹配持仓当前被表格筛选条件隐藏");
+}
+
+function clearHoldingRowHighlight(tableSelector) {
+  const table = $(tableSelector);
+  if (!table) return;
+  table._highlightCodes = null;
+  if (table._tableState && table._tableState.redraw) table._tableState.redraw();
+}
+
+let activeHoldingSelection = null;
+let syncingHoldingSelection = false;
+
+function bindHoldingChartClick(chart, tableSelector, prefix) {
+  chart.off("selectchanged");
+  chart.on("selectchanged", (event) => {
+    if (syncingHoldingSelection) return;
+    const selected = (event.selected || []).find((item) => item.seriesIndex === 0);
+    const selectedIndexes = selected
+      ? (Array.isArray(selected.dataIndex) ? selected.dataIndex : [selected.dataIndex])
+      : [];
+    const dataIndex = selectedIndexes.length ? selectedIndexes[selectedIndexes.length - 1] : null;
+    syncingHoldingSelection = true;
+    try {
+      if (dataIndex === null || dataIndex === undefined) {
+        if (activeHoldingSelection && activeHoldingSelection.chart === chart) {
+          clearHoldingRowHighlight(activeHoldingSelection.tableSelector);
+          activeHoldingSelection = null;
+        }
+        return;
+      }
+      if (activeHoldingSelection) {
+        const previous = activeHoldingSelection;
+        if (previous.chart !== chart && !previous.chart.isDisposed()) {
+          previous.chart.dispatchAction({
+            type: "unselect", seriesIndex: 0, dataIndex: previous.dataIndex,
+          });
+        }
+        clearHoldingRowHighlight(previous.tableSelector);
+      }
+      activeHoldingSelection = { chart, dataIndex, tableSelector, prefix };
+      const datum = (((chart.getOption().series || [])[0] || {}).data || [])[dataIndex];
+      focusHoldingRows(tableSelector, datum && datum.codes);
+    } finally {
+      syncingHoldingSelection = false;
+    }
+  });
+  chart.on("mouseover", () => chart.getZr().setCursorStyle("pointer"));
+  chart.on("mouseout", () => chart.getZr().setCursorStyle("default"));
+}
+
+function bindHoldingChartTrackpad(chart, totalBars, visibleBars) {
+  if (totalBars <= visibleBars) return;
+  const dom = chart.getDom();
+  let pendingPixels = 0;
+  let animationFrame = null;
+  dom.addEventListener("wheel", (event) => {
+    // Preserve ordinary page scrolling; only a predominantly horizontal
+    // two-finger gesture pans the category window.
+    if (Math.abs(event.deltaX) < 1 || Math.abs(event.deltaX) <= Math.abs(event.deltaY)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const scale = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16
+      : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? dom.clientWidth : 1;
+    pendingPixels += event.deltaX * scale;
+    if (animationFrame !== null) return;
+    animationFrame = requestAnimationFrame(() => {
+      animationFrame = null;
+      if (chart.isDisposed()) return;
+      const zoom = (chart.getOption().dataZoom || [])[0] || {};
+      const denominator = Math.max(1, totalBars - 1);
+      const currentStart = Number.isFinite(Number(zoom.start))
+        ? Number(zoom.start)
+        : Number(zoom.startValue || 0) / denominator * 100;
+      const currentEnd = Number.isFinite(Number(zoom.end))
+        ? Number(zoom.end)
+        : Number(zoom.endValue ?? visibleBars - 1) / denominator * 100;
+      const windowPercent = currentEnd - currentStart;
+      const deltaPercent = pendingPixels / Math.max(1, dom.clientWidth) * 100;
+      pendingPixels = 0;
+      const nextStart = Math.max(0, Math.min(100 - windowPercent, currentStart + deltaPercent));
+      if (Math.abs(nextStart - currentStart) < 0.001) return;
+      const range = { start: nextStart, end: nextStart + windowPercent };
+      chart.dispatchAction({
+        type: "dataZoom",
+        batch: [
+          { dataZoomIndex: 0, ...range },
+          { dataZoomIndex: 1, ...range },
+        ],
+      });
+    });
+  }, { passive: false, capture: true });
+}
+
+function bindHoldingChartEntryFlash(chart, totalBars, visibleBars) {
+  if (totalBars <= visibleBars) return;
+  let previousFirst = 0;
+  let previousLast = visibleBars - 1;
+  let scheduled = false;
+  let clearTimer = null;
+  chart.off("datazoom");
+  chart.on("datazoom", () => {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      if (chart.isDisposed()) return;
+      const zoom = (chart.getOption().dataZoom || [])[0] || {};
+      const denominator = Math.max(1, totalBars - 1);
+      const startPercent = Number.isFinite(Number(zoom.start))
+        ? Number(zoom.start)
+        : Number(zoom.startValue || 0) / denominator * 100;
+      const endPercent = Number.isFinite(Number(zoom.end))
+        ? Number(zoom.end)
+        : Number(zoom.endValue ?? visibleBars - 1) / denominator * 100;
+      const first = Math.max(0, Math.floor(startPercent / 100 * denominator));
+      const last = Math.min(totalBars - 1, Math.ceil(endPercent / 100 * denominator));
+      const entered = [];
+      for (let index = first; index <= last; index += 1) {
+        if (index < previousFirst || index > previousLast) entered.push(index);
+      }
+      previousFirst = first;
+      previousLast = last;
+      if (!entered.length) return;
+      chart.dispatchAction({ type: "downplay", seriesIndex: 0 });
+      chart.dispatchAction({ type: "highlight", seriesIndex: 0, dataIndex: entered });
+      clearTimeout(clearTimer);
+      clearTimer = setTimeout(() => {
+        if (!chart.isDisposed()) chart.dispatchAction({ type: "downplay", seriesIndex: 0 });
+      }, 450);
+    });
+  });
+}
+
+function renderHoldingClassificationCharts(prefix, rows, classifications, tableSelector) {
+  const container = $(`#${prefix}-position-charts`);
+  if (!container) return;
+  const ids = HOLDING_CHARTS.map((config) => `${prefix}-holding-${config.suffix}`);
+  if (activeHoldingSelection && activeHoldingSelection.prefix === prefix) {
+    activeHoldingSelection = null;
+  }
+  ids.forEach(disposeChart);
+  if (!rows || rows.length === 0 || !classifications || Object.keys(classifications).length === 0) {
+    container.innerHTML = '<div class="empty">暂无持仓分类数据</div>';
+    return;
+  }
+  container.innerHTML = ids.map((id, index) => {
+    const wide = HOLDING_CHARTS[index].wide ? " holding-classification-chart-wide" : "";
+    return `<div id="${id}" class="holding-classification-chart${wide}"></div>`;
+  }).join("");
+  const totalMarketValue = latestHoldingRows(rows)
+    .reduce((total, row) => total + holdingChartValue(row), 0);
+  HOLDING_CHARTS.forEach((config, index) => {
+    const chart = getChart(ids[index]);
+    const parts = holdingParts(
+      rows,
+      classifications,
+      config.field,
+      config.minPercentage,
+      config.type === "bar",
+      totalMarketValue,
+    );
+    if (!parts.length) {
+      chart.setOption({
+        backgroundColor: "transparent",
+        title: { text: config.title, left: "center", textStyle: { color: "#d7dce6", fontSize: 14 } },
+        graphic: { type: "text", left: "center", top: "middle", style: { text: "暂无数据", fill: "#8a94a8" } },
+      }, true);
+      return;
+    }
+    if (config.type === "pie") {
+      chart.setOption({
+        backgroundColor: "transparent",
+        title: { text: config.title, left: "center", textStyle: { color: "#d7dce6", fontSize: 14 } },
+        tooltip: {
+          trigger: "item",
+          formatter: (p) => `${p.name}<br>市值 ${holdingValueLabel(p.value)}（${p.percent}%）<br>${p.data.codes.length} 只持仓`,
+        },
+        legend: { type: "scroll", bottom: 0, textStyle: { color: "#8a94a8" } },
+        series: [{
+          type: "pie", radius: ["35%", "61%"], center: ["50%", "48%"],
+          selectedMode: "single", selectedOffset: 9,
+          label: { color: "#d7dce6", formatter: "{b}\n{d}%" },
+          labelLine: { length: 8, length2: 7 },
+          itemStyle: { borderColor: "#171d2b", borderWidth: 2 },
+          select: {
+            itemStyle: { borderColor: "#ff9800", borderWidth: 4, shadowBlur: 16, shadowColor: "rgba(255, 152, 0, .65)" },
+          },
+          data: parts,
+        }],
+      }, true);
+    } else {
+      const barData = parts.map((part) => ({
+        name: part.name,
+        value: part.value,
+        percentage: totalMarketValue > 0 ? part.value / totalMarketValue : 0,
+        codes: part.codes,
+      }));
+      // Keep one fixed scale for the complete series. Otherwise ECharts rescales
+      // the y-axis to each dataZoom window and bars appear to change height while
+      // the user pans horizontally.
+      const fixedYAxisMax = Math.max(...barData.map((item) => item.value)) * 1.15;
+      const visibleBarCount = 30;
+      const dataZoom = config.scrollable && parts.length > visibleBarCount ? [
+        {
+          type: "inside", xAxisIndex: 0, startValue: 0, endValue: visibleBarCount - 1,
+          zoomLock: true, zoomOnMouseWheel: false, moveOnMouseWheel: false, moveOnMouseMove: true,
+        },
+        {
+          type: "slider", xAxisIndex: 0, startValue: 0, endValue: visibleBarCount - 1,
+          zoomLock: true, height: 18, bottom: 8,
+          borderColor: "#2a3346", fillerColor: "rgba(76, 141, 255, .22)",
+          handleStyle: { color: "#4c8dff", borderColor: "#77a8ff" },
+          textStyle: { color: "#8a94a8" },
+        },
+      ] : [];
+      chart.setOption({
+        backgroundColor: "transparent",
+        title: { text: config.title, left: "center", textStyle: { color: "#d7dce6", fontSize: 14 } },
+        tooltip: {
+          trigger: "item",
+          formatter: (p) => `${p.name}<br>市值 ${holdingValueLabel(p.value)}`
+            + `<br>持仓市值占比 ${(p.data.percentage * 100).toFixed(1)}%`
+            + `<br>${p.data.codes.length} 只持仓`,
+        },
+        grid: { left: 58, right: 18, top: 62, bottom: dataZoom.length ? 105 : 78 },
+        dataZoom,
+        xAxis: {
+          type: "category", data: parts.map((part) => part.name),
+          axisLabel: {
+            color: "#8a94a8", interval: 0, rotate: 32,
+            formatter: (value) => value.length > 8 ? `${value.slice(0, 8)}…` : value,
+          },
+        },
+        yAxis: {
+          type: "value", min: 0, max: fixedYAxisMax,
+          axisLabel: { color: "#8a94a8", formatter: holdingValueLabel },
+          splitLine: { lineStyle: { color: "#2a3346" } },
+        },
+        series: [{
+          type: "bar", barMaxWidth: 34, selectedMode: "single",
+          itemStyle: { color: "#4c8dff", borderRadius: [3, 3, 0, 0] },
+          emphasis: {
+            itemStyle: { color: "#f5c451", shadowBlur: 12, shadowColor: "rgba(245, 196, 81, .55)" },
+          },
+          select: {
+            itemStyle: { color: "#ff9800", shadowBlur: 16, shadowColor: "rgba(255, 152, 0, .65)" },
+          },
+          label: {
+            show: true, position: "top", color: "#d7dce6", fontSize: 11,
+            formatter: (p) => `${(p.data.percentage * 100).toFixed(1)}%`,
+          },
+          data: barData,
+        }],
+      }, true);
+      if (dataZoom.length) {
+        bindHoldingChartEntryFlash(chart, parts.length, visibleBarCount);
+        bindHoldingChartTrackpad(chart, parts.length, visibleBarCount);
+      }
+    }
+    bindHoldingChartClick(chart, tableSelector, prefix);
+  });
+}
 
 function baseLineOption(title) {
   return {
@@ -1711,13 +2082,18 @@ function buildRtFooter(rows, asset, filtered) {
   };
 }
 
-function renderRealtime(positions, asset) {
-  const el = $("#rt-positions");
-  if (!positions || positions.length === 0) { el.innerHTML = '<div class="empty">无持仓</div>'; return; }
+function renderRealtime(positions, asset, classifications = {}) {
+  const el = $("#rt-position-table");
+  el._highlightCodes = null;
+  if (!positions || positions.length === 0) {
+    el.innerHTML = '<div class="empty">无持仓</div>';
+    renderHoldingClassificationCharts("rt", [], {}, "#rt-position-table");
+    return;
+  }
   // The node payload uses `name` for 证券名称; the table column is `stock_name`.
   positions.forEach((p) => { if (p.stock_name === undefined) p.stock_name = p.name; });
   const total = positions.length;
-  renderTable("#rt-positions", positions, {
+  renderTable("#rt-position-table", positions, {
     columns: RT_COLS,
     headers: RT_HEADERS,
     linkStock: true,       // 证券代码 / 证券名称 → K 线图
@@ -1733,6 +2109,7 @@ function renderRealtime(positions, asset) {
     onRender: (root) => root.querySelectorAll("button.rt-sell")
       .forEach((b) => b.addEventListener("click", () => sellStock(b.dataset.code, b.dataset.name, b.dataset.qty))),
   });
+  renderHoldingClassificationCharts("rt", positions, classifications, "#rt-position-table");
 }
 
 // 资产 sub-panel — account-level assets from the same /realtime/positions payload
@@ -1830,19 +2207,21 @@ function nodeApiHint(container) {
 async function loadRealtime() {
   if (!state.account) return;
   if (!hasNodeApi()) {
-    nodeApiHint("#rt-positions");
+    nodeApiHint("#rt-position-table");
+    renderHoldingClassificationCharts("rt", [], {}, "#rt-position-table");
     renderRealtimeAsset(null, "该账户未配置实盘节点 API（node_api）");
     $("#rt-updated").textContent = "";
     return;
   }
   try {
-    const { positions, asset } = await api("/api/realtime/positions",
+    const { positions, asset, classifications } = await api("/api/realtime/positions",
       { account: state.account.account_id, trader: state.account.trader_id });
-    renderRealtime(positions, asset);
+    renderRealtime(positions, asset, classifications || {});
     renderRealtimeAsset(asset);
     $("#rt-updated").textContent = "更新于 " + new Date().toLocaleTimeString();
   } catch (e) {
-    $("#rt-positions").innerHTML = '<div class="empty">获取失败</div>';
+    $("#rt-position-table").innerHTML = '<div class="empty">获取失败</div>';
+    renderHoldingClassificationCharts("rt", [], {}, "#rt-position-table");
     renderRealtimeAsset(null, "获取失败");
     toast(e.message);
   }
