@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 from lives.broker_data_source import BigQmtBrokerDataSource
+from lives.live_bigqmt_target_model_predictions import _apply_bigqmt_args
 from lives.live_bigqmt_target_model_predictions import build_node
 
 
@@ -25,6 +26,7 @@ def test_bigqmt_node_uses_extended_connection_timeout() -> None:
         adjust_type="none",
         strategy_name="target-model-predictions",
         no_sellable_check=False,
+        bigqmt_account_cash_offset=250000.0,
     )
     context = SimpleNamespace(instrument_ids=[])
     expected = object()
@@ -49,6 +51,16 @@ def test_bigqmt_node_uses_extended_connection_timeout() -> None:
     assert execution.poll_enabled is True
     assert execution.poll_interval_secs == 1.0
     assert data.rpc_timeout_secs == execution.rpc_timeout_secs == 6.0
+    assert execution.account_cash_offset == 250000.0
+
+
+def test_bigqmt_cash_offset_comes_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("BIGQMT_ACCOUNT_CASH_OFFSET", "1250000.50")
+    args = SimpleNamespace(account_id="12345678")
+
+    _apply_bigqmt_args(args)
+
+    assert args.bigqmt_account_cash_offset == 1250000.50
 
 
 def test_bigqmt_order_snapshot_exposes_recorder_client_order_id() -> None:

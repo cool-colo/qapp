@@ -32,6 +32,12 @@ the corresponding curated `dwd_*` tables. Historical rows only use daily and
 classification records available by the row/snapshot date; live tables use the
 latest records available. Moving away before 300 ms cancels the panel and the query.
 Moving into an open panel keeps it visible; leaving it or pressing Escape closes it.
+
+The **变更记录** sidebar page stores manually entered operational changes in
+`web/change_records.json` (next to `compare_presets.json`). Records are newest first;
+they can be added and edited in place, while deletion requires the configured
+`control_pin`.
+
 Stock-name clicks still open 信号 R 线.
 
 Both **实时信息 → 持仓** and **按日快照 → 持仓** include market-value
@@ -42,12 +48,12 @@ Pie charts show every category above 3% of total held market value and roll the 
 into “其他”. Histograms show every exposure above 5% and omit the remainder without
 an “其他” bar. Every bar shows its percentage of total held market value, and the
 concept-board chart excludes 融资融券. Clicking any visible slice or bar focuses the
-holdings table and highlights every matching stock. When more than thirty concept-board
-bars pass the threshold, the chart shows thirty at a time with a horizontal slider;
-on a Mac trackpad, a two-finger horizontal gesture over the chart pans the same window
-without clicking the slider. Trackpad deltas update the same continuous percentage
-range as the slider and are coalesced once per animation frame for smooth inertial
-movement. Histogram y-axis bounds use the complete series, so bar heights do not
+holdings table and highlights every matching stock. When more than thirty bars pass
+the threshold in any histogram, the chart shows thirty at a time with a horizontal
+slider; on a Mac trackpad, a two-finger horizontal gesture over the chart pans the
+same window without clicking the slider. Trackpad deltas update the same continuous
+percentage range as the slider and are coalesced once per animation frame for smooth
+inertial movement. Histogram y-axis bounds use the complete series, so bar heights do not
 rescale as high-value bars move in or out of the visible window. Bars newly entering
 the window briefly highlight for 450 ms; this runs only when the visible category
 range changes, for both slider and trackpad movement. A clicked slice or bar remains
@@ -119,6 +125,10 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/kline` | `stock_code, start, end` |
 | `GET /api/stock_info` | `stock_code, date?` (latest daily metrics on/before date; default today) |
 | `GET /api/kline_with_trades` | `source, account, trader, stock_code, start, end` |
+| `GET /api/change_records` | — |
+| `POST /api/change_records` | body: `{title, details}` |
+| `PUT /api/change_records/{id}` | body: `{title, details}` |
+| `DELETE /api/change_records/{id}` | body: `{pin}` (required) |
 | `GET /api/realtime/positions` | `account, trader` |
 | `GET /api/strategy/targets` | `account, trader` |
 | `GET /api/control/state` | `account, trader` |

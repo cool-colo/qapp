@@ -114,6 +114,11 @@ function pct(v) {
   return (v * 100).toFixed(2) + "%";
 }
 function todayISO() { return new Date().toISOString().slice(0, 10); }
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>'"]/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
+  }[char]));
+}
 
 const NUMERIC_RE = /_rate|_bps|price|value|asset|cash|pnl|amount|qty|volume|weight|score|return|equity|commission|balance|sharpe|volatil/;
 function isNumericCol(col) { return NUMERIC_RE.test(col); }
@@ -233,6 +238,7 @@ function refreshActiveTab() {
   else if (tab === "stratinfo") loadStratInfo();
   else if (tab === "control") { loadControl(); loadTargets(); }
   else if (tab === "dqc") loadDqc();
+  else if (tab === "changes") loadChangeRecords();
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +292,7 @@ function activateNavItem(btn, { load = true } = {}) {
     else if (tab === "stratinfo") loadStratInfo();
     else if (tab === "control") { loadControl(); loadTargets(); }
     else if (tab === "dqc") loadDqc();
+    else if (tab === "changes") loadChangeRecords();
   }
   setTimeout(resizeCharts, 0);
 }
@@ -1011,7 +1018,7 @@ const HOLDING_CHARTS = [
   { suffix: "sw-l2", title: "申万二级行业", field: "sw_industry_l2", type: "pie", minPercentage: 0.03 },
   { suffix: "sw-l3", title: "申万三级行业", field: "sw_industry_l3", type: "pie", minPercentage: 0.03 },
   { suffix: "dc-concept", title: "东财概念", field: "dc_concepts", type: "bar", minPercentage: 0.05, wide: true },
-  { suffix: "dc-member-concept", title: "东财概念板块", field: "dc_member_concepts", type: "bar", minPercentage: 0.05, wide: true, scrollable: true },
+  { suffix: "dc-member-concept", title: "东财概念板块", field: "dc_member_concepts", type: "bar", minPercentage: 0.05, wide: true },
   { suffix: "dc-member-industry", title: "东财行业板块", field: "dc_member_industries", type: "bar", minPercentage: 0.05, wide: true },
   { suffix: "dc-member-region", title: "东财地域板块", field: "dc_member_regions", type: "bar", minPercentage: 0.05, wide: true },
 ];
@@ -1304,7 +1311,7 @@ function renderHoldingClassificationCharts(prefix, rows, classifications, tableS
       // the user pans horizontally.
       const fixedYAxisMax = Math.max(...barData.map((item) => item.value)) * 1.15;
       const visibleBarCount = 30;
-      const dataZoom = config.scrollable && parts.length > visibleBarCount ? [
+      const dataZoom = parts.length > visibleBarCount ? [
         {
           type: "inside", xAxisIndex: 0, startValue: 0, endValue: visibleBarCount - 1,
           zoomLock: true, zoomOnMouseWheel: false, moveOnMouseWheel: false, moveOnMouseMove: true,
@@ -2936,6 +2943,121 @@ $("#dqc-metric-name").addEventListener("change", () => {
 });
 $("#dqc-metric-entity").addEventListener("change", plotDqcMetric);
 $("#dqc-metric-plot").addEventListener("click", plotDqcMetric);
+
+// ---------------------------------------------------------------------------
+// Significant change records (global, manually maintained, newest first)
+// ---------------------------------------------------------------------------
+let editingChangeId = null;
+
+function formatChangeTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value || "");
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit", weekday: "long",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).format(date);
+}
+
+function closeChangeForm() {
+  editingChangeId = null;
+  $("#change-form").reset();
+  $("#change-form").hidden = true;
+}
+
+function openChangeForm(record = null) {
+  editingChangeId = record ? record.id : null;
+  $("#change-form-title").textContent = record ? "修改变更记录" : "新增变更记录";
+  $("#change-title").value = record ? record.title : "";
+  $("#change-details").value = record ? record.details : "";
+  $("#change-form").hidden = false;
+  $("#change-title").focus();
+}
+
+async function loadChangeRecords() {
+  const container = $("#change-records");
+  container.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const { records } = await api("/api/change_records");
+    if (!records.length) {
+      container.innerHTML = '<div class="empty">暂无变更记录</div>';
+      return;
+    }
+    container.innerHTML = records.map((record) => {
+      const updated = record.updated_at && record.updated_at !== record.created_at
+        ? `<div class="change-record-updated">修改于 ${escapeHtml(formatChangeTime(record.updated_at))}</div>` : "";
+      return `<article class="change-record" data-id="${escapeHtml(record.id)}">
+        <div class="change-record-head">
+          <div>
+            <h4 class="change-record-title">${escapeHtml(record.title)}</h4>
+            <div class="change-record-date">${escapeHtml(formatChangeTime(record.created_at))}</div>
+            ${updated}
+          </div>
+          <div class="change-record-actions">
+            <button type="button" class="ghost change-edit">修改</button>
+            <button type="button" class="danger change-delete">删除</button>
+          </div>
+        </div>
+        <div class="change-record-details">${escapeHtml(record.details).replace(/\n/g, "<br>")}</div>
+      </article>`;
+    }).join("");
+
+    container.querySelectorAll(".change-edit").forEach((button) => {
+      button.addEventListener("click", () => {
+        const id = button.closest(".change-record").dataset.id;
+        openChangeForm(records.find((record) => record.id === id));
+      });
+    });
+    container.querySelectorAll(".change-delete").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const record = records.find((item) => item.id === button.closest(".change-record").dataset.id);
+        const pin = await pinDialog({
+          title: "删除变更记录",
+          bodyHtml: `确定删除 <b>${escapeHtml(record.title)}</b>？删除后无法恢复。`,
+          okText: "删除", danger: true,
+        });
+        if (pin === null) return;
+        try {
+          await api(`/api/change_records/${encodeURIComponent(record.id)}`, {}, {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ pin }),
+          });
+          if (editingChangeId === record.id) closeChangeForm();
+          await loadChangeRecords();
+        } catch (e) { toast(e.message); }
+      });
+    });
+  } catch (e) {
+    toast(e.message);
+    container.innerHTML = '<div class="empty">加载失败</div>';
+  }
+}
+
+$("#change-add").addEventListener("click", () => openChangeForm());
+$("#change-refresh").addEventListener("click", loadChangeRecords);
+$("#change-cancel").addEventListener("click", closeChangeForm);
+$("#change-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const payload = {
+    title: $("#change-title").value.trim(),
+    details: $("#change-details").value.trim(),
+  };
+  if (!payload.title || !payload.details) {
+    toast("标题和详细内容均不能为空");
+    return;
+  }
+  const id = editingChangeId;
+  const path = id ? `/api/change_records/${encodeURIComponent(id)}` : "/api/change_records";
+  try {
+    await api(path, {}, {
+      method: id ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    closeChangeForm();
+    await loadChangeRecords();
+  } catch (e) { toast(e.message); }
+});
 
 // ---------------------------------------------------------------------------
 // Init

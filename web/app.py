@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from web import compare_presets
+from web import change_records, compare_presets
 from web.config import AppConfig, load_config
 from web.db import DataAccess, MySqlSource, NodeApiClient, jsonable, jsonable_rows, quote_literal
 from web.returns_report import (
@@ -42,6 +42,15 @@ from web import dqc_report
 class ComparePreset(BaseModel):
     name: str
     series: list[dict[str, Any]]
+
+
+class ChangeRecordWrite(BaseModel):
+    title: str
+    details: str
+
+
+class ChangeRecordDelete(BaseModel):
+    pin: str
 
 
 class SellRequest(BaseModel):
@@ -808,6 +817,42 @@ def delete_compare_preset(name: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+# ---- manually recorded significant changes -------------------------------
+
+
+@app.get("/api/change_records")
+def get_change_records() -> dict[str, Any]:
+    return {"records": change_records.list_records()}
+
+
+@app.post("/api/change_records")
+def add_change_record(body: ChangeRecordWrite) -> dict[str, Any]:
+    try:
+        record = change_records.add_record(body.title, body.details)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"record": record}
+
+
+@app.put("/api/change_records/{record_id}")
+def update_change_record(record_id: str, body: ChangeRecordWrite) -> dict[str, Any]:
+    try:
+        record = change_records.update_record(record_id, body.title, body.details)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"no such change record: {record_id!r}")
+    return {"record": record}
+
+
+@app.delete("/api/change_records/{record_id}")
+def delete_change_record(record_id: str, body: ChangeRecordDelete) -> dict[str, Any]:
+    _require_change_record_delete_pin(body.pin)
+    if not change_records.delete_record(record_id):
+        raise HTTPException(status_code=404, detail=f"no such change record: {record_id!r}")
+    return {"ok": True}
+
+
 # ---- data quality (DQC) ----------------------------------------------------
 # Read-only views over the tushare-integration DQC tables in the SHARED ClickHouse
 # (dq_dqc_* systematic checks + dq_validation_* publish gates). These are GLOBAL data
@@ -1212,6 +1257,15 @@ def _require_pin(pin: str | None) -> None:
     expected = _config().control_pin
     if expected is None:
         return
+    if not pin or pin != expected:
+        raise HTTPException(status_code=403, detail="PIN 码错误")
+
+
+def _require_change_record_delete_pin(pin: str | None) -> None:
+    """Significant-change history must never be deletable without a configured PIN."""
+    expected = _config().control_pin
+    if expected is None:
+        raise HTTPException(status_code=403, detail="删除变更记录前必须配置 control_pin")
     if not pin or pin != expected:
         raise HTTPException(status_code=403, detail="PIN 码错误")
 

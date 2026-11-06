@@ -45,6 +45,7 @@
         <button class="nav-item" data-tab="compare">对比</button>
         <button class="nav-item" data-tab="kline">个股 K 线</button>
         <button class="nav-item" data-tab="rline">信号R线</button>
+        <button class="nav-item" data-tab="changes">变更记录</button>
         <div class="nav-group" data-group="control">
           <button class="nav-item nav-parent" data-tab="control">交易管理</button>
           <button class="nav-item nav-sub" data-tab="control" data-sub="control">控制</button>
@@ -216,6 +217,33 @@
           </div>
         </div>
         <div id="rline-chart" class="chart chart-tall"></div>
+      </section>
+
+      <!-- ============ Manually recorded significant changes ============ -->
+      <section id="tab-changes" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <button id="change-add">新增记录</button>
+            <button id="change-refresh" class="ghost">刷新</button>
+            <span class="hint">记录系统、策略或数据的重要人工变更；最新记录显示在最上方</span>
+          </div>
+        </div>
+        <form id="change-form" class="change-form" hidden>
+          <h4 id="change-form-title">新增变更记录</h4>
+          <label>标题
+            <input id="change-title" type="text" maxlength="120" required
+                   placeholder="简要说明本次变更" />
+          </label>
+          <label>详细内容
+            <textarea id="change-details" maxlength="5000" required
+                      placeholder="记录变更内容、原因、影响或注意事项"></textarea>
+          </label>
+          <div class="change-form-actions">
+            <button type="submit" id="change-save">保存</button>
+            <button type="button" id="change-cancel" class="ghost">取消</button>
+          </div>
+        </form>
+        <div id="change-records" class="change-records"></div>
       </section>
 
       <!-- ============ Realtime info tab (实时信息) ============ -->
