@@ -80,7 +80,9 @@ class AsyncOrderEventWriter:
                 raise RuntimeError("order-event persistence worker is not running")
             self._pending_count += 1
             self._queued_at.append(enqueued_at)
-        self._queue.put(replace(write, enqueued_monotonic=enqueued_at))
+            # Keep acceptance and enqueueing atomic with respect to stop(). Otherwise
+            # the stop sentinel can overtake a write which submit() already accepted.
+            self._queue.put(replace(write, enqueued_monotonic=enqueued_at))
 
     def flush(self, timeout_secs: float = 10.0) -> bool:
         deadline = time.monotonic() + max(0.0, timeout_secs)

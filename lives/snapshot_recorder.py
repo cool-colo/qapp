@@ -1136,6 +1136,10 @@ class SnapshotRecorder(Actor):
                 if isinstance(event, OrderFilled)
                 else None
             )
+            status_time = self._local_lifecycle_time_naive(
+                event,
+                local_received_time,
+            )
             self._order_event_writer.submit(
                 OrderEventWrite(
                     event_record=self._order_event_record(
@@ -1145,7 +1149,7 @@ class SnapshotRecorder(Actor):
                         trade_record,
                     ),
                     order_record=order_record,
-                    status_time=self._event_time_naive(event),
+                    status_time=status_time,
                     trade_record=trade_record,
                 ),
             )
@@ -1154,16 +1158,21 @@ class SnapshotRecorder(Actor):
 
     def _upsert_order_from_event(self, event: Any) -> None:
         """Synchronous compatibility helper used by focused unit tests."""
+        local_received_time = self._now_naive()
         record = SnapshotRecorder._order_record_from_event(
             self,
             event,
-            self._now_naive(),
+            local_received_time,
         )
         if record is None:
             return
         self._writer.upsert_realtime_order(
             record,
-            status_time=self._event_time_naive(event),
+            status_time=SnapshotRecorder._local_lifecycle_time_naive(
+                self,
+                event,
+                local_received_time,
+            ),
         )
 
     def _order_record_from_event(
@@ -2554,9 +2563,13 @@ class SnapshotRecorder(Actor):
         converted = self._ns_to_date(ts)
         return converted or self._now().date()
 
-    def _event_time_naive(self, event: Any) -> datetime:
-        ts = int(getattr(event, "ts_event", 0) or 0)
-        return self._ns_to_naive(ts) or self._now_naive()
+    def _local_lifecycle_time_naive(
+        self,
+        event: Any,
+        local_received_time: datetime,
+    ) -> datetime:
+        ts_init = int(getattr(event, "ts_init", 0) or 0)
+        return SnapshotRecorder._ns_to_naive(self, ts_init) or local_received_time
 
     def _ns_to_date(self, ts_event: int) -> date | None:
         if ts_event <= 0:

@@ -1380,7 +1380,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertIn("INSERT INTO `live_trade_realtime`", trade_sql)
 
     def test_writer_ensure_trade_indexes_adds_trade_date(self) -> None:
-        writer = object.__new__(LiveSnapshotWriter)
+        writer = LiveSnapshotWriter.for_testing(MagicMock())
         writer._query = MagicMock(
             return_value=[
                 ("live_trade", 0, "uk_trade", 1, "account_id"),
@@ -1405,7 +1405,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
 
     def test_writer_adds_status_times_only_to_realtime_order_table(self) -> None:
-        writer = object.__new__(LiveSnapshotWriter)
+        writer = LiveSnapshotWriter.for_testing(MagicMock())
         writer._query = MagicMock(return_value=[("id",), ("accepted_at",)])
         writer._execute = MagicMock()
 
@@ -2130,9 +2130,6 @@ class TargetLiveConfigTest(unittest.TestCase):
             instrument_id_text,
         )
         recorder._event_info = SnapshotRecorder._event_info
-        recorder._event_time_naive = MagicMock(
-            return_value=datetime(2026, 7, 9, 13, 21, 42),
-        )
         recorder._qmt_time_to_naive = SnapshotRecorder._qmt_time_to_naive
         recorder._book_snapshot_payload = SnapshotRecorder._book_snapshot_payload
         recorder._book_side_payload = SnapshotRecorder._book_side_payload
@@ -2190,8 +2187,30 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(record.qmt_raw["broker_code"], "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE")
         self.assertEqual(
             writer.upsert_realtime_order.call_args.kwargs["status_time"],
-            datetime(2026, 7, 9, 13, 21, 42),
+            datetime(2026, 7, 9, 13, 21, 43),
         )
+
+    def test_order_lifecycle_time_prefers_local_event_time(self) -> None:
+        recorder = SimpleNamespace(
+            config=SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER"),
+        )
+        local_event_time = datetime(2026, 7, 9, 13, 21, 42)
+        local_received_time = datetime(2026, 7, 9, 13, 21, 43)
+        event = SimpleNamespace(
+            ts_event=pd.Timestamp(
+                "2026-07-09 09:30:00",
+                tz="Asia/Shanghai",
+            ).value,
+            ts_init=pd.Timestamp(local_event_time, tz="Asia/Shanghai").value,
+        )
+
+        status_time = SnapshotRecorder._local_lifecycle_time_naive(
+            recorder,
+            event,
+            local_received_time,
+        )
+
+        self.assertEqual(status_time, local_event_time)
 
     def test_order_status_uses_enum_name_for_live_order_status(self) -> None:
         class EnumLikeStatus:

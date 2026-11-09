@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import queue
+import threading
 from datetime import date
 from datetime import datetime
 from unittest.mock import MagicMock
@@ -81,6 +83,56 @@ def test_async_order_event_writer_retries_idempotent_bundle() -> None:
     assert writer.write_realtime_order_event.call_count == 2
     assert worker.metrics()["failed_attempts"] == 1
     assert worker.metrics()["last_error"] is None
+
+
+def test_stop_cannot_overtake_an_accepted_submission() -> None:
+    class BlockingPutQueue(queue.Queue):
+        def __init__(self) -> None:
+            super().__init__()
+            self.write_put_started = threading.Event()
+            self.allow_write_put = threading.Event()
+            self.stop_put_started = threading.Event()
+
+        def put(self, item, block=True, timeout=None) -> None:
+            if isinstance(item, OrderEventWrite):
+                self.write_put_started.set()
+                assert self.allow_write_put.wait(1.0)
+            else:
+                self.stop_put_started.set()
+            super().put(item, block, timeout)
+
+    writer = MagicMock()
+    worker = AsyncOrderEventWriter(writer)
+    controlled_queue = BlockingPutQueue()
+    worker._queue = controlled_queue
+    worker.start()
+
+    submit_thread = threading.Thread(target=worker.submit, args=(_bundle("E-1"),))
+    submit_thread.start()
+    assert controlled_queue.write_put_started.wait(1.0)
+
+    stop_results: list[bool] = []
+    stop_call_started = threading.Event()
+
+    def stop_worker() -> None:
+        stop_call_started.set()
+        stop_results.append(worker.stop(1.0))
+
+    stop_thread = threading.Thread(target=stop_worker)
+    stop_thread.start()
+    assert stop_call_started.wait(1.0)
+
+    # stop() must remain behind submit()'s acceptance/enqueue critical section.
+    assert not controlled_queue.stop_put_started.wait(0.05)
+    controlled_queue.allow_write_put.set()
+    submit_thread.join(1.0)
+    stop_thread.join(1.0)
+
+    assert not submit_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert stop_results == [True]
+    writer.write_realtime_order_event.assert_called_once()
+    assert worker.metrics()["pending_count"] == 0
 
 
 def test_writer_commits_event_and_realtime_summary_in_one_transaction() -> None:

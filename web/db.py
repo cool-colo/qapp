@@ -201,7 +201,7 @@ LEFT JOIN (
     FROM dwd_sw_industry_member FINAL
     WHERE ts_code IN ({code_literals})
       AND in_date <= toDate({day})
-      AND end_date >= toDate({day})
+      AND end_date > toDate({day})
       AND available_date <= toDate({day})
     GROUP BY ts_code
 ) AS sw ON sw.ts_code = requested.stock_code
@@ -377,7 +377,7 @@ LEFT JOIN (
     FROM dwd_sw_industry_member FINAL
     WHERE ts_code = {quote_literal(stock_code)}
       AND in_date <= toDate({quote_literal(as_of)})
-      AND end_date >= toDate({quote_literal(as_of)})
+      AND end_date > toDate({quote_literal(as_of)})
       AND available_date <= toDate({quote_literal(as_of)})
     ORDER BY in_date DESC
     LIMIT 1
