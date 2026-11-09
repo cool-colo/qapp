@@ -310,6 +310,8 @@ class TestableTargetQuantityStrategy:
     _converge_async = TargetQuantityStrategy._converge_async
     _awaiting_pre_open_reconcile = TargetQuantityStrategy._awaiting_pre_open_reconcile
     _order_book_depth_logging_enabled = TargetQuantityStrategy._order_book_depth_logging_enabled
+    _log_depth_event_probe = TargetQuantityStrategy._log_depth_event_probe
+    _format_depth_side = staticmethod(TargetQuantityStrategy._format_depth_side)
     _should_log_sample = staticmethod(TargetQuantityStrategy._should_log_sample)
     _on_converge_timer = TargetQuantityStrategy._on_converge_timer
     _desired_quantities = TargetQuantityStrategy._desired_quantities
@@ -566,6 +568,9 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._whole_market_fetch_observers = []
         strategy._depth_books = {}
         strategy._depth_book_ts_init = {}
+        strategy._depth_event_probe_date = None
+        strategy._depth_event_probe_instrument_id = None
+        strategy._depth_event_probe_ts_event = None
         strategy._price_trend_samples = {}
         strategy._subscribed_order_book_depth_instruments = set()
         strategy._sleep_calls = []
@@ -1120,10 +1125,10 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy.update_target_quantities({INST_A: 95000}, date(2026, 7, 2), "large")
 
         self.assertEqual([order.quantity for order in strategy.submitted_orders], [
-            Decimal("29900"),
-            Decimal("29900"),
-            Decimal("29900"),
-            Decimal("5300"),
+            Decimal("29800"),
+            Decimal("29800"),
+            Decimal("29800"),
+            Decimal("5600"),
         ])
 
     def test_target_helpers_value_position_with_today_open_not_last_close(self) -> None:
@@ -1393,7 +1398,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         strategy.update_target_quantities({INST_A: 95000}, date(2026, 7, 2), "partial")
 
-        self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("29900")])
+        self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("29800")])
         self.assertEqual(strategy._deferred_buys, {str(INST_A): Decimal("95000")})
 
     def test_buy_cash_gate_reserves_open_buy_notional(self) -> None:
@@ -1876,7 +1881,14 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             any("Pre-open execution-state reconciliation succeeded" in args[0] for args, _kwargs in strategy.log.infos),
         )
 
-    def _make_depth(self, instrument_id: InstrumentId, bid: float, ask: float, ts: str):
+    def _make_depth(
+        self,
+        instrument_id: InstrumentId,
+        bid: float,
+        ask: float,
+        ts: str,
+        ts_init: str | None = None,
+    ):
         def level(price: float, size: float):
             return type("DepthLevel", (), {"price": Decimal(str(price)), "size": Decimal(str(size))})()
 
@@ -1888,7 +1900,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
                 "bids": [level(bid, 1000)],
                 "asks": [level(ask, 1200)],
                 "ts_event": china_ts_ns(ts),
-                "ts_init": china_ts_ns(ts),
+                "ts_init": china_ts_ns(ts_init or ts),
             },
         )()
 
@@ -1908,6 +1920,95 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         bids, asks = strategy._depth_books[str(INST_A)]
         self.assertEqual(bids, [(9.99, 1000.0)])
         self.assertEqual(asks, [(10.01, 1200.0)])
+
+    def test_depth_event_probe_logs_one_instrument_changes_only_before_0935(self) -> None:
+        strategy = self.make_strategy()
+        strategy._subscribed_order_book_depth_instruments = {str(INST_A), str(INST_B)}
+
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.99, 10.01, "2026-07-02 09:25:00"),
+        )
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.98, 10.02, "2026-07-02 09:25:00"),
+        )
+        strategy.on_order_book_depth(
+            self._make_depth(INST_B, 19.99, 20.01, "2026-07-02 09:25:01"),
+        )
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.99, 10.01, "2026-07-02 09:25:01"),
+        )
+        strategy.on_order_book_depth(
+            self._make_depth(
+                INST_A,
+                9.99,
+                10.01,
+                "2026-07-02 09:25:02",
+                ts_init="2026-07-02 09:35:00",
+            ),
+        )
+        strategy.on_order_book_depth(
+            self._make_depth(INST_B, 19.99, 20.01, "2026-07-03 09:25:00"),
+        )
+
+        probe_messages = [
+            args[0]
+            for args, _kwargs in strategy.log.infos
+            if args[0].startswith("Order-book depth ts_event change")
+        ]
+        self.assertEqual(len(probe_messages), 3)
+        self.assertIn(f"instrument_id={INST_A}", probe_messages[0])
+        self.assertIn(f"ts_event={china_ts_ns('2026-07-02 09:25:00')}", probe_messages[0])
+        self.assertIn(f"ts_event={china_ts_ns('2026-07-02 09:25:01')}", probe_messages[1])
+        self.assertIn(f"instrument_id={INST_B}", probe_messages[2])
+        self.assertEqual(strategy._depth_event_probe_instrument_id, str(INST_B))
+
+    def test_depth_event_time_drives_inner_convergence_with_stale_quote_time(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:30:02", tz="UTC")
+        strategy._trading_day = trading_date
+        strategy._depth_converged_today = False
+        strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 09:25:00")
+        strategy._target_quantities = {str(INST_A): Decimal("500")}
+        strategy._target_version = "depth-event-time"
+
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 09:30:02"),
+        )
+
+        self.assertTrue(strategy._depth_converged_today)
+        self.assertEqual(len(strategy.submitted_orders), 1)
+        self.assertEqual(strategy.submitted_orders[0].instrument_id, INST_A)
+        # First-order pricing uses the configured 50 bps open offset; depth is
+        # used only after the first cancel.
+        self.assertEqual(strategy.submitted_orders[0].price, Decimal("10.05"))
+
+    def test_depth_converged_flag_stays_false_when_convergence_does_not_start(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:30:02", tz="UTC")
+        strategy._trading_day = trading_date
+        strategy._depth_converged_today = False
+        strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 09:25:00")
+        strategy._target_quantities = {str(INST_A): Decimal("500")}
+        strategy._target_version = "depth-lock-retry"
+        strategy._converge_lock.acquire()
+        try:
+            strategy.on_order_book_depth(
+                self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 09:30:02"),
+            )
+        finally:
+            strategy._converge_lock.release()
+
+        self.assertFalse(strategy._depth_converged_today)
+        self.assertEqual(strategy.submitted_orders, [])
+
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 09:30:03"),
+        )
+
+        self.assertTrue(strategy._depth_converged_today)
+        self.assertEqual(len(strategy.submitted_orders), 1)
 
     def test_five_level_book_imbalance_uses_sizes_from_first_five_levels(self) -> None:
         strategy = self.make_strategy()

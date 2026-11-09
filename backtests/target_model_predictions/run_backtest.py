@@ -578,6 +578,8 @@ def build_engine(
             stop_time=params.stop_time,
             require_account_cash=True,
             unfilled_timeout_secs=0,
+            buy_offset_bps=params.buy_offset_bps,
+            sell_offset_bps=params.sell_offset_bps,
             price_trend_effect_enabled=params.price_trend_effect_enabled,
             price_trend_window_secs=params.price_trend_window_secs,
             price_trend_threshold_bps=params.price_trend_threshold_bps,

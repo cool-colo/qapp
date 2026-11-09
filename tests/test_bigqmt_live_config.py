@@ -27,6 +27,10 @@ def test_bigqmt_node_uses_extended_connection_timeout() -> None:
         strategy_name="target-model-predictions",
         no_sellable_check=False,
         bigqmt_account_cash_offset=250000.0,
+        bigqmt_use_quote_push=False,
+        bigqmt_market_poll_enabled=True,
+        bigqmt_quote_push_stale_secs=30.0,
+        bigqmt_quote_fallback_poll_interval_secs=60.0,
     )
     context = SimpleNamespace(instrument_ids=[])
     expected = object()
@@ -48,6 +52,8 @@ def test_bigqmt_node_uses_extended_connection_timeout() -> None:
     assert data.use_quote_push is False
     assert data.poll_enabled is True
     assert data.poll_interval_secs == 3.0
+    assert data.quote_push_stale_after_secs == 30.0
+    assert data.quote_push_fallback_poll_interval_secs == 60.0
     assert execution.poll_enabled is True
     assert execution.poll_interval_secs == 1.0
     assert data.rpc_timeout_secs == execution.rpc_timeout_secs == 6.0
@@ -61,6 +67,18 @@ def test_bigqmt_cash_offset_comes_from_environment(monkeypatch) -> None:
     _apply_bigqmt_args(args)
 
     assert args.bigqmt_account_cash_offset == 1250000.50
+
+
+def test_bigqmt_quote_push_can_be_enabled_without_continuous_market_polling(monkeypatch) -> None:
+    monkeypatch.setenv("BIGQMT_USE_QUOTE_PUSH", "1")
+    args = SimpleNamespace(account_id="12345678")
+
+    _apply_bigqmt_args(args)
+
+    assert args.bigqmt_use_quote_push is True
+    assert args.bigqmt_market_poll_enabled is False
+    assert args.bigqmt_quote_push_stale_secs == 30.0
+    assert args.bigqmt_quote_fallback_poll_interval_secs == 60.0
 
 
 def test_bigqmt_order_snapshot_exposes_recorder_client_order_id() -> None:

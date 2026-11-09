@@ -67,6 +67,8 @@ _OPEN_INT_TO_MARKET_STATUS: dict[int, MarketStatusAction] = {
     23: MarketStatusAction.CLOSE,  # 盘后固定价格行情完毕
 }
 
+_DEPTH_EVENT_PROBE_CUTOFF = pd.Timestamp("09:35").time()
+
 
 @dataclass(frozen=True)
 class TargetQuantityTargetEvent:
@@ -267,8 +269,8 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     exchange_trading_windows: str = "09:30-11:30,13:00-14:55"
     stop_time: str | None = "14:55"
     initial_last_closes: dict[str, float] | None = None
-    unfilled_timeout_secs: float = 60.0
-    resubmit_check_interval_secs: float = 2.0
+    unfilled_timeout_secs: float = 3.0
+    resubmit_check_interval_secs: float = 1.0
     # A broker sellable-position denial that lands shortly after this strategy
     # cancels its own sell for the same instrument is treated as a transient
     # freeze-release race (the broker has not yet released the shares frozen by
@@ -284,8 +286,8 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     cancel_reconverge_delay_secs: float = 0.1
     cash_buffer_percent: float = 0.01
     target_cash_buffer_percent: float = 0.05
-    buy_offset_bps: float = 5.0
-    sell_offset_bps: float = 5.0
+    buy_offset_bps: float = 50.0
+    sell_offset_bps: float = 50.0
     buy_max_price_bps: float = 100.0
     buy_cancel_threshold: int = 1
     sell_cancel_threshold: int = 1
@@ -414,6 +416,12 @@ class TargetQuantityStrategy(Strategy):
         self._depth_converged_today = False
         self._depth_books: dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]] = {}
         self._depth_book_ts_init: dict[str, int] = {}
+        # Before 09:35, trace every ts_event change for one data-bearing depth
+        # subscription. This is independent of the general random sample so the
+        # pre-open event-time progression can be reconstructed from logs.
+        self._depth_event_probe_date: date | None = None
+        self._depth_event_probe_instrument_id: str | None = None
+        self._depth_event_probe_ts_event: int | None = None
         self._price_trend_samples: dict[str, deque[PriceTrendSample]] = {}
         self._subscribed_order_book_depth_instruments: set[str] = set()
         self._sleep = time.sleep
@@ -1707,7 +1715,8 @@ class TargetQuantityStrategy(Strategy):
     def on_order_book_depth(self, depth: OrderBookDepth10) -> None:
         bids = self._ladder_levels(depth.bids)
         asks = self._ladder_levels(depth.asks)
-        trading_date = self._event_trading_date(int(getattr(depth, "ts_event", 0) or 0)) or self._clock_date()
+        depth_ts_event = int(depth.ts_event)
+        trading_date = self._event_trading_date(depth_ts_event) or self._clock_date()
         # The depth book is captured for aggressive walk-book pricing only. Its
         # mid/best price is NOT a dependable reference for today's open or last
         # price (pre-open auction levels are provisional, snapshots are sparse), so
@@ -1716,14 +1725,16 @@ class TargetQuantityStrategy(Strategy):
         self._roll_trading_day(trading_date)
         self._depth_books[str(depth.instrument_id)] = (bids, asks)
         self._depth_book_ts_init[str(depth.instrument_id)] = int(depth.ts_init)
+        self._log_depth_event_probe(depth, depth_ts_event)
         # On the first depth callback of each trading day, converge immediately so
         # orders are submitted as early as possible (priced against real depth)
         # rather than waiting for the next bar/timer. Gated on the trading window.
-        if not self._depth_converged_today and self._within_trading_window(
-            int(getattr(depth, "ts_event", 0) or 0),
+        if not self._depth_converged_today and self._converge_to_target(
+            current_date=trading_date,
+            trigger="order_book_depth",
+            ts_event=depth_ts_event,
         ):
             self._depth_converged_today = True
-            self._converge_to_target(current_date=trading_date, trigger="order_book_depth")
         if not self._should_log_sample(self.config.order_book_depth_log_sample_rate):
             return
         self.log.info(
@@ -1732,6 +1743,55 @@ class TargetQuantityStrategy(Strategy):
             f"bids={self._format_depth_side(depth.bids)}, "
             f"asks={self._format_depth_side(depth.asks)}, "
             f"ts_event={depth.ts_event}, ts_init={depth.ts_init}",
+            color=LogColor.CYAN,
+        )
+
+    def _log_depth_event_probe(
+        self,
+        depth: OrderBookDepth10,
+        ts_event: int,
+    ) -> None:
+        """Log each event-time change for one depth subscription before 09:35."""
+        ts_init = int(depth.ts_init)
+        local_init = pd.Timestamp(ts_init, unit="ns", tz="UTC").tz_convert(
+            self.config.timezone_name,
+        )
+        if local_init.time() >= _DEPTH_EVENT_PROBE_CUTOFF:
+            return
+
+        local_date = local_init.date()
+        if local_date != self._depth_event_probe_date:
+            self._depth_event_probe_date = local_date
+            self._depth_event_probe_instrument_id = None
+            self._depth_event_probe_ts_event = None
+
+        instrument_id = str(depth.instrument_id)
+        active_subscriptions = self._subscribed_order_book_depth_instruments
+        if instrument_id not in active_subscriptions:
+            return
+        if self._depth_event_probe_instrument_id not in active_subscriptions:
+            self._depth_event_probe_instrument_id = None
+            self._depth_event_probe_ts_event = None
+        if self._depth_event_probe_instrument_id is None:
+            # Taking the first data-bearing subscription avoids selecting a
+            # suspended instrument which never produces depth callbacks.
+            self._depth_event_probe_instrument_id = instrument_id
+        if instrument_id != self._depth_event_probe_instrument_id:
+            return
+        if ts_event == self._depth_event_probe_ts_event:
+            return
+
+        previous_event_ns = self._depth_event_probe_ts_event
+        self._depth_event_probe_ts_event = ts_event
+        event_to_init_ms = (ts_init - ts_event) / 1_000_000
+        self.log.info(
+            "Order-book depth ts_event change, "
+            f"instrument_id={depth.instrument_id}, "
+            f"previous_event_ns={previous_event_ns}, "
+            f"bids={self._format_depth_side(depth.bids)}, "
+            f"asks={self._format_depth_side(depth.asks)}, "
+            f"ts_event={ts_event}, ts_init={ts_init}, "
+            f"event_to_init_ms={event_to_init_ms:.3f}",
             color=LogColor.CYAN,
         )
 
@@ -1953,12 +2013,20 @@ class TargetQuantityStrategy(Strategy):
         except Exception as exc:
             self.log.warning(f"target convergence failed: {exc}")
 
-    def _converge_to_target(self, current_date: date, trigger: str, force: bool = False) -> None:
+    def _converge_to_target(
+        self,
+        current_date: date,
+        trigger: str,
+        force: bool = False,
+        ts_event: int | None = None,
+    ) -> bool:
+        """Run convergence after passing its window gate and acquiring its lock."""
         # ``force`` (set only by a manual SELL) bypasses the manual-pause flag so a
         # requested liquidation still runs while trading is paused. It does NOT
-        # bypass the trading-window gate.
-        if (self._trading_paused and not force) or not self._within_trading_window():
-            return
+        # bypass the trading-window gate. Data callbacks pass their exchange event
+        # timestamp so the gate does not fall back to an older quote timestamp.
+        if (self._trading_paused and not force) or not self._within_trading_window(ts_event):
+            return False
         # A forced (manual-sell) convergence must not be silently dropped when the
         # trading thread holds the lock, so it waits (bounded); ordinary triggers
         # skip when already converging.
@@ -1967,11 +2035,12 @@ class TargetQuantityStrategy(Strategy):
         else:
             acquired = self._converge_lock.acquire(blocking=False)
         if not acquired:
-            return
+            return False
         try:
             self._converge_to_target_locked(current_date=current_date, trigger=trigger)
         finally:
             self._converge_lock.release()
+        return True
 
     def _converge_to_target_locked(self, current_date: date, trigger: str) -> None:
         if not self._target_version:

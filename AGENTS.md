@@ -239,7 +239,8 @@ snapshot (open from the daily bar; suspended stocks get `open_int=1`), a heartbe
 - The YAML holds only **strategy-tuning** knobs: position sizing
   (`max_position_percent`, `stop_loss`, `trailing_take_profit`,
   `min_listed_days`, ...), order lifecycle (`unfilled_timeout_secs`,
-  `resubmit_interval_secs`, `cash_buffer_percent`, `order_slice_notional`,
+  `resubmit_check_interval_secs`, `process_targets_interval_secs`,
+  `cash_buffer_percent`, `order_slice_notional`,
   `limit_stop_mode`, `stop_time`), planner/risk manager
   (`target_weight_planner`, `risk_manager_*`), name filters, trading windows, full-tick,
   order id tag, log sample rates.

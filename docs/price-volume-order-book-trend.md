@@ -112,7 +112,7 @@ offset_multiplier = 1 + severity * (3 - 1)
 - 订单发生首次撤单后，继续使用既有的累计深度覆盖与逐 tick 穿透定价，趋势乘数不再
   改变该阶段的 depth-walk 行为；
 - 达到有效超时并不会主动唤醒撤单；撤单在下一次成功执行的 convergence cycle 中检查。
-  当前周期配置为 2 秒，因此可能在超过有效超时后继续等待最多约一个检查周期；其它
+  当前周期配置为 1 秒，因此可能在超过有效超时后继续等待最多约一个检查周期；其它
   convergence 触发事件也可能更早执行检查。
 
 ## 配置
@@ -120,6 +120,11 @@ offset_multiplier = 1 + severity * (3 - 1)
 配置位于 `configs/strategy*.yaml`，并由 `StrategyParams` 校验：
 
 ```yaml
+unfilled_timeout_secs: 3.0
+resubmit_check_interval_secs: 1.0
+process_targets_interval_secs: 2.0
+buy_offset_bps: 50.0
+sell_offset_bps: 50.0
 price_trend_effect_enabled: false
 price_trend_window_secs: 10.0
 price_trend_threshold_bps: 20.0
@@ -129,6 +134,11 @@ price_trend_book_max_age_secs: 2.0
 price_trend_min_timeout_multiplier: 0.3
 price_trend_max_offset_multiplier: 3.0
 ```
+
+取消次数为 0 的首单使用开盘价上下 50 bps（0.5%）报价；首次撤单后仍按盘口累计深度
+及逐 tick 穿透规则重报。未成交基础撤单阈值为 3 秒。
+`resubmit_check_interval_secs` 只控制未成交订单检查与执行收敛；
+`process_targets_interval_secs` 独立控制每日目标处理触发，两者不再共用配置。
 
 `price_trend_effect_enabled=false` 时仍然采样并计算全部趋势指标，`trend_bps` 和
 `trend_severity` 也照常记录，但实际应用的 `timeout_multiplier` 与

@@ -61,8 +61,11 @@ class StrategyParams:
     initial_cash: Decimal = Decimal("1000000")
 
     # Order lifecycle / cash gating
-    unfilled_timeout_secs: float = 60.0
-    resubmit_interval_secs: float = 2.0
+    unfilled_timeout_secs: float = 3.0
+    resubmit_check_interval_secs: float = 1.0
+    process_targets_interval_secs: float = 2.0
+    buy_offset_bps: float = 50.0
+    sell_offset_bps: float = 50.0
     price_trend_effect_enabled: bool = True
     price_trend_window_secs: float = 10.0
     price_trend_threshold_bps: float = 20.0
@@ -121,6 +124,10 @@ class StrategyParams:
             raise ValueError("consecutive_up_limit_days must be non-negative")
         if not 0.0 <= float(self.max_open_gap_up) <= 1.0:
             raise ValueError("max_open_gap_up must be between 0 and 1")
+        if float(self.buy_offset_bps) < 0:
+            raise ValueError("buy_offset_bps must be non-negative")
+        if float(self.sell_offset_bps) < 0:
+            raise ValueError("sell_offset_bps must be non-negative")
         if float(self.price_trend_window_secs) <= 0:
             raise ValueError("price_trend_window_secs must be positive")
         if float(self.price_trend_threshold_bps) < 0:

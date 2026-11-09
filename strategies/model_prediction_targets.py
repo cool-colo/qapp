@@ -63,7 +63,7 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     risk_manager_mode: str = "simulation"
     risk_manager_timeout_secs: float = 10.0
     process_targets_on_timer: bool = False
-    process_targets_interval_secs: float = 10.0
+    process_targets_interval_secs: float = 2.0
 
 
 class TargetModelPredictionsStrategy(TargetQuantityStrategy):
