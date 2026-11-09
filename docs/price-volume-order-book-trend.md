@@ -120,6 +120,7 @@ offset_multiplier = 1 + severity * (3 - 1)
 配置位于 `configs/strategy*.yaml`，并由 `StrategyParams` 校验：
 
 ```yaml
+price_trend_effect_enabled: false
 price_trend_window_secs: 10.0
 price_trend_threshold_bps: 20.0
 price_trend_max_bps: 40.0
@@ -128,6 +129,11 @@ price_trend_book_max_age_secs: 2.0
 price_trend_min_timeout_multiplier: 0.3
 price_trend_max_offset_multiplier: 3.0
 ```
+
+`price_trend_effect_enabled=false` 时仍然采样并计算全部趋势指标，`trend_bps` 和
+`trend_severity` 也照常记录，但实际应用的 `timeout_multiplier` 与
+`offset_multiplier` 固定为 `1.0`，因此不改变撤单等待时间或首次报价。设置为 `true`
+才应用上述趋势效果。
 
 非法窗口、阈值顺序、确认强度或乘数会在启动时直接抛出 `ValueError`。
 
@@ -142,6 +148,7 @@ book_imbalance
 confirmation_score
 trend_bps
 trend_severity
+price_trend_effect_enabled
 timeout_multiplier
 offset_multiplier
 ```

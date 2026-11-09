@@ -63,6 +63,7 @@ class StrategyParams:
     # Order lifecycle / cash gating
     unfilled_timeout_secs: float = 60.0
     resubmit_interval_secs: float = 2.0
+    price_trend_effect_enabled: bool = True
     price_trend_window_secs: float = 10.0
     price_trend_threshold_bps: float = 20.0
     price_trend_max_bps: float = 40.0

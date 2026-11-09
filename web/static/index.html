@@ -43,6 +43,7 @@
         </div>
         <button class="nav-item" data-tab="series">随时间</button>
         <button class="nav-item" data-tab="compare">对比</button>
+        <button class="nav-item" data-tab="orderexec">委托执行</button>
         <button class="nav-item" data-tab="kline">个股 K 线</button>
         <button class="nav-item" data-tab="rline">信号R线</button>
         <button class="nav-item" data-tab="changes">变更记录</button>
@@ -184,6 +185,41 @@
               </div>
             </div>
             <div id="cmp-chart" class="chart"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ Order execution inspector ============ -->
+      <section id="tab-orderexec" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <label>股票代码 <input type="text" id="oe-code" placeholder="000001.SZ" /></label>
+            <label>交易日 <input type="date" id="oe-date" /></label>
+            <label>起始 <input type="time" id="oe-start" step="1" /></label>
+            <label>结束 <input type="time" id="oe-end" step="1" /></label>
+            <div class="multi-select" id="oe-layer-ms">
+              <span class="ms-caption">图层</span>
+              <button type="button" class="ms-toggle" id="oe-layer-toggle">选择图层</button>
+              <div class="ms-panel" id="oe-layer-panel"></div>
+            </div>
+            <button id="oe-plot">分析</button>
+            <span class="hint">时间留空自动覆盖委托前后；实线/实心=券商，虚线/空心=本地</span>
+          </div>
+        </div>
+        <div id="orderexec-chart" class="chart chart-tall"></div>
+        <div id="orderexec-coverage" class="orderexec-note"></div>
+        <h3 class="section-heading">诊断</h3>
+        <div id="orderexec-diagnostics" class="table-wrap"></div>
+        <h3 class="section-heading">完整事件</h3>
+        <div id="orderexec-events" class="table-wrap"></div>
+        <div class="orderexec-tables">
+          <div>
+            <h3 class="section-heading">券商委托 / 成交</h3>
+            <div id="orderexec-broker" class="table-wrap"></div>
+          </div>
+          <div>
+            <h3 class="section-heading">本地委托 / 成交</h3>
+            <div id="orderexec-local" class="table-wrap"></div>
           </div>
         </div>
       </section>

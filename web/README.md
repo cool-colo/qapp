@@ -18,6 +18,11 @@ A local, read-only dashboard for the live trading data this repo persists:
   account's **buy (red ↑) / sell (green ↓)** fills overlaid as markers. Changing a date
   or the 显示买卖点 option redraws right away (as it does in **对比**, where a date change
   re-plots whenever at least one series is added).
+- **委托执行** — broker-authoritative `live_order`/`live_trade` records overlaid with
+  local Nautilus lifecycle events and RiceQuant minute/tick prices. A checkbox
+  multi-select controls minute candles, tick/BBO, broker orders/trades, and local
+  states/events independently; diagnostics flag price marketability and broker/local
+  discrepancies without treating a crossed tick as proof of fill eligibility.
 
 Every table goes through one shared renderer, which prefixes a leading **序号**
 row-number column: it numbers the *visible* rows, so it follows the current sort/filter
@@ -67,7 +72,7 @@ It is a self-contained consumer — nothing here is imported by the strategy / b
 
 - **MySQL** `live_*` tables — asset/position/target/order/trade snapshots, plus
   `live_daily_stock_return` and `index_eod_price` used by the return report.
-- **ClickHouse** (HTTP) — daily OHLCV bars.
+- **ClickHouse** (HTTP) — daily OHLCV plus RiceQuant minute/tick market context.
 
 实盘 (real) and 模拟盘 (simulation) live in **separate MySQL databases**; each is a
 named entry under `sources` in the config. Multiple accounts within one database are
@@ -125,6 +130,7 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/kline` | `stock_code, start, end` |
 | `GET /api/stock_info` | `stock_code, date?` (latest daily metrics on/before date; default today) |
 | `GET /api/kline_with_trades` | `source, account, trader, stock_code, start, end` |
+| `GET /api/order-execution` | `source, account, trader, stock_code, trade_date, start?, end?, tick_limit?` |
 | `GET /api/change_records` | — |
 | `POST /api/change_records` | body: `{title, details}` |
 | `PUT /api/change_records/{id}` | body: `{title, details}` |

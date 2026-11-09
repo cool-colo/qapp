@@ -445,6 +445,7 @@ def build_target_model_node(
             risk_manager_timeout_secs=params.risk_manager_timeout_secs,
             unfilled_timeout_secs=params.unfilled_timeout_secs,
             resubmit_check_interval_secs=params.resubmit_interval_secs,
+            price_trend_effect_enabled=params.price_trend_effect_enabled,
             price_trend_window_secs=params.price_trend_window_secs,
             price_trend_threshold_bps=params.price_trend_threshold_bps,
             price_trend_max_bps=params.price_trend_max_bps,

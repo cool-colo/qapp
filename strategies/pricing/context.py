@@ -37,6 +37,7 @@ class PriceContext:
     confirmation_score: float = 0.0
     trend_bps: float = 0.0
     trend_severity: float = 0.0
+    price_trend_effect_enabled: bool = True
     timeout_multiplier: float = 1.0
     offset_multiplier: float = 1.0
 

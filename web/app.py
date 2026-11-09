@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from web import change_records, compare_presets
+from web import order_execution_report
 from web.config import AppConfig, load_config
 from web.db import DataAccess, MySqlSource, NodeApiClient, jsonable, jsonable_rows, quote_literal
 from web.returns_report import (
@@ -401,6 +402,39 @@ def get_trades(
         params,
     )
     return {"rows": data.attach_names(jsonable_rows(rows))}
+
+
+@app.get("/api/order-execution")
+def get_order_execution(
+    source: str,
+    account: str,
+    trader: str,
+    stock_code: str,
+    trade_date: str,
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+    tick_limit: int = Query(order_execution_report.DEFAULT_TICK_LIMIT),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Broker/local order lifecycle over RiceQuant minute and tick prices."""
+    try:
+        payload = order_execution_report.query_order_execution(
+            _mysql(data, source),
+            data.clickhouse,
+            account=account,
+            trader=trader,
+            stock_code=stock_code,
+            trading_date=trade_date,
+            start=start,
+            end=end,
+            tick_limit=tick_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload["stock_name"] = data.resolve_names([stock_code]).get(stock_code, "")
+    return payload
 
 
 # ---- time series -----------------------------------------------------------

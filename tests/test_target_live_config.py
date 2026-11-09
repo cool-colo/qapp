@@ -26,12 +26,15 @@ from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
+from backtests.result_writers.live_records import LiveTradeRecord
 from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
 from backtests.result_writers.live_records import WHOLE_MARKET
 from backtests.result_writers.live_records import WHOLE_MARKET_SCHEMA_VERSION
 from backtests.result_writers.live_writer import LiveSnapshotWriter
+from backtests.result_writers.live_writer import REALTIME_ORDER_STATUS_COLUMNS
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.enums import MarketStatusAction
+from nautilus_trader.model.enums import OrderSide
 
 from lives.live_qmt_target_model_predictions import _emit_snapshot_status
 from lives.live_qmt_target_model_predictions import LiveTargetModelPredictionsStrategy
@@ -1333,6 +1336,95 @@ class TargetLiveConfigTest(unittest.TestCase):
         sql = cursor.executemany.call_args.args[0]
         self.assertIn("COALESCE(VALUES(`signal_date`), `signal_date`)", sql)
 
+    def test_realtime_order_and_trade_write_to_separate_tables(self) -> None:
+        cursor = MagicMock()
+        connection = SimpleNamespace(
+            cursor=MagicMock(return_value=cursor),
+            commit=MagicMock(),
+            rollback=MagicMock(),
+        )
+        writer = LiveSnapshotWriter.for_testing(connection)
+        order = LiveOrderRecord(
+            trade_date=date(2026, 7, 9),
+            write_time=datetime(2026, 7, 9, 9, 31),
+            account_id="ACC",
+            trader_id="TRADER",
+            client_order_id="O-1",
+            instrument_id="000001.SZ.BIGQMT",
+            status="accepted",
+        )
+        trade = LiveTradeRecord(
+            trade_date=date(2026, 7, 9),
+            write_time=datetime(2026, 7, 9, 9, 32),
+            account_id="ACC",
+            trader_id="TRADER",
+            trade_id="T-1",
+            client_order_id="O-1",
+            instrument_id="000001.SZ.BIGQMT",
+        )
+
+        writer.upsert_realtime_order(order, datetime(2026, 7, 9, 9, 30, 59))
+        order_sql = cursor.executemany.call_args.args[0]
+        writer.upsert_realtime_trade(trade)
+        trade_sql = cursor.executemany.call_args.args[0]
+
+        self.assertIn("INSERT INTO `live_order_realtime`", order_sql)
+        self.assertIn(
+            "`accepted_at` = COALESCE(`accepted_at`, VALUES(`accepted_at`))",
+            order_sql,
+        )
+        self.assertIn("INSERT INTO `live_trade_realtime`", trade_sql)
+
+    def test_writer_ensure_trade_indexes_adds_trade_date(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._query = MagicMock(
+            return_value=[
+                ("live_trade", 0, "uk_trade", 1, "account_id"),
+                ("live_trade", 0, "uk_trade", 2, "trader_id"),
+                ("live_trade", 0, "uk_trade", 3, "trade_id"),
+            ],
+        )
+        writer._execute = MagicMock()
+
+        writer._ensure_trade_indexes()
+
+        self.assertEqual(
+            writer._execute.call_args_list,
+            [
+                call("ALTER TABLE `live_trade` DROP INDEX `uk_trade`", ()),
+                call(
+                    "ALTER TABLE `live_trade` ADD UNIQUE KEY `uk_trade` "
+                    "(`account_id`,`trader_id`,`trade_date`,`trade_id`)",
+                    (),
+                ),
+            ],
+        )
+
+    def test_writer_adds_status_times_only_to_realtime_order_table(self) -> None:
+        writer = object.__new__(LiveSnapshotWriter)
+        writer._query = MagicMock(return_value=[("id",), ("accepted_at",)])
+        writer._execute = MagicMock()
+
+        writer._ensure_realtime_order_columns()
+
+        writer._query.assert_called_once_with(
+            "SHOW COLUMNS FROM `live_order_realtime`",
+            (),
+        )
+        expected_missing = [
+            column for column in REALTIME_ORDER_STATUS_COLUMNS if column != "accepted_at"
+        ]
+        self.assertEqual(
+            writer._execute.call_args_list,
+            [
+                call(
+                    f"ALTER TABLE `live_order_realtime` ADD COLUMN `{column}` DATETIME NULL",
+                    (),
+                )
+                for column in expected_missing
+            ],
+        )
+
     def test_target_signal_dates_for_date_keeps_only_unambiguous_stocks(self) -> None:
         cursor = MagicMock()
         cursor.fetchall.return_value = [
@@ -1989,7 +2081,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
 
     def test_order_event_truncates_reason_for_live_order_but_keeps_full_payload(self) -> None:
-        writer = SimpleNamespace(upsert_order=MagicMock())
+        writer = SimpleNamespace(upsert_realtime_order=MagicMock())
         recorder = SimpleNamespace()
         recorder.config = SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER")
         recorder._writer = writer
@@ -2034,6 +2126,9 @@ class TargetLiveConfigTest(unittest.TestCase):
             instrument_id_text,
         )
         recorder._event_info = SnapshotRecorder._event_info
+        recorder._event_time_naive = MagicMock(
+            return_value=datetime(2026, 7, 9, 13, 21, 42),
+        )
         recorder._qmt_time_to_naive = SnapshotRecorder._qmt_time_to_naive
         recorder._book_snapshot_payload = SnapshotRecorder._book_snapshot_payload
         recorder._book_side_payload = SnapshotRecorder._book_side_payload
@@ -2044,7 +2139,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             "cum_notional=299052.00 CNY"
         )
         event = type(
-            "OrderDeniedEvent",
+            "OrderDenied",
             (),
             {
                 "client_order_id": "O-1",
@@ -2065,7 +2160,7 @@ class TargetLiveConfigTest(unittest.TestCase):
 
         SnapshotRecorder._upsert_order_from_event(recorder, event)
 
-        record = writer.upsert_order.call_args.args[0]
+        record = writer.upsert_realtime_order.call_args.args[0]
         self.assertEqual(record.client_order_id, "O-1")
         self.assertEqual(record.signal_date, date(2026, 7, 8))
         self.assertEqual(record.target_qty, 20000)
@@ -2089,6 +2184,10 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
         self.assertEqual(record.qmt_raw["reason"], long_reason)
         self.assertEqual(record.qmt_raw["broker_code"], "CUM_NOTIONAL_EXCEEDS_FREE_BALANCE")
+        self.assertEqual(
+            writer.upsert_realtime_order.call_args.kwargs["status_time"],
+            datetime(2026, 7, 9, 13, 21, 42),
+        )
 
     def test_order_status_uses_enum_name_for_live_order_status(self) -> None:
         class EnumLikeStatus:
@@ -2117,6 +2216,40 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(text, "pending_review")
+
+    def test_trade_event_writes_only_to_realtime_trade_table(self) -> None:
+        writer = SimpleNamespace(upsert_realtime_trade=MagicMock())
+        recorder = SimpleNamespace(
+            config=SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER"),
+            _writer=writer,
+            _now_naive=MagicMock(return_value=datetime(2026, 7, 9, 9, 32)),
+            _event_date=MagicMock(return_value=date(2026, 7, 9)),
+            _stock_code=MagicMock(return_value="000001.SZ"),
+            _decimal_or_none=SnapshotRecorder._decimal_or_none,
+            _int_or_none=SnapshotRecorder._int_or_none,
+            _maybe_str=SnapshotRecorder._maybe_str,
+            _commission=SnapshotRecorder._commission,
+            _event_info=SnapshotRecorder._event_info,
+            _qmt_time_to_naive=MagicMock(return_value=datetime(2026, 7, 9, 9, 31, 59)),
+        )
+        event = SimpleNamespace(
+            instrument_id="000001.SZ.BIGQMT",
+            last_qty=100,
+            last_px=10.5,
+            trade_id="T-1",
+            client_order_id="O-1",
+            venue_order_id="V-1",
+            order_side=OrderSide.BUY,
+            commission=Decimal("5.00"),
+            info={"traded_time_ms": 1783560719000},
+        )
+
+        SnapshotRecorder._write_trade(recorder, event)
+
+        record = writer.upsert_realtime_trade.call_args.args[0]
+        self.assertEqual(record.trade_id, "T-1")
+        self.assertEqual(record.source, "live")
+        self.assertEqual(record.amount, Decimal("1050.0"))
 
     @staticmethod
     def _make_snapshot_recorder_stub(now_text: str) -> SimpleNamespace:

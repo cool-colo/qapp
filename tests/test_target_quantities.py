@@ -2032,6 +2032,43 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertAlmostEqual(trend.timeout_multiplier, 0.65, places=6)
         self.assertAlmostEqual(trend.offset_multiplier, 2.0, places=6)
 
+    def test_execution_trend_can_be_observed_without_affecting_execution(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            price_trend_effect_enabled=False,
+        )
+        instrument_id = str(INST_A)
+        strategy._price_trend_samples[instrument_id] = deque(
+            [
+                PriceTrendSample(10_000_000_000, 10.00, 100),
+                PriceTrendSample(20_000_000_000, 10.05, 1_000),
+            ],
+        )
+
+        trend = strategy._execution_trend(
+            instrument_id,
+            OrderSide.BUY,
+            now_ns=20_000_000_000,
+        )
+
+        self.assertGreater(trend.trend_bps, 0.0)
+        self.assertEqual(trend.severity, 1.0)
+        self.assertEqual(trend.timeout_multiplier, 1.0)
+        self.assertEqual(trend.offset_multiplier, 1.0)
+
+        context = strategy._build_price_context(
+            strategy.cache.instrument(INST_A),
+            INST_A,
+            OrderSide.BUY,
+            Decimal("100"),
+        )
+        self.assertFalse(context.price_trend_effect_enabled)
+        self.assertEqual(context.trend_severity, 1.0)
+        self.assertEqual(context.timeout_multiplier, 1.0)
+        self.assertEqual(context.offset_multiplier, 1.0)
+
     def test_book_imbalance_does_not_trigger_without_price_history(self) -> None:
         strategy = self.make_strategy()
         instrument_id = str(INST_A)

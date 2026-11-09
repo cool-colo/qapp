@@ -327,6 +327,17 @@ a.rlink:hover { text-decoration: underline; }
 
 .chart { width: calc(100% - 40px); height: 460px; margin: 16px 20px; background: var(--panel); border-radius: 6px; }
 .chart-tall { height: 620px; }
+.orderexec-note { margin: -4px 20px 12px; color: var(--muted); font-size: 12px; }
+.section-heading { margin: 14px 20px 6px; color: var(--text); font-size: 14px; }
+.orderexec-tables {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px; margin: 0 20px 20px;
+}
+.orderexec-tables .table-wrap { margin: 0; max-height: 340px; overflow: auto; }
+.orderexec-tables .section-heading { margin-left: 0; }
+@media (max-width: 1100px) {
+  .orderexec-tables { grid-template-columns: 1fr; }
+}
 
 /* Report table: black zero on a light cell so it's visible on dark bg */
 #report-table { margin: 16px 20px; }

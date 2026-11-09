@@ -10,6 +10,7 @@ class StrategyParamsPriceTrendTest(unittest.TestCase):
         params = StrategyParams.from_yaml("configs/strategy.yaml")
 
         self.assertEqual(params.resubmit_interval_secs, 2.0)
+        self.assertFalse(params.price_trend_effect_enabled)
         self.assertEqual(params.price_trend_window_secs, 10.0)
         self.assertEqual(params.price_trend_threshold_bps, 20.0)
         self.assertEqual(params.price_trend_max_bps, 40.0)

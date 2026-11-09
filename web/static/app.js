@@ -232,6 +232,7 @@ function refreshActiveTab() {
   else if (tab === "sigqual") loadSignalQuality();
   else if (tab === "series") { if ($("#series-start").value && $("#series-end").value) $("#series-plot").click(); }
   else if (tab === "compare") { if (cmpSeries.length) plotCompare(); }
+  else if (tab === "orderexec") { if ($("#oe-code").value.trim()) plotOrderExecution(); }
   else if (tab === "kline") { if ($("#kline-code").value.trim()) plotKline(); }
   else if (tab === "rline") { if ($("#rline-code").value.trim()) plotRline(); }
   else if (tab === "realtime") loadRealtime();
@@ -1673,6 +1674,293 @@ async function loadSavedPresets() {
     highlightSavedPreset();
   } catch (e) { toast(e.message); }
 }
+
+// ---------------------------------------------------------------------------
+// Order execution inspector
+// ---------------------------------------------------------------------------
+const OE_LAYERS = [
+  ["minute", "分钟K线", true],
+  ["tick", "Tick 最新价", true],
+  ["bbo", "最优买卖价", true],
+  ["depth", "五档盘口", false],
+  ["broker_orders", "券商委托", true],
+  ["broker_trades", "券商成交", true],
+  ["local_orders", "本地委托状态", false],
+  ["local_trades", "本地成交", false],
+  ["local_events", "本地生命周期事件", true],
+];
+let orderExecutionData = null;
+let orderExecutionDraw = 0;
+const OE_ASSESSMENT = {
+  rejected_before_execution: "执行前拒绝，不是价格原因",
+  partially_or_fully_filled: "已有部分或全部成交",
+  incomplete_tick_coverage: "Tick 范围不完整，不能下结论",
+  price_never_marketable: "有效期内价格从未可成交",
+  marketable_without_fill_review_queue_or_latency: "曾可成交但未成交，检查排队/延迟",
+};
+
+function renderOrderExecutionLayerPanel() {
+  $("#oe-layer-panel").innerHTML =
+    `<div class="ms-list">${OE_LAYERS.map(([id, label, checked]) =>
+      `<label class="ms-opt"><input type="checkbox" value="${id}" ${checked ? "checked" : ""}/><span>${label}</span></label>`
+    ).join("")}</div>
+     <div class="ms-actions">
+       <button type="button" data-act="all">全选</button>
+       <button type="button" data-act="none">清空</button>
+     </div>`;
+  updateOrderExecutionLayerLabel();
+}
+function selectedOrderExecutionLayers() {
+  return new Set($$("#oe-layer-panel input:checked").map((input) => input.value));
+}
+function updateOrderExecutionLayerLabel() {
+  const count = selectedOrderExecutionLayers().size;
+  $("#oe-layer-toggle").textContent = count ? `${count} 个图层` : "选择图层";
+}
+function oeTime(value) {
+  if (!value) return null;
+  let text = String(value).trim().replace(" ", "T");
+  text = text.replace(/(\.\d{3})\d+/, "$1");
+  if (!/(Z|[+-]\d{2}:?\d{2})$/.test(text)) text += "+08:00";
+  const millis = Date.parse(text);
+  return Number.isFinite(millis) ? millis : null;
+}
+function oeOrderStart(row, local = false) {
+  const fields = local
+    ? ["accepted_at", "submitted_at", "initialized_at", "order_time", "write_time"]
+    : ["order_time", "write_time"];
+  for (const field of fields) {
+    const value = oeTime(row[field]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+function oeOrderEnd(row, fallback) {
+  for (const field of ["rejected_at", "canceled_at", "expired_at", "filled_at", "denied_at"]) {
+    const value = oeTime(row[field]);
+    if (value !== null) return value;
+  }
+  return fallback;
+}
+function oeStatusColor(status) {
+  const value = String(status || "").toLowerCase();
+  if (value === "filled") return "#26a69a";
+  if (value === "partially_filled") return "#f6c85f";
+  if (["rejected", "denied", "expired"].includes(value)) return "#ef5350";
+  if (value === "canceled") return "#8a94a8";
+  return "#8c9eff";
+}
+function minuteCandleSeries(rows) {
+  const candles = rows.filter((row) =>
+    oeTime(row.ts) !== null && [row.open, row.close, row.low, row.high].every((value) => Number.isFinite(Number(value))));
+  return {
+    name: "分钟K线", type: "custom", silent: false,
+    data: candles.map((row) => [oeTime(row.ts), row.open, row.close, row.low, row.high]),
+    renderItem(params, api) {
+      const timestamp = api.value(0);
+      const open = Number(api.value(1)), close = Number(api.value(2));
+      const low = Number(api.value(3)), high = Number(api.value(4));
+      const x = api.coord([timestamp, open])[0];
+      const openY = api.coord([timestamp, open])[1];
+      const closeY = api.coord([timestamp, close])[1];
+      const lowY = api.coord([timestamp, low])[1];
+      const highY = api.coord([timestamp, high])[1];
+      const width = Math.max(2, Math.min(9, Math.abs(api.size([60000, 0])[0]) * 0.65));
+      const color = close >= open ? "#ef5350" : "#26a69a";
+      return {
+        type: "group", children: [
+          { type: "line", shape: { x1: x, y1: highY, x2: x, y2: lowY }, style: { stroke: color, lineWidth: 1 } },
+          { type: "rect", shape: {
+              x: x - width / 2, y: Math.min(openY, closeY), width,
+              height: Math.max(1, Math.abs(closeY - openY)),
+            }, style: { fill: color, stroke: color } },
+        ],
+      };
+    },
+    tooltip: { valueFormatter: (value) => fmt(value) },
+  };
+}
+function orderLineSeries(row, source, rangeEnd, local = false) {
+  const start = oeOrderStart(row, local);
+  const price = Number(row.limit_price);
+  if (start === null || !Number.isFinite(price)) return null;
+  const end = local ? oeOrderEnd(row, rangeEnd) : rangeEnd;
+  const side = String(row.side || "").toLowerCase();
+  const sourceLabel = source === "broker" ? "券商" : "本地";
+  return {
+    name: `${sourceLabel}委托 ${row.client_order_id}`, type: "line",
+    showSymbol: false, connectNulls: false,
+    data: [[start, price], [end, price]],
+    lineStyle: {
+      color: side === "buy" ? "#ef5350" : "#26a69a",
+      width: source === "broker" ? 3 : 2,
+      type: source === "broker" ? "solid" : "dashed",
+    },
+    emphasis: { focus: "series" },
+    tooltip: { valueFormatter: () => `${side} ${fmt(row.quantity)} @ ${fmt(row.limit_price)} · ${row.status}` },
+  };
+}
+function tradeSeries(rows, source) {
+  const broker = source === "broker";
+  return {
+    name: broker ? "券商成交" : "本地成交", type: "scatter",
+    symbol: "circle", symbolSize: broker ? 12 : 10,
+    data: rows.map((row) => ({
+      value: [oeTime(row.trade_time || row.write_time), Number(row.price)],
+      meta: row,
+      itemStyle: {
+        color: broker ? (String(row.side).toLowerCase() === "buy" ? "#ef5350" : "#26a69a") : "transparent",
+        borderColor: String(row.side).toLowerCase() === "buy" ? "#ef5350" : "#26a69a",
+        borderWidth: broker ? 1 : 2,
+      },
+    })).filter((item) => item.value[0] !== null && Number.isFinite(item.value[1])),
+    tooltip: { formatter: (p) => `${p.seriesName}<br>${escapeHtml(p.data.meta.client_order_id)}<br>${fmt(p.data.meta.quantity)} @ ${fmt(p.data.meta.price)}` },
+  };
+}
+function renderOrderExecution(payload) {
+  const layers = selectedOrderExecutionLayers();
+  const minutes = payload.market.minutes || [], ticks = payload.market.ticks || [];
+  const rangeStart = oeTime(payload.range.start);
+  const rangeEnd = oeTime(payload.range.end);
+  const clientIds = Array.from(new Set([
+    ...payload.broker.orders.map((row) => row.client_order_id),
+    ...payload.local.orders.map((row) => row.client_order_id),
+    ...payload.local.events.map((row) => row.client_order_id),
+  ])).filter(Boolean);
+  const series = [];
+  if (layers.has("minute")) series.push(minuteCandleSeries(minutes));
+  if (layers.has("tick")) series.push({
+    name: "Tick 最新价", type: "line", showSymbol: false, sampling: "lttb",
+    data: ticks.map((row) => [oeTime(row.ts), row.last]), lineStyle: { color: "#f6c85f", width: 1 },
+  });
+  if (layers.has("bbo")) {
+    series.push({ name: "卖一", type: "line", showSymbol: false, sampling: "lttb",
+      data: ticks.map((row) => [oeTime(row.ts), row.a1]), lineStyle: { color: "#ff8a80", width: 1, opacity: 0.75 } });
+    series.push({ name: "买一", type: "line", showSymbol: false, sampling: "lttb",
+      data: ticks.map((row) => [oeTime(row.ts), row.b1]), lineStyle: { color: "#69f0ae", width: 1, opacity: 0.75 } });
+  }
+  if (layers.has("depth")) {
+    for (let level = 2; level <= 5; level += 1) {
+      series.push({ name: `卖${level}`, type: "line", showSymbol: false, sampling: "lttb",
+        data: ticks.map((row) => [oeTime(row.ts), row[`a${level}`]]),
+        lineStyle: { color: "#ff8a80", width: 1, opacity: 0.25 } });
+      series.push({ name: `买${level}`, type: "line", showSymbol: false, sampling: "lttb",
+        data: ticks.map((row) => [oeTime(row.ts), row[`b${level}`]]),
+        lineStyle: { color: "#69f0ae", width: 1, opacity: 0.25 } });
+    }
+  }
+  if (layers.has("broker_orders")) {
+    payload.broker.orders.forEach((row) => { const item = orderLineSeries(row, "broker", rangeEnd); if (item) series.push(item); });
+  }
+  if (layers.has("local_orders")) {
+    payload.local.orders.forEach((row) => { const item = orderLineSeries(row, "local", rangeEnd, true); if (item) series.push(item); });
+  }
+  if (layers.has("broker_trades")) series.push(tradeSeries(payload.broker.trades, "broker"));
+  if (layers.has("local_trades")) series.push(tradeSeries(payload.local.trades, "local"));
+  if (layers.has("local_events")) {
+    series.push({
+      name: "本地生命周期事件", type: "scatter", xAxisIndex: 1, yAxisIndex: 1,
+      symbolSize: 10,
+      data: payload.local.events.map((row) => ({
+        value: [oeTime(row.local_received_time || row.local_event_time), row.client_order_id],
+        meta: row,
+        itemStyle: { color: oeStatusColor(row.status) },
+      })).filter((item) => item.value[0] !== null),
+      tooltip: { formatter: (p) => {
+        const row = p.data.meta;
+        return `<b>${escapeHtml(row.event_type)}</b><br>${escapeHtml(row.client_order_id)} · ${escapeHtml(row.status)}<br>` +
+          `券商时间 ${escapeHtml(row.broker_event_time || "-")} (${escapeHtml(row.broker_time_kind)})<br>` +
+          `本地事件 ${escapeHtml(row.local_event_time || "-")}<br>本地接收 ${escapeHtml(row.local_received_time || "-")}`;
+      } },
+    });
+  }
+  const title = `${payload.stock_code}${payload.stock_name ? " " + payload.stock_name : ""} · ${payload.trade_date}`;
+  const option = {
+    backgroundColor: "transparent",
+    title: { text: title, left: 10, textStyle: { color: "#d7dce6", fontSize: 14 } },
+    tooltip: { trigger: "item", confine: true },
+    legend: { type: "scroll", top: 28, left: 10, right: 10, textStyle: { color: "#8a94a8" } },
+    axisPointer: { link: [{ xAxisIndex: [0, 1] }] },
+    grid: [
+      { left: 72, right: 30, top: 78, height: "58%" },
+      { left: 180, right: 30, top: "75%", height: "14%" },
+    ],
+    xAxis: [
+      { type: "time", min: rangeStart, max: rangeEnd, axisLabel: { color: "#8a94a8" }, splitLine: { show: false } },
+      { type: "time", min: rangeStart, max: rangeEnd, gridIndex: 1, axisLabel: { color: "#8a94a8" }, splitLine: { show: false } },
+    ],
+    yAxis: [
+      { type: "value", scale: true, axisLabel: { color: "#8a94a8" }, splitLine: { lineStyle: { color: "#2a3346" } } },
+      { type: "category", gridIndex: 1, data: clientIds, axisLabel: { color: "#8a94a8", width: 150, overflow: "truncate" } },
+    ],
+    dataZoom: [
+      { type: "inside", xAxisIndex: [0, 1] },
+      { type: "slider", xAxisIndex: [0, 1], height: 18, bottom: 8 },
+    ],
+    series,
+  };
+  getChart("orderexec-chart").setOption(option, true);
+
+  const coverage = payload.coverage;
+  $("#orderexec-coverage").textContent = coverage.ticks_truncated
+    ? `Tick 数据已达到 ${coverage.tick_limit.toLocaleString()} 条上限；诊断不完整，请缩短时间范围。`
+    : `Tick ${coverage.returned_ticks.toLocaleString()} 条；诊断使用完整返回范围。`;
+  const diagnostics = payload.diagnostics.map((row) => ({
+    ...row,
+    assessment: OE_ASSESSMENT[row.assessment] || row.assessment,
+    discrepancies: (row.discrepancies || []).join(", "),
+  }));
+  renderTable("#orderexec-diagnostics", diagnostics, { defaultSort: {} });
+  renderTable("#orderexec-events", payload.local.events, { defaultSort: {} });
+  renderTable("#orderexec-broker", [
+    ...payload.broker.orders.map((row) => ({ record_type: "order", ...row })),
+    ...payload.broker.trades.map((row) => ({ record_type: "trade", ...row })),
+  ], { defaultSort: {} });
+  renderTable("#orderexec-local", [
+    ...payload.local.orders.map((row) => ({ record_type: "order", ...row })),
+    ...payload.local.trades.map((row) => ({ record_type: "trade", ...row })),
+  ], { defaultSort: {} });
+}
+async function plotOrderExecution() {
+  const draw = ++orderExecutionDraw;
+  const stockCode = $("#oe-code").value.trim().toUpperCase();
+  const tradeDate = $("#oe-date").value;
+  if (!stockCode || !tradeDate) { toast("请填写股票代码和交易日"); return; }
+  const startTime = $("#oe-start").value;
+  const endTime = $("#oe-end").value;
+  try {
+    const payload = await api("/api/order-execution", {
+      ...accountParams(), stock_code: stockCode, trade_date: tradeDate,
+      start: startTime ? `${tradeDate}T${startTime}+08:00` : undefined,
+      end: endTime ? `${tradeDate}T${endTime}+08:00` : undefined,
+    });
+    if (draw !== orderExecutionDraw) return;
+    orderExecutionData = payload;
+    renderOrderExecution(payload);
+  } catch (e) { if (draw === orderExecutionDraw) toast(e.message); }
+}
+renderOrderExecutionLayerPanel();
+$("#oe-date").value = todayISO();
+$("#oe-layer-toggle").addEventListener("click", (event) => {
+  event.stopPropagation(); $("#oe-layer-ms").classList.toggle("open");
+});
+$("#oe-layer-panel").addEventListener("click", (event) => {
+  const act = event.target.dataset.act;
+  if (!act) return;
+  event.preventDefault();
+  $$("#oe-layer-panel input").forEach((input) => { input.checked = act === "all"; });
+  updateOrderExecutionLayerLabel();
+  if (orderExecutionData) renderOrderExecution(orderExecutionData);
+});
+$("#oe-layer-panel").addEventListener("change", () => {
+  updateOrderExecutionLayerLabel();
+  if (orderExecutionData) renderOrderExecution(orderExecutionData);
+});
+document.addEventListener("click", (event) => {
+  const owner = event.target.closest && event.target.closest("#oe-layer-ms");
+  if (!owner) $("#oe-layer-ms").classList.remove("open");
+});
+$("#oe-plot").addEventListener("click", plotOrderExecution);
 
 // ---------------------------------------------------------------------------
 // K-line tab

@@ -31,6 +31,7 @@ initial_cash: 1000000
 # --- Order lifecycle / cash gating ---
 unfilled_timeout_secs: 10.0
 resubmit_interval_secs: 2.0     # feeds resubmit_check_interval_secs AND process_targets_interval_secs
+price_trend_effect_enabled: false  # false: keep calculating/recording, but do not alter price or timeout
 price_trend_window_secs: 10.0
 price_trend_threshold_bps: 20.0
 price_trend_max_bps: 40.0

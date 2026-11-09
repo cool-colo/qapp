@@ -73,6 +73,8 @@ def test_bigqmt_order_snapshot_exposes_recorder_client_order_id() -> None:
                 "order_remark": "O-20260805-001",
                 "order_type": 23,
                 "order_volume": 100,
+                "traded_volume": 100,
+                "order_status": 56,
             },
         ],
     )
@@ -81,6 +83,43 @@ def test_bigqmt_order_snapshot_exposes_recorder_client_order_id() -> None:
 
     assert rows[0]["client_order_id"] == "O-20260805-001"
     assert rows[0]["instrument_id"] == "600000.SH.BIGQMT"
+    assert rows[0]["lifecycle_status"] == "FILLED"
+
+
+def test_bigqmt_order_snapshot_normalizes_qmt_lifecycle_statuses() -> None:
+    source = BigQmtBrokerDataSource(SimpleNamespace())
+    source._query = AsyncMock(
+        return_value=[
+            {
+                "stock_code": "600000.SH",
+                "order_remark": f"O-{status}",
+                "order_status": status,
+                "order_volume": 100,
+                "traded_volume": traded_volume,
+            }
+            for status, traded_volume in (
+                (50, 0),
+                (55, 50),
+                (53, 50),
+                (54, 0),
+                (56, 100),
+                (57, 0),
+                (255, 0),
+            )
+        ],
+    )
+
+    rows = asyncio.run(source.broker_order_snapshot())
+
+    assert [row["lifecycle_status"] for row in rows] == [
+        "ACCEPTED",
+        "PARTIALLY_FILLED",
+        "CANCELED",
+        "CANCELED",
+        "FILLED",
+        "REJECTED",
+        "UNKNOWN",
+    ]
 
 
 def test_bigqmt_trade_snapshot_exposes_recorder_trade_and_client_ids() -> None:

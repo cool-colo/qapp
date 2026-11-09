@@ -1,4 +1,4 @@
-"""Data access for the dashboard: MySQL (live_* tables) and ClickHouse (bars).
+"""Data access for the dashboard: MySQL live tables and ClickHouse market data.
 
 Both clients are read-only and self-contained. The ClickHouse client is a small
 standalone copy of the HTTP query helpers in

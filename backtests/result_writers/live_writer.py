@@ -13,6 +13,7 @@ from backtests.result_writers.live_records import AFTER_TRADING
 from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveAssetSnapshotRecord
+from backtests.result_writers.live_records import LiveOrderEventRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
 from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
@@ -38,6 +39,24 @@ def _json_dumps(value: Mapping[str, Any] | None) -> str | None:
 
 def _timestamp(value: datetime | None) -> datetime:
     return value or datetime.now()
+
+
+REALTIME_ORDER_STATUS_COLUMNS = (
+    "initialized_at",
+    "denied_at",
+    "emulated_at",
+    "released_at",
+    "submitted_at",
+    "accepted_at",
+    "rejected_at",
+    "canceled_at",
+    "expired_at",
+    "triggered_at",
+    "pending_update_at",
+    "pending_cancel_at",
+    "partially_filled_at",
+    "filled_at",
+)
 
 
 class _SingleConnectionEngine:
@@ -261,7 +280,126 @@ CREATE TABLE IF NOT EXISTS `live_trade` (
   `created_at`    DATETIME     NOT NULL,
   `schema_version` INT         NOT NULL DEFAULT 1,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_trade` (`account_id`,`trader_id`,`trade_id`)
+  UNIQUE KEY `uk_trade` (`account_id`,`trader_id`,`trade_date`,`trade_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `live_order_realtime` (
+  `id`            BIGINT       NOT NULL AUTO_INCREMENT,
+  `trade_date`    DATE         NOT NULL,
+  `write_time`    DATETIME     NOT NULL,
+  `account_id`    VARCHAR(64)  NOT NULL,
+  `trader_id`     VARCHAR(64)  NOT NULL,
+  `client_order_id` VARCHAR(64) NOT NULL,
+  `venue_order_id`  VARCHAR(64) NULL,
+  `instrument_id` VARCHAR(32)  NOT NULL,
+  `signal_date`   DATE         NULL,
+  `stock_code`    VARCHAR(16)  NULL,
+  `side`          VARCHAR(8)   NULL,
+  `source`        VARCHAR(16)  NOT NULL DEFAULT 'live',
+  `order_type`    VARCHAR(16)  NULL,
+  `limit_price`   DECIMAL(20,4) NULL,
+  `quantity`      BIGINT       NULL,
+  `filled_qty`    BIGINT       NULL DEFAULT 0,
+  `avg_fill_price` DECIMAL(20,4) NULL,
+  `status`        VARCHAR(24)  NOT NULL,
+  `initialized_at` DATETIME    NULL,
+  `denied_at`      DATETIME    NULL,
+  `emulated_at`    DATETIME    NULL,
+  `released_at`    DATETIME    NULL,
+  `submitted_at`   DATETIME    NULL,
+  `accepted_at`    DATETIME    NULL,
+  `rejected_at`    DATETIME    NULL,
+  `canceled_at`    DATETIME    NULL,
+  `expired_at`     DATETIME    NULL,
+  `triggered_at`   DATETIME    NULL,
+  `pending_update_at` DATETIME NULL,
+  `pending_cancel_at` DATETIME NULL,
+  `partially_filled_at` DATETIME NULL,
+  `filled_at`      DATETIME    NULL,
+  `target_qty`    BIGINT       NULL,
+  `target_version` VARCHAR(128) NULL,
+  `open_price`    DECIMAL(20,4) NULL,
+  `book_snapshot` JSON         NULL,
+  `reason`        VARCHAR(64)  NULL,
+  `order_time`    DATETIME     NULL,
+  `qmt_raw`       JSON         NULL,
+  `created_at`    DATETIME     NOT NULL,
+  `updated_at`    DATETIME     NOT NULL,
+  `schema_version` INT         NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_order_realtime` (`account_id`,`trader_id`,`trade_date`,`client_order_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `live_order_event` (
+  `id`                 BIGINT       NOT NULL AUTO_INCREMENT,
+  `trade_date`         DATE         NOT NULL,
+  `account_id`         VARCHAR(64)  NOT NULL,
+  `trader_id`          VARCHAR(64)  NOT NULL,
+  `event_id`           VARCHAR(64)  NOT NULL,
+  `event_type`         VARCHAR(32)  NOT NULL,
+  `client_order_id`    VARCHAR(64)  NOT NULL,
+  `venue_order_id`     VARCHAR(64)  NULL,
+  `instrument_id`      VARCHAR(32)  NOT NULL,
+  `stock_code`         VARCHAR(16)  NULL,
+  `side`               VARCHAR(8)   NULL,
+  `order_type`         VARCHAR(24)  NULL,
+  `limit_price`        DECIMAL(20,4) NULL,
+  `quantity`           BIGINT       NULL,
+  `filled_qty`         BIGINT       NOT NULL DEFAULT 0,
+  `avg_fill_price`     DECIMAL(20,4) NULL,
+  `status`             VARCHAR(32)  NOT NULL,
+  `trade_id`           VARCHAR(64)  NULL,
+  `last_fill_price`    DECIMAL(20,4) NULL,
+  `last_fill_qty`      BIGINT       NULL,
+  `broker_event_time`  DATETIME(6)  NULL,
+  `broker_event_ns`    BIGINT       NULL,
+  `broker_time_kind`   VARCHAR(24)  NOT NULL,
+  `local_event_time`   DATETIME(6)  NULL,
+  `local_event_ns`     BIGINT       NULL,
+  `local_received_time` DATETIME(6) NOT NULL,
+  `persisted_at`       DATETIME(6)  NOT NULL,
+  `reconciliation`     BOOLEAN      NOT NULL DEFAULT FALSE,
+  `signal_date`        DATE         NULL,
+  `target_qty`         BIGINT       NULL,
+  `target_version`     VARCHAR(128) NULL,
+  `reason`             TEXT         NULL,
+  `book_snapshot`      JSON         NULL,
+  `raw_info`           JSON         NULL,
+  `schema_version`     INT          NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_order_event` (`account_id`,`trader_id`,`event_id`),
+  KEY `ix_order_event_stock_time`
+      (`account_id`,`trader_id`,`trade_date`,`stock_code`,`local_received_time`),
+  KEY `ix_order_event_client`
+      (`account_id`,`trader_id`,`trade_date`,`client_order_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `live_trade_realtime` (
+  `id`            BIGINT       NOT NULL AUTO_INCREMENT,
+  `trade_date`    DATE         NOT NULL,
+  `write_time`    DATETIME     NOT NULL,
+  `account_id`    VARCHAR(64)  NOT NULL,
+  `trader_id`     VARCHAR(64)  NOT NULL,
+  `trade_id`      VARCHAR(64)  NOT NULL,
+  `client_order_id` VARCHAR(64) NOT NULL,
+  `venue_order_id`  VARCHAR(64) NULL,
+  `instrument_id` VARCHAR(32)  NOT NULL,
+  `stock_code`    VARCHAR(16)  NULL,
+  `side`          VARCHAR(8)   NULL,
+  `source`        VARCHAR(16)  NOT NULL DEFAULT 'live',
+  `price`         DECIMAL(20,4) NULL,
+  `quantity`      BIGINT       NULL,
+  `amount`        DECIMAL(20,4) NULL,
+  `commission`    DECIMAL(20,4) NULL,
+  `trade_time`    DATETIME     NULL,
+  `qmt_raw`       JSON         NULL,
+  `created_at`    DATETIME     NOT NULL,
+  `schema_version` INT         NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_trade_realtime` (`account_id`,`trader_id`,`trade_date`,`trade_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
 )
@@ -270,8 +408,10 @@ CREATE TABLE IF NOT EXISTS `live_trade` (
 class LiveSnapshotWriter:
     """
     Persist live daily snapshots (assets, positions, held-stock ticks), frozen
-    portfolio targets, and order/trade lifecycle events into the ``live_*`` MySQL
-    schema.
+    portfolio targets, broker-authoritative order/trade snapshots, and real-time
+    Nautilus order/trade events into the ``live_*`` MySQL schema. Broker snapshots use
+    ``live_order`` / ``live_trade``; event-stream records use the separate
+    ``live_order_realtime`` / ``live_trade_realtime`` tables.
 
     Kept independent of the backtest ``backtest_*`` writer: the live tables carry a
     snapshot_type and account/trader identity rather than an experiment id, and hold
@@ -409,7 +549,9 @@ class LiveSnapshotWriter:
         self._ensure_target_columns()
         self._ensure_position_columns()
         self._ensure_order_columns()
+        self._ensure_realtime_order_columns()
         self._ensure_trade_columns()
+        self._ensure_trade_indexes()
         self._ensure_stock_tick_columns()
         self._ensure_target_indexes()
 
@@ -592,6 +734,55 @@ class LiveSnapshotWriter:
                 # Concurrent add or insufficient privilege — leave as-is.
                 pass
 
+    def _ensure_realtime_order_columns(self) -> None:
+        """Add per-status event timestamps to the real-time order table."""
+        try:
+            existing = {
+                str(row[0])
+                for row in self._query("SHOW COLUMNS FROM `live_order_realtime`", ())
+            }
+        except Exception:
+            return
+        for column in REALTIME_ORDER_STATUS_COLUMNS:
+            if column in existing:
+                continue
+            try:
+                self._execute(
+                    f"ALTER TABLE `live_order_realtime` ADD COLUMN `{column}` DATETIME NULL",
+                    (),
+                )
+            except Exception:
+                # Concurrent add or insufficient privilege — leave as-is.
+                pass
+
+    def _ensure_trade_indexes(self) -> None:
+        """Keep broker trade identity scoped to its trading date."""
+        expected = ("account_id", "trader_id", "trade_date", "trade_id")
+        try:
+            rows = self._query("SHOW INDEX FROM `live_trade`", ())
+        except Exception:
+            return
+        current = tuple(
+            str(row[4])
+            for row in sorted(
+                (row for row in rows if len(row) >= 5 and str(row[2]) == "uk_trade"),
+                key=lambda row: int(row[3]),
+            )
+        )
+        if current == expected:
+            return
+        try:
+            if current:
+                self._execute("ALTER TABLE `live_trade` DROP INDEX `uk_trade`", ())
+            self._execute(
+                "ALTER TABLE `live_trade` ADD UNIQUE KEY `uk_trade` "
+                "(`account_id`,`trader_id`,`trade_date`,`trade_id`)",
+                (),
+            )
+        except Exception:
+            # Concurrent DDL or insufficient privilege — leave as-is.
+            pass
+
     def _ensure_target_indexes(self) -> None:
         """
         Keep the target table unique key aligned with the phase-aware write path.
@@ -746,11 +937,101 @@ class LiveSnapshotWriter:
             coalesce_columns=("signal_date",),
         )
 
+    def upsert_realtime_order(
+        self,
+        record: LiveOrderRecord,
+        status_time: datetime,
+    ) -> None:
+        row = self._order_row(record)
+        row.update({column: None for column in REALTIME_ORDER_STATUS_COLUMNS})
+        status_column = f"{record.status}_at"
+        if status_column in REALTIME_ORDER_STATUS_COLUMNS:
+            row[status_column] = status_time
+        self._upsert_many(
+            "live_order_realtime",
+            [row],
+            key_columns=("account_id", "trader_id", "trade_date", "client_order_id"),
+            preserve_columns=("created_at",),
+            coalesce_columns=("signal_date",),
+            set_once_columns=REALTIME_ORDER_STATUS_COLUMNS,
+        )
+
+    def write_realtime_order_event(
+        self,
+        event_record: LiveOrderEventRecord,
+        order_record: LiveOrderRecord,
+        status_time: datetime,
+        trade_record: LiveTradeRecord | None = None,
+    ) -> None:
+        """Atomically append an event and update its derived real-time summaries."""
+        event_row = self._order_event_row(event_record)
+        event_columns = list(event_row)
+        event_sql = (
+            "INSERT INTO `live_order_event` "
+            f"({', '.join(self._quote_identifier(column) for column in event_columns)}) "
+            f"VALUES ({', '.join(['%s'] * len(event_columns))}) "
+            "ON DUPLICATE KEY UPDATE `event_id` = VALUES(`event_id`)"
+        )
+        event_params = tuple(event_row[column] for column in event_columns)
+
+        order_row = self._order_row(order_record)
+        order_row.update({column: None for column in REALTIME_ORDER_STATUS_COLUMNS})
+        status_column = f"{order_record.status}_at"
+        if status_column in REALTIME_ORDER_STATUS_COLUMNS:
+            order_row[status_column] = status_time
+        order_sql, order_params = self._upsert_command(
+            "live_order_realtime",
+            order_row,
+            key_columns=("account_id", "trader_id", "trade_date", "client_order_id"),
+            preserve_columns=("created_at",),
+            coalesce_columns=("signal_date",),
+            set_once_columns=REALTIME_ORDER_STATUS_COLUMNS,
+        )
+
+        trade_command: tuple[str, tuple[Any, ...]] | None = None
+        if trade_record is not None:
+            trade_command = self._upsert_command(
+                "live_trade_realtime",
+                self._trade_row(trade_record),
+                key_columns=("account_id", "trader_id", "trade_date", "trade_id"),
+                preserve_columns=("created_at",),
+            )
+
+        connection = self._engine.raw_connection()
+        try:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(event_sql, event_params)
+                # A replayed UUID means the original transaction already committed.
+                # Do not let an old replay regress the latest-order summary.
+                if cursor.rowcount == 0:
+                    self._commit_if_needed(connection)
+                    return
+                cursor.execute(order_sql, order_params)
+                if trade_command is not None:
+                    cursor.execute(*trade_command)
+                self._commit_if_needed(connection)
+            except Exception:
+                self._rollback_if_needed(connection)
+                raise
+            finally:
+                self._close_cursor(cursor)
+        finally:
+            connection.close()
+
     def upsert_trade(self, record: LiveTradeRecord) -> None:
         self._upsert_many(
             "live_trade",
             [self._trade_row(record)],
-            key_columns=("account_id", "trader_id", "trade_id"),
+            key_columns=("account_id", "trader_id", "trade_date", "trade_id"),
+            preserve_columns=("created_at",),
+        )
+
+    def upsert_realtime_trade(self, record: LiveTradeRecord) -> None:
+        self._upsert_many(
+            "live_trade_realtime",
+            [self._trade_row(record)],
+            key_columns=("account_id", "trader_id", "trade_date", "trade_id"),
             preserve_columns=("created_at",),
         )
 
@@ -1356,6 +1637,45 @@ class LiveSnapshotWriter:
         }
 
     @staticmethod
+    def _order_event_row(record: LiveOrderEventRecord) -> dict[str, Any]:
+        return {
+            "trade_date": record.trade_date,
+            "account_id": record.account_id,
+            "trader_id": record.trader_id,
+            "event_id": record.event_id,
+            "event_type": record.event_type,
+            "client_order_id": record.client_order_id,
+            "venue_order_id": record.venue_order_id,
+            "instrument_id": record.instrument_id,
+            "stock_code": record.stock_code,
+            "side": record.side,
+            "order_type": record.order_type,
+            "limit_price": record.limit_price,
+            "quantity": record.quantity,
+            "filled_qty": record.filled_qty,
+            "avg_fill_price": record.avg_fill_price,
+            "status": record.status,
+            "trade_id": record.trade_id,
+            "last_fill_price": record.last_fill_price,
+            "last_fill_qty": record.last_fill_qty,
+            "broker_event_time": record.broker_event_time,
+            "broker_event_ns": record.broker_event_ns,
+            "broker_time_kind": record.broker_time_kind,
+            "local_event_time": record.local_event_time,
+            "local_event_ns": record.local_event_ns,
+            "local_received_time": record.local_received_time,
+            "persisted_at": record.persisted_at,
+            "reconciliation": record.reconciliation,
+            "signal_date": record.signal_date,
+            "target_qty": record.target_qty,
+            "target_version": record.target_version,
+            "reason": record.reason,
+            "book_snapshot": _json_dumps(record.book_snapshot),
+            "raw_info": _json_dumps(record.raw_info),
+            "schema_version": record.schema_version,
+        }
+
+    @staticmethod
     def _trade_row(record: LiveTradeRecord) -> dict[str, Any]:
         return {
             "trade_date": record.trade_date,
@@ -1388,10 +1708,33 @@ class LiveSnapshotWriter:
         key_columns: Sequence[str],
         preserve_columns: Sequence[str] = (),
         coalesce_columns: Sequence[str] = (),
+        set_once_columns: Sequence[str] = (),
     ) -> None:
         if not rows:
             return
-        columns = list(rows[0].keys())
+        sql, _ = self._upsert_command(
+            table,
+            rows[0],
+            key_columns=key_columns,
+            preserve_columns=preserve_columns,
+            coalesce_columns=coalesce_columns,
+            set_once_columns=set_once_columns,
+        )
+        columns = list(rows[0])
+        params = [tuple(row[column] for column in columns) for row in rows]
+        self._executemany(sql, params)
+
+    def _upsert_command(
+        self,
+        table: str,
+        row: Mapping[str, Any],
+        *,
+        key_columns: Sequence[str],
+        preserve_columns: Sequence[str] = (),
+        coalesce_columns: Sequence[str] = (),
+        set_once_columns: Sequence[str] = (),
+    ) -> tuple[str, tuple[Any, ...]]:
+        columns = list(row)
         updates = []
         skipped_columns = set(key_columns).union(preserve_columns)
         for column in columns:
@@ -1402,6 +1745,10 @@ class LiveSnapshotWriter:
                 updates.append(
                     f"{quoted_column} = COALESCE(VALUES({quoted_column}), {quoted_column})"
                 )
+            elif column in set_once_columns:
+                updates.append(
+                    f"{quoted_column} = COALESCE({quoted_column}, VALUES({quoted_column}))"
+                )
             else:
                 updates.append(f"{quoted_column} = VALUES({quoted_column})")
         sql = (
@@ -1410,8 +1757,7 @@ class LiveSnapshotWriter:
             f"VALUES ({', '.join(['%s'] * len(columns))}) "
             f"ON DUPLICATE KEY UPDATE {', '.join(updates)}"
         )
-        params = [tuple(row[column] for column in columns) for row in rows]
-        self._executemany(sql, params)
+        return sql, tuple(row[column] for column in columns)
 
     def _query(self, sql: str, params: Sequence[Any]) -> list[tuple[Any, ...]]:
         connection = self._engine.raw_connection()

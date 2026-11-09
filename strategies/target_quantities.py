@@ -146,6 +146,7 @@ class IntentContext:
             "confirmation_score": ctx.confirmation_score,
             "trend_bps": ctx.trend_bps,
             "trend_severity": ctx.trend_severity,
+            "price_trend_effect_enabled": ctx.price_trend_effect_enabled,
             "timeout_multiplier": ctx.timeout_multiplier,
             "offset_multiplier": ctx.offset_multiplier,
         }
@@ -288,6 +289,7 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     buy_max_price_bps: float = 100.0
     buy_cancel_threshold: int = 1
     sell_cancel_threshold: int = 1
+    price_trend_effect_enabled: bool = True
     price_trend_window_secs: float = 10.0
     price_trend_threshold_bps: float = 20.0
     price_trend_max_bps: float = 40.0
@@ -1657,12 +1659,15 @@ class TargetQuantityStrategy(Strategy):
             threshold = float(self.config.price_trend_threshold_bps)
             maximum = float(self.config.price_trend_max_bps)
             severity = max(0.0, min(1.0, (abs(trend_bps) - threshold) / (maximum - threshold)))
-        timeout_multiplier = 1.0 - severity * (
-            1.0 - float(self.config.price_trend_min_timeout_multiplier)
-        )
-        offset_multiplier = 1.0 + severity * (
-            float(self.config.price_trend_max_offset_multiplier) - 1.0
-        )
+        timeout_multiplier = 1.0
+        offset_multiplier = 1.0
+        if self.config.price_trend_effect_enabled:
+            timeout_multiplier -= severity * (
+                1.0 - float(self.config.price_trend_min_timeout_multiplier)
+            )
+            offset_multiplier += severity * (
+                float(self.config.price_trend_max_offset_multiplier) - 1.0
+            )
         return ExecutionTrend(
             price_return_bps=price_return_bps,
             volume_confirmation=volume_confirmation,
@@ -2283,6 +2288,7 @@ class TargetQuantityStrategy(Strategy):
                 confirmation_score=trend.confirmation_score,
                 trend_bps=trend.trend_bps,
                 trend_severity=trend.severity,
+                price_trend_effect_enabled=self.config.price_trend_effect_enabled,
                 effective_timeout_secs=effective_timeout_secs,
                 timeout_multiplier=trend.timeout_multiplier,
                 offset_multiplier=trend.offset_multiplier,
@@ -3046,6 +3052,7 @@ class TargetQuantityStrategy(Strategy):
             confirmation_score=trend.confirmation_score,
             trend_bps=trend.trend_bps,
             trend_severity=trend.severity,
+            price_trend_effect_enabled=self.config.price_trend_effect_enabled,
             timeout_multiplier=trend.timeout_multiplier,
             offset_multiplier=trend.offset_multiplier,
         )

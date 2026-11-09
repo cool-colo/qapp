@@ -187,6 +187,46 @@ class LiveOrderRecord:
 
 
 @dataclass(frozen=True)
+class LiveOrderEventRecord:
+    """Append-only audit row for one Nautilus order event."""
+
+    trade_date: date
+    account_id: str
+    trader_id: str
+    event_id: str
+    event_type: str
+    client_order_id: str
+    instrument_id: str
+    status: str
+    local_received_time: datetime
+    persisted_at: datetime
+    venue_order_id: str | None = None
+    stock_code: str | None = None
+    side: str | None = None
+    order_type: str | None = None
+    limit_price: Decimal | None = None
+    quantity: int | None = None
+    filled_qty: int = 0
+    avg_fill_price: Decimal | None = None
+    trade_id: str | None = None
+    last_fill_price: Decimal | None = None
+    last_fill_qty: int | None = None
+    broker_event_time: datetime | None = None
+    broker_event_ns: int | None = None
+    broker_time_kind: str = "unavailable"
+    local_event_time: datetime | None = None
+    local_event_ns: int | None = None
+    reconciliation: bool = False
+    signal_date: date | None = None
+    target_qty: int | None = None
+    target_version: str | None = None
+    reason: str | None = None
+    book_snapshot: JsonMapping | None = None
+    raw_info: JsonMapping | None = None
+    schema_version: int = 1
+
+
+@dataclass(frozen=True)
 class LiveTradeRecord:
     trade_date: date
     write_time: datetime
