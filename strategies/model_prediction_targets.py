@@ -63,7 +63,7 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     risk_manager_mode: str = "simulation"
     risk_manager_timeout_secs: float = 10.0
     process_targets_on_timer: bool = False
-    process_targets_interval_secs: float = 10.0
+    process_targets_interval_secs: float = 2.0
 
 
 class TargetModelPredictionsStrategy(TargetQuantityStrategy):
@@ -971,7 +971,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         holdings_value = sum(
             holding.quantity * holding.price for holding in current_holdings
         )
-        if self._account_id_equals(86904088):
+        if self._account_id_equals(86904088000):
             investable_asset = float(holdings_value * 1.01)
         else:
             investable_asset = total_asset * (

@@ -37,7 +37,8 @@ class OpenOffsetSellPriceStrategy(SellPriceStrategy):
         if base is None:
             self.logger.warning("No base price available for sell price computation")
             return None
-        offset = base_offset(base, ctx.tick, self.offset_bps)
+        offset_multiplier = ctx.offset_multiplier if ctx.cancel_count < self.cancel_threshold else 1.0
+        offset = base_offset(base, ctx.tick, self.offset_bps * offset_multiplier)
         base_price = base - offset
 
         if ctx.cancel_count < self.cancel_threshold:
@@ -98,7 +99,8 @@ class OpenOffsetBuyPriceStrategy(BuyPriceStrategy):
         if base is None:
             self.logger.warning("No base price available for buy price computation")
             return None
-        offset = base_offset(base, ctx.tick, self.offset_bps)
+        offset_multiplier = ctx.offset_multiplier if ctx.cancel_count < self.cancel_threshold else 1.0
+        offset = base_offset(base, ctx.tick, self.offset_bps * offset_multiplier)
         base_price = base + offset
         cap = base + base_offset(base, ctx.tick, self.max_price_bps)
 

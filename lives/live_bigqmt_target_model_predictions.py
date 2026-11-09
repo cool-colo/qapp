@@ -43,6 +43,18 @@ def _env(name: str, default: str | None = None) -> str | None:
     return value if value not in (None, "") else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = _env(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value, got {value!r}")
+
+
 def _apply_bigqmt_args(args: Any) -> None:
     """
     Attach Big QMT RPC-bridge transport settings to args from the environment.
@@ -54,6 +66,8 @@ def _apply_bigqmt_args(args: Any) -> None:
 
     Note: ``live_common``'s ``--redis-*`` args configure the Nautilus *cache* Redis;
     the ``BIGQMT_REDIS_*`` settings below are the separate RPC-bridge Redis.
+    ``BIGQMT_ACCOUNT_CASH_OFFSET`` excludes a fixed cash amount from the Nautilus
+    account view while the adapter retains the untouched broker asset payload.
     """
     args.bigqmt_redis_host = _env("BIGQMT_REDIS_HOST", "127.0.0.1")
     args.bigqmt_redis_port = int(_env("BIGQMT_REDIS_PORT", "6379"))
@@ -61,6 +75,24 @@ def _apply_bigqmt_args(args: Any) -> None:
     args.bigqmt_redis_password = _env("BIGQMT_REDIS_PASSWORD")
     args.transport = _env("BIGQMT_TRANSPORT", "redis")
     args.rpc_timeout_secs = float(_env("BIGQMT_RPC_TIMEOUT_SECONDS", "30.0"))
+    args.bigqmt_account_cash_offset = float(_env("BIGQMT_ACCOUNT_CASH_OFFSET", "0"))
+    args.bigqmt_use_quote_push = _env_bool("BIGQMT_USE_QUOTE_PUSH", False)
+    args.bigqmt_market_poll_enabled = _env_bool(
+        "BIGQMT_MARKET_POLL_ENABLED",
+        not args.bigqmt_use_quote_push,
+    )
+    args.bigqmt_quote_push_stale_secs = float(
+        _env("BIGQMT_QUOTE_PUSH_STALE_SECONDS", "30.0"),
+    )
+    args.bigqmt_quote_fallback_poll_interval_secs = float(
+        _env("BIGQMT_QUOTE_FALLBACK_POLL_INTERVAL_SECONDS", "60.0"),
+    )
+    if args.bigqmt_account_cash_offset < 0:
+        raise ValueError("BIGQMT_ACCOUNT_CASH_OFFSET must be non-negative")
+    if args.bigqmt_quote_push_stale_secs <= 0:
+        raise ValueError("BIGQMT_QUOTE_PUSH_STALE_SECONDS must be positive")
+    if args.bigqmt_quote_fallback_poll_interval_secs < 0:
+        raise ValueError("BIGQMT_QUOTE_FALLBACK_POLL_INTERVAL_SECONDS must be non-negative")
     # account_id falls back to BIGQMT_ACCOUNT_ID when QMT_ACCOUNT_ID is unset.
     if not str(getattr(args, "account_id", "") or "").strip():
         args.account_id = _env("BIGQMT_ACCOUNT_ID", "")
@@ -127,9 +159,13 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
                 redis_password=args.bigqmt_redis_password,
                 transport=args.transport,
                 rpc_timeout_secs=args.rpc_timeout_secs,
-                use_quote_push=False,
-                poll_enabled=True,
+                use_quote_push=args.bigqmt_use_quote_push,
+                poll_enabled=args.bigqmt_market_poll_enabled,
                 poll_interval_secs=args.poll_interval_secs,
+                quote_push_stale_after_secs=args.bigqmt_quote_push_stale_secs,
+                quote_push_fallback_poll_interval_secs=(
+                    args.bigqmt_quote_fallback_poll_interval_secs
+                ),
                 instrument_provider=instrument_provider,
                 adjust_type=args.adjust_type,
             ),
@@ -146,6 +182,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
                 poll_interval_secs=1.0,
                 strategy_name=args.strategy_name,
                 enforce_sellable_position=not args.no_sellable_check,
+                account_cash_offset=args.bigqmt_account_cash_offset,
                 instrument_provider=instrument_provider,
             ),
             data_factory=BigQMTLiveDataClientFactory,

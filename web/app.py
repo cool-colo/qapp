@@ -17,7 +17,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from web import compare_presets
+from web import change_records, compare_presets
+from web import order_execution_report
 from web.config import AppConfig, load_config
 from web.db import DataAccess, MySqlSource, NodeApiClient, jsonable, jsonable_rows, quote_literal
 from web.returns_report import (
@@ -42,6 +43,15 @@ from web import dqc_report
 class ComparePreset(BaseModel):
     name: str
     series: list[dict[str, Any]]
+
+
+class ChangeRecordWrite(BaseModel):
+    title: str
+    details: str
+
+
+class ChangeRecordDelete(BaseModel):
+    pin: str
 
 
 class SellRequest(BaseModel):
@@ -162,6 +172,19 @@ def _check_snapshot_type(snapshot_type: str | None) -> None:
         )
 
 
+def _position_classifications(
+    data: DataAccess,
+    rows: list[dict[str, Any]],
+    as_of: str,
+) -> dict[str, dict[str, Any]]:
+    """Best-effort bulk classifications; holdings remain usable if CH is down."""
+    codes = [str(row["stock_code"]) for row in rows if row.get("stock_code")]
+    try:
+        return data.clickhouse.stock_classifications(codes, as_of)
+    except RuntimeError:
+        return {}
+
+
 # ---- reference / discovery -------------------------------------------------
 
 
@@ -278,7 +301,12 @@ def get_positions(
         """,
         params,
     )
-    return {"rows": data.attach_names(jsonable_rows(rows))}
+    position_rows = data.attach_names(jsonable_rows(rows))
+    return {
+        "rows": position_rows,
+        "classifications": _position_classifications(data, position_rows, date),
+        "classification_date": date,
+    }
 
 
 @app.get("/api/target")
@@ -374,6 +402,39 @@ def get_trades(
         params,
     )
     return {"rows": data.attach_names(jsonable_rows(rows))}
+
+
+@app.get("/api/order-execution")
+def get_order_execution(
+    source: str,
+    account: str,
+    trader: str,
+    stock_code: str,
+    trade_date: str,
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+    tick_limit: int = Query(order_execution_report.DEFAULT_TICK_LIMIT),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Broker/local order lifecycle over RiceQuant minute and tick prices."""
+    try:
+        payload = order_execution_report.query_order_execution(
+            _mysql(data, source),
+            data.clickhouse,
+            account=account,
+            trader=trader,
+            stock_code=stock_code,
+            trading_date=trade_date,
+            start=start,
+            end=end,
+            tick_limit=tick_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload["stock_name"] = data.resolve_names([stock_code]).get(stock_code, "")
+    return payload
 
 
 # ---- time series -----------------------------------------------------------
@@ -790,6 +851,42 @@ def delete_compare_preset(name: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+# ---- manually recorded significant changes -------------------------------
+
+
+@app.get("/api/change_records")
+def get_change_records() -> dict[str, Any]:
+    return {"records": change_records.list_records()}
+
+
+@app.post("/api/change_records")
+def add_change_record(body: ChangeRecordWrite) -> dict[str, Any]:
+    try:
+        record = change_records.add_record(body.title, body.details)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"record": record}
+
+
+@app.put("/api/change_records/{record_id}")
+def update_change_record(record_id: str, body: ChangeRecordWrite) -> dict[str, Any]:
+    try:
+        record = change_records.update_record(record_id, body.title, body.details)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"no such change record: {record_id!r}")
+    return {"record": record}
+
+
+@app.delete("/api/change_records/{record_id}")
+def delete_change_record(record_id: str, body: ChangeRecordDelete) -> dict[str, Any]:
+    _require_change_record_delete_pin(body.pin)
+    if not change_records.delete_record(record_id):
+        raise HTTPException(status_code=404, detail=f"no such change record: {record_id!r}")
+    return {"ok": True}
+
+
 # ---- data quality (DQC) ----------------------------------------------------
 # Read-only views over the tushare-integration DQC tables in the SHARED ClickHouse
 # (dq_dqc_* systematic checks + dq_validation_* publish gates). These are GLOBAL data
@@ -1048,7 +1145,13 @@ def realtime_positions(
     for row in positions:
         if not row.get("name"):
             row["name"] = row.get("stock_name") or ""
-    return {"positions": positions, "asset": payload.get("asset") or {}}
+    classification_date = date.today().isoformat()
+    return {
+        "positions": positions,
+        "asset": payload.get("asset") or {},
+        "classifications": _position_classifications(data, positions, classification_date),
+        "classification_date": classification_date,
+    }
 
 
 @app.get("/api/strategy/info")
@@ -1188,6 +1291,15 @@ def _require_pin(pin: str | None) -> None:
     expected = _config().control_pin
     if expected is None:
         return
+    if not pin or pin != expected:
+        raise HTTPException(status_code=403, detail="PIN 码错误")
+
+
+def _require_change_record_delete_pin(pin: str | None) -> None:
+    """Significant-change history must never be deletable without a configured PIN."""
+    expected = _config().control_pin
+    if expected is None:
+        raise HTTPException(status_code=403, detail="删除变更记录前必须配置 control_pin")
     if not pin or pin != expected:
         raise HTTPException(status_code=403, detail="PIN 码错误")
 

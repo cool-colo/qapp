@@ -1,4 +1,4 @@
-"""Data access for the dashboard: MySQL (live_* tables) and ClickHouse (bars).
+"""Data access for the dashboard: MySQL live tables and ClickHouse market data.
 
 Both clients are read-only and self-contained. The ClickHouse client is a small
 standalone copy of the HTTP query helpers in
@@ -12,6 +12,7 @@ import json
 import re
 from datetime import date, datetime
 from decimal import Decimal
+from time import monotonic
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -105,6 +106,10 @@ class ClickHouseClient:
 
     def __init__(self, config: ClickHouseConfig) -> None:
         self._config = config
+        self._classification_cache: dict[
+            tuple[str, tuple[str, ...]],
+            tuple[float, dict[str, dict[str, Any]]],
+        ] = {}
 
     def query(self, sql: str) -> list[dict[str, Any]]:
         params: dict[str, str] = {}
@@ -154,6 +159,133 @@ class ClickHouseClient:
             return {}
         return {str(r["ts_code"]): str(r["name"]) for r in rows}
 
+    def stock_classifications(self, codes: list[str], as_of: str) -> dict[str, dict[str, Any]]:
+        """Return as-of DWD industry/concept classifications for several stocks.
+
+        The dashboard uses this bulk path for holdings charts. Eastmoney board
+        memberships from ``dwd_dc_index``/``dwd_dc_member`` are split by their real
+        concept, industry, and region types. Current-version filters exclude
+        superseded DWD rows, and availability dates prevent historical look-ahead.
+        """
+        requested = sorted({str(code) for code in codes if code})
+        if not requested:
+            return {}
+        cache_key = (as_of, tuple(requested))
+        cached = self._classification_cache.get(cache_key)
+        now = monotonic()
+        if cached and cached[0] > now:
+            return cached[1]
+        code_literals = ", ".join(quote_literal(code) for code in requested)
+        requested_array = f"[{code_literals}]"
+        day = quote_literal(as_of)
+        current = "toDateTime64('2299-12-31 00:00:00.000', 3)"
+        sql = f"""
+SELECT
+    requested.stock_code,
+    sw.sw_industry_l1,
+    sw.sw_industry_l2,
+    sw.sw_industry_l3,
+    concepts.dc_concepts,
+    boards.dc_member_concepts,
+    boards.dc_member_industries,
+    boards.dc_member_regions
+FROM (
+    SELECT arrayJoin({requested_array}) AS stock_code
+) AS requested
+LEFT JOIN (
+    SELECT
+        ts_code,
+        argMax(l1_name, in_date) AS sw_industry_l1,
+        argMax(l2_name, in_date) AS sw_industry_l2,
+        argMax(l3_name, in_date) AS sw_industry_l3
+    FROM dwd_sw_industry_member FINAL
+    WHERE ts_code IN ({code_literals})
+      AND in_date <= toDate({day})
+      AND end_date > toDate({day})
+      AND available_date <= toDate({day})
+    GROUP BY ts_code
+) AS sw ON sw.ts_code = requested.stock_code
+LEFT JOIN (
+    SELECT
+        member.ts_code,
+        arraySort(groupUniqArray(ifNull(concept.name, member.theme_code))) AS dc_concepts
+    FROM dwd_dc_concept_cons AS member
+    LEFT JOIN dwd_dc_concept AS concept
+      ON concept.theme_code = member.theme_code
+     AND concept.trade_date = member.trade_date
+     AND concept.sys_to = {current}
+    WHERE member.ts_code IN ({code_literals})
+      AND member.sys_to = {current}
+      AND (member.ts_code, member.trade_date) IN (
+          SELECT ts_code, max(trade_date)
+          FROM dwd_dc_concept_cons
+          WHERE ts_code IN ({code_literals})
+            AND available_trade_date <= toDate({day})
+            AND sys_to = {current}
+          GROUP BY ts_code
+      )
+    GROUP BY member.ts_code
+) AS concepts ON concepts.ts_code = requested.stock_code
+LEFT JOIN (
+    SELECT
+        member.con_code,
+        arraySort(groupUniqArrayIf(
+            ifNull(board.name, member.ts_code),
+            ifNull(board.idx_type, '') = '概念板块'
+              AND ifNull(board.name, '') != '融资融券'
+        )) AS dc_member_concepts,
+        arraySort(groupUniqArrayIf(
+            ifNull(board.name, member.ts_code),
+            ifNull(board.idx_type, '') = '行业板块'
+        )) AS dc_member_industries,
+        arraySort(groupUniqArrayIf(
+            ifNull(board.name, member.ts_code),
+            ifNull(board.idx_type, '') = '地域板块'
+        )) AS dc_member_regions
+    FROM dwd_dc_member AS member
+    LEFT JOIN dwd_dc_index AS board
+      ON board.ts_code = member.ts_code
+     AND board.trade_date = member.trade_date
+     AND board.sys_to = {current}
+    WHERE member.con_code IN ({code_literals})
+      AND member.sys_to = {current}
+      AND (member.con_code, member.trade_date) IN (
+          SELECT con_code, max(trade_date)
+          FROM dwd_dc_member
+          WHERE con_code IN ({code_literals})
+            AND available_trade_date <= toDate({day})
+            AND sys_to = {current}
+          GROUP BY con_code
+      )
+    GROUP BY member.con_code
+) AS boards ON boards.con_code = requested.stock_code
+SETTINGS join_use_nulls = 1
+"""
+        rows = self.query(sql)
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            code = str(row["stock_code"])
+            result[code] = {
+                "sw_industry_l1": row.get("sw_industry_l1"),
+                "sw_industry_l2": row.get("sw_industry_l2"),
+                "sw_industry_l3": row.get("sw_industry_l3"),
+                "dc_concepts": row.get("dc_concepts") or [],
+                "dc_member_concepts": row.get("dc_member_concepts") or [],
+                "dc_member_industries": row.get("dc_member_industries") or [],
+                "dc_member_regions": row.get("dc_member_regions") or [],
+            }
+        # Realtime holdings can refresh every 15 seconds while classifications are
+        # daily data. A short bounded cache avoids repeatedly scanning the DWD tables
+        # without hiding same-day warehouse updates for long.
+        if len(self._classification_cache) >= 64:
+            oldest_key = min(
+                self._classification_cache,
+                key=lambda key: self._classification_cache[key][0],
+            )
+            self._classification_cache.pop(oldest_key, None)
+        self._classification_cache[cache_key] = (now + 300.0, result)
+        return result
+
     def bar_query(
         self,
         symbol: str,
@@ -189,7 +321,9 @@ ORDER BY {ts} ASC{limit_clause}
 
         The wide table retains Tushare units: market caps in 万元, amount in 千元,
         volume in 手, and rates in percent. Expose CNY, shares and fractional rates
-        to the frontend. Missing/non-finite metrics remain NULL, never zero.
+        to the frontend. Industry and concept memberships come from the curated DWD
+        tables and only use records available by ``as_of``. Missing/non-finite metrics
+        remain NULL, never zero.
         """
         metrics = [
             ("close", "close"),
@@ -217,7 +351,12 @@ ORDER BY {ts} ASC{limit_clause}
 SELECT
     basic.name AS stock_name, basic.industry, basic.area, basic.market,
     nullIf(basic.list_date, toDate('1970-01-01')) AS listed_date,
-    daily.trade_date, {metric_names}
+    daily.trade_date, {metric_names},
+    sw.l1_name AS sw_industry_l1,
+    sw.l2_name AS sw_industry_l2,
+    sw.l3_name AS sw_industry_l3,
+    concepts.dc_concepts,
+    boards.dc_boards
 FROM (
     SELECT name, industry, area, market, list_date
     FROM stock_basic
@@ -233,6 +372,53 @@ LEFT JOIN (
     ORDER BY trade_date DESC
     LIMIT 1
 ) AS daily ON 1 = 1
+LEFT JOIN (
+    SELECT l1_name, l2_name, l3_name
+    FROM dwd_sw_industry_member FINAL
+    WHERE ts_code = {quote_literal(stock_code)}
+      AND in_date <= toDate({quote_literal(as_of)})
+      AND end_date > toDate({quote_literal(as_of)})
+      AND available_date <= toDate({quote_literal(as_of)})
+    ORDER BY in_date DESC
+    LIMIT 1
+) AS sw ON 1 = 1
+LEFT JOIN (
+    SELECT arraySort(groupUniqArray(ifNull(concept.name, member.theme_code))) AS dc_concepts
+    FROM dwd_dc_concept_cons AS member
+    LEFT JOIN dwd_dc_concept AS concept
+      ON concept.theme_code = member.theme_code
+     AND concept.trade_date = member.trade_date
+     AND concept.sys_to = toDateTime64('2299-12-31 00:00:00.000', 3)
+    WHERE member.ts_code = {quote_literal(stock_code)}
+      AND member.sys_to = toDateTime64('2299-12-31 00:00:00.000', 3)
+      AND member.trade_date = (
+          SELECT max(trade_date)
+          FROM dwd_dc_concept_cons
+          WHERE ts_code = {quote_literal(stock_code)}
+            AND available_trade_date <= toDate({quote_literal(as_of)})
+            AND sys_to = toDateTime64('2299-12-31 00:00:00.000', 3)
+      )
+) AS concepts ON 1 = 1
+LEFT JOIN (
+    SELECT arrayFilter(
+        value -> value != '融资融券',
+        arraySort(groupUniqArray(ifNull(board.name, member.ts_code)))
+    ) AS dc_boards
+    FROM dwd_dc_member AS member
+    LEFT JOIN dwd_dc_index AS board
+      ON board.ts_code = member.ts_code
+     AND board.trade_date = member.trade_date
+     AND board.sys_to = toDateTime64('2299-12-31 00:00:00.000', 3)
+    WHERE member.con_code = {quote_literal(stock_code)}
+      AND member.sys_to = toDateTime64('2299-12-31 00:00:00.000', 3)
+      AND member.trade_date = (
+          SELECT max(trade_date)
+          FROM dwd_dc_member
+          WHERE con_code = {quote_literal(stock_code)}
+            AND available_trade_date <= toDate({quote_literal(as_of)})
+            AND sys_to = toDateTime64('2299-12-31 00:00:00.000', 3)
+)
+) AS boards ON 1 = 1
 SETTINGS join_use_nulls = 1
 """
 

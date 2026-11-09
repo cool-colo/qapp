@@ -130,7 +130,37 @@ def normalize_bigqmt_orders(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # recorder's canonical client_order_id field.
         if not row.get("client_order_id"):
             row["client_order_id"] = row.get("order_remark")
+        row["lifecycle_status"] = _bigqmt_order_lifecycle_status(row)
     return normalized
+
+
+# Official XtQuant order_status values:
+# https://dict.thinktrader.net/nativeApi/xttrader.html#委托状态-order-status
+_BIGQMT_ORDER_LIFECYCLE_BY_STATUS = {
+    48: "SUBMITTED",  # 未报
+    49: "SUBMITTED",  # 待报
+    50: "ACCEPTED",  # 已报
+    51: "PENDING_CANCEL",  # 已报待撤
+    52: "PENDING_CANCEL",  # 部成待撤
+    53: "CANCELED",  # 部撤
+    54: "CANCELED",  # 已撤
+    55: "PARTIALLY_FILLED",  # 部成
+    56: "FILLED",  # 已成
+    57: "REJECTED",  # 废单
+    255: "UNKNOWN",  # 未知
+}
+
+
+def _bigqmt_order_lifecycle_status(row: dict[str, Any]) -> str:
+    """Translate MiniQMT ``order_status`` into the recorder lifecycle contract."""
+    try:
+        status_code = int(row["order_status"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("BigQMT order row requires an integer order_status") from exc
+    try:
+        return _BIGQMT_ORDER_LIFECYCLE_BY_STATUS[status_code]
+    except KeyError as exc:
+        raise ValueError(f"unsupported BigQMT order_status: {status_code}") from exc
 
 
 def normalize_bigqmt_trades(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

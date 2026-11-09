@@ -31,6 +31,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -38,6 +39,7 @@ from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.config import ActorConfig
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.events import OrderEvent
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 
@@ -49,12 +51,15 @@ from backtests.result_writers.live_records import SOURCE_LIVE
 from backtests.result_writers.live_records import WHOLE_MARKET
 from backtests.result_writers.live_records import WHOLE_MARKET_SCHEMA_VERSION
 from backtests.result_writers.live_records import LiveAssetSnapshotRecord
+from backtests.result_writers.live_records import LiveOrderEventRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
 from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveTradeRecord
 from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
+from lives.order_event_persistence import AsyncOrderEventWriter
+from lives.order_event_persistence import OrderEventWrite
 
 
 SyncTaskCallback = Callable[[str, int, dict[str, Any]], None]
@@ -117,6 +122,7 @@ class SnapshotRecorder(Actor):
         fetch_trades: Any | None = None,
         fetch_open_prices: Any | None = None,
         event_reporter: Callable[[str, str, dict[str, Any]], None] | None = None,
+        order_event_writer: AsyncOrderEventWriter | None = None,
     ) -> None:
         super().__init__(config)
         self._writer = writer
@@ -128,6 +134,11 @@ class SnapshotRecorder(Actor):
         self._fetch_open_prices = fetch_open_prices
         self._event_reporter = event_reporter
         self._writer.set_logger(self.log)
+        self._order_event_writer = order_event_writer or AsyncOrderEventWriter(
+            writer,
+            logger=self.log,
+            now=lambda: datetime.now(ZoneInfo(config.timezone_name)).replace(tzinfo=None),
+        )
         self._before_time = self._parse_hh_mm(config.before_time)
         self._after_time = self._parse_hh_mm(config.after_time)
         # Guards so each phase applies the frozen target to the strategy at most once
@@ -137,6 +148,7 @@ class SnapshotRecorder(Actor):
     # ---- lifecycle -----------------------------------------------------------
 
     def on_start(self) -> None:
+        self._order_event_writer.start()
         self._subscribe_order_events()
         if self._before_time is not None:
             self._schedule_daily(self._BEFORE_ALERT, self._before_time, self._on_before_timer)
@@ -145,6 +157,18 @@ class SnapshotRecorder(Actor):
         # Catch up on whatever phase we started inside of, so a mid-day (re)start still
         # records snapshots and loads/generates the day's target.
         self._catch_up_on_start()
+
+    def on_stop(self) -> None:
+        if not self._order_event_writer.stop(timeout_secs=10.0):
+            metrics = self._order_event_writer.metrics()
+            self.log.error(
+                "order-event persistence did not drain before shutdown: "
+                f"pending={metrics['pending_count']} last_error={metrics['last_error']}",
+            )
+
+    def order_event_persistence_metrics(self) -> dict[str, Any]:
+        """Return side-effect-free queue health for node/status integrations."""
+        return self._order_event_writer.metrics()
 
     def _catch_up_on_start(self) -> None:
         now = self._now()
@@ -380,10 +404,9 @@ class SnapshotRecorder(Actor):
             source,
             on_complete=callback("live_position_snapshot"),
         )
-        # Reconstruct today's order/trade rows from the QMT broker lists. The live
-        # msgbus path may have missed or mis-recorded them; QMT is authoritative after
-        # close, so these upserts (idempotent on client_order_id / trade_id) overwrite
-        # whatever the live path left behind.
+        # Reconstruct today's broker-authoritative order/trade rows from the QMT lists.
+        # The live msgbus stream is persisted separately in live_order_realtime and
+        # live_trade_realtime, so after-close backfill cannot replace those records.
         self._backfill_orders(
             trading_date,
             on_complete=callback("live_order"),
@@ -1100,24 +1123,66 @@ class SnapshotRecorder(Actor):
         except Exception as exc:
             self.log.warning(f"could not subscribe to order events: {exc}")
 
-    def _on_order_event(self, event: Any) -> None:
-        # Snapshot the current cache view of the order on every event so status
-        # transitions (submitted → accepted → filled/canceled/rejected) upsert onto the
-        # same row. Fills additionally produce an immutable trade row.
+    def _on_order_event(self, event: OrderEvent) -> None:
+        # Materialize the mutable cache view before returning from the message-bus
+        # callback. The FIFO worker performs all MySQL I/O away from the node thread.
         try:
-            self._upsert_order_from_event(event)
+            local_received_time = self._now_naive()
+            order_record = self._order_record_from_event(event, local_received_time)
+            if order_record is None:
+                return
+            trade_record = (
+                self._trade_record_from_event(event, local_received_time)
+                if isinstance(event, OrderFilled)
+                else None
+            )
+            status_time = self._local_lifecycle_time_naive(
+                event,
+                local_received_time,
+            )
+            self._order_event_writer.submit(
+                OrderEventWrite(
+                    event_record=self._order_event_record(
+                        event,
+                        order_record,
+                        local_received_time,
+                        trade_record,
+                    ),
+                    order_record=order_record,
+                    status_time=status_time,
+                    trade_record=trade_record,
+                ),
+            )
         except Exception as exc:
-            self.log.warning(f"order event persist failed: {exc}")
-        if isinstance(event, OrderFilled):
-            try:
-                self._write_trade(event)
-            except Exception as exc:
-                self.log.warning(f"trade persist failed: {exc}")
+            self.log.warning(f"order event enqueue failed: {exc}")
 
     def _upsert_order_from_event(self, event: Any) -> None:
+        """Synchronous compatibility helper used by focused unit tests."""
+        local_received_time = self._now_naive()
+        record = SnapshotRecorder._order_record_from_event(
+            self,
+            event,
+            local_received_time,
+        )
+        if record is None:
+            return
+        self._writer.upsert_realtime_order(
+            record,
+            status_time=SnapshotRecorder._local_lifecycle_time_naive(
+                self,
+                event,
+                local_received_time,
+            ),
+        )
+
+    def _order_record_from_event(
+        self,
+        event: Any,
+        local_received_time: datetime,
+    ) -> LiveOrderRecord | None:
         client_order_id = str(getattr(event, "client_order_id", "") or "")
         if not client_order_id:
-            return
+            return None
         order = None
         try:
             order = self.cache.order(getattr(event, "client_order_id"))
@@ -1131,7 +1196,7 @@ class SnapshotRecorder(Actor):
         trading_date = self._event_date(event)
         record = LiveOrderRecord(
             trade_date=trading_date,
-            write_time=self._now_naive(),
+            write_time=local_received_time,
             account_id=self.config.account_id,
             trader_id=self.config.trader_id,
             client_order_id=client_order_id,
@@ -1156,12 +1221,26 @@ class SnapshotRecorder(Actor):
                 self._event_info(event), "order_at", "order_time_ms"
             ),
             qmt_raw=self._order_event_payload(event),
-            created_at=self._now_naive(),
-            updated_at=self._now_naive(),
+            created_at=local_received_time,
+            updated_at=local_received_time,
         )
-        self._writer.upsert_order(record)
+        return record
 
     def _write_trade(self, event: OrderFilled) -> None:
+        """Synchronous compatibility helper used by focused unit tests."""
+        self._writer.upsert_realtime_trade(
+            SnapshotRecorder._trade_record_from_event(
+                self,
+                event,
+                self._now_naive(),
+            ),
+        )
+
+    def _trade_record_from_event(
+        self,
+        event: OrderFilled,
+        local_received_time: datetime,
+    ) -> LiveTradeRecord:
         instrument_id_text = str(event.instrument_id)
         last_qty = self._decimal_or_none(event.last_qty)
         last_px = self._decimal_or_none(event.last_px)
@@ -1170,7 +1249,7 @@ class SnapshotRecorder(Actor):
             amount = last_qty * last_px
         record = LiveTradeRecord(
             trade_date=self._event_date(event),
-            write_time=self._now_naive(),
+            write_time=local_received_time,
             account_id=self.config.account_id,
             trader_id=self.config.trader_id,
             trade_id=str(event.trade_id),
@@ -1187,9 +1266,78 @@ class SnapshotRecorder(Actor):
                 self._event_info(event), "traded_at", "traded_time_ms"
             ),
             qmt_raw=self._event_info(event),
-            created_at=self._now_naive(),
+            created_at=local_received_time,
         )
-        self._writer.upsert_trade(record)
+        return record
+
+    def _order_event_record(
+        self,
+        event: OrderEvent,
+        order: LiveOrderRecord,
+        local_received_time: datetime,
+        trade: LiveTradeRecord | None,
+    ) -> LiveOrderEventRecord:
+        broker_event_ns = int(event.ts_event) if int(event.ts_event) > 0 else None
+        local_event_ns = int(event.ts_init) if int(event.ts_init) > 0 else None
+        event_info = self._event_info(event)
+        reason = self._maybe_str(getattr(event, "reason", None))
+        return LiveOrderEventRecord(
+            trade_date=order.trade_date,
+            account_id=order.account_id,
+            trader_id=order.trader_id,
+            event_id=str(event.id),
+            event_type=type(event).__name__,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            instrument_id=order.instrument_id,
+            stock_code=order.stock_code,
+            side=order.side,
+            order_type=order.order_type,
+            limit_price=order.limit_price,
+            quantity=order.quantity,
+            filled_qty=order.filled_qty,
+            avg_fill_price=order.avg_fill_price,
+            status=order.status,
+            trade_id=(trade.trade_id if trade is not None else None),
+            last_fill_price=(trade.price if trade is not None else None),
+            last_fill_qty=(trade.quantity if trade is not None else None),
+            broker_event_time=(
+                self._ns_to_naive(broker_event_ns) if broker_event_ns is not None else None
+            ),
+            broker_event_ns=broker_event_ns,
+            broker_time_kind=self._broker_time_kind(event, event_info),
+            local_event_time=(
+                self._ns_to_naive(local_event_ns) if local_event_ns is not None else None
+            ),
+            local_event_ns=local_event_ns,
+            local_received_time=local_received_time,
+            # The asynchronous worker replaces this immediately before its write.
+            persisted_at=local_received_time,
+            reconciliation=bool(event.reconciliation),
+            signal_date=order.signal_date,
+            target_qty=order.target_qty,
+            target_version=order.target_version,
+            reason=reason,
+            book_snapshot=order.book_snapshot,
+            raw_info=self._order_event_payload(event),
+        )
+
+    def _broker_time_kind(
+        self,
+        event: OrderEvent,
+        info: dict[str, Any] | None,
+    ) -> str:
+        if int(event.ts_event) <= 0:
+            return "unavailable"
+        info = info or {}
+        if isinstance(event, OrderFilled) or "traded_at" in info or "traded_time_ms" in info:
+            return "trade_time"
+        if "order_at" in info or "order_time_ms" in info:
+            return "order_time"
+        if self.config.broker_name.upper() in {"QMT", "BIGQMT"}:
+            # The current QMT adapter stamps status events with broker order_time_ms.
+            return "order_time"
+        return "event_time"
 
     # ---- full tick -----------------------------------------------------------
 
@@ -2414,6 +2562,14 @@ class SnapshotRecorder(Actor):
         ts = int(getattr(event, "ts_event", 0) or 0)
         converted = self._ns_to_date(ts)
         return converted or self._now().date()
+
+    def _local_lifecycle_time_naive(
+        self,
+        event: Any,
+        local_received_time: datetime,
+    ) -> datetime:
+        ts_init = int(getattr(event, "ts_init", 0) or 0)
+        return SnapshotRecorder._ns_to_naive(self, ts_init) or local_received_time
 
     def _ns_to_date(self, ts_event: int) -> date | None:
         if ts_event <= 0:

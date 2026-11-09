@@ -43,8 +43,10 @@
         </div>
         <button class="nav-item" data-tab="series">随时间</button>
         <button class="nav-item" data-tab="compare">对比</button>
+        <button class="nav-item" data-tab="orderexec">委托执行</button>
         <button class="nav-item" data-tab="kline">个股 K 线</button>
         <button class="nav-item" data-tab="rline">信号R线</button>
+        <button class="nav-item" data-tab="changes">变更记录</button>
         <div class="nav-group" data-group="control">
           <button class="nav-item nav-parent" data-tab="control">交易管理</button>
           <button class="nav-item nav-sub" data-tab="control" data-sub="control">控制</button>
@@ -79,7 +81,10 @@
             <label class="inline"><input type="checkbox" id="snap-auto" /> 自动刷新(15s)</label>
           </div>
         </div>
-        <div id="snap-positions" class="sub-panel active table-wrap"></div>
+        <div id="snap-positions" class="sub-panel active holdings-panel">
+          <div id="snap-position-table" class="table-wrap holding-position-table"></div>
+          <div id="snap-position-charts" class="holding-classification-charts"></div>
+        </div>
         <div id="snap-asset" class="sub-panel table-wrap"></div>
         <div id="snap-target" class="sub-panel table-wrap"></div>
         <div id="snap-orders" class="sub-panel table-wrap"></div>
@@ -184,6 +189,41 @@
         </div>
       </section>
 
+      <!-- ============ Order execution inspector ============ -->
+      <section id="tab-orderexec" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <label>股票代码 <input type="text" id="oe-code" placeholder="000001.SZ" /></label>
+            <label>交易日 <input type="date" id="oe-date" /></label>
+            <label>起始 <input type="time" id="oe-start" step="1" /></label>
+            <label>结束 <input type="time" id="oe-end" step="1" /></label>
+            <div class="multi-select" id="oe-layer-ms">
+              <span class="ms-caption">图层</span>
+              <button type="button" class="ms-toggle" id="oe-layer-toggle">选择图层</button>
+              <div class="ms-panel" id="oe-layer-panel"></div>
+            </div>
+            <button id="oe-plot">分析</button>
+            <span class="hint">时间留空自动覆盖委托前后；实线/实心=券商，虚线/空心=本地</span>
+          </div>
+        </div>
+        <div id="orderexec-chart" class="chart chart-tall"></div>
+        <div id="orderexec-coverage" class="orderexec-note"></div>
+        <h3 class="section-heading">诊断</h3>
+        <div id="orderexec-diagnostics" class="table-wrap"></div>
+        <h3 class="section-heading">完整事件</h3>
+        <div id="orderexec-events" class="table-wrap"></div>
+        <div class="orderexec-tables">
+          <div>
+            <h3 class="section-heading">券商委托 / 成交</h3>
+            <div id="orderexec-broker" class="table-wrap"></div>
+          </div>
+          <div>
+            <h3 class="section-heading">本地委托 / 成交</h3>
+            <div id="orderexec-local" class="table-wrap"></div>
+          </div>
+        </div>
+      </section>
+
       <!-- ============ K-line tab ============ -->
       <section id="tab-kline" class="tab-panel">
         <div class="subbar">
@@ -215,6 +255,33 @@
         <div id="rline-chart" class="chart chart-tall"></div>
       </section>
 
+      <!-- ============ Manually recorded significant changes ============ -->
+      <section id="tab-changes" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <button id="change-add">新增记录</button>
+            <button id="change-refresh" class="ghost">刷新</button>
+            <span class="hint">记录系统、策略或数据的重要人工变更；最新记录显示在最上方</span>
+          </div>
+        </div>
+        <form id="change-form" class="change-form" hidden>
+          <h4 id="change-form-title">新增变更记录</h4>
+          <label>标题
+            <input id="change-title" type="text" maxlength="120" required
+                   placeholder="简要说明本次变更" />
+          </label>
+          <label>详细内容
+            <textarea id="change-details" maxlength="5000" required
+                      placeholder="记录变更内容、原因、影响或注意事项"></textarea>
+          </label>
+          <div class="change-form-actions">
+            <button type="submit" id="change-save">保存</button>
+            <button type="button" id="change-cancel" class="ghost">取消</button>
+          </div>
+        </form>
+        <div id="change-records" class="change-records"></div>
+      </section>
+
       <!-- ============ Realtime info tab (实时信息) ============ -->
       <section id="tab-realtime" class="tab-panel active">
         <div class="subbar">
@@ -224,7 +291,10 @@
             <span id="rt-updated" class="hint"></span>
           </div>
         </div>
-        <div id="rt-positions" class="rt-sub-panel active table-wrap"></div>
+        <div id="rt-positions" class="rt-sub-panel active holdings-panel">
+          <div id="rt-position-table" class="table-wrap holding-position-table"></div>
+          <div id="rt-position-charts" class="holding-classification-charts"></div>
+        </div>
         <div id="rt-asset" class="rt-sub-panel table-wrap"></div>
       </section>
 

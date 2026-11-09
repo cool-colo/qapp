@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from dataclasses import field
@@ -26,6 +27,7 @@ from strategies.target_quantities import TargetQuantityStrategyConfig
 from strategies.target_quantities import TargetQuantityStrategy
 from strategies.target_quantities import TickSnapshot
 from strategies.target_quantities import NotionalOrderSplitter
+from strategies.target_quantities import PriceTrendSample
 from strategies.pricing import OpenOffsetBuyPriceStrategy
 from strategies.pricing import OpenOffsetSellPriceStrategy
 
@@ -308,6 +310,8 @@ class TestableTargetQuantityStrategy:
     _converge_async = TargetQuantityStrategy._converge_async
     _awaiting_pre_open_reconcile = TargetQuantityStrategy._awaiting_pre_open_reconcile
     _order_book_depth_logging_enabled = TargetQuantityStrategy._order_book_depth_logging_enabled
+    _log_depth_event_probe = TargetQuantityStrategy._log_depth_event_probe
+    _format_depth_side = staticmethod(TargetQuantityStrategy._format_depth_side)
     _should_log_sample = staticmethod(TargetQuantityStrategy._should_log_sample)
     _on_converge_timer = TargetQuantityStrategy._on_converge_timer
     _desired_quantities = TargetQuantityStrategy._desired_quantities
@@ -317,6 +321,12 @@ class TestableTargetQuantityStrategy:
     _price_limit_reason = TargetQuantityStrategy._price_limit_reason
     _target_achieved = TargetQuantityStrategy._target_achieved
     _reconcile_unfilled_orders = TargetQuantityStrategy._reconcile_unfilled_orders
+    _record_price_trend_sample = TargetQuantityStrategy._record_price_trend_sample
+    _volume_direction_confirmation = staticmethod(
+        TargetQuantityStrategy._volume_direction_confirmation,
+    )
+    _five_level_book_imbalance = TargetQuantityStrategy._five_level_book_imbalance
+    _execution_trend = TargetQuantityStrategy._execution_trend
     _unfilled_timeout_anchor_ts = staticmethod(
         TargetQuantityStrategy._unfilled_timeout_anchor_ts,
     )
@@ -557,6 +567,11 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._whole_market_final_success_dates = set()
         strategy._whole_market_fetch_observers = []
         strategy._depth_books = {}
+        strategy._depth_book_ts_init = {}
+        strategy._depth_event_probe_date = None
+        strategy._depth_event_probe_instrument_id = None
+        strategy._depth_event_probe_ts_event = None
+        strategy._price_trend_samples = {}
         strategy._subscribed_order_book_depth_instruments = set()
         strategy._sleep_calls = []
         strategy._sleep = lambda seconds: strategy._sleep_calls.append(seconds)
@@ -1110,10 +1125,10 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy.update_target_quantities({INST_A: 95000}, date(2026, 7, 2), "large")
 
         self.assertEqual([order.quantity for order in strategy.submitted_orders], [
-            Decimal("29900"),
-            Decimal("29900"),
-            Decimal("29900"),
-            Decimal("5300"),
+            Decimal("29800"),
+            Decimal("29800"),
+            Decimal("29800"),
+            Decimal("5600"),
         ])
 
     def test_target_helpers_value_position_with_today_open_not_last_close(self) -> None:
@@ -1383,7 +1398,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         strategy.update_target_quantities({INST_A: 95000}, date(2026, 7, 2), "partial")
 
-        self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("29900")])
+        self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("29800")])
         self.assertEqual(strategy._deferred_buys, {str(INST_A): Decimal("95000")})
 
     def test_buy_cash_gate_reserves_open_buy_notional(self) -> None:
@@ -1866,7 +1881,14 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             any("Pre-open execution-state reconciliation succeeded" in args[0] for args, _kwargs in strategy.log.infos),
         )
 
-    def _make_depth(self, instrument_id: InstrumentId, bid: float, ask: float, ts: str):
+    def _make_depth(
+        self,
+        instrument_id: InstrumentId,
+        bid: float,
+        ask: float,
+        ts: str,
+        ts_init: str | None = None,
+    ):
         def level(price: float, size: float):
             return type("DepthLevel", (), {"price": Decimal(str(price)), "size": Decimal(str(size))})()
 
@@ -1878,7 +1900,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
                 "bids": [level(bid, 1000)],
                 "asks": [level(ask, 1200)],
                 "ts_event": china_ts_ns(ts),
-                "ts_init": china_ts_ns(ts),
+                "ts_init": china_ts_ns(ts_init or ts),
             },
         )()
 
@@ -1898,6 +1920,285 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         bids, asks = strategy._depth_books[str(INST_A)]
         self.assertEqual(bids, [(9.99, 1000.0)])
         self.assertEqual(asks, [(10.01, 1200.0)])
+
+    def test_depth_event_probe_logs_one_instrument_changes_only_before_0935(self) -> None:
+        strategy = self.make_strategy()
+        strategy._subscribed_order_book_depth_instruments = {str(INST_A), str(INST_B)}
+
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.99, 10.01, "2026-07-02 09:25:00"),
+        )
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.98, 10.02, "2026-07-02 09:25:00"),
+        )
+        strategy.on_order_book_depth(
+            self._make_depth(INST_B, 19.99, 20.01, "2026-07-02 09:25:01"),
+        )
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.99, 10.01, "2026-07-02 09:25:01"),
+        )
+        strategy.on_order_book_depth(
+            self._make_depth(
+                INST_A,
+                9.99,
+                10.01,
+                "2026-07-02 09:25:02",
+                ts_init="2026-07-02 09:35:00",
+            ),
+        )
+        strategy.on_order_book_depth(
+            self._make_depth(INST_B, 19.99, 20.01, "2026-07-03 09:25:00"),
+        )
+
+        probe_messages = [
+            args[0]
+            for args, _kwargs in strategy.log.infos
+            if args[0].startswith("Order-book depth ts_event change")
+        ]
+        self.assertEqual(len(probe_messages), 3)
+        self.assertIn(f"instrument_id={INST_A}", probe_messages[0])
+        self.assertIn(f"ts_event={china_ts_ns('2026-07-02 09:25:00')}", probe_messages[0])
+        self.assertIn(f"ts_event={china_ts_ns('2026-07-02 09:25:01')}", probe_messages[1])
+        self.assertIn(f"instrument_id={INST_B}", probe_messages[2])
+        self.assertEqual(strategy._depth_event_probe_instrument_id, str(INST_B))
+
+    def test_depth_event_time_drives_inner_convergence_with_stale_quote_time(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:30:02", tz="UTC")
+        strategy._trading_day = trading_date
+        strategy._depth_converged_today = False
+        strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 09:25:00")
+        strategy._target_quantities = {str(INST_A): Decimal("500")}
+        strategy._target_version = "depth-event-time"
+
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 09:30:02"),
+        )
+
+        self.assertTrue(strategy._depth_converged_today)
+        self.assertEqual(len(strategy.submitted_orders), 1)
+        self.assertEqual(strategy.submitted_orders[0].instrument_id, INST_A)
+        # First-order pricing uses the configured 50 bps open offset; depth is
+        # used only after the first cancel.
+        self.assertEqual(strategy.submitted_orders[0].price, Decimal("10.05"))
+
+    def test_depth_converged_flag_stays_false_when_convergence_does_not_start(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:30:02", tz="UTC")
+        strategy._trading_day = trading_date
+        strategy._depth_converged_today = False
+        strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 09:25:00")
+        strategy._target_quantities = {str(INST_A): Decimal("500")}
+        strategy._target_version = "depth-lock-retry"
+        strategy._converge_lock.acquire()
+        try:
+            strategy.on_order_book_depth(
+                self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 09:30:02"),
+            )
+        finally:
+            strategy._converge_lock.release()
+
+        self.assertFalse(strategy._depth_converged_today)
+        self.assertEqual(strategy.submitted_orders, [])
+
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 09:30:03"),
+        )
+
+        self.assertTrue(strategy._depth_converged_today)
+        self.assertEqual(len(strategy.submitted_orders), 1)
+
+    def test_five_level_book_imbalance_uses_sizes_from_first_five_levels(self) -> None:
+        strategy = self.make_strategy()
+        now_ns = 20_000_000_000
+        strategy._depth_books[str(INST_A)] = (
+            [(9.99 - index * 0.01, 200.0) for index in range(6)],
+            [(10.01 + index * 0.01, 100.0) for index in range(6)],
+        )
+        strategy._depth_book_ts_init[str(INST_A)] = now_ns - 1_000_000_000
+
+        imbalance = strategy._five_level_book_imbalance(str(INST_A), now_ns)
+
+        self.assertAlmostEqual(imbalance, (1000.0 - 500.0) / 1500.0)
+
+    def test_five_level_book_imbalance_favors_near_touch_liquidity(self) -> None:
+        strategy = self.make_strategy()
+        now_ns = 20_000_000_000
+        # Raw five-level totals are equal. Ask liquidity is concentrated at level
+        # one while bid liquidity is concentrated at level five, so rank-weighted
+        # imbalance must indicate ask pressure.
+        strategy._depth_books[str(INST_A)] = (
+            [
+                (9.99, 1.0),
+                (9.98, 1.0),
+                (9.97, 1.0),
+                (9.96, 1.0),
+                (9.95, 996.0),
+            ],
+            [
+                (10.01, 996.0),
+                (10.02, 1.0),
+                (10.03, 1.0),
+                (10.04, 1.0),
+                (10.05, 1.0),
+            ],
+        )
+        strategy._depth_book_ts_init[str(INST_A)] = now_ns
+
+        imbalance = strategy._five_level_book_imbalance(str(INST_A), now_ns)
+
+        bid_pressure = 1.0 + 1.0 / 2 + 1.0 / 3 + 1.0 / 4 + 996.0 / 5
+        ask_pressure = 996.0 + 1.0 / 2 + 1.0 / 3 + 1.0 / 4 + 1.0 / 5
+        expected = (bid_pressure - ask_pressure) / (bid_pressure + ask_pressure)
+        self.assertAlmostEqual(imbalance, expected)
+
+    def test_five_level_book_imbalance_rejects_stale_or_crossed_book(self) -> None:
+        strategy = self.make_strategy()
+        now_ns = 20_000_000_000
+        strategy._depth_books[str(INST_A)] = ([(10.01, 100.0)], [(10.00, 100.0)])
+        strategy._depth_book_ts_init[str(INST_A)] = now_ns
+        self.assertIsNone(strategy._five_level_book_imbalance(str(INST_A), now_ns))
+
+        strategy._depth_books[str(INST_A)] = ([(9.99, 100.0)], [(10.01, 100.0)])
+        strategy._depth_book_ts_init[str(INST_A)] = now_ns - 3_000_000_000
+        self.assertIsNone(strategy._five_level_book_imbalance(str(INST_A), now_ns))
+
+    def test_execution_trend_combines_volume_and_book_without_reversing_price(self) -> None:
+        strategy = self.make_strategy()
+        instrument_id = str(INST_A)
+        strategy._price_trend_samples[instrument_id] = deque(
+            [
+                PriceTrendSample(10_000_000_000, 10.00, 100),
+                PriceTrendSample(15_000_000_000, 9.90, 1_000),
+                PriceTrendSample(20_000_000_000, 10.01, 1_100),
+            ],
+        )
+        strategy._depth_books[instrument_id] = (
+            [(9.99, 100.0)] * 5,
+            [(10.01, 900.0)] * 5,
+        )
+        strategy._depth_book_ts_init[instrument_id] = 20_000_000_000
+
+        trend = strategy._execution_trend(
+            instrument_id,
+            OrderSide.BUY,
+            now_ns=20_000_000_000,
+        )
+
+        self.assertGreater(trend.price_return_bps, 0)
+        self.assertLess(trend.volume_confirmation, 0)
+        self.assertLess(trend.book_imbalance, 0)
+        self.assertGreater(trend.trend_bps, 0)
+        self.assertLess(trend.trend_bps, trend.price_return_bps)
+
+    def test_execution_trend_only_accelerates_adverse_side(self) -> None:
+        strategy = self.make_strategy()
+        instrument_id = str(INST_A)
+        strategy._price_trend_samples[instrument_id] = deque(
+            [
+                PriceTrendSample(10_000_000_000, 10.00, 100),
+                PriceTrendSample(20_000_000_000, 10.05, 1_000),
+            ],
+        )
+
+        buy = strategy._execution_trend(instrument_id, OrderSide.BUY, now_ns=20_000_000_000)
+        sell = strategy._execution_trend(instrument_id, OrderSide.SELL, now_ns=20_000_000_000)
+
+        self.assertEqual(buy.severity, 1.0)
+        self.assertAlmostEqual(buy.timeout_multiplier, 0.3)
+        self.assertEqual(buy.offset_multiplier, 3.0)
+        self.assertEqual(sell.severity, 0.0)
+        self.assertEqual(sell.timeout_multiplier, 1.0)
+        self.assertEqual(sell.offset_multiplier, 1.0)
+
+    def test_execution_trend_interpolates_between_thresholds(self) -> None:
+        strategy = self.make_strategy()
+        instrument_id = str(INST_A)
+        strategy._price_trend_samples[instrument_id] = deque(
+            [
+                PriceTrendSample(10_000_000_000, 10.00, None),
+                PriceTrendSample(20_000_000_000, 10.03, None),
+            ],
+        )
+
+        trend = strategy._execution_trend(
+            instrument_id,
+            OrderSide.BUY,
+            now_ns=20_000_000_000,
+        )
+
+        self.assertAlmostEqual(trend.severity, 0.5, places=6)
+        self.assertAlmostEqual(trend.timeout_multiplier, 0.65, places=6)
+        self.assertAlmostEqual(trend.offset_multiplier, 2.0, places=6)
+
+    def test_execution_trend_can_be_observed_without_affecting_execution(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            price_trend_effect_enabled=False,
+        )
+        instrument_id = str(INST_A)
+        strategy._price_trend_samples[instrument_id] = deque(
+            [
+                PriceTrendSample(10_000_000_000, 10.00, 100),
+                PriceTrendSample(20_000_000_000, 10.05, 1_000),
+            ],
+        )
+
+        trend = strategy._execution_trend(
+            instrument_id,
+            OrderSide.BUY,
+            now_ns=20_000_000_000,
+        )
+
+        self.assertGreater(trend.trend_bps, 0.0)
+        self.assertEqual(trend.severity, 1.0)
+        self.assertEqual(trend.timeout_multiplier, 1.0)
+        self.assertEqual(trend.offset_multiplier, 1.0)
+
+        context = strategy._build_price_context(
+            strategy.cache.instrument(INST_A),
+            INST_A,
+            OrderSide.BUY,
+            Decimal("100"),
+        )
+        self.assertFalse(context.price_trend_effect_enabled)
+        self.assertEqual(context.trend_severity, 1.0)
+        self.assertEqual(context.timeout_multiplier, 1.0)
+        self.assertEqual(context.offset_multiplier, 1.0)
+
+    def test_book_imbalance_does_not_trigger_without_price_history(self) -> None:
+        strategy = self.make_strategy()
+        instrument_id = str(INST_A)
+        strategy._depth_books[instrument_id] = (
+            [(9.99, 1_000.0)] * 5,
+            [(10.01, 1.0)] * 5,
+        )
+        strategy._depth_book_ts_init[instrument_id] = 20_000_000_000
+
+        trend = strategy._execution_trend(
+            instrument_id,
+            OrderSide.BUY,
+            now_ns=20_000_000_000,
+        )
+
+        self.assertGreater(trend.book_imbalance, 0)
+        self.assertEqual(trend.trend_bps, 0.0)
+        self.assertEqual(trend.severity, 0.0)
+
+    def test_volume_confirmation_ignores_cumulative_volume_rollback(self) -> None:
+        confirmation = TargetQuantityStrategy._volume_direction_confirmation(
+            [
+                PriceTrendSample(1, 10.0, 1_000),
+                PriceTrendSample(2, 10.1, 100),
+            ],
+            1.0,
+        )
+
+        self.assertIsNone(confirmation)
 
     def test_full_tick_open_overrides_existing_non_authoritative_open(self) -> None:
         # Regression for the 42.14-vs-53.09 bug: a stale non-authoritative value
@@ -2207,6 +2508,67 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(strategy.canceled_orders, [order])
         self.assertEqual(strategy._cancel_count_sell, {str(INST_A): 1})
         self.assertEqual(strategy._cancel_count_buy, {})
+
+    def test_reconcile_uses_shorter_timeout_for_adverse_trend(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            unfilled_timeout_secs=10.0,
+            price_trend_min_timeout_multiplier=0.3,
+            stop_time=None,
+        )
+        strategy._price_trend_samples[str(INST_A)] = deque(
+            [
+                PriceTrendSample(1_000_000_000, 10.00, 100),
+                PriceTrendSample(11_000_000_000, 10.05, 1_000),
+            ],
+        )
+        accepted = MagicMock(spec=OrderAccepted, ts_init=7_000_000_000)
+        order = FakeOrder(
+            client_order_id="B-TREND",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("100"),
+            price=Decimal("10.01"),
+            status=OrderStatus.ACCEPTED,
+            ts_last=1,
+            events=[accepted],
+        )
+        strategy.cache.open_orders.append(order)
+        strategy.clock.ts = 12_000_000_000
+
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [order])
+        context = strategy.order_events[-1].extra["intent_context"]
+        self.assertAlmostEqual(context["effective_timeout_secs"], 3.0)
+        self.assertEqual(context["trend_severity"], 1.0)
+
+    def test_price_trend_state_resets_on_trading_day_roll(self) -> None:
+        strategy = self.make_strategy()
+        strategy._trading_day = date(2026, 7, 2)
+        strategy._price_trend_samples[str(INST_A)] = deque(
+            [PriceTrendSample(1, 10.0, 100)],
+        )
+        strategy._depth_book_ts_init[str(INST_A)] = 1
+
+        strategy._roll_trading_day(date(2026, 7, 3))
+
+        self.assertEqual(strategy._price_trend_samples, {})
+        self.assertEqual(strategy._depth_book_ts_init, {})
+
+    def test_price_trend_config_validation_fails_fast(self) -> None:
+        config = TargetQuantityStrategyConfig(
+            instrument_ids=[],
+            bar_types={},
+            price_trend_threshold_bps=40.0,
+            price_trend_max_bps=20.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "price_trend_max_bps"):
+            TargetQuantityStrategy._validate_price_trend_config(config)
 
     def test_reconcile_does_not_cancel_buy_at_max_price_cap(self) -> None:
         trading_date = date(2026, 7, 2)

@@ -31,6 +31,15 @@ class PriceContext:
     # (price, size) levels, best-first. May be empty (e.g. backtest with no book).
     bids: list[tuple[float, float]] = field(default_factory=list)
     asks: list[tuple[float, float]] = field(default_factory=list)
+    price_return_bps: float = 0.0
+    volume_confirmation: float | None = None
+    book_imbalance: float | None = None
+    confirmation_score: float = 0.0
+    trend_bps: float = 0.0
+    trend_severity: float = 0.0
+    price_trend_effect_enabled: bool = True
+    timeout_multiplier: float = 1.0
+    offset_multiplier: float = 1.0
 
     def base_price(self) -> float | None:
         """Reference price for the base offset: today's open only."""

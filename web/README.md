@@ -18,6 +18,11 @@ A local, read-only dashboard for the live trading data this repo persists:
   account's **buy (red ↑) / sell (green ↓)** fills overlaid as markers. Changing a date
   or the 显示买卖点 option redraws right away (as it does in **对比**, where a date change
   re-plots whenever at least one series is added).
+- **委托执行** — broker-authoritative `live_order`/`live_trade` records overlaid with
+  local Nautilus lifecycle events and RiceQuant minute/tick prices. A checkbox
+  multi-select controls minute candles, tick/BBO, broker orders/trades, and local
+  states/events independently; diagnostics flag price marketability and broker/local
+  discrepancies without treating a crossed tick as proof of fill eligibility.
 
 Every table goes through one shared renderer, which prefixes a leading **序号**
 row-number column: it numbers the *visible* rows, so it follows the current sort/filter
@@ -25,13 +30,40 @@ and stays pinned to the left edge while a wide table scrolls sideways.
 
 Hover over a **stock name for 300 ms** to open its information panel: 总市值、
 流通市值、换手率、自由流通换手率、市盈率 TTM、市净率、量比、成交额、成交量、
-OHLC prices, industry, market and listing date. It reads daily metrics from
-ClickHouse `dws_stock_factor_wide` and basic details from `stock_basic`, and displays
-the actual data date. Historical rows use the latest daily record on or before the
-row/snapshot date; live tables use the latest daily record available. Moving away
-before 300 ms cancels the panel and the query. Moving into an open panel keeps
-it visible; leaving it or pressing Escape closes it. Stock-name clicks still open
-信号 R 线.
+OHLC prices, SW level 1/2/3 industries, Eastmoney concepts and board
+memberships, market and listing date. It reads daily metrics from ClickHouse
+`dws_stock_factor_wide`, basic details from `stock_basic`, and classifications from
+the corresponding curated `dwd_*` tables. Historical rows only use daily and
+classification records available by the row/snapshot date; live tables use the
+latest records available. Moving away before 300 ms cancels the panel and the query.
+Moving into an open panel keeps it visible; leaving it or pressing Escape closes it.
+
+The **变更记录** sidebar page stores manually entered operational changes in
+`web/change_records.json` (next to `compare_presets.json`). Records are newest first;
+they can be added and edited in place, while deletion requires the configured
+`control_pin`.
+
+Stock-name clicks still open 信号 R 线.
+
+Both **实时信息 → 持仓** and **按日快照 → 持仓** include market-value
+classification charts below the holdings table: one pie for each SW industry level,
+plus full-width descending histograms for Eastmoney concepts and the concept,
+industry, and region board memberships sourced from `dwd_dc_index`/`dwd_dc_member`.
+Pie charts show every category above 3% of total held market value and roll the rest
+into “其他”. Histograms show every exposure above 5% and omit the remainder without
+an “其他” bar. Every bar shows its percentage of total held market value, and the
+concept-board chart excludes 融资融券. Clicking any visible slice or bar focuses the
+holdings table and highlights every matching stock. When more than thirty bars pass
+the threshold in any histogram, the chart shows thirty at a time with a horizontal
+slider; on a Mac trackpad, a two-finger horizontal gesture over the chart pans the
+same window without clicking the slider. Trackpad deltas update the same continuous
+percentage range as the slider and are coalesced once per animation frame for smooth
+inertial movement. Histogram y-axis bounds use the complete series, so bar heights do not
+rescale as high-value bars move in or out of the visible window. Bars newly entering
+the window briefly highlight for 450 ms; this runs only when the visible category
+range changes, for both slider and trackpad movement. A clicked slice or bar remains
+selected until it is clicked again or another chart item is selected, mirroring the
+persistent row highlight in the holdings table.
 
 It is a self-contained consumer — nothing here is imported by the strategy / backtest
 / live trading code.
@@ -40,7 +72,7 @@ It is a self-contained consumer — nothing here is imported by the strategy / b
 
 - **MySQL** `live_*` tables — asset/position/target/order/trade snapshots, plus
   `live_daily_stock_return` and `index_eod_price` used by the return report.
-- **ClickHouse** (HTTP) — daily OHLCV bars.
+- **ClickHouse** (HTTP) — daily OHLCV plus RiceQuant minute/tick market context.
 
 实盘 (real) and 模拟盘 (simulation) live in **separate MySQL databases**; each is a
 named entry under `sources` in the config. Multiple accounts within one database are
@@ -98,6 +130,11 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/kline` | `stock_code, start, end` |
 | `GET /api/stock_info` | `stock_code, date?` (latest daily metrics on/before date; default today) |
 | `GET /api/kline_with_trades` | `source, account, trader, stock_code, start, end` |
+| `GET /api/order-execution` | `source, account, trader, stock_code, trade_date, start?, end?, tick_limit?` |
+| `GET /api/change_records` | — |
+| `POST /api/change_records` | body: `{title, details}` |
+| `PUT /api/change_records/{id}` | body: `{title, details}` |
+| `DELETE /api/change_records/{id}` | body: `{pin}` (required) |
 | `GET /api/realtime/positions` | `account, trader` |
 | `GET /api/strategy/targets` | `account, trader` |
 | `GET /api/control/state` | `account, trader` |

@@ -29,8 +29,21 @@ holding_days: 10           # backtest rebalance cadence (unused by live target-t
 initial_cash: 1000000
 
 # --- Order lifecycle / cash gating ---
-unfilled_timeout_secs: 10.0
-resubmit_interval_secs: 5.0     # feeds resubmit_check_interval_secs AND process_targets_interval_secs
+unfilled_timeout_secs: 3.0
+resubmit_check_interval_secs: 1.0  # open-order timeout/convergence check cadence
+process_targets_interval_secs: 2.0 # daily target-processing trigger cadence
+buy_offset_bps: 50.0              # first BUY quote: open + 50 bps (0.5%)
+sell_offset_bps: 50.0             # first SELL quote: open - 50 bps (0.5%)
+# Price direction is primary; traded volume and standard five-level order-book
+# imbalance confirm its magnitude but can never reverse it.
+price_trend_effect_enabled: false  # false: keep calculating/recording, but do not alter price or timeout
+price_trend_window_secs: 10.0
+price_trend_threshold_bps: 20.0
+price_trend_max_bps: 40.0
+price_trend_confirmation_strength: 0.5
+price_trend_book_max_age_secs: 2.0
+price_trend_min_timeout_multiplier: 0.3
+price_trend_max_offset_multiplier: 3.0
 cash_buffer_percent: 0.0
 target_cash_buffer_percent: 0.01
 order_slice_notional: 300000     # CNY cap per slice; 0 disables this cap; instrument quantity limits still apply

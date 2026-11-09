@@ -50,4 +50,5 @@ start_prod_live_trading.sh
 # Dashboard local config (real credentials) — use web/config.example.yaml as a template
 web/config.yaml
 web/compare_presets.json
+web/change_records.json
 
