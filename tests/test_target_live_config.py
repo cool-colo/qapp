@@ -49,6 +49,7 @@ from strategies.model_prediction_targets import TargetModelPredictionsStrategyCo
 from strategies.model_target_planners import ModelTargetPlan
 from strategies.model_target_planners import TargetContext
 from strategies.model_target_planners import TargetInfo
+from strategies.target_quantities import DepthBookSnapshot
 from strategies.target_quantities import TargetQuantityStrategy
 from strategies.target_quantities import TickSnapshot
 
@@ -2151,11 +2152,11 @@ class TargetLiveConfigTest(unittest.TestCase):
         )()
         recorder._strategy._today_open = {"001202.SZ.QMT": 19.87}
         recorder._strategy._book_snapshot = MagicMock(
-            return_value=(
-                19.85,
-                19.88,
-                [(19.85, 2100.0), (19.84, 1000.0)],
-                [(19.88, 1800.0), (19.89, 2600.0)],
+            return_value=DepthBookSnapshot(
+                bids=((19.85, 2100.0), (19.84, 1000.0)),
+                asks=((19.88, 1800.0), (19.89, 2600.0)),
+                ts_event=1_720_500_000_000_000_000,
+                ts_init=1_720_500_000_100_000_000,
             ),
         )
 
@@ -2173,6 +2174,8 @@ class TargetLiveConfigTest(unittest.TestCase):
             {
                 "best_bid": 19.85,
                 "best_ask": 19.88,
+                "ts_event": 1_720_500_000_000_000_000,
+                "ts_init": 1_720_500_000_100_000_000,
                 "bids": [
                     {"price": 19.85, "size": 2100.0},
                     {"price": 19.84, "size": 1000.0},

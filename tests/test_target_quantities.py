@@ -23,6 +23,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 
 from strategies.async_scheduling import AsyncAwaitableScheduler
 from strategies.execution_reconciliation import ExecutionStateReconciler
+from strategies.target_quantities import DepthBookSnapshot
 from strategies.target_quantities import TargetQuantityStrategyConfig
 from strategies.target_quantities import TargetQuantityStrategy
 from strategies.target_quantities import TickSnapshot
@@ -39,6 +40,21 @@ INST_C = InstrumentId.from_str("000003.SZ.QMT")
 
 def china_ts_ns(value: str) -> int:
     return pd.Timestamp(value, tz="Asia/Shanghai").tz_convert("UTC").value
+
+
+def depth_book_snapshot(
+    bids: list[tuple[float, float]],
+    asks: list[tuple[float, float]],
+    *,
+    ts_init: int,
+    ts_event: int | None = None,
+) -> DepthBookSnapshot:
+    return DepthBookSnapshot(
+        bids=tuple(bids),
+        asks=tuple(asks),
+        ts_event=ts_init if ts_event is None else ts_event,
+        ts_init=ts_init,
+    )
 
 
 class FakeMoney:
@@ -358,6 +374,7 @@ class TestableTargetQuantityStrategy:
     _build_price_context = TargetQuantityStrategy._build_price_context
     _quote_snapshot = TargetQuantityStrategy._quote_snapshot
     _book_snapshot = TargetQuantityStrategy._book_snapshot
+    _book_lots_to_shares = staticmethod(TargetQuantityStrategy._book_lots_to_shares)
     _ladder_levels = staticmethod(TargetQuantityStrategy._ladder_levels)
     _at_buy_price_cap = TargetQuantityStrategy._at_buy_price_cap
     _target_quantity = TargetQuantityStrategy._target_quantity
@@ -567,7 +584,6 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._whole_market_final_success_dates = set()
         strategy._whole_market_fetch_observers = []
         strategy._depth_books = {}
-        strategy._depth_book_ts_init = {}
         strategy._depth_event_probe_date = None
         strategy._depth_event_probe_instrument_id = None
         strategy._depth_event_probe_ts_event = None
@@ -1917,9 +1933,35 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         # walk-book ladder is captured.
         self.assertNotIn(str(INST_A), strategy._today_open)
         self.assertNotIn(str(INST_A), strategy._last_close)
-        bids, asks = strategy._depth_books[str(INST_A)]
-        self.assertEqual(bids, [(9.99, 1000.0)])
-        self.assertEqual(asks, [(10.01, 1200.0)])
+        snapshot = strategy._depth_books[str(INST_A)]
+        self.assertEqual(snapshot.bids, ((9.99, 1000.0),))
+        self.assertEqual(snapshot.asks, ((10.01, 1200.0),))
+        self.assertEqual(snapshot.ts_event, china_ts_ns("2026-07-02 09:30:01"))
+        self.assertEqual(snapshot.ts_init, china_ts_ns("2026-07-02 09:30:01"))
+
+    def test_price_context_converts_book_lots_to_shares_before_walk(self) -> None:
+        strategy = self.make_strategy(open_prices={INST_A: 11.91})
+        instrument_id = str(INST_A)
+        strategy._cancel_count_buy[instrument_id] = 1
+        strategy._depth_books[instrument_id] = depth_book_snapshot(
+            [(11.97, 16.0), (11.95, 15.0)],
+            [(11.98, 95.0), (11.99, 49.0), (12.00, 16.0), (12.01, 13.0), (12.04, 2.0)],
+            ts_event=19_000_000_000,
+            ts_init=20_000_000_000,
+        )
+
+        context = strategy._build_price_context(
+            strategy.cache.instrument(INST_A),
+            INST_A,
+            OrderSide.BUY,
+            Decimal("4200"),
+        )
+
+        self.assertEqual(context.asks[0], (11.98, 9_500.0))
+        self.assertEqual(context.asks[-1], (12.04, 200.0))
+        self.assertEqual(context.ts_event, 19_000_000_000)
+        self.assertEqual(context.ts_init, 20_000_000_000)
+        self.assertAlmostEqual(strategy._buy_pricer.compute(context), 11.99)
 
     def test_depth_event_probe_logs_one_instrument_changes_only_before_0935(self) -> None:
         strategy = self.make_strategy()
@@ -2013,11 +2055,11 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_five_level_book_imbalance_uses_sizes_from_first_five_levels(self) -> None:
         strategy = self.make_strategy()
         now_ns = 20_000_000_000
-        strategy._depth_books[str(INST_A)] = (
+        strategy._depth_books[str(INST_A)] = depth_book_snapshot(
             [(9.99 - index * 0.01, 200.0) for index in range(6)],
             [(10.01 + index * 0.01, 100.0) for index in range(6)],
+            ts_init=now_ns - 1_000_000_000,
         )
-        strategy._depth_book_ts_init[str(INST_A)] = now_ns - 1_000_000_000
 
         imbalance = strategy._five_level_book_imbalance(str(INST_A), now_ns)
 
@@ -2029,7 +2071,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         # Raw five-level totals are equal. Ask liquidity is concentrated at level
         # one while bid liquidity is concentrated at level five, so rank-weighted
         # imbalance must indicate ask pressure.
-        strategy._depth_books[str(INST_A)] = (
+        strategy._depth_books[str(INST_A)] = depth_book_snapshot(
             [
                 (9.99, 1.0),
                 (9.98, 1.0),
@@ -2044,8 +2086,8 @@ class TargetQuantityStrategyTest(unittest.TestCase):
                 (10.04, 1.0),
                 (10.05, 1.0),
             ],
+            ts_init=now_ns,
         )
-        strategy._depth_book_ts_init[str(INST_A)] = now_ns
 
         imbalance = strategy._five_level_book_imbalance(str(INST_A), now_ns)
 
@@ -2057,12 +2099,18 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_five_level_book_imbalance_rejects_stale_or_crossed_book(self) -> None:
         strategy = self.make_strategy()
         now_ns = 20_000_000_000
-        strategy._depth_books[str(INST_A)] = ([(10.01, 100.0)], [(10.00, 100.0)])
-        strategy._depth_book_ts_init[str(INST_A)] = now_ns
+        strategy._depth_books[str(INST_A)] = depth_book_snapshot(
+            [(10.01, 100.0)],
+            [(10.00, 100.0)],
+            ts_init=now_ns,
+        )
         self.assertIsNone(strategy._five_level_book_imbalance(str(INST_A), now_ns))
 
-        strategy._depth_books[str(INST_A)] = ([(9.99, 100.0)], [(10.01, 100.0)])
-        strategy._depth_book_ts_init[str(INST_A)] = now_ns - 3_000_000_000
+        strategy._depth_books[str(INST_A)] = depth_book_snapshot(
+            [(9.99, 100.0)],
+            [(10.01, 100.0)],
+            ts_init=now_ns - 3_000_000_000,
+        )
         self.assertIsNone(strategy._five_level_book_imbalance(str(INST_A), now_ns))
 
     def test_execution_trend_combines_volume_and_book_without_reversing_price(self) -> None:
@@ -2075,11 +2123,11 @@ class TargetQuantityStrategyTest(unittest.TestCase):
                 PriceTrendSample(20_000_000_000, 10.01, 1_100),
             ],
         )
-        strategy._depth_books[instrument_id] = (
+        strategy._depth_books[instrument_id] = depth_book_snapshot(
             [(9.99, 100.0)] * 5,
             [(10.01, 900.0)] * 5,
+            ts_init=20_000_000_000,
         )
-        strategy._depth_book_ts_init[instrument_id] = 20_000_000_000
 
         trend = strategy._execution_trend(
             instrument_id,
@@ -2173,11 +2221,11 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_book_imbalance_does_not_trigger_without_price_history(self) -> None:
         strategy = self.make_strategy()
         instrument_id = str(INST_A)
-        strategy._depth_books[instrument_id] = (
+        strategy._depth_books[instrument_id] = depth_book_snapshot(
             [(9.99, 1_000.0)] * 5,
             [(10.01, 1.0)] * 5,
+            ts_init=20_000_000_000,
         )
-        strategy._depth_book_ts_init[instrument_id] = 20_000_000_000
 
         trend = strategy._execution_trend(
             instrument_id,
@@ -2552,12 +2600,16 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._price_trend_samples[str(INST_A)] = deque(
             [PriceTrendSample(1, 10.0, 100)],
         )
-        strategy._depth_book_ts_init[str(INST_A)] = 1
+        strategy._depth_books[str(INST_A)] = depth_book_snapshot(
+            [(9.99, 100.0)],
+            [(10.01, 100.0)],
+            ts_init=1,
+        )
 
         strategy._roll_trading_day(date(2026, 7, 3))
 
         self.assertEqual(strategy._price_trend_samples, {})
-        self.assertEqual(strategy._depth_book_ts_init, {})
+        self.assertEqual(strategy._depth_books, {})
 
     def test_price_trend_config_validation_fails_fast(self) -> None:
         config = TargetQuantityStrategyConfig(

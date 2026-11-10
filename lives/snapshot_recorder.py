@@ -60,6 +60,7 @@ from backtests.result_writers.live_records import LiveTradeRecord
 from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
 from lives.order_event_persistence import AsyncOrderEventWriter
 from lives.order_event_persistence import OrderEventWrite
+from strategies.target_quantities import DepthBookSnapshot
 
 
 SyncTaskCallback = Callable[[str, int, dict[str, Any]], None]
@@ -2247,35 +2248,23 @@ class SnapshotRecorder(Actor):
         quote_snapshot = getattr(self._strategy, "_quote_snapshot", None)
         if callable(quote_snapshot):
             try:
-                best_bid, best_ask = quote_snapshot(resolved_instrument)
+                snapshot = quote_snapshot(resolved_instrument)
             except Exception:
                 return None
-            return self._book_snapshot_payload(
-                (
-                    best_bid,
-                    best_ask,
-                    [(best_bid, 0.0)] if best_bid is not None else [],
-                    [(best_ask, 0.0)] if best_ask is not None else [],
-                ),
-            )
+            return self._book_snapshot_payload(snapshot)
         return None
 
     @classmethod
-    def _book_snapshot_payload(cls, snapshot: Any) -> dict[str, Any] | None:
-        if snapshot is None:
+    def _book_snapshot_payload(
+        cls,
+        snapshot: DepthBookSnapshot | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(snapshot, DepthBookSnapshot):
             return None
-        if isinstance(snapshot, tuple) and len(snapshot) == 2:
-            bids, asks = snapshot
-            best_bid = bids[0][0] if bids else None
-            best_ask = asks[0][0] if asks else None
-        elif isinstance(snapshot, tuple) and len(snapshot) == 4:
-            best_bid, best_ask, bids, asks = snapshot
-        else:
-            return None
-        bid_levels = cls._book_side_payload(bids)
-        ask_levels = cls._book_side_payload(asks)
-        best_bid_value = cls._float_or_none(best_bid)
-        best_ask_value = cls._float_or_none(best_ask)
+        bid_levels = cls._book_side_payload(snapshot.bids)
+        ask_levels = cls._book_side_payload(snapshot.asks)
+        best_bid_value = cls._float_or_none(snapshot.best_bid)
+        best_ask_value = cls._float_or_none(snapshot.best_ask)
         if (
             best_bid_value is None
             and best_ask_value is None
@@ -2286,6 +2275,8 @@ class SnapshotRecorder(Actor):
         return {
             "best_bid": best_bid_value,
             "best_ask": best_ask_value,
+            "ts_event": snapshot.ts_event,
+            "ts_init": snapshot.ts_init,
             "bids": bid_levels,
             "asks": ask_levels,
         }

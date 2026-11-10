@@ -28,6 +28,9 @@ class PriceContext:
     cancel_count: int
     best_bid: float | None = None
     best_ask: float | None = None
+    # Source market-data timestamps for the captured bid/ask ladder.
+    ts_event: int | None = None
+    ts_init: int | None = None
     # (price, size) levels, best-first. May be empty (e.g. backtest with no book).
     bids: list[tuple[float, float]] = field(default_factory=list)
     asks: list[tuple[float, float]] = field(default_factory=list)

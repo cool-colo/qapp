@@ -68,6 +68,23 @@ _OPEN_INT_TO_MARKET_STATUS: dict[int, MarketStatusAction] = {
 }
 
 _DEPTH_EVENT_PROBE_CUTOFF = pd.Timestamp("09:35").time()
+_A_SHARE_SHARES_PER_LOT = 100.0
+
+
+@dataclass(frozen=True)
+class DepthBookSnapshot:
+    bids: tuple[tuple[float, float], ...]
+    asks: tuple[tuple[float, float], ...]
+    ts_event: int
+    ts_init: int
+
+    @property
+    def best_bid(self) -> float | None:
+        return self.bids[0][0] if self.bids else None
+
+    @property
+    def best_ask(self) -> float | None:
+        return self.asks[0][0] if self.asks else None
 
 
 @dataclass(frozen=True)
@@ -140,6 +157,8 @@ class IntentContext:
             "cancel_count": ctx.cancel_count,
             "best_bid": ctx.best_bid,
             "best_ask": ctx.best_ask,
+            "ts_event": ctx.ts_event,
+            "ts_init": ctx.ts_init,
             "bids": ctx.bids,
             "asks": ctx.asks,
             "price_return_bps": ctx.price_return_bps,
@@ -414,8 +433,7 @@ class TargetQuantityStrategy(Strategy):
         # has fired (reset per day in _roll_trading_day). Lets the earliest
         # order-book depth callback submit orders as early as possible.
         self._depth_converged_today = False
-        self._depth_books: dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]] = {}
-        self._depth_book_ts_init: dict[str, int] = {}
+        self._depth_books: dict[str, DepthBookSnapshot] = {}
         # Before 09:35, trace every ts_event change for one data-bearing depth
         # subscription. This is independent of the general random sample so the
         # pre-open event-time progression can be reconstructed from logs.
@@ -1527,7 +1545,6 @@ class TargetQuantityStrategy(Strategy):
         self._market_status = {}
         self._whole_market_status = {}
         self._depth_books = {}
-        self._depth_book_ts_init = {}
         self._price_trend_samples = {}
         self._depth_converged_today = False
         self._cancel_count_buy = {}
@@ -1600,14 +1617,13 @@ class TargetQuantityStrategy(Strategy):
         now_ns: int,
     ) -> float | None:
         book = self._depth_books.get(instrument_id)
-        ts_init = self._depth_book_ts_init.get(instrument_id)
-        if book is None or ts_init is None:
+        if book is None:
             return None
         max_age_ns = int(float(self.config.price_trend_book_max_age_secs) * 1_000_000_000)
-        age_ns = now_ns - ts_init
+        age_ns = now_ns - book.ts_init
         if age_ns < 0 or age_ns > max_age_ns:
             return None
-        bids, asks = book
+        bids, asks = book.bids, book.asks
         if not bids or not asks or bids[0][0] >= asks[0][0]:
             return None
         bid_pressure = sum(
@@ -1723,8 +1739,12 @@ class TargetQuantityStrategy(Strategy):
         # it must never feed _today_open / _last_close. Today's open comes from
         # real bars or the QMT full-tick snapshot.
         self._roll_trading_day(trading_date)
-        self._depth_books[str(depth.instrument_id)] = (bids, asks)
-        self._depth_book_ts_init[str(depth.instrument_id)] = int(depth.ts_init)
+        self._depth_books[str(depth.instrument_id)] = DepthBookSnapshot(
+            bids=tuple(bids),
+            asks=tuple(asks),
+            ts_event=int(depth.ts_event),
+            ts_init=int(depth.ts_init),
+        )
         self._log_depth_event_probe(depth, depth_ts_event)
         # On the first depth callback of each trading day, converge immediately so
         # orders are submitted as early as possible (priced against real depth)
@@ -3097,7 +3117,13 @@ class TargetQuantityStrategy(Strategy):
     ) -> PriceContext:
         instrument_id_text = str(instrument_id)
         tick = float(instrument.price_increment)
-        best_bid, best_ask, bids, asks = self._book_snapshot(instrument_id)
+        book = self._book_snapshot(instrument_id)
+        # QMT/BigQMT stock depth reports level volume in hands (手), while target
+        # and order quantities are shares. Keep the captured book raw for market
+        # diagnostics, but normalize the pricing context before walk-book compares
+        # resting liquidity with the requested order quantity.
+        bids = self._book_lots_to_shares(book.bids)
+        asks = self._book_lots_to_shares(book.asks)
         if side == OrderSide.BUY:
             cancel_count = self._cancel_count_buy.get(instrument_id_text, 0)
         else:
@@ -3111,8 +3137,10 @@ class TargetQuantityStrategy(Strategy):
             tick=tick,
             quantity=Decimal(str(quantity)) if quantity is not None else Decimal("0"),
             cancel_count=cancel_count,
-            best_bid=best_bid,
-            best_ask=best_ask,
+            best_bid=book.best_bid,
+            best_ask=book.best_ask,
+            ts_event=book.ts_event,
+            ts_init=book.ts_init,
             bids=bids,
             asks=asks,
             price_return_bps=trend.price_return_bps,
@@ -3129,7 +3157,7 @@ class TargetQuantityStrategy(Strategy):
     def _quote_snapshot(
         self,
         instrument_id: InstrumentId,
-    ) -> tuple[float | None, float | None]:
+    ) -> DepthBookSnapshot:
         best_bid: float | None = None
         best_ask: float | None = None
         try:
@@ -3137,7 +3165,7 @@ class TargetQuantityStrategy(Strategy):
         except Exception:
             quote = None
         if quote is None:
-            return best_bid, best_ask
+            return DepthBookSnapshot(bids=(), asks=(), ts_event=0, ts_init=0)
         try:
             bid_price = float(quote.bid_price)
             if bid_price > 0:
@@ -3150,25 +3178,35 @@ class TargetQuantityStrategy(Strategy):
                 best_ask = ask_price
         except Exception:
             pass
-        return best_bid, best_ask
+        return DepthBookSnapshot(
+            bids=((best_bid, 0.0),) if best_bid is not None else (),
+            asks=((best_ask, 0.0),) if best_ask is not None else (),
+            ts_event=int(quote.ts_event),
+            ts_init=int(quote.ts_init),
+        )
 
     def _book_snapshot(
         self,
         instrument_id: InstrumentId,
-    ) -> tuple[float | None, float | None, list[tuple[float, float]], list[tuple[float, float]]]:
+    ) -> DepthBookSnapshot:
         """
         Read the latest depth event captured by on_order_book_depth. This avoids
         reaching through adapter internals while still letting the price strategy
         use live depth when the strategy subscribed to it.
         """
-        bids, asks = self._depth_books.get(str(instrument_id), ([], []))
-        best_bid = bids[0][0] if bids else None
-        best_ask = asks[0][0] if asks else None
-        if best_bid is None and best_ask is None:
-            best_bid, best_ask = self._quote_snapshot(instrument_id)
-            bids = [(best_bid, 0.0)] if best_bid is not None else []
-            asks = [(best_ask, 0.0)] if best_ask is not None else []
-        return best_bid, best_ask, bids, asks
+        snapshot = self._depth_books.get(str(instrument_id))
+        if snapshot is not None:
+            return snapshot
+        return self._quote_snapshot(instrument_id)
+
+    @staticmethod
+    def _book_lots_to_shares(
+        levels: Sequence[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        return [
+            (price, size * _A_SHARE_SHARES_PER_LOT)
+            for price, size in levels
+        ]
 
     @staticmethod
     def _ladder_levels(levels: Any) -> list[tuple[float, float]]:
