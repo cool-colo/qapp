@@ -247,9 +247,9 @@ def parse_args() -> argparse.Namespace:
         "--refresh-time",
         default=env("MODEL_LIVE_REFRESH_TIME", "09:10"),
         help=(
-            "Daily reference-data refresh time as HH:MM in --exchange-timezone (default "
-            "09:10 Beijing). Fires once per day. Set empty to disable and fall back to "
-            "--refresh-interval-secs."
+            "Main daily reference-data refresh time as HH:MM in --exchange-timezone "
+            "(default 09:10 Beijing), in addition to the fixed 07:00 refresh. Set empty "
+            "to disable the main refresh and fall back to --refresh-interval-secs."
         ),
     )
     parser.add_argument(

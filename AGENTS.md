@@ -125,7 +125,7 @@ files (see Code Style below).
     BigQMT: env pre-parse, daily log-file naming, snapshot args).
   - `live_bigqmt_target_model_predictions.py` — Big QMT (Redis RPC bridge) entrypoint.
   - `_target_model_node.py` — **shared node builder** `build_target_model_node()`:
-    `LiveTargetModelPredictionsStrategy` (adds the daily 09:10 reference-data refresh,
+    `LiveTargetModelPredictionsStrategy` (adds daily 07:00 and 09:10 reference-data refreshes,
     execution reconciliation, DingTalk event reporting) + `TradingNode` wiring +
     `SnapshotRecorder` + Prometheus exporter + status server. `VenueClients` dataclass
     carries venue client configs/factories.
@@ -210,7 +210,7 @@ files (see Code Style below).
 ### Live node
 
 `build_target_model_node()` builds a single `TradingNode` containing:
-the strategy (`LiveTargetModelPredictionsStrategy` — daily refresh timer at 09:10
+the strategy (`LiveTargetModelPredictionsStrategy` — daily refresh timers at 07:00 and 09:10
 Asia/Shanghai that reloads signals/universe from ClickHouse and re-subscribes bars),
 a `SnapshotRecorder` actor (before/after-trading MySQL snapshots + live target-plan
 persistence), a `PrometheusExporter` actor (if `--metrics-port > 0`), and an external

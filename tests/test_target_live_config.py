@@ -483,8 +483,6 @@ class TargetLiveConfigTest(unittest.TestCase):
         reporter = MagicMock()
         strategy._event_reporter = SimpleNamespace(report=reporter)
         strategy._REFRESH_ALERT = LiveTargetModelPredictionsStrategy._REFRESH_ALERT
-        strategy._refresh_time = (9, 0)
-        strategy._schedule_daily_refresh = MagicMock()
         strategy._active_stock_codes = MagicMock(return_value=set())
         strategy._clock_date = MagicMock(return_value=date(2026, 7, 8))
         strategy._refresh_context = MagicMock(side_effect=RuntimeError("refresh unavailable"))
@@ -499,13 +497,54 @@ class TargetLiveConfigTest(unittest.TestCase):
             details,
         )
 
-        LiveTargetModelPredictionsStrategy._on_refresh_timer(strategy, None)
+        LiveTargetModelPredictionsStrategy._refresh_target_model_data(
+            strategy,
+            event_name=LiveTargetModelPredictionsStrategy._REFRESH_ALERT,
+            configured_time=(9, 0),
+        )
 
-        strategy._schedule_daily_refresh.assert_called_once_with()
         event_name, status, details = reporter.call_args.args
         self.assertEqual(event_name, LiveTargetModelPredictionsStrategy._REFRESH_ALERT)
         self.assertEqual(status, "failed")
         self.assertEqual(details["error"], "refresh unavailable")
+
+    def test_live_early_refresh_reschedules_and_loads_data(self) -> None:
+        strategy = SimpleNamespace()
+        strategy._EARLY_REFRESH_ALERT = LiveTargetModelPredictionsStrategy._EARLY_REFRESH_ALERT
+        strategy._EARLY_REFRESH_TIME = LiveTargetModelPredictionsStrategy._EARLY_REFRESH_TIME
+        strategy._schedule_early_refresh = MagicMock()
+        strategy._refresh_target_model_data = MagicMock()
+
+        LiveTargetModelPredictionsStrategy._on_early_refresh_timer(strategy, None)
+
+        strategy._schedule_early_refresh.assert_called_once_with()
+        strategy._refresh_target_model_data.assert_called_once_with(
+            event_name=LiveTargetModelPredictionsStrategy._EARLY_REFRESH_ALERT,
+            configured_time=(7, 0),
+        )
+
+    def test_live_early_refresh_is_scheduled_for_seven(self) -> None:
+        alert_time = pd.Timestamp("2026-07-09 07:00", tz="Asia/Shanghai")
+        callback = MagicMock()
+        strategy = SimpleNamespace(
+            _EARLY_REFRESH_ALERT=LiveTargetModelPredictionsStrategy._EARLY_REFRESH_ALERT,
+            _EARLY_REFRESH_TIME=LiveTargetModelPredictionsStrategy._EARLY_REFRESH_TIME,
+            _next_refresh_time=MagicMock(return_value=alert_time),
+            _on_early_refresh_timer=callback,
+            clock=MagicMock(),
+            log=MagicMock(),
+            config=SimpleNamespace(timezone_name="Asia/Shanghai"),
+        )
+
+        LiveTargetModelPredictionsStrategy._schedule_early_refresh(strategy)
+
+        strategy._next_refresh_time.assert_called_once_with((7, 0))
+        strategy.clock.set_time_alert.assert_called_once_with(
+            name=LiveTargetModelPredictionsStrategy._EARLY_REFRESH_ALERT,
+            alert_time=alert_time,
+            callback=callback,
+            override=True,
+        )
 
     def test_live_full_tick_prefetch_reports_completion(self) -> None:
         strategy = LiveTargetModelPredictionsStrategy.__new__(LiveTargetModelPredictionsStrategy)

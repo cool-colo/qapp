@@ -51,6 +51,8 @@ class VenueClients:
 
 class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
     _REFRESH_ALERT = "TARGET-MODEL-DATA-REFRESH"
+    _EARLY_REFRESH_ALERT = "TARGET-MODEL-DATA-EARLY-REFRESH"
+    _EARLY_REFRESH_TIME = (7, 0)
 
     def __init__(
         self,
@@ -80,10 +82,10 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         hh, mm = str(value).strip().split(":")
         return int(hh), int(mm)
 
-    def _next_refresh_time(self) -> pd.Timestamp:
+    def _next_refresh_time(self, refresh_time: tuple[int, int] | None = None) -> pd.Timestamp:
         tz = self.config.timezone_name
         now = pd.Timestamp(self.clock.utc_now()).tz_convert(tz)
-        hh, mm = self._refresh_time
+        hh, mm = self._refresh_time if refresh_time is None else refresh_time
         target = now.normalize() + pd.Timedelta(hours=hh, minutes=mm)
         if target <= now:
             target = target + pd.Timedelta(days=1)
@@ -92,6 +94,7 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
     def on_start(self) -> None:
         super().on_start()
         self._execution_reconciliation.request_after_strategy_start()
+        self._schedule_early_refresh()
         if self._refresh_time is not None:
             self._schedule_daily_refresh()
         elif self._refresh_interval_secs > 0:
@@ -101,6 +104,20 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
                 callback=self._on_refresh_timer,
                 fire_immediately=False,
             )
+
+    def _schedule_early_refresh(self) -> None:
+        alert_time = self._next_refresh_time(self._EARLY_REFRESH_TIME)
+        self.clock.set_time_alert(
+            name=self._EARLY_REFRESH_ALERT,
+            alert_time=alert_time,
+            callback=self._on_early_refresh_timer,
+            override=True,
+        )
+        self.log.info(
+            f"Next early target-model refresh scheduled for {alert_time.isoformat()} "
+            f"({self.config.timezone_name})",
+            color=LogColor.BLUE,
+        )
 
     def _schedule_daily_refresh(self) -> None:
         alert_time = self._next_refresh_time()
@@ -117,10 +134,26 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         )
 
     def _on_refresh_timer(self, _event: Any) -> None:
-        started = time.monotonic()
-        fixed_time_event = self._refresh_time is not None
         if self._refresh_time is not None:
             self._schedule_daily_refresh()
+        self._refresh_target_model_data(
+            event_name=self._REFRESH_ALERT,
+            configured_time=self._refresh_time,
+        )
+
+    def _on_early_refresh_timer(self, _event: Any) -> None:
+        self._schedule_early_refresh()
+        self._refresh_target_model_data(
+            event_name=self._EARLY_REFRESH_ALERT,
+            configured_time=self._EARLY_REFRESH_TIME,
+        )
+
+    def _refresh_target_model_data(
+        self,
+        event_name: str,
+        configured_time: tuple[int, int] | None,
+    ) -> None:
+        started = time.monotonic()
         status = "success"
         details: dict[str, Any] = {}
         try:
@@ -159,16 +192,14 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
             details["error"] = str(exc)
             self.log.warning(f"Target-model data refresh failed, keeping previous data: {exc}")
         self._execution_reconciliation.request_after_target_refresh()
-        if fixed_time_event:
+        if configured_time is not None:
             try:
                 details["trading_date"] = self._clock_date()
-                details["configured_time"] = (
-                    f"{self._refresh_time[0]:02d}:{self._refresh_time[1]:02d}"
-                )
+                details["configured_time"] = f"{configured_time[0]:02d}:{configured_time[1]:02d}"
                 details["duration_ms"] = (time.monotonic() - started) * 1000.0
-                self._report_event(self._REFRESH_ALERT, status, details)
+                self._report_event(event_name, status, details)
             except Exception as exc:
-                self.log.warning(f"Could not summarize DingTalk event {self._REFRESH_ALERT}: {exc}")
+                self.log.warning(f"Could not summarize DingTalk event {event_name}: {exc}")
 
     def _on_process_targets_timer(self, _event: Any) -> None:
         if not self._within_trading_window():
