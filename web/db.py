@@ -94,6 +94,18 @@ def quote_literal(value: str) -> str:
     return f"'{escaped}'"
 
 
+def ricequant_order_book_id(stock_code: str) -> str:
+    """Convert the dashboard's Tushare-style stock code to a RiceQuant id."""
+    code = str(stock_code).strip().upper()
+    if not re.fullmatch(r"[0-9]{6}\.(SZ|SH|BJ)", code):
+        raise ValueError(f"unsupported RiceQuant stock code: {stock_code!r}")
+    suffixes = {".SZ": ".XSHE", ".SH": ".XSHG", ".BJ": ".BJSE"}
+    for suffix, rq_suffix in suffixes.items():
+        if code.endswith(suffix):
+            return f"{code[:-len(suffix)]}{rq_suffix}"
+    raise AssertionError(f"unhandled RiceQuant stock code: {stock_code!r}")
+
+
 def ensure_json_each_row(sql: str) -> str:
     stripped = sql.strip().rstrip(";")
     if re.search(r"\bFORMAT\s+JSONEachRow\b", stripped, flags=re.IGNORECASE):
@@ -164,8 +176,10 @@ class ClickHouseClient:
 
         The dashboard uses this bulk path for holdings charts. Eastmoney board
         memberships from ``dwd_dc_index``/``dwd_dc_member`` are split by their real
-        concept, industry, and region types. Current-version filters exclude
-        superseded DWD rows, and availability dates prevent historical look-ahead.
+        concept, industry, and region types. RiceQuant snapshots add concepts,
+        sectors, and non-Shenwan industry classifications. Current-version filters
+        exclude superseded DWD rows, and availability dates prevent historical
+        look-ahead.
         """
         requested = sorted({str(code) for code in codes if code})
         if not requested:
@@ -176,7 +190,13 @@ class ClickHouseClient:
         if cached and cached[0] > now:
             return cached[1]
         code_literals = ", ".join(quote_literal(code) for code in requested)
-        requested_array = f"[{code_literals}]"
+        requested_items = ", ".join(
+            f"tuple({quote_literal(code)}, {quote_literal(ricequant_order_book_id(code))})"
+            for code in requested
+        )
+        rq_literals = ", ".join(
+            quote_literal(ricequant_order_book_id(code)) for code in requested
+        )
         day = quote_literal(as_of)
         current = "toDateTime64('2299-12-31 00:00:00.000', 3)"
         sql = f"""
@@ -188,9 +208,19 @@ SELECT
     concepts.dc_concepts,
     boards.dc_member_concepts,
     boards.dc_member_industries,
-    boards.dc_member_regions
+    boards.dc_member_regions,
+    rq_concepts.rq_concepts,
+    rq_industries.rq_industry_l1,
+    rq_industries.rq_industry_l2,
+    rq_industries.rq_industry_l3,
+    rq_sectors.rq_sectors
 FROM (
-    SELECT arrayJoin({requested_array}) AS stock_code
+    SELECT
+        tupleElement(requested_item, 1) AS stock_code,
+        tupleElement(requested_item, 2) AS rq_order_book_id
+    FROM (
+        SELECT arrayJoin([{requested_items}]) AS requested_item
+    )
 ) AS requested
 LEFT JOIN (
     SELECT
@@ -259,6 +289,69 @@ LEFT JOIN (
       )
     GROUP BY member.con_code
 ) AS boards ON boards.con_code = requested.stock_code
+LEFT JOIN (
+    SELECT
+        order_book_id,
+        arraySort(groupUniqArray(concept_name)) AS rq_concepts
+    FROM (
+        SELECT
+            order_book_id,
+            concept_name,
+            dense_rank() OVER (
+                PARTITION BY order_book_id
+                ORDER BY snapshot_date DESC, observed_at DESC
+            ) AS version_rank
+        FROM ricequant_concept_snapshot
+        WHERE order_book_id IN ({rq_literals})
+          AND snapshot_date <= toDate({day})
+          AND observation_date <= toDate({day})
+    )
+    WHERE version_rank = 1
+    GROUP BY order_book_id
+) AS rq_concepts ON rq_concepts.order_book_id = requested.rq_order_book_id
+LEFT JOIN (
+    SELECT
+        order_book_id,
+        arraySort(groupUniqArrayIf(industry_name, industry_level = 1)) AS rq_industry_l1,
+        arraySort(groupUniqArrayIf(industry_name, industry_level = 2)) AS rq_industry_l2,
+        arraySort(groupUniqArrayIf(industry_name, industry_level = 3)) AS rq_industry_l3
+    FROM (
+        SELECT
+            order_book_id,
+            industry_level,
+            industry_name,
+            dense_rank() OVER (
+                PARTITION BY order_book_id, source_name
+                ORDER BY snapshot_date DESC, observed_at DESC
+            ) AS version_rank
+        FROM ricequant_industry_snapshot
+        WHERE order_book_id IN ({rq_literals})
+          AND lower(source_name) != 'shenwan'
+          AND snapshot_date <= toDate({day})
+          AND observation_date <= toDate({day})
+    )
+    WHERE version_rank = 1
+    GROUP BY order_book_id
+) AS rq_industries ON rq_industries.order_book_id = requested.rq_order_book_id
+LEFT JOIN (
+    SELECT
+        order_book_id,
+        arraySort(groupUniqArray(sector_name)) AS rq_sectors
+    FROM (
+        SELECT
+            order_book_id,
+            sector_name,
+            dense_rank() OVER (
+                PARTITION BY order_book_id
+                ORDER BY observed_at DESC
+            ) AS version_rank
+        FROM ricequant_sector_snapshot
+        WHERE order_book_id IN ({rq_literals})
+          AND observation_date <= toDate({day})
+    )
+    WHERE version_rank = 1
+    GROUP BY order_book_id
+) AS rq_sectors ON rq_sectors.order_book_id = requested.rq_order_book_id
 SETTINGS join_use_nulls = 1
 """
         rows = self.query(sql)
@@ -273,6 +366,11 @@ SETTINGS join_use_nulls = 1
                 "dc_member_concepts": row.get("dc_member_concepts") or [],
                 "dc_member_industries": row.get("dc_member_industries") or [],
                 "dc_member_regions": row.get("dc_member_regions") or [],
+                "rq_concepts": row.get("rq_concepts") or [],
+                "rq_industry_l1": row.get("rq_industry_l1") or [],
+                "rq_industry_l2": row.get("rq_industry_l2") or [],
+                "rq_industry_l3": row.get("rq_industry_l3") or [],
+                "rq_sectors": row.get("rq_sectors") or [],
             }
         # Realtime holdings can refresh every 15 seconds while classifications are
         # daily data. A short bounded cache avoids repeatedly scanning the DWD tables
@@ -322,8 +420,8 @@ ORDER BY {ts} ASC{limit_clause}
         The wide table retains Tushare units: market caps in 万元, amount in 千元,
         volume in 手, and rates in percent. Expose CNY, shares and fractional rates
         to the frontend. Industry and concept memberships come from the curated DWD
-        tables and only use records available by ``as_of``. Missing/non-finite metrics
-        remain NULL, never zero.
+        tables and RiceQuant snapshots, and only use records available by ``as_of``.
+        Missing/non-finite metrics remain NULL, never zero.
         """
         metrics = [
             ("close", "close"),
@@ -347,6 +445,7 @@ ORDER BY {ts} ASC{limit_clause}
             for expression, alias in metrics
         )
         metric_names = ", ".join(f"daily.{alias}" for _, alias in metrics)
+        rq_order_book_id = ricequant_order_book_id(stock_code)
         return f"""
 SELECT
     basic.name AS stock_name, basic.industry, basic.area, basic.market,
@@ -356,7 +455,12 @@ SELECT
     sw.l2_name AS sw_industry_l2,
     sw.l3_name AS sw_industry_l3,
     concepts.dc_concepts,
-    boards.dc_boards
+    boards.dc_boards,
+    rq_concepts.rq_concepts,
+    rq_industries.rq_industry_l1,
+    rq_industries.rq_industry_l2,
+    rq_industries.rq_industry_l3,
+    rq_sectors.rq_sectors
 FROM (
     SELECT name, industry, area, market, list_date
     FROM stock_basic
@@ -419,6 +523,54 @@ LEFT JOIN (
             AND sys_to = toDateTime64('2299-12-31 00:00:00.000', 3)
 )
 ) AS boards ON 1 = 1
+LEFT JOIN (
+    SELECT arraySort(groupUniqArray(concept_name)) AS rq_concepts
+    FROM (
+        SELECT
+            concept_name,
+            dense_rank() OVER (
+                ORDER BY snapshot_date DESC, observed_at DESC
+            ) AS version_rank
+        FROM ricequant_concept_snapshot
+        WHERE order_book_id = {quote_literal(rq_order_book_id)}
+          AND snapshot_date <= toDate({quote_literal(as_of)})
+          AND observation_date <= toDate({quote_literal(as_of)})
+    )
+    WHERE version_rank = 1
+) AS rq_concepts ON 1 = 1
+LEFT JOIN (
+    SELECT
+        arraySort(groupUniqArrayIf(industry_name, industry_level = 1)) AS rq_industry_l1,
+        arraySort(groupUniqArrayIf(industry_name, industry_level = 2)) AS rq_industry_l2,
+        arraySort(groupUniqArrayIf(industry_name, industry_level = 3)) AS rq_industry_l3
+    FROM (
+        SELECT
+            industry_level,
+            industry_name,
+            dense_rank() OVER (
+                PARTITION BY source_name
+                ORDER BY snapshot_date DESC, observed_at DESC
+            ) AS version_rank
+        FROM ricequant_industry_snapshot
+        WHERE order_book_id = {quote_literal(rq_order_book_id)}
+          AND lower(source_name) != 'shenwan'
+          AND snapshot_date <= toDate({quote_literal(as_of)})
+          AND observation_date <= toDate({quote_literal(as_of)})
+    )
+    WHERE version_rank = 1
+) AS rq_industries ON 1 = 1
+LEFT JOIN (
+    SELECT arraySort(groupUniqArray(sector_name)) AS rq_sectors
+    FROM (
+        SELECT
+            sector_name,
+            dense_rank() OVER (ORDER BY observed_at DESC) AS version_rank
+        FROM ricequant_sector_snapshot
+        WHERE order_book_id = {quote_literal(rq_order_book_id)}
+          AND observation_date <= toDate({quote_literal(as_of)})
+    )
+    WHERE version_rank = 1
+) AS rq_sectors ON 1 = 1
 SETTINGS join_use_nulls = 1
 """
 

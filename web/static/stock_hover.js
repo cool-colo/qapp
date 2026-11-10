@@ -92,11 +92,16 @@
     const sign = typeof change === "number" ? (change > 0 ? "pos" : change < 0 ? "neg" : "zero") : "";
     const details = [info.industry, info.area, info.market].filter(Boolean).map(escape).join(" · ");
     const classifications = [
-      ["申万一级", escape(info.sw_industry_l1 || "—")],
-      ["申万二级", escape(info.sw_industry_l2 || "—")],
-      ["申万三级", escape(info.sw_industry_l3 || "—")],
-      ["东财概念", tags(info.dc_concepts)],
-      ["东财板块", tags(info.dc_boards)],
+      ["申万一级", escape(info.sw_industry_l1 || "—"), false],
+      ["申万二级", escape(info.sw_industry_l2 || "—"), false],
+      ["申万三级", escape(info.sw_industry_l3 || "—"), false],
+      ["米筐一级分类", tags(info.rq_industry_l1), false],
+      ["米筐二级分类", tags(info.rq_industry_l2), false],
+      ["米筐三级分类", tags(info.rq_industry_l3), false],
+      ["米筐概念", tags(info.rq_concepts), true],
+      ["米筐板块", tags(info.rq_sectors), true],
+      ["东财概念", tags(info.dc_concepts), true],
+      ["东财板块", tags(info.dc_boards), true],
     ];
     panel.innerHTML = heading(info.stock_name || name, info.stock_code)
       + `<div class="stock-hover-meta">${details || "—"}</div>`
@@ -104,7 +109,7 @@
         ? `<div class="stock-hover-quote"><strong class="${sign}">${number(info.close)}</strong><span class="${sign}">${rate(change)}</span><span>收盘 / 涨跌幅</span></div>`
           + `<dl class="stock-hover-metrics">${fields.map(([label, value]) => `<div><dt>${label}</dt><dd>${value}</dd></div>`).join("")}</dl>`
         : `<div class="stock-hover-message">暂无截至 ${escape(info.as_of)} 的日线数据</div>`)
-      + `<dl class="stock-hover-classifications">${classifications.map(([label, value]) => `<div><dt>${label}</dt><dd>${value}</dd></div>`).join("")}</dl>`
+      + `<dl class="stock-hover-classifications">${classifications.map(([label, value, wide]) => `<div${wide ? ' class="wide"' : ""}><dt>${label}</dt><dd>${value}</dd></div>`).join("")}</dl>`
       + `<div class="stock-hover-footer">上市日期：${escape(info.listed_date ? String(info.listed_date).slice(0, 10) : "—")}<br>`
       + `日线数据：${escape(info.trade_date ? String(info.trade_date).slice(0, 10) : "—")}</div>`;
     position();

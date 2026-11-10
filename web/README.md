@@ -30,8 +30,9 @@ and stays pinned to the left edge while a wide table scrolls sideways.
 
 Hover over a **stock name for 300 ms** to open its information panel: 总市值、
 流通市值、换手率、自由流通换手率、市盈率 TTM、市净率、量比、成交额、成交量、
-OHLC prices, SW level 1/2/3 industries, Eastmoney concepts and board
-memberships, market and listing date. It reads daily metrics from ClickHouse
+OHLC prices, SW level 1/2/3 industries, RiceQuant concepts, non-SW industry
+classifications and sectors, Eastmoney concepts and board memberships, market and
+listing date. It reads daily metrics from ClickHouse
 `dws_stock_factor_wide`, basic details from `stock_basic`, and classifications from
 the corresponding curated `dwd_*` tables. Historical rows only use daily and
 classification records available by the row/snapshot date; live tables use the
@@ -46,9 +47,10 @@ they can be added and edited in place, while deletion requires the configured
 Stock-name clicks still open 信号 R 线.
 
 Both **实时信息 → 持仓** and **按日快照 → 持仓** include market-value
-classification charts below the holdings table: one pie for each SW industry level,
-plus full-width descending histograms for Eastmoney concepts and the concept,
-industry, and region board memberships sourced from `dwd_dc_index`/`dwd_dc_member`.
+classification charts below the holdings table: one pie for each SW industry level;
+RiceQuant non-SW industry and sector pies plus a concept histogram; and full-width
+descending histograms for Eastmoney concepts and the concept, industry, and region
+board memberships sourced from `dwd_dc_index`/`dwd_dc_member`.
 Pie charts show every category above 3% of total held market value and roll the rest
 into “其他”. Histograms show every exposure above 5% and omit the remainder without
 an “其他” bar. Every bar shows its percentage of total held market value, and the
