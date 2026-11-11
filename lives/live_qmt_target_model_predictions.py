@@ -228,6 +228,33 @@ def _add_snapshot_recorder(
         fetch_open_prices=fetch_open_prices,
         event_reporter=event_reporter.report if event_reporter is not None else None,
     )
+    strategy.configure_preopen_latency_persister(
+        recorder.persist_preopen_latency_sample,
+    )
+    try:
+        probe_date = pd.Timestamp.now(tz=args.exchange_timezone).date()
+        saved_probe = writer.load_preopen_latency_probe(
+            str(args.account_id),
+            str(args.trader_id),
+            probe_date,
+        )
+        if saved_probe is not None:
+            strategy.restore_preopen_latency_sample(
+                trade_date=saved_probe.trade_date,
+                source=saved_probe.source,
+                instrument_id=saved_probe.instrument_id,
+                ts_event_ns=saved_probe.ts_event_ns,
+                ts_init_ns=saved_probe.ts_init_ns,
+                observed_ns=saved_probe.observed_ns,
+                event_to_init_ms=saved_probe.event_to_init_ms,
+                init_to_observed_ms=saved_probe.init_to_observed_ms,
+            )
+    except Exception as exc:  # noqa: BLE001 - same-day restore is best-effort
+        _emit_snapshot_status(
+            node,
+            f"[snapshot] pre-open latency restore skipped: {exc}",
+            is_warning=True,
+        )
     strategy.configure_live_target_plan_persister(recorder.persist_strategy_target_plan)
     node.trader.add_actor(recorder)
     _emit_snapshot_status(

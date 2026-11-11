@@ -119,6 +119,24 @@ class LiveWholeMarketSnapshotSummary:
 
 
 @dataclass(frozen=True)
+class LivePreopenLatencyProbeRecord:
+    trade_date: date
+    account_id: str
+    trader_id: str
+    source: str
+    instrument_id: str
+    ts_event_ns: int
+    ts_init_ns: int
+    observed_ns: int
+    event_to_init_ms: int
+    init_to_observed_ms: int
+    applied_advance_ms: int
+    fixed_advance_ms: int
+    scheduled_time: datetime
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class LiveTargetRecord:
     trade_date: date
     write_time: datetime

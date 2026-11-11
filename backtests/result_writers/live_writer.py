@@ -16,6 +16,7 @@ from backtests.result_writers.live_records import LiveAssetSnapshotRecord
 from backtests.result_writers.live_records import LiveOrderEventRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
+from backtests.result_writers.live_records import LivePreopenLatencyProbeRecord
 from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveTradeRecord
@@ -187,6 +188,27 @@ CREATE TABLE IF NOT EXISTS `live_stock_tick_snapshot` (
   `schema_version`        INT           NOT NULL DEFAULT 1,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_stock_tick` (`trade_date`,`snapshot_type`,`instrument_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `live_preopen_latency_probe` (
+  `id`                    BIGINT       NOT NULL AUTO_INCREMENT,
+  `trade_date`            DATE         NOT NULL,
+  `account_id`            VARCHAR(64)  NOT NULL,
+  `trader_id`             VARCHAR(64)  NOT NULL,
+  `source`                VARCHAR(32)  NOT NULL,
+  `instrument_id`         VARCHAR(32)  NOT NULL,
+  `ts_event_ns`           BIGINT       NOT NULL,
+  `ts_init_ns`            BIGINT       NOT NULL,
+  `observed_ns`           BIGINT       NOT NULL,
+  `event_to_init_ms`      BIGINT       NOT NULL,
+  `init_to_observed_ms`   BIGINT       NOT NULL,
+  `applied_advance_ms`    BIGINT       NOT NULL,
+  `fixed_advance_ms`      BIGINT       NOT NULL DEFAULT 0,
+  `scheduled_time`        DATETIME(6)  NOT NULL,
+  `created_at`            DATETIME(6)  NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_preopen_latency_probe` (`account_id`,`trader_id`,`trade_date`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
@@ -553,6 +575,7 @@ class LiveSnapshotWriter:
         self._ensure_trade_columns()
         self._ensure_trade_indexes()
         self._ensure_stock_tick_columns()
+        self._ensure_preopen_latency_columns()
         self._ensure_target_indexes()
 
     def create_target_table(self) -> None:
@@ -659,6 +682,27 @@ class LiveSnapshotWriter:
             except Exception:
                 # Concurrent add or insufficient privilege — leave as-is.
                 pass
+
+    def _ensure_preopen_latency_columns(self) -> None:
+        """Add latency-audit columns introduced after the probe table."""
+        try:
+            existing = {
+                str(row[0])
+                for row in self._query("SHOW COLUMNS FROM `live_preopen_latency_probe`", ())
+            }
+        except Exception:
+            return
+        if "fixed_advance_ms" in existing:
+            return
+        try:
+            self._execute(
+                "ALTER TABLE `live_preopen_latency_probe` "
+                "ADD COLUMN `fixed_advance_ms` BIGINT NOT NULL DEFAULT 0 "
+                "AFTER `applied_advance_ms`",
+                (),
+            )
+        except Exception:
+            pass
 
     def _ensure_order_columns(self) -> None:
         """
@@ -868,6 +912,33 @@ class LiveSnapshotWriter:
             [self._stock_tick_row(record) for record in records],
             key_columns=("trade_date", "snapshot_type", "instrument_id"),
             preserve_columns=("created_at",),
+        )
+
+    def write_preopen_latency_probe(self, record: LivePreopenLatencyProbeRecord) -> None:
+        """Persist the first probe for an account/day without replacing it."""
+        self._execute(
+            "INSERT IGNORE INTO `live_preopen_latency_probe` "
+            "(`trade_date`,`account_id`,`trader_id`,`source`,`instrument_id`,"
+            "`ts_event_ns`,`ts_init_ns`,`observed_ns`,`event_to_init_ms`,"
+            "`init_to_observed_ms`,`applied_advance_ms`,`fixed_advance_ms`,"
+            "`scheduled_time`,`created_at`) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                record.trade_date,
+                record.account_id,
+                record.trader_id,
+                record.source,
+                record.instrument_id,
+                record.ts_event_ns,
+                record.ts_init_ns,
+                record.observed_ns,
+                record.event_to_init_ms,
+                record.init_to_observed_ms,
+                record.applied_advance_ms,
+                record.fixed_advance_ms,
+                record.scheduled_time,
+                _timestamp(record.created_at),
+            ),
         )
 
     def replace_whole_market_tick_snapshots(
@@ -1227,6 +1298,40 @@ class LiveSnapshotWriter:
             ),
         )
         return self._distinct_codes(prior)
+
+    def load_preopen_latency_probe(
+        self,
+        account_id: str,
+        trader_id: str,
+        trade_date: date,
+    ) -> LivePreopenLatencyProbeRecord | None:
+        rows = self._query(
+            "SELECT `source`,`instrument_id`,`ts_event_ns`,`ts_init_ns`,`observed_ns`,"
+            "`event_to_init_ms`,`init_to_observed_ms`,`applied_advance_ms`,"
+            "`fixed_advance_ms`,"
+            "`scheduled_time`,`created_at` FROM `live_preopen_latency_probe` "
+            "WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s LIMIT 1",
+            (account_id, trader_id, trade_date),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return LivePreopenLatencyProbeRecord(
+            trade_date=trade_date,
+            account_id=account_id,
+            trader_id=trader_id,
+            source=str(row[0]),
+            instrument_id=str(row[1]),
+            ts_event_ns=int(row[2]),
+            ts_init_ns=int(row[3]),
+            observed_ns=int(row[4]),
+            event_to_init_ms=int(row[5]),
+            init_to_observed_ms=int(row[6]),
+            applied_advance_ms=int(row[7]),
+            fixed_advance_ms=int(row[8]),
+            scheduled_time=row[9],
+            created_at=row[10],
+        )
 
     @staticmethod
     def _distinct_codes(rows: Sequence[Any]) -> list[str]:

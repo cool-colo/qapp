@@ -154,7 +154,7 @@ button:disabled:hover { filter: none; }
 .tab-panel.active { display: block; }
 .sub-panel { display: none; margin: 16px 20px; }
 .sub-panel.active { display: block; }
-/* Sub-panels inside the 实时信息 tab (持仓 / 资产) — no extra margin; they sit
+/* Sub-panels inside the 实时信息 tab (持仓 / 资产 / 交易) — no extra margin; they sit
    directly under the tab's subbar like the original single positions panel did. */
 .rt-sub-panel { display: none; }
 .rt-sub-panel.active { display: block; }
@@ -240,6 +240,28 @@ table.kv-asset td { min-width: 140px; }
 .asset-split { display: flex; flex-wrap: wrap; align-items: stretch; gap: 16px; padding: 12px; }
 .asset-split table.kv-asset { flex: 0 0 auto; align-self: flex-start; }
 .asset-pie { flex: 1 1 340px; min-width: 300px; min-height: 280px; }
+
+/* Today's buy/sell turnover relative to the before-trading total asset. */
+.trade-summary-meta { margin: 16px 20px 8px; color: var(--muted); font-size: 12px; }
+.trade-summary-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr));
+  gap: 14px; margin: 0 20px 20px;
+}
+.trade-summary-card {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  padding: 16px;
+}
+.trade-summary-card.buy { border-top: 3px solid var(--up); }
+.trade-summary-card.sell { border-top: 3px solid var(--down); }
+.trade-summary-card.total { border-top: 3px solid var(--accent); }
+.trade-summary-title { color: var(--text); font-size: 15px; font-weight: 700; margin-bottom: 14px; }
+.trade-summary-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.trade-summary-metrics div { display: flex; flex-direction: column; gap: 5px; }
+.trade-summary-metrics span { color: var(--muted); font-size: 12px; }
+.trade-summary-metrics b { color: var(--text); font-size: 18px; }
+@media (max-width: 900px) {
+  .trade-summary-grid { grid-template-columns: 1fr; }
+}
 
 /* Click-to-sort headers + a per-column filter funnel (hover / active). */
 tr.head-row th[role="button"] { cursor: pointer; user-select: none; white-space: nowrap; }

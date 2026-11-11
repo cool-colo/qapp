@@ -25,6 +25,7 @@ from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveOrderRecord
+from backtests.result_writers.live_records import LivePreopenLatencyProbeRecord
 from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
 from backtests.result_writers.live_records import LiveTradeRecord
 from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
@@ -922,6 +923,66 @@ class TargetLiveConfigTest(unittest.TestCase):
 
         self.assertEqual(rows, [(7,)])
         cursor.execute.assert_called_once_with("SELECT 1", ())
+
+    def test_writer_preopen_latency_probe_is_first_write_wins(self) -> None:
+        cursor = MagicMock()
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        writer = LiveSnapshotWriter.for_testing(connection=connection, commit=True)
+        record = LivePreopenLatencyProbeRecord(
+            trade_date=date(2026, 11, 11),
+            account_id="ACC",
+            trader_id="TRADER",
+            source="order_book_depth",
+            instrument_id="688509.SH.BIGQMT",
+            ts_event_ns=1794360300000000000,
+            ts_init_ns=1794360436007021565,
+            observed_ns=1794360436011993274,
+            event_to_init_ms=136007,
+            init_to_observed_ms=4,
+            applied_advance_ms=3000,
+            fixed_advance_ms=50,
+            scheduled_time=datetime(2026, 11, 11, 9, 29, 56, 950000),
+            created_at=datetime(2026, 11, 11, 9, 27, 16),
+        )
+
+        writer.write_preopen_latency_probe(record)
+
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("INSERT IGNORE INTO `live_preopen_latency_probe`", sql)
+        self.assertEqual(params[0:5], (date(2026, 11, 11), "ACC", "TRADER", "order_book_depth", "688509.SH.BIGQMT"))
+
+    def test_writer_loads_same_day_preopen_latency_probe(self) -> None:
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            (
+                "quote_tick",
+                "000001.SZ.BIGQMT",
+                100,
+                200,
+                210,
+                0,
+                0,
+                0,
+                50,
+                datetime(2026, 11, 11, 9, 30),
+                datetime(2026, 11, 11, 9, 25),
+            ),
+        ]
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        writer = LiveSnapshotWriter.for_testing(connection=connection)
+
+        record = writer.load_preopen_latency_probe(
+            "ACC",
+            "TRADER",
+            date(2026, 11, 11),
+        )
+
+        self.assertEqual(record.source, "quote_tick")
+        self.assertEqual(record.trade_date, date(2026, 11, 11))
+        self.assertEqual(record.ts_init_ns, 200)
+        self.assertEqual(record.fixed_advance_ms, 50)
 
     def test_writer_write_target_portfolios_keys_by_snapshot_type(self) -> None:
         writer = object.__new__(LiveSnapshotWriter)

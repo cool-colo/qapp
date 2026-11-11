@@ -11,8 +11,8 @@ Thread-safety: the controller runs on the control-server thread. Setting the pau
 flag is an atomic bool write. ``manual_sell`` serializes its target mutation against
 the trading thread's convergence via the host's convergence lock (acquired blocking
 with a timeout so a manual sell is not silently dropped mid-convergence), releases it
-before forcing convergence (the host re-acquires the same non-reentrant lock), and
-forces convergence so the sell runs even while paused.
+before requesting convergence (the host re-acquires the same non-reentrant lock), and
+uses a manual trigger so the sell runs even while paused.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ from datetime import date
 from decimal import Decimal
 from typing import Protocol
 from typing import runtime_checkable
+
+from strategies.convergence import ConvergenceTrigger
 
 
 @runtime_checkable
@@ -64,8 +66,12 @@ class TradingControlHost(Protocol):
     ) -> None:
         """Push a new target map (does not itself force convergence while paused)."""
 
-    def control_force_converge(self, current_date: date, trigger: str) -> None:
-        """Force one convergence, bypassing the pause flag (re-acquires the lock)."""
+    def control_converge(
+        self,
+        current_date: date,
+        trigger: ConvergenceTrigger,
+    ) -> None:
+        """Run one typed convergence pass (re-acquires the lock)."""
 
     def control_log(self, message: str) -> None:
         """Emit an informational log line through the strategy logger."""
@@ -132,7 +138,7 @@ class TradingController:
         the current targets: doing so left positive targets for names not yet held,
         which convergence then bought. Sell-all must leave the book flat.
 
-        Then pushes the new target and forces convergence — bypassing the manual-pause
+        Then pushes the new target and requests manual convergence — bypassing the manual-pause
         flag for this one action without clearing it. There is no restore: the next
         daily/hourly target refresh repopulates targets.
 
@@ -184,7 +190,7 @@ class TradingController:
 
             current_date = self._host.control_clock_date()
         finally:
-            # Release before applying targets / forcing convergence — the host
+            # Release before applying targets / requesting convergence — the host
             # re-acquires this same non-reentrant lock in both.
             lock.release()
 
@@ -194,9 +200,14 @@ class TradingController:
                 target_date=current_date,
                 reason=reason,
             )
-            # apply_targets' own convergence early-returns while paused; force it here
-            # so the sell runs regardless of the pause flag.
-            self._host.control_force_converge(current_date=current_date, trigger=reason)
+            # apply_targets' own convergence early-returns while paused. The manual
+            # trigger type carries the explicit pause-bypass and blocking-lock policy.
+            trigger = (
+                ConvergenceTrigger.MANUAL_SELL_ALL
+                if reason == SELL_ALL_REASON
+                else ConvergenceTrigger.MANUAL_SELL
+            )
+            self._host.control_converge(current_date=current_date, trigger=trigger)
 
         return {
             "affected": affected,

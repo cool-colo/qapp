@@ -97,6 +97,9 @@ class StrategyParams:
     # Exchange windows (timezone_name stays on CLI as --exchange-timezone)
     trading_windows: str = "09:29-11:30,13:00-14:55"
     exchange_trading_windows: str = "09:30-11:30,13:00-14:55"
+    preopen_latency_execution_enabled: bool = False
+    preopen_latency_max_advance_ms: int = 3000
+    preopen_latency_fixed_advance_ms: int = 50
 
     # Full-tick snapshot
     full_tick_refresh_secs: float = 1.0
@@ -117,6 +120,7 @@ class StrategyParams:
 
     # Logging sample rates
     trade_tick_log_sample_rate: float = 0.0
+    # Depth is always logged at 09:20-09:35 and 14:55-15:05; this rate applies otherwise.
     order_book_depth_log_sample_rate: float = 0.0
 
     def __post_init__(self) -> None:
@@ -142,6 +146,10 @@ class StrategyParams:
             raise ValueError("price_trend_min_timeout_multiplier must be in (0, 1]")
         if float(self.price_trend_max_offset_multiplier) < 1.0:
             raise ValueError("price_trend_max_offset_multiplier must be at least 1")
+        if int(self.preopen_latency_max_advance_ms) < 0:
+            raise ValueError("preopen_latency_max_advance_ms must be non-negative")
+        if int(self.preopen_latency_fixed_advance_ms) < 0:
+            raise ValueError("preopen_latency_fixed_advance_ms must be non-negative")
 
     @property
     def exit_non_targets(self) -> bool:

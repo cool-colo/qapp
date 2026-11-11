@@ -25,6 +25,7 @@ from strategies.async_scheduling import AsyncAwaitableScheduler
 from strategies.execution_reconciliation import ExecutionStateReconciler
 from strategies.target_quantities import DepthBookSnapshot
 from strategies.target_quantities import TargetQuantityStrategyConfig
+from strategies.convergence import ConvergenceTrigger
 from strategies.target_quantities import TargetQuantityStrategy
 from strategies.target_quantities import TickSnapshot
 from strategies.target_quantities import NotionalOrderSplitter
@@ -305,6 +306,7 @@ class TestableTargetQuantityStrategy:
     _FULL_TICK_REFRESH_TIMER = TargetQuantityStrategy._FULL_TICK_REFRESH_TIMER
     _FULL_TICK_PREFETCH_ALERT = TargetQuantityStrategy._FULL_TICK_PREFETCH_ALERT
     _TERMINAL_ORDER_STATUSES = TargetQuantityStrategy._TERMINAL_ORDER_STATUSES
+    _PREOPEN_LATENCY_ALERT = TargetQuantityStrategy._PREOPEN_LATENCY_ALERT
     on_start = TargetQuantityStrategy.on_start
     refresh_target_instruments = TargetQuantityStrategy.refresh_target_instruments
     _subscribe_market_data = TargetQuantityStrategy._subscribe_market_data
@@ -326,6 +328,7 @@ class TestableTargetQuantityStrategy:
     _converge_async = TargetQuantityStrategy._converge_async
     _awaiting_pre_open_reconcile = TargetQuantityStrategy._awaiting_pre_open_reconcile
     _order_book_depth_logging_enabled = TargetQuantityStrategy._order_book_depth_logging_enabled
+    _should_log_order_book_depth_sample = TargetQuantityStrategy._should_log_order_book_depth_sample
     _log_depth_event_probe = TargetQuantityStrategy._log_depth_event_probe
     _format_depth_side = staticmethod(TargetQuantityStrategy._format_depth_side)
     _should_log_sample = staticmethod(TargetQuantityStrategy._should_log_sample)
@@ -404,6 +407,11 @@ class TestableTargetQuantityStrategy:
     _note_quote_tick = TargetQuantityStrategy._note_quote_tick
     on_quote_tick = TargetQuantityStrategy.on_quote_tick
     _subscribe_quote_tick_window_probes = TargetQuantityStrategy._subscribe_quote_tick_window_probes
+    _capture_preopen_latency_sample = TargetQuantityStrategy._capture_preopen_latency_sample
+    _build_preopen_latency_sample = TargetQuantityStrategy._build_preopen_latency_sample
+    _schedule_preopen_latency_alert = TargetQuantityStrategy._schedule_preopen_latency_alert
+    _on_preopen_latency_timer = TargetQuantityStrategy._on_preopen_latency_timer
+    _within_preopen_latency_window = TargetQuantityStrategy._within_preopen_latency_window
     investable_total_asset = TargetQuantityStrategy.investable_total_asset
     _clock_date = TargetQuantityStrategy._clock_date
     _record_target = TargetQuantityStrategy._record_target
@@ -596,6 +604,8 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._trading_day = None
         strategy._quote_tick_window_probe_ids = set()
         strategy._subscribed_quote_tick_probe_instruments = set()
+        strategy._preopen_latency_sample = None
+        strategy._preopen_latency_persister = None
         # Seed a current in-window exchange event timestamp; these tests exercise
         # convergence behavior, not the trading-window gate.
         strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 10:00:00")
@@ -736,6 +746,13 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         self.assertEqual(strategy.subscribed_quote_ticks, [INST_A, INST_B])
         self.assertEqual(strategy.subscribed_trade_ticks, [])
+        self.assertEqual(
+            strategy.subscribed_order_book_depths,
+            [
+                (INST_A, {"book_type": BookType.L2_MBP, "depth": 10}),
+                (INST_B, {"book_type": BookType.L2_MBP, "depth": 10}),
+            ],
+        )
 
     def test_refresh_target_instruments_subscribes_ticks_for_new_instruments(self) -> None:
         bar_type = BarType.from_str(f"{INST_B}-1-MINUTE-LAST-EXTERNAL")
@@ -828,8 +845,96 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         self.assertEqual(strategy._last_quote_tick_ts_event, china_ts_ns("2026-07-02 09:25:00"))
         self.assertFalse(strategy._within_trading_window())
-        self.assertEqual(len(strategy.log.infos), 1)
-        self.assertIn("forced pre-open diagnostics", strategy.log.infos[0][0][0])
+        messages = [args[0] for args, _kwargs in strategy.log.infos]
+        self.assertTrue(any("Captured pre-open latency sample" in message for message in messages))
+        self.assertTrue(any("forced pre-open diagnostics" in message for message in messages))
+
+    def test_preopen_latency_first_sample_wins_and_caps_advance(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            subscribe_quote_ticks=False,
+            quote_tick_window_probe_instrument_ids=(INST_A,),
+            preopen_latency_execution_enabled=True,
+            preopen_latency_max_advance_ms=3000,
+        )
+        strategy._quote_tick_window_probe_ids = {str(INST_A)}
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:27:16", tz="UTC")
+        persisted = []
+        strategy._preopen_latency_persister = persisted.append
+        tick = type(
+            "Tick",
+            (),
+            {
+                "instrument_id": INST_A,
+                "bid_price": Decimal("10.00"),
+                "bid_size": Decimal("100"),
+                "ask_price": Decimal("10.01"),
+                "ask_size": Decimal("100"),
+                "ts_event": china_ts_ns("2026-07-02 09:25:00"),
+                "ts_init": china_ts_ns("2026-07-02 09:27:16"),
+            },
+        )()
+
+        strategy.on_quote_tick(tick)
+        strategy._capture_preopen_latency_sample(
+            source="order_book_depth",
+            instrument_id=str(INST_A),
+            ts_event_ns=china_ts_ns("2026-07-02 09:25:01"),
+            ts_init_ns=china_ts_ns("2026-07-02 09:25:02"),
+        )
+
+        sample = strategy._preopen_latency_sample
+        self.assertEqual(sample.source, "quote_tick")
+        self.assertEqual(sample.event_to_init_ms, 136000)
+        self.assertEqual(sample.applied_advance_ms, 3000)
+        self.assertEqual(sample.fixed_advance_ms, 50)
+        self.assertEqual(sample.total_advance_ms, 3050)
+        self.assertEqual(len(persisted), 1)
+        alert = strategy.clock.time_alerts[-1]
+        self.assertEqual(alert["name"], TargetQuantityStrategy._PREOPEN_LATENCY_ALERT)
+        self.assertEqual(
+            alert["alert_time"],
+            pd.Timestamp("2026-07-02 09:29:56.950", tz="Asia/Shanghai"),
+        )
+
+    def test_preopen_latency_trigger_alone_can_open_preopen_window(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy()
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            preopen_latency_execution_enabled=True,
+            preopen_latency_max_advance_ms=3000,
+        )
+        strategy.clock.now = pd.Timestamp("2026-07-02 01:29:57", tz="UTC")
+        strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 09:25:00")
+        strategy._preopen_latency_sample = strategy._build_preopen_latency_sample(
+            trade_date=trading_date,
+            source="quote_tick",
+            instrument_id=str(INST_A),
+            ts_event_ns=china_ts_ns("2026-07-02 09:25:00"),
+            ts_init_ns=china_ts_ns("2026-07-02 09:27:16"),
+            observed_ns=china_ts_ns("2026-07-02 09:27:16"),
+            event_to_init_ms=136000,
+            init_to_observed_ms=0,
+        )
+        calls = []
+        strategy._converge_to_target_locked = lambda current_date, trigger: calls.append(
+            (current_date, trigger),
+        )
+
+        self.assertFalse(
+            strategy._converge_to_target(trading_date, ConvergenceTrigger.TIMER),
+        )
+        self.assertTrue(
+            strategy._converge_to_target(
+                trading_date,
+                ConvergenceTrigger.PREOPEN_LATENCY,
+            ),
+        )
+        self.assertEqual(calls, [(trading_date, ConvergenceTrigger.PREOPEN_LATENCY)])
 
     def test_quote_tick_0929_does_not_unlock_exchange_window(self) -> None:
         strategy = self.make_strategy()
@@ -972,6 +1077,24 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             {str(INST_A), str(INST_B)},
         )
         self.assertEqual(strategy._sleep_calls, [10.0])
+
+    def test_update_target_never_unsubscribes_fixed_depth_probe(self) -> None:
+        strategy = self.make_strategy()
+        strategy._quote_tick_window_probe_ids = {str(INST_A)}
+        strategy._subscribed_order_book_depth_instruments = {str(INST_A), str(INST_C)}
+
+        strategy.update_target_quantities(
+            {INST_B: 400},
+            date(2026, 7, 2),
+            "depth_refresh",
+        )
+
+        self.assertEqual(strategy.unsubscribed_order_book_depths, [INST_C])
+        self.assertNotIn(INST_A, strategy.unsubscribed_order_book_depths)
+        self.assertEqual(
+            strategy._subscribed_order_book_depth_instruments,
+            {str(INST_A), str(INST_B)},
+        )
 
     def test_update_target_skips_depth_refresh_when_target_unchanged(self) -> None:
         strategy = self.make_strategy()
@@ -1196,7 +1319,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._deferred_buys[str(INST_A)] = Decimal("2200")
 
         strategy.update_target_quantities({INST_A: 2200}, trading_date, "star")
-        strategy._converge_to_target(trading_date, "timer")
+        strategy._converge_to_target(trading_date, ConvergenceTrigger.TIMER)
 
         self.assertEqual(strategy.submitted_orders, [])
         self.assertEqual(strategy._deferred_buys, {})
@@ -1456,7 +1579,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy.submit_orders_to_cache = False
 
         strategy.update_target_quantities({INST_A: 1200}, trading_date, "cache_lag")
-        strategy._converge_to_target(trading_date, "timer")
+        strategy._converge_to_target(trading_date, ConvergenceTrigger.TIMER)
 
         self.assertEqual(len(strategy.submitted_orders), 1)
         self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("1200"))
@@ -1472,7 +1595,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         strategy.update_target_quantities({INST_A: 3200}, trading_date, "incident-152")
         for _ in range(37):  # 185 seconds, matching the observed late callback window
-            strategy._converge_to_target(trading_date, "five_second_timer")
+            strategy._converge_to_target(trading_date, ConvergenceTrigger.TIMER)
 
         self.assertEqual(len(strategy.submitted_orders), 1)
         self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("3200"))
@@ -1490,7 +1613,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._target_version = "manual-version"
         strategy.clock.now = pd.Timestamp("2026-07-02 00:00:00", tz="UTC")
 
-        strategy._converge_to_target(trading_date, "timer")
+        strategy._converge_to_target(trading_date, ConvergenceTrigger.TIMER)
 
         self.assertEqual(strategy.submitted_orders, [])
 
@@ -1512,12 +1635,12 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         # Close the gate: pre-open reconcile configured but not yet completed.
         strategy._execution_state_reconciler._reconciled_once = False
 
-        strategy._converge_to_target(trading_date, "timer")
+        strategy._converge_to_target(trading_date, ConvergenceTrigger.TIMER)
         self.assertEqual(strategy.submitted_orders, [])
 
         # A successful reconcile opens the gate; convergence now submits.
         strategy._execution_state_reconciler._reconciled_once = True
-        strategy._converge_to_target(trading_date, "timer")
+        strategy._converge_to_target(trading_date, ConvergenceTrigger.TIMER)
         self.assertEqual(len(strategy.submitted_orders), 1)
         self.assertEqual(strategy.submitted_orders[0].side, OrderSide.BUY)
 
@@ -1547,7 +1670,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             # Simulate a concurrent timer/full-tick callback firing mid-submit. The
             # lock is already held by the outer pass, so this must be a no-op.
             before = len(strategy.submitted_orders)
-            strategy._converge_to_target(trading_date, "reentrant")
+            strategy._converge_to_target(trading_date, ConvergenceTrigger.TIMER)
             reentered.append(len(strategy.submitted_orders) - before)
 
         strategy.submit_order = submit_and_reenter
@@ -1938,6 +2061,50 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(snapshot.asks, ((10.01, 1200.0),))
         self.assertEqual(snapshot.ts_event, china_ts_ns("2026-07-02 09:30:01"))
         self.assertEqual(snapshot.ts_init, china_ts_ns("2026-07-02 09:30:01"))
+
+    def test_order_book_depth_logs_all_during_open_and_close_windows(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            order_book_depth_log_sample_rate=0.0,
+        )
+
+        for timestamp in (
+            "2026-07-02 09:20:00",
+            "2026-07-02 09:35:00",
+            "2026-07-02 14:55:00",
+            "2026-07-02 15:05:00",
+        ):
+            strategy.on_order_book_depth(
+                self._make_depth(INST_A, 9.99, 10.01, timestamp),
+            )
+
+        sample_logs = [
+            args[0]
+            for args, _kwargs in strategy.log.infos
+            if args[0].startswith("Order-book depth sample, ")
+        ]
+        self.assertEqual(len(sample_logs), 4)
+
+    def test_order_book_depth_uses_sampling_outside_full_log_windows(self) -> None:
+        strategy = self.make_strategy()
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            order_book_depth_log_sample_rate=0.0,
+        )
+
+        strategy.on_order_book_depth(
+            self._make_depth(INST_A, 9.99, 10.01, "2026-07-02 10:00:00"),
+        )
+
+        self.assertFalse(
+            any(
+                args[0].startswith("Order-book depth sample, ")
+                for args, _kwargs in strategy.log.infos
+            ),
+        )
 
     def test_price_context_converts_book_lots_to_shares_before_walk(self) -> None:
         strategy = self.make_strategy(open_prices={INST_A: 11.91})

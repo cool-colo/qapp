@@ -8,6 +8,7 @@ from decimal import Decimal
 from strategies.trading_control import SELL_ALL_REASON
 from strategies.trading_control import SELL_REASON
 from strategies.trading_control import TradingController
+from strategies.convergence import ConvergenceTrigger
 
 
 class FakeControlHost:
@@ -48,8 +49,9 @@ class FakeControlHost:
     def control_apply_targets(self, targets, target_date, reason) -> None:
         self.applied_targets = dict(targets)
 
-    def control_force_converge(self, current_date, trigger) -> None:
+    def control_converge(self, current_date, trigger: ConvergenceTrigger) -> None:
         self.forced = True
+        self.convergence_trigger = trigger
 
     def control_log(self, message: str) -> None:
         pass
@@ -74,6 +76,7 @@ class SellAllTests(unittest.TestCase):
         self.assertEqual(host.applied_targets, {"A.QMT": Decimal(0)})
         self.assertNotIn("B.QMT", host.applied_targets)
         self.assertTrue(host.forced)
+        self.assertIs(host.convergence_trigger, ConvergenceTrigger.MANUAL_SELL_ALL)
 
     def test_sell_all_keeps_non_sellable_remainder(self) -> None:
         # 100 held, only 60 sellable -> target the 40-share non-sellable remainder.
@@ -101,6 +104,7 @@ class SellAllTests(unittest.TestCase):
 
         self.assertEqual(result["affected"], ["A.QMT"])
         self.assertEqual(host.applied_targets, {"A.QMT": Decimal(0), "B.QMT": Decimal(200)})
+        self.assertIs(host.convergence_trigger, ConvergenceTrigger.MANUAL_SELL)
 
     def test_sell_all_skips_unknown_sellable(self) -> None:
         # Sellable unknown -> skipped, not targeted (avoid selling an unknown qty).

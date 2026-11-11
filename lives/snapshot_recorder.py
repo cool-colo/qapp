@@ -25,7 +25,11 @@ from __future__ import annotations
 
 import inspect
 import asyncio
+import threading
 import time
+from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait
 from datetime import date
 from datetime import datetime
 from decimal import Decimal
@@ -54,6 +58,7 @@ from backtests.result_writers.live_records import LiveAssetSnapshotRecord
 from backtests.result_writers.live_records import LiveOrderEventRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
+from backtests.result_writers.live_records import LivePreopenLatencyProbeRecord
 from backtests.result_writers.live_records import LiveStockTickSnapshotRecord
 from backtests.result_writers.live_records import LiveTargetRecord
 from backtests.result_writers.live_records import LiveTradeRecord
@@ -61,6 +66,7 @@ from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
 from lives.order_event_persistence import AsyncOrderEventWriter
 from lives.order_event_persistence import OrderEventWrite
 from strategies.target_quantities import DepthBookSnapshot
+from strategies.target_quantities import PreopenLatencySample
 
 
 SyncTaskCallback = Callable[[str, int, dict[str, Any]], None]
@@ -140,6 +146,12 @@ class SnapshotRecorder(Actor):
             logger=self.log,
             now=lambda: datetime.now(ZoneInfo(config.timezone_name)).replace(tzinfo=None),
         )
+        self._latency_write_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="preopen-latency-write",
+        )
+        self._latency_write_futures: set[Future[Any]] = set()
+        self._latency_write_lock = threading.Lock()
         self._before_time = self._parse_hh_mm(config.before_time)
         self._after_time = self._parse_hh_mm(config.after_time)
         # Guards so each phase applies the frozen target to the strategy at most once
@@ -166,10 +178,61 @@ class SnapshotRecorder(Actor):
                 "order-event persistence did not drain before shutdown: "
                 f"pending={metrics['pending_count']} last_error={metrics['last_error']}",
             )
+        self._latency_write_executor.shutdown(wait=False)
+        with self._latency_write_lock:
+            futures = tuple(self._latency_write_futures)
+        _done, pending = wait(futures, timeout=10.0)
+        if pending:
+            self.log.error(
+                f"pre-open latency persistence did not drain before shutdown: "
+                f"pending={len(pending)}",
+            )
 
     def order_event_persistence_metrics(self) -> dict[str, Any]:
         """Return side-effect-free queue health for node/status integrations."""
         return self._order_event_writer.metrics()
+
+    def persist_preopen_latency_sample(self, sample: PreopenLatencySample) -> None:
+        """Queue one first-wins latency probe without blocking the strategy callback."""
+        timezone_name = self.config.timezone_name
+        scheduled_time = (
+            pd.Timestamp(sample.scheduled_ts_ns, unit="ns", tz="UTC")
+            .tz_convert(timezone_name)
+            .to_pydatetime()
+            .replace(tzinfo=None)
+        )
+        record = LivePreopenLatencyProbeRecord(
+            trade_date=sample.trade_date,
+            account_id=self.config.account_id,
+            trader_id=self.config.trader_id,
+            source=sample.source,
+            instrument_id=sample.instrument_id,
+            ts_event_ns=sample.ts_event_ns,
+            ts_init_ns=sample.ts_init_ns,
+            observed_ns=sample.observed_ns,
+            event_to_init_ms=sample.event_to_init_ms,
+            init_to_observed_ms=sample.init_to_observed_ms,
+            applied_advance_ms=sample.applied_advance_ms,
+            fixed_advance_ms=sample.fixed_advance_ms,
+            scheduled_time=scheduled_time,
+            created_at=datetime.now(ZoneInfo(timezone_name)).replace(tzinfo=None),
+        )
+        future = self._latency_write_executor.submit(
+            self._writer.write_preopen_latency_probe,
+            record,
+        )
+        with self._latency_write_lock:
+            self._latency_write_futures.add(future)
+
+        def _completed(done: Future[Any]) -> None:
+            with self._latency_write_lock:
+                self._latency_write_futures.discard(done)
+            try:
+                done.result()
+            except Exception as exc:
+                self.log.warning(f"Pre-open latency persistence failed: {exc}")
+
+        future.add_done_callback(_completed)
 
     def _catch_up_on_start(self) -> None:
         now = self._now()

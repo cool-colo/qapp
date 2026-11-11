@@ -279,7 +279,7 @@ function activateNavItem(btn, { load = true } = {}) {
   if (tab === "offline") tab = "report";
   const panel = $(`#tab-${tab}`);
   if (panel) panel.classList.add("active");
-  // 实时信息 has 持仓 / 资产 sub-panels; a nav-sub click selects which one shows.
+  // 实时信息 has 持仓 / 资产 / 交易 sub-panels; a nav-sub click selects which one shows.
   // A click on the parent (no data-sub) defaults to 持仓.
   if (tab === "realtime") showRealtimeSub(btn.dataset.sub || "positions");
   if (tab === "stratinfo") showStratInfoSub(btn.dataset.sub || "signals");
@@ -318,7 +318,7 @@ function restoreActiveNav() {
   if (btn) activateNavItem(btn, { load: false });
 }
 
-// Toggle between the 持仓 (#rt-positions) and 资产 (#rt-asset) sub-panels.
+// Toggle between the 持仓 / 资产 / 交易 sub-panels.
 function showRealtimeSub(sub) {
   $$(".rt-sub-panel").forEach((p) => p.classList.remove("active"));
   const target = $(`#rt-${sub}`);
@@ -2469,6 +2469,43 @@ function renderRealtimeAsset(asset, emptyText = "无资产数据") {
   renderRealtimeAssetPie(asset);
 }
 
+// 交易 sub-panel — today's local fill turnover from MySQL. Rates use the same
+// account's before_trading total_asset as their denominator.
+function renderRealtimeTradeSummary(summary) {
+  const el = $("#rt-trades");
+  if (!summary) { el.innerHTML = '<div class="empty">无交易数据</div>'; return; }
+  const groups = [
+    ["buy", "买入", summary.buy_amount, summary.buy_rate],
+    ["sell", "卖出", summary.sell_amount, summary.sell_rate],
+    ["total", "合计", summary.total_amount, summary.total_rate],
+  ];
+  const cards = groups.map(([kind, label, amount, rate]) =>
+    `<div class="trade-summary-card ${kind}">
+       <div class="trade-summary-title">${label}</div>
+       <div class="trade-summary-metrics">
+         <div><span>金额</span><b>${fmt(amount)}</b></div>
+         <div><span>占总资产</span><b>${pct(rate)}</b></div>
+       </div>
+     </div>`
+  ).join("");
+  const assetText = summary.total_asset === null || summary.total_asset === undefined
+    ? "未找到当日 before_trading 总资产，比例暂不可用"
+    : `盘前总资产 ${fmt(summary.total_asset)}`;
+  el.innerHTML =
+    `<div class="trade-summary-meta">${escapeHtml(summary.trade_date)} · ${assetText}</div>` +
+    `<div class="trade-summary-grid">${cards}</div>`;
+}
+
+async function loadRealtimeTradeSummary() {
+  try {
+    const summary = await api("/api/realtime/trade-summary", accountParams());
+    renderRealtimeTradeSummary(summary);
+  } catch (e) {
+    $("#rt-trades").innerHTML = '<div class="empty">获取失败</div>';
+    toast(e.message);
+  }
+}
+
 async function sellStock(code, name, qty) {
   const title = "确认卖出";
   const body = `即将市价卖出<br><b>${name ? name + " " : ""}${code}</b>`
@@ -2498,7 +2535,7 @@ async function sellStock(code, name, qty) {
   } catch (e) { toast(e.message); }
 }
 
-// The realtime/control tabs need a live-node control API for the selected account.
+// Realtime positions/assets and control need a live-node API; the trade summary does not.
 function hasNodeApi() { return !!(state.account && state.account.has_node_api); }
 function nodeApiHint(container) {
   $(container).innerHTML = '<div class="empty">该账户未配置实盘节点 API（node_api）</div>';
@@ -2506,6 +2543,12 @@ function nodeApiHint(container) {
 
 async function loadRealtime() {
   if (!state.account) return;
+  const activeSub = document.querySelector("#tab-realtime .rt-sub-panel.active");
+  if (activeSub && activeSub.id === "rt-trades") {
+    await loadRealtimeTradeSummary();
+    $("#rt-updated").textContent = "更新于 " + new Date().toLocaleTimeString();
+    return;
+  }
   if (!hasNodeApi()) {
     nodeApiHint("#rt-position-table");
     renderHoldingClassificationCharts("rt", [], {}, "#rt-position-table");

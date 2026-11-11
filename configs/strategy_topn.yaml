@@ -68,6 +68,9 @@ excluded_name_prefixes:
 # --- Exchange windows (timezone stays on CLI: --exchange-timezone) ---
 trading_windows: "09:29-11:30,13:00-14:55"
 exchange_trading_windows: "09:30-11:30,13:00-14:55"
+preopen_latency_execution_enabled: false
+preopen_latency_max_advance_ms: 3000
+preopen_latency_fixed_advance_ms: 50
 
 # --- Full-tick snapshot ---
 full_tick_refresh_secs: 1.0
@@ -78,4 +81,5 @@ order_id_tag: "001"
 
 # --- Logging sample rates ---
 trade_tick_log_sample_rate: 0.0
+# Always full at 09:20-09:35 and 14:55-15:05; sampled at other times.
 order_book_depth_log_sample_rate: 0.01

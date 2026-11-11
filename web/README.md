@@ -3,7 +3,10 @@
 A local, read-only dashboard for the live trading data this repo persists:
 
 - **实时信息** — the live node's 持仓 table plus a 资产 sub-page: the broker 资金
-  key/value card next to a **资产构成** pie of 持仓市值 / 可用资金 / 冻结资金.
+  key/value card next to a **资产构成** pie of 持仓市值 / 可用资金 / 冻结资金. The
+  交易 sub-page reads today's `live_trade_realtime` fills from MySQL and shows buy,
+  sell, and total turnover amounts and their rates against today's
+  `before_trading` `live_asset_snapshot.total_asset`.
 - **按日快照** — asset / positions / target portfolio / orders / trades for a chosen
   date + phase. Each stock row links to its **个股 K 线** view.
 - **随时间** — time series: pick one or more metrics from a checkbox list (asset
@@ -137,6 +140,7 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `POST /api/change_records` | body: `{title, details}` |
 | `PUT /api/change_records/{id}` | body: `{title, details}` |
 | `DELETE /api/change_records/{id}` | body: `{pin}` (required) |
+| `GET /api/realtime/trade-summary` | `source, account, trader` |
 | `GET /api/realtime/positions` | `account, trader` |
 | `GET /api/strategy/targets` | `account, trader` |
 | `GET /api/control/state` | `account, trader` |
@@ -147,8 +151,9 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `POST /api/control/sell_all` | `account, trader` |
 | `POST /api/control/sell` | body: `{account, trader, stock_code}` |
 
-The `realtime/*` and `control/*` endpoints proxy to the **per-account** live-node
-control API. Each account (`account_id/trader_id`) runs its own live node (qapp) with
+`GET /api/realtime/positions` and the `control/*` endpoints proxy to the
+**per-account** live-node control API. The trade-summary endpoint reads MySQL directly.
+Each account (`account_id/trader_id`) runs its own live node (qapp) with
 its own `--control-port`, so the node URL is configured under the top-level `node_api:`
 map keyed by `"account_id/trader_id"` (**not** per source) — see `config.example.yaml`.
 The node's `X-Control-Token` stays server-side. `GET /api/accounts` returns a

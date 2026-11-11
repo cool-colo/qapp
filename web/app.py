@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, timedelta
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -1119,6 +1120,76 @@ def get_dqc_validation_results(
     sql = dqc_report.build_validation_results_sql(start, end, layer, stage, table)
     rows = _dqc_query(data, sql, "validation results")
     return {"columns": dqc_report.VALIDATION_RESULT_COLUMNS, "rows": jsonable_rows(rows)}
+
+
+# ---- MySQL realtime summaries ----------------------------------------------
+
+
+@app.get("/api/realtime/trade-summary")
+def realtime_trade_summary(
+    source: str,
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Today's buy/sell turnover relative to the before-trading total asset."""
+    mysql = _mysql(data, source)
+    trading_date = date.today().isoformat()
+    params = {
+        "account_id": account,
+        "trader_id": trader,
+        "trade_date": trading_date,
+    }
+    asset_rows = mysql.query(
+        f"""
+        SELECT total_asset
+        FROM live_asset_snapshot
+        WHERE {_ACCOUNT_KEYS}
+          AND trade_date = %(trade_date)s
+          AND snapshot_type = 'before_trading'
+        LIMIT 1
+        """,
+        params,
+    )
+    trade_rows = mysql.query(
+        f"""
+        SELECT
+            COALESCE(SUM(
+                CASE WHEN UPPER(side) = 'BUY'
+                     THEN COALESCE(amount, 0) ELSE 0 END
+            ), 0) AS buy_amount,
+            COALESCE(SUM(
+                CASE WHEN UPPER(side) = 'SELL'
+                     THEN COALESCE(amount, 0) ELSE 0 END
+            ), 0) AS sell_amount
+        FROM live_trade_realtime
+        WHERE {_ACCOUNT_KEYS}
+          AND trade_date = %(trade_date)s
+        """,
+        params,
+    )
+
+    def as_decimal(value: Any) -> Decimal:
+        return Decimal(str(value)) if value is not None else Decimal(0)
+
+    asset_value = asset_rows[0].get("total_asset") if asset_rows else None
+    total_asset = as_decimal(asset_value) if asset_value is not None else None
+    trade_row = trade_rows[0] if trade_rows else {}
+    buy_amount = as_decimal(trade_row.get("buy_amount"))
+    sell_amount = as_decimal(trade_row.get("sell_amount"))
+    total_amount = buy_amount + sell_amount
+    usable_asset = total_asset is not None and total_asset > 0
+    summary = {
+        "trade_date": trading_date,
+        "total_asset": total_asset,
+        "buy_amount": buy_amount,
+        "buy_rate": buy_amount / total_asset if usable_asset else None,
+        "sell_amount": sell_amount,
+        "sell_rate": sell_amount / total_asset if usable_asset else None,
+        "total_amount": total_amount,
+        "total_rate": total_amount / total_asset if usable_asset else None,
+    }
+    return {key: jsonable(value) for key, value in summary.items()}
 
 
 # ---- live-node realtime + control proxy ------------------------------------

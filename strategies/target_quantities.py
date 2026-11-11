@@ -38,6 +38,7 @@ from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.trading.strategy import Strategy
 
 from strategies.async_scheduling import AsyncAwaitableScheduler
+from strategies.convergence import ConvergenceTrigger
 from strategies.execution_reconciliation import ExecutionStateReconciler
 from strategies.order_splitter import LimitOrderQuantityRules
 from strategies.order_splitter import NotionalOrderSplitter
@@ -68,6 +69,9 @@ _OPEN_INT_TO_MARKET_STATUS: dict[int, MarketStatusAction] = {
 }
 
 _DEPTH_EVENT_PROBE_CUTOFF = pd.Timestamp("09:35").time()
+_ORDER_BOOK_DEPTH_FULL_LOG_WINDOWS = "09:20-09:35,14:55-15:05"
+_PREOPEN_LATENCY_EVENT_START = pd.Timestamp("09:25").time()
+_PREOPEN_LATENCY_EVENT_END = pd.Timestamp("09:30").time()
 _A_SHARE_SHARES_PER_LOT = 100.0
 
 
@@ -85,6 +89,25 @@ class DepthBookSnapshot:
     @property
     def best_ask(self) -> float | None:
         return self.asks[0][0] if self.asks else None
+
+
+@dataclass(frozen=True)
+class PreopenLatencySample:
+    trade_date: date
+    source: str
+    instrument_id: str
+    ts_event_ns: int
+    ts_init_ns: int
+    observed_ns: int
+    event_to_init_ms: int
+    init_to_observed_ms: int
+    applied_advance_ms: int
+    fixed_advance_ms: int
+    scheduled_ts_ns: int
+
+    @property
+    def total_advance_ms(self) -> int:
+        return self.applied_advance_ms + self.fixed_advance_ms
 
 
 @dataclass(frozen=True)
@@ -329,6 +352,9 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     subscribe_trade_ticks: bool = True
     quote_tick_window_probe_instrument_ids: tuple[InstrumentId, ...] = ()
     subscribe_order_book_depth: bool = False
+    preopen_latency_execution_enabled: bool = False
+    preopen_latency_max_advance_ms: int = 3000
+    preopen_latency_fixed_advance_ms: int = 50
     full_tick_refresh_secs: float = 1.0
     full_tick_prefetch_time: str | None = "09:27"
     # Whole-market (京沪深A) full-tick snapshot cadence. Intraday it is kept only in
@@ -369,6 +395,7 @@ class TargetQuantityStrategy(Strategy):
     _WHOLE_MARKET_REFRESH_TIMER = "WHOLE-MARKET-FULL-TICK-REFRESH"
     _WHOLE_MARKET_PREFETCH_ALERT = "WHOLE-MARKET-FULL-TICK-PREFETCH"
     _WHOLE_MARKET_FINAL_REFRESH_ALERT = "WHOLE-MARKET-FULL-TICK-FINAL"
+    _PREOPEN_LATENCY_ALERT = "TARGET-WEIGHT-PREOPEN-LATENCY"
     _TERMINAL_ORDER_STATUSES = {
         OrderStatus.DENIED,
         OrderStatus.REJECTED,
@@ -380,6 +407,10 @@ class TargetQuantityStrategy(Strategy):
     def __init__(self, config: TargetQuantityStrategyConfig) -> None:
         super().__init__(config)
         self._validate_price_trend_config(config)
+        if int(config.preopen_latency_max_advance_ms) < 0:
+            raise ValueError("preopen_latency_max_advance_ms must be non-negative")
+        if int(config.preopen_latency_fixed_advance_ms) < 0:
+            raise ValueError("preopen_latency_fixed_advance_ms must be non-negative")
         self._instrument_ids = list(config.instrument_ids)
         self._bar_types = {str(key): value for key, value in config.bar_types.items()}
         self._last_close = normalize_initial_last_closes(config.initial_last_closes)
@@ -457,16 +488,18 @@ class TargetQuantityStrategy(Strategy):
             for instrument_id in config.quote_tick_window_probe_instrument_ids
         }
         self._subscribed_quote_tick_probe_instruments: set[str] = set()
+        self._preopen_latency_sample: PreopenLatencySample | None = None
+        self._preopen_latency_persister: Callable[[PreopenLatencySample], None] | None = None
         self._convergence_suspended = False
         # Persistent manual-pause flag, controlled via the live-node control API.
         # When set, ordinary convergence is skipped, but a manual SELL still runs
-        # (it forces convergence for that one action without clearing the flag).
+        # because its typed trigger bypasses the pause without clearing it.
         # Loaded from MySQL at node startup; mutated only by set_trading_paused.
         self._trading_paused = False
         # Persistent guard, controlled via the live-node control API, that freezes
         # automatic target acceptance (daily/hourly refresh, snapshot recorder) so a
         # fresh target map cannot clobber a manual sell in the window between
-        # control_apply_targets and control_force_converge. Orthogonal to
+        # control_apply_targets and control_converge. Orthogonal to
         # _trading_paused: it blocks target *writes*, not convergence, and the manual
         # sell bypasses it (control_apply_targets passes bypass_pause=True).
         self._target_updates_paused = False
@@ -563,6 +596,40 @@ class TargetQuantityStrategy(Strategy):
         """
         self._full_tick_source = fetch_full_tick
 
+    def configure_preopen_latency_persister(
+        self,
+        persist: Callable[[PreopenLatencySample], None] | None,
+    ) -> None:
+        """Inject the infrastructure-owned non-blocking sample persistence hook."""
+        self._preopen_latency_persister = persist
+
+    def restore_preopen_latency_sample(
+        self,
+        *,
+        trade_date: date,
+        source: str,
+        instrument_id: str,
+        ts_event_ns: int,
+        ts_init_ns: int,
+        observed_ns: int,
+        event_to_init_ms: int,
+        init_to_observed_ms: int,
+    ) -> bool:
+        """Restore an existing same-day probe row before the strategy starts."""
+        if trade_date != self._clock_date() or self._preopen_latency_sample is not None:
+            return False
+        self._preopen_latency_sample = self._build_preopen_latency_sample(
+            trade_date=trade_date,
+            source=source,
+            instrument_id=instrument_id,
+            ts_event_ns=ts_event_ns,
+            ts_init_ns=ts_init_ns,
+            observed_ns=observed_ns,
+            event_to_init_ms=event_to_init_ms,
+            init_to_observed_ms=init_to_observed_ms,
+        )
+        return True
+
     def configure_whole_market_full_tick_source(
         self,
         fetch_whole_market_full_tick: Any | None,
@@ -605,6 +672,7 @@ class TargetQuantityStrategy(Strategy):
         for bar_type in self._bar_types.values():
             self._subscribe_market_data(bar_type)
         self._subscribe_quote_tick_window_probes()
+        self._schedule_preopen_latency_alert()
         interval_secs = float(self.config.resubmit_check_interval_secs)
         if float(self.config.unfilled_timeout_secs) > 0 and interval_secs > 0:
             self.clock.set_timer(
@@ -1300,8 +1368,12 @@ class TargetQuantityStrategy(Strategy):
             signal_date=None,
         )
 
-    def control_force_converge(self, current_date: date, trigger: str) -> None:
-        self._converge_to_target(current_date=current_date, trigger=trigger, force=True)
+    def control_converge(
+        self,
+        current_date: date,
+        trigger: ConvergenceTrigger,
+    ) -> None:
+        self._converge_to_target(current_date=current_date, trigger=trigger)
 
     def control_log(self, message: str) -> None:
         self.log.info(message, color=LogColor.YELLOW)
@@ -1348,23 +1420,47 @@ class TargetQuantityStrategy(Strategy):
             self.subscribe_trade_ticks(bar_type.instrument_id)
 
     def _subscribe_quote_tick_window_probes(self) -> None:
-        if bool(self.config.subscribe_quote_ticks):
-            return
         for instrument_id_text in sorted(self._quote_tick_window_probe_ids):
-            if instrument_id_text in self._subscribed_quote_tick_probe_instruments:
-                continue
             instrument_id = InstrumentId.from_str(instrument_id_text)
-            try:
-                self.subscribe_quote_ticks(instrument_id)
-            except Exception as exc:
-                self.log.warning(f"Quote-tick window probe subscribe failed for {instrument_id}: {exc}")
-                continue
-            self._subscribed_quote_tick_probe_instruments.add(instrument_id_text)
+            if (
+                not bool(self.config.subscribe_quote_ticks)
+                and instrument_id_text not in self._subscribed_quote_tick_probe_instruments
+            ):
+                try:
+                    self.subscribe_quote_ticks(instrument_id)
+                except Exception as exc:
+                    self.log.warning(
+                        f"Quote-tick window probe subscribe failed for {instrument_id}: {exc}",
+                    )
+                else:
+                    self._subscribed_quote_tick_probe_instruments.add(instrument_id_text)
+            if instrument_id_text not in self._subscribed_order_book_depth_instruments:
+                try:
+                    self.subscribe_order_book_depth(
+                        instrument_id,
+                        book_type=BookType.L2_MBP,
+                        depth=10,
+                    )
+                except Exception as exc:
+                    self.log.warning(
+                        f"Order-book depth window probe subscribe failed for {instrument_id}: {exc}",
+                    )
+                else:
+                    self._subscribed_order_book_depth_instruments.add(instrument_id_text)
         if self._subscribed_quote_tick_probe_instruments:
             self.log.info(
                 "Subscribed quote-tick window probes: "
                 f"count={len(self._subscribed_quote_tick_probe_instruments)} "
                 f"instruments={sorted(self._subscribed_quote_tick_probe_instruments)}",
+                color=LogColor.BLUE,
+            )
+        if self._quote_tick_window_probe_ids:
+            subscribed_depth = self._quote_tick_window_probe_ids.intersection(
+                self._subscribed_order_book_depth_instruments,
+            )
+            self.log.info(
+                "Subscribed order-book depth window probes: "
+                f"count={len(subscribed_depth)} instruments={sorted(subscribed_depth)}",
                 color=LogColor.BLUE,
             )
 
@@ -1444,11 +1540,18 @@ class TargetQuantityStrategy(Strategy):
         )
         if self._convergence_suspended:
             return
-        self._converge_to_target(current_date=target_date, trigger="target_update")
+        self._converge_to_target(
+            current_date=target_date,
+            trigger=ConvergenceTrigger.TARGET_UPDATE,
+        )
 
     def _refresh_order_book_depth_subscriptions(self, quantities: dict[str, Decimal]) -> None:
         subscribed_ids = set(self._subscribed_order_book_depth_instruments)
-        desired_ids = set(quantities).union(self._held_instrument_ids())
+        desired_ids = (
+            set(quantities)
+            .union(self._held_instrument_ids())
+            .union(self._quote_tick_window_probe_ids)
+        )
         removable_ids = subscribed_ids.difference(desired_ids)
         addable_ids = desired_ids.difference(subscribed_ids)
         removed_ids: set[str] = set()
@@ -1523,7 +1626,10 @@ class TargetQuantityStrategy(Strategy):
         self._convergence_suspended = (not within_window) or self._trading_paused
         self.on_target_bar(bar)
         self._convergence_suspended = self._trading_paused
-        self._converge_to_target(current_date=trading_date, trigger="bar")
+        self._converge_to_target(
+            current_date=trading_date,
+            trigger=ConvergenceTrigger.BAR,
+        )
 
     def on_target_bar(self, bar: Bar) -> None:
         """Hook for subclasses to update targets before convergence."""
@@ -1550,6 +1656,11 @@ class TargetQuantityStrategy(Strategy):
         self._cancel_count_buy = {}
         self._cancel_count_sell = {}
         self._recent_sell_cancel_ts = {}
+        if (
+            self._preopen_latency_sample is not None
+            and self._preopen_latency_sample.trade_date != trading_date
+        ):
+            self._preopen_latency_sample = None
         # New trading day: stale quote timestamps must not satisfy the exchange
         # window gate.
         if self._event_trading_date(self._last_quote_tick_ts_event) != trading_date:
@@ -1705,6 +1816,12 @@ class TargetQuantityStrategy(Strategy):
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         self._note_quote_tick(tick)
+        self._capture_preopen_latency_sample(
+            source="quote_tick",
+            instrument_id=str(tick.instrument_id),
+            ts_event_ns=int(tick.ts_event),
+            ts_init_ns=int(tick.ts_init),
+        )
         if not self._within_pre_open_quote_log_window():
             return
         self.log.info(
@@ -1732,6 +1849,12 @@ class TargetQuantityStrategy(Strategy):
         bids = self._ladder_levels(depth.bids)
         asks = self._ladder_levels(depth.asks)
         depth_ts_event = int(depth.ts_event)
+        self._capture_preopen_latency_sample(
+            source="order_book_depth",
+            instrument_id=str(depth.instrument_id),
+            ts_event_ns=depth_ts_event,
+            ts_init_ns=int(depth.ts_init),
+        )
         trading_date = self._event_trading_date(depth_ts_event) or self._clock_date()
         # The depth book is captured for aggressive walk-book pricing only. Its
         # mid/best price is NOT a dependable reference for today's open or last
@@ -1751,11 +1874,11 @@ class TargetQuantityStrategy(Strategy):
         # rather than waiting for the next bar/timer. Gated on the trading window.
         if not self._depth_converged_today and self._converge_to_target(
             current_date=trading_date,
-            trigger="order_book_depth",
+            trigger=ConvergenceTrigger.ORDER_BOOK_DEPTH,
             ts_event=depth_ts_event,
         ):
             self._depth_converged_today = True
-        if not self._should_log_sample(self.config.order_book_depth_log_sample_rate):
+        if not self._should_log_order_book_depth_sample(depth):
             return
         self.log.info(
             "Order-book depth sample, "
@@ -1817,6 +1940,26 @@ class TargetQuantityStrategy(Strategy):
 
     def _order_book_depth_logging_enabled(self) -> bool:
         return float(self.config.order_book_depth_log_sample_rate) > 0.0
+
+    def _should_log_order_book_depth_sample(self, depth: OrderBookDepth10) -> bool:
+        """Force full depth logs around open/close; sample at all other times."""
+        try:
+            ts_init = int(depth.ts_init)
+            if ts_init <= 0:
+                raise ValueError("ts_init must be positive")
+            local_time = pd.Timestamp(ts_init, unit="ns", tz="UTC").tz_convert(
+                self.config.timezone_name,
+            ).time()
+        except Exception:
+            try:
+                local_time = pd.Timestamp(self.clock.utc_now()).tz_convert(
+                    self.config.timezone_name,
+                ).time()
+            except Exception:
+                return self._should_log_sample(self.config.order_book_depth_log_sample_rate)
+        if self._time_in_windows(local_time, _ORDER_BOOK_DEPTH_FULL_LOG_WINDOWS):
+            return True
+        return self._should_log_sample(self.config.order_book_depth_log_sample_rate)
 
     @staticmethod
     def _should_log_sample(sample_rate: float) -> bool:
@@ -1888,7 +2031,10 @@ class TargetQuantityStrategy(Strategy):
             # behind this fill before the converge runs, so it sees settled position
             # state. The non-blocking lock in _converge_to_target still applies.
             self._async_scheduler.schedule(
-                self._converge_async(current_date=self._clock_date(), trigger="sell_fill"),
+                self._converge_async(
+                    current_date=self._clock_date(),
+                    trigger=ConvergenceTrigger.SELL_FILL,
+                ),
             )
 
     def on_order_canceled(self, event: Any) -> None:
@@ -1926,7 +2072,7 @@ class TargetQuantityStrategy(Strategy):
         self._async_scheduler.schedule(
             self._converge_async(
                 current_date=self._clock_date(),
-                trigger="cancel",
+                trigger=ConvergenceTrigger.CANCEL,
                 delay_secs=float(self.config.cancel_reconverge_delay_secs),
             ),
         )
@@ -1934,7 +2080,7 @@ class TargetQuantityStrategy(Strategy):
     async def _converge_async(
         self,
         current_date: date,
-        trigger: str,
+        trigger: ConvergenceTrigger,
         delay_secs: float = 0.0,
     ) -> None:
         # Runs on the node event loop. `delay_secs` is used only by the cancel path
@@ -2028,7 +2174,10 @@ class TargetQuantityStrategy(Strategy):
         # no-op rather than stacking.
         try:
             self._async_scheduler.schedule(
-                self._converge_async(current_date=self._clock_date(), trigger="timer"),
+                self._converge_async(
+                    current_date=self._clock_date(),
+                    trigger=ConvergenceTrigger.TIMER,
+                ),
             )
         except Exception as exc:
             self.log.warning(f"target convergence failed: {exc}")
@@ -2036,21 +2185,20 @@ class TargetQuantityStrategy(Strategy):
     def _converge_to_target(
         self,
         current_date: date,
-        trigger: str,
-        force: bool = False,
+        trigger: ConvergenceTrigger,
         ts_event: int | None = None,
     ) -> bool:
         """Run convergence after passing its window gate and acquiring its lock."""
-        # ``force`` (set only by a manual SELL) bypasses the manual-pause flag so a
-        # requested liquidation still runs while trading is paused. It does NOT
-        # bypass the trading-window gate. Data callbacks pass their exchange event
-        # timestamp so the gate does not fall back to an older quote timestamp.
-        if (self._trading_paused and not force) or not self._within_trading_window(ts_event):
+        if self._trading_paused and not trigger.bypasses_pause:
             return False
-        # A forced (manual-sell) convergence must not be silently dropped when the
-        # trading thread holds the lock, so it waits (bounded); ordinary triggers
-        # skip when already converging.
-        if force:
+        window_open = self._within_trading_window(ts_event)
+        if trigger.allows_preopen_window:
+            window_open = window_open or self._within_preopen_latency_window(current_date)
+        if not window_open:
+            return False
+        # A manual convergence must not be silently dropped when the trading thread
+        # holds the lock. Ordinary and pre-open triggers remain non-blocking.
+        if trigger.waits_for_lock:
             acquired = self._converge_lock.acquire(timeout=5.0)
         else:
             acquired = self._converge_lock.acquire(blocking=False)
@@ -2062,7 +2210,12 @@ class TargetQuantityStrategy(Strategy):
             self._converge_lock.release()
         return True
 
-    def _converge_to_target_locked(self, current_date: date, trigger: str) -> None:
+    def _converge_to_target_locked(
+        self,
+        current_date: date,
+        trigger: ConvergenceTrigger,
+    ) -> None:
+        trigger_value = trigger.value
         if not self._target_version:
             self.log.warning("target convergence skipped: no target version set")
             return
@@ -2075,7 +2228,7 @@ class TargetQuantityStrategy(Strategy):
             # timer triggers will re-drive convergence right after it does.
             self.log.info(
                 f"target convergence skipped: awaiting pre-open execution-state "
-                f"reconciliation (trigger={trigger})",
+                f"reconciliation (trigger={trigger_value})",
                 color=LogColor.BLUE,
             )
             return
@@ -2097,7 +2250,7 @@ class TargetQuantityStrategy(Strategy):
                 color=LogColor.BLUE,
             )
             return
-        self._log_account_sizing_snapshot(trigger)
+        self._log_account_sizing_snapshot(trigger_value)
         self._reconcile_unfilled_orders(current_date)
         open_order_instruments = self._open_order_instruments()
         desired = self._desired_quantities()
@@ -2128,7 +2281,7 @@ class TargetQuantityStrategy(Strategy):
                     skip_intent_error.append(instrument_id_text)
                 continue
             intent.context.record(
-                convergence_trigger=trigger,
+                convergence_trigger=trigger_value,
                 target_version=self._target_version,
                 trading_date=current_date,
             )
@@ -2159,7 +2312,7 @@ class TargetQuantityStrategy(Strategy):
                 skip_intent_error.append(instrument_id_text)
 
         self._log_convergence_summary(
-            trigger=trigger,
+            trigger=trigger_value,
             desired_count=len(desired),
             sell_intents=sell_intents,
             buy_intents=buy_intents,
@@ -2189,7 +2342,7 @@ class TargetQuantityStrategy(Strategy):
         if self._target_achieved():
             self._achieved_versions.add(self._target_version)
             self.log.info(
-                f"target achieved version={self._target_version} trigger={trigger} "
+                f"target achieved version={self._target_version} trigger={trigger_value} "
                 f"count={len(self._target_quantities)}",
                 color=LogColor.GREEN,
             )
@@ -3509,6 +3662,178 @@ class TargetQuantityStrategy(Strategy):
         if ts_event <= 0:
             raise ValueError(f"Quote tick ts_event must be positive, got {ts_event}")
         self._last_quote_tick_ts_event = ts_event
+
+    def _capture_preopen_latency_sample(
+        self,
+        *,
+        source: str,
+        instrument_id: str,
+        ts_event_ns: int,
+        ts_init_ns: int,
+    ) -> None:
+        """Capture the first qualifying quote/depth sample for the local trade date."""
+        if instrument_id not in self._quote_tick_window_probe_ids:
+            return
+        current_date = self._clock_date()
+        existing = self._preopen_latency_sample
+        if existing is not None:
+            if existing.trade_date == current_date:
+                return
+            self._preopen_latency_sample = None
+        if ts_event_ns <= 0 or ts_init_ns < ts_event_ns:
+            return
+        try:
+            event_time = pd.Timestamp(ts_event_ns, unit="ns", tz="UTC").tz_convert(
+                self.config.timezone_name,
+            )
+        except Exception:
+            return
+        if event_time.date() != current_date:
+            return
+        if not (_PREOPEN_LATENCY_EVENT_START <= event_time.time() < _PREOPEN_LATENCY_EVENT_END):
+            return
+
+        observed_ns = int(self.clock.timestamp_ns())
+        event_to_init_ms = (ts_init_ns - ts_event_ns) // 1_000_000
+        init_to_observed_ms = (observed_ns - ts_init_ns) // 1_000_000
+        sample = self._build_preopen_latency_sample(
+            trade_date=current_date,
+            source=source,
+            instrument_id=instrument_id,
+            ts_event_ns=ts_event_ns,
+            ts_init_ns=ts_init_ns,
+            observed_ns=observed_ns,
+            event_to_init_ms=event_to_init_ms,
+            init_to_observed_ms=init_to_observed_ms,
+        )
+        # Publish the in-memory winner before scheduling or persistence. Nautilus
+        # dispatches callbacks serially, and this also makes re-entrant test calls
+        # first-wins.
+        self._preopen_latency_sample = sample
+        scheduled = pd.Timestamp(sample.scheduled_ts_ns, unit="ns", tz="UTC").tz_convert(
+            self.config.timezone_name,
+        )
+        self.log.info(
+            "Captured pre-open latency sample, "
+            f"source={sample.source}, instrument_id={sample.instrument_id}, "
+            f"ts_event={sample.ts_event_ns}, ts_init={sample.ts_init_ns}, "
+            f"observed_ns={sample.observed_ns}, "
+            f"event_to_init_ms={sample.event_to_init_ms}, "
+            f"init_to_observed_ms={sample.init_to_observed_ms}, "
+            f"applied_advance_ms={sample.applied_advance_ms}, "
+            f"fixed_advance_ms={sample.fixed_advance_ms}, "
+            f"total_advance_ms={sample.total_advance_ms}, "
+            f"scheduled_for={scheduled.isoformat()}",
+            color=LogColor.CYAN,
+        )
+        self._schedule_preopen_latency_alert()
+        persist = self._preopen_latency_persister
+        if persist is not None:
+            try:
+                persist(sample)
+            except Exception as exc:
+                self.log.warning(f"Pre-open latency persistence enqueue failed: {exc}")
+
+    def _build_preopen_latency_sample(
+        self,
+        *,
+        trade_date: date,
+        source: str,
+        instrument_id: str,
+        ts_event_ns: int,
+        ts_init_ns: int,
+        observed_ns: int,
+        event_to_init_ms: int,
+        init_to_observed_ms: int,
+    ) -> PreopenLatencySample:
+        applied_advance_ms = min(
+            max(0, int(event_to_init_ms)),
+            int(self.config.preopen_latency_max_advance_ms),
+        )
+        fixed_advance_ms = int(self.config.preopen_latency_fixed_advance_ms)
+        session_open = pd.Timestamp(trade_date).tz_localize(
+            self.config.timezone_name,
+        ) + pd.Timedelta(hours=9, minutes=30)
+        scheduled = session_open - pd.Timedelta(
+            milliseconds=applied_advance_ms + fixed_advance_ms,
+        )
+        return PreopenLatencySample(
+            trade_date=trade_date,
+            source=str(source),
+            instrument_id=str(instrument_id),
+            ts_event_ns=int(ts_event_ns),
+            ts_init_ns=int(ts_init_ns),
+            observed_ns=int(observed_ns),
+            event_to_init_ms=int(event_to_init_ms),
+            init_to_observed_ms=int(init_to_observed_ms),
+            applied_advance_ms=applied_advance_ms,
+            fixed_advance_ms=fixed_advance_ms,
+            scheduled_ts_ns=int(scheduled.tz_convert("UTC").value),
+        )
+
+    def _schedule_preopen_latency_alert(self) -> None:
+        sample = self._preopen_latency_sample
+        if not bool(self.config.preopen_latency_execution_enabled) or sample is None:
+            return
+        now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
+        if sample.trade_date != now.date():
+            return
+        session_open = now.normalize() + pd.Timedelta(hours=9, minutes=30)
+        if now >= session_open:
+            return
+        alert_time = pd.Timestamp(sample.scheduled_ts_ns, unit="ns", tz="UTC").tz_convert(
+            self.config.timezone_name,
+        )
+        if alert_time <= now:
+            self._on_preopen_latency_timer(None)
+            return
+        self.clock.set_time_alert(
+            name=self._PREOPEN_LATENCY_ALERT,
+            alert_time=alert_time,
+            callback=self._on_preopen_latency_timer,
+            override=True,
+        )
+        self.log.info(
+            f"Pre-open latency convergence scheduled for {alert_time.isoformat()} "
+            f"(raw_ms={sample.event_to_init_ms}, "
+            f"applied_ms={sample.applied_advance_ms}, "
+            f"fixed_ms={sample.fixed_advance_ms}, "
+            f"total_ms={sample.total_advance_ms}, source={sample.source})",
+            color=LogColor.BLUE,
+        )
+
+    def _on_preopen_latency_timer(self, _event: Any) -> None:
+        sample = self._preopen_latency_sample
+        if sample is None or sample.trade_date != self._clock_date():
+            return
+        self.log.info(
+            "Running pre-open latency convergence, "
+            f"raw_ms={sample.event_to_init_ms}, "
+            f"applied_ms={sample.applied_advance_ms}, "
+            f"fixed_ms={sample.fixed_advance_ms}, "
+            f"total_ms={sample.total_advance_ms}, "
+            f"source={sample.source}, instrument_id={sample.instrument_id}",
+            color=LogColor.YELLOW,
+        )
+        self._converge_to_target(
+            current_date=sample.trade_date,
+            trigger=ConvergenceTrigger.PREOPEN_LATENCY,
+        )
+
+    def _within_preopen_latency_window(self, current_date: date) -> bool:
+        sample = self._preopen_latency_sample
+        if (
+            not bool(self.config.preopen_latency_execution_enabled)
+            or sample is None
+            or sample.trade_date != current_date
+            or current_date != self._clock_date()
+        ):
+            return False
+        try:
+            now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
+        except Exception:
+            return False
+        return _PREOPEN_LATENCY_EVENT_START <= now < _PREOPEN_LATENCY_EVENT_END
 
     def _within_pre_open_quote_log_window(self) -> bool:
         try:
