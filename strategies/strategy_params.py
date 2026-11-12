@@ -61,11 +61,15 @@ class StrategyParams:
     initial_cash: Decimal = Decimal("1000000")
 
     # Order lifecycle / cash gating
-    unfilled_timeout_secs: float = 3.0
-    resubmit_check_interval_secs: float = 1.0
+    resubmit_check_interval_secs: float = 0.5
     process_targets_interval_secs: float = 2.0
-    buy_offset_bps: float = 50.0
-    sell_offset_bps: float = 50.0
+    submission_book_max_age_secs: float = 4.0
+    cancel_book_max_age_secs: float = 4.0
+    same_side_price_improvement_threshold: Decimal = Decimal("20")
+    price_mismatch_cancel_delay_secs: float = 30.0
+    partial_fill_cancel_grace_secs: float = 300.0
+    partial_fill_notional_threshold: Decimal = Decimal("30000")
+    small_leaves_notional_threshold: Decimal = Decimal("20000")
     price_trend_effect_enabled: bool = True
     price_trend_window_secs: float = 10.0
     price_trend_threshold_bps: float = 20.0
@@ -97,6 +101,8 @@ class StrategyParams:
     # Exchange windows (timezone_name stays on CLI as --exchange-timezone)
     trading_windows: str = "09:29-11:30,13:00-14:55"
     exchange_trading_windows: str = "09:30-11:30,13:00-14:55"
+    execution_windows: str = "14:30-14:55"
+    exchange_execution_windows: str = "14:30-14:55"
     preopen_latency_execution_enabled: bool = False
     preopen_latency_max_advance_ms: int = 3000
     preopen_latency_fixed_advance_ms: int = 50
@@ -128,10 +134,20 @@ class StrategyParams:
             raise ValueError("consecutive_up_limit_days must be non-negative")
         if not 0.0 <= float(self.max_open_gap_up) <= 1.0:
             raise ValueError("max_open_gap_up must be between 0 and 1")
-        if float(self.buy_offset_bps) < 0:
-            raise ValueError("buy_offset_bps must be non-negative")
-        if float(self.sell_offset_bps) < 0:
-            raise ValueError("sell_offset_bps must be non-negative")
+        if float(self.submission_book_max_age_secs) < 0:
+            raise ValueError("submission_book_max_age_secs must be non-negative")
+        if float(self.cancel_book_max_age_secs) < 0:
+            raise ValueError("cancel_book_max_age_secs must be non-negative")
+        if self.same_side_price_improvement_threshold < 0:
+            raise ValueError("same_side_price_improvement_threshold must be non-negative")
+        if float(self.price_mismatch_cancel_delay_secs) < 0:
+            raise ValueError("price_mismatch_cancel_delay_secs must be non-negative")
+        if float(self.partial_fill_cancel_grace_secs) < 0:
+            raise ValueError("partial_fill_cancel_grace_secs must be non-negative")
+        if self.partial_fill_notional_threshold < 0:
+            raise ValueError("partial_fill_notional_threshold must be non-negative")
+        if self.small_leaves_notional_threshold < 0:
+            raise ValueError("small_leaves_notional_threshold must be non-negative")
         if float(self.price_trend_window_secs) <= 0:
             raise ValueError("price_trend_window_secs must be positive")
         if float(self.price_trend_threshold_bps) < 0:
@@ -232,10 +248,15 @@ class StrategyParams:
             )
 
         data = dict(raw)
-        if "order_slice_notional" in data:
-            data["order_slice_notional"] = _to_decimal(data["order_slice_notional"])
-        if "initial_cash" in data:
-            data["initial_cash"] = _to_decimal(data["initial_cash"])
+        for name in (
+            "order_slice_notional",
+            "initial_cash",
+            "partial_fill_notional_threshold",
+            "small_leaves_notional_threshold",
+            "same_side_price_improvement_threshold",
+        ):
+            if name in data:
+                data[name] = _to_decimal(data[name])
         if "excluded_name_prefixes" in data:
             data["excluded_name_prefixes"] = _to_prefix_tuple(data["excluded_name_prefixes"])
 

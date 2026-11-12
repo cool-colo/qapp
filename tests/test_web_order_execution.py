@@ -35,9 +35,23 @@ def test_automatic_window_includes_order_and_later_deal() -> None:
         [{"trade_time": datetime(2026, 7, 9, 10, 20)}],
         [],
         [],
+        [],
     )
     assert start == datetime(2026, 7, 9, 9, 55)
     assert end == datetime(2026, 7, 9, 10, 25)
+
+
+def test_automatic_window_includes_unlinked_decision() -> None:
+    start, end = _automatic_window(
+        "2026-07-09",
+        [],
+        [],
+        [],
+        [],
+        [{"decision_time": datetime(2026, 7, 9, 14, 30)}],
+    )
+    assert start == datetime(2026, 7, 9, 14, 25)
+    assert end == datetime(2026, 7, 9, 14, 55)
 
 
 def test_clickhouse_queries_use_partition_symbol_and_time_filters() -> None:
@@ -144,6 +158,14 @@ def test_report_keeps_broker_and_local_sources_separate() -> None:
                     "status": "accepted",
                     "local_received_time": datetime(2026, 7, 9, 9, 30, 1),
                 }]
+            if "FROM live_order_decision" in sql:
+                return [{
+                    "decision_id": "D-1", "intent_id": "I-1",
+                    "client_order_id": "O-1", "stock_code": "000001.SZ",
+                    "decision_type": "SUBMIT_REQUESTED",
+                    "decision_status": "requested", "reason_code": "target",
+                    "decision_time": datetime(2026, 7, 9, 9, 30),
+                }]
             raise AssertionError(sql)
 
     class FakeClickHouse:
@@ -165,5 +187,6 @@ def test_report_keeps_broker_and_local_sources_separate() -> None:
 
     assert payload["broker"]["orders"][0]["status"] == "canceled"
     assert payload["local"]["events"][0]["event_type"] == "OrderAccepted"
+    assert payload["local"]["decisions"][0]["client_order_id"] == "O-1"
     assert payload["market"]["ticks"][0]["a1"] == 10.0
     assert payload["diagnostics"][0]["marketable_tick_count"] == 1

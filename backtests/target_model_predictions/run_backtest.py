@@ -52,6 +52,7 @@ from backtests.result_writers.live_writer import LiveSnapshotWriter  # noqa: E40
 from lives.snapshot_recorder import SnapshotRecorder  # noqa: E402
 from lives.snapshot_recorder import SnapshotRecorderConfig  # noqa: E402
 from market_data import DailyStockData  # noqa: E402
+from strategies.convergence import ConvergenceTrigger  # noqa: E402
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy  # noqa: E402
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig  # noqa: E402
 from strategies.strategy_params import StrategyParams  # noqa: E402
@@ -68,9 +69,9 @@ STRATEGY_VERSION_ID = os.getenv("BACKTEST_STRATEGY_VERSION_ID", "dev")
 REPORT_DECIMAL_QUANTUM = Decimal("0.001")
 REPORT_PROCESSOR = BaseBacktest(REPORT_DECIMAL_QUANTUM, csv_index=True)
 PLANNING_CLIENT_ID = ClientId("BACKTEST_PLANNING")
-HEARTBEAT_TIME = "09:30:00"
+HEARTBEAT_TIME = "14:30:00"
 PLANNING_TIME = "09:30:01"
-EXECUTION_BAR_TIME = "09:31:00"
+EXECUTION_BAR_TIME = "14:30:01"
 
 
 class DailyPlanningEvent(Data):
@@ -132,6 +133,14 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         )
         self.apply_full_tick_snapshot(data.full_tick_snapshot, "backtest_planning")
         self._process_trading_day_once(data.trading_date, "planning_event")
+
+    def on_quote_tick(self, tick: QuoteTick) -> None:
+        super().on_quote_tick(tick)
+        self._converge_to_target(
+            current_date=bar_trading_date(tick, self.config.timezone_name),
+            trigger=ConvergenceTrigger.ORDER_BOOK_DEPTH,
+            ts_event=int(tick.ts_event),
+        )
 
 
 class BacktestTargetPlanRecorder(SnapshotRecorder):
@@ -337,9 +346,10 @@ def prepare_backtest_event_data(
     """
     Build a deterministic live-like daily event sequence.
 
-    The planning snapshot is the strategy input. Quotes only open the executor's
-    exchange-time gate, and bars arrive afterward solely for venue matching and
-    portfolio valuation.
+    The 09:30 planning snapshot is the strategy input. Per-instrument synthetic
+    quotes open the 14:30 execution gate, and bars arrive one second afterward
+    solely for venue matching and portfolio valuation. Daily data has no historical
+    L2, so each synthetic same-side best uses that day's open.
     """
     raw_bars_by_date: dict[date, dict[str, Bar]] = {}
     for stock_code, bars in bars_by_stock.items():
@@ -367,7 +377,6 @@ def prepare_backtest_event_data(
         bars_for_date = raw_bars_by_date.get(trading_date, {})
         suspended = bundle.suspended_by_date.get(trading_date, set())
         snapshot: dict[str, dict[str, Any]] = {}
-        heartbeat_stock: str | None = None
 
         for stock_code in sorted(bars_by_stock):
             instrument = instruments_by_stock[stock_code]
@@ -391,8 +400,6 @@ def prepare_backtest_event_data(
                 "last_close": last_close,
                 "open_int": 13,
             }
-            if heartbeat_stock is None:
-                heartbeat_stock = stock_code
 
         planning_ts = exchange_timestamp_ns(
             trading_date,
@@ -411,8 +418,9 @@ def prepare_backtest_event_data(
         )
         planning_events.append(CustomData(data_type, planning_event))
 
-        if heartbeat_stock is not None:
-            heartbeat_bar = bars_for_date[heartbeat_stock]
+        for heartbeat_stock, heartbeat_bar in sorted(bars_for_date.items()):
+            if heartbeat_stock in suspended:
+                continue
             heartbeat_instrument = instruments_by_stock[heartbeat_stock]
             heartbeat_ts = exchange_timestamp_ns(
                 trading_date,
@@ -575,11 +583,19 @@ def build_engine(
             exit_non_targets=params.exit_non_targets,
             trading_windows=params.trading_windows,
             exchange_trading_windows=params.exchange_trading_windows,
+            execution_windows=params.execution_windows,
+            exchange_execution_windows=params.exchange_execution_windows,
             stop_time=params.stop_time,
             require_account_cash=True,
-            unfilled_timeout_secs=0,
-            buy_offset_bps=params.buy_offset_bps,
-            sell_offset_bps=params.sell_offset_bps,
+            submission_book_max_age_secs=params.submission_book_max_age_secs,
+            cancel_book_max_age_secs=params.cancel_book_max_age_secs,
+            same_side_price_improvement_threshold=(
+                params.same_side_price_improvement_threshold
+            ),
+            price_mismatch_cancel_delay_secs=params.price_mismatch_cancel_delay_secs,
+            partial_fill_cancel_grace_secs=params.partial_fill_cancel_grace_secs,
+            partial_fill_notional_threshold=params.partial_fill_notional_threshold,
+            small_leaves_notional_threshold=params.small_leaves_notional_threshold,
             price_trend_effect_enabled=params.price_trend_effect_enabled,
             price_trend_window_secs=params.price_trend_window_secs,
             price_trend_threshold_bps=params.price_trend_threshold_bps,
@@ -774,6 +790,17 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.risk_manager_mode": params.risk_manager_mode,
         "strategy.risk_manager_timeout_secs": params.risk_manager_timeout_secs,
         "strategy.order_slice_notional": params.order_slice_notional,
+        "strategy.execution_windows": params.execution_windows,
+        "strategy.exchange_execution_windows": params.exchange_execution_windows,
+        "strategy.submission_book_max_age_secs": params.submission_book_max_age_secs,
+        "strategy.cancel_book_max_age_secs": params.cancel_book_max_age_secs,
+        "strategy.same_side_price_improvement_threshold": (
+            params.same_side_price_improvement_threshold
+        ),
+        "strategy.price_mismatch_cancel_delay_secs": params.price_mismatch_cancel_delay_secs,
+        "strategy.partial_fill_cancel_grace_secs": params.partial_fill_cancel_grace_secs,
+        "strategy.partial_fill_notional_threshold": params.partial_fill_notional_threshold,
+        "strategy.small_leaves_notional_threshold": params.small_leaves_notional_threshold,
         "base.start_date": args.start,
         "base.end_date": args.end,
         "base.initial_cash": args.starting_cash,

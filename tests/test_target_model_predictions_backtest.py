@@ -168,7 +168,7 @@ class BacktestPlanningEventTest(unittest.TestCase):
         )
 
         self.assertEqual(len(planning), 2)
-        self.assertEqual(len(heartbeats), 2)
+        self.assertEqual(len(heartbeats), 4)
         second_event = planning[1].data
         self.assertEqual(
             second_event.full_tick_snapshot["000001.SZ.QMT"]["open"],
@@ -180,14 +180,19 @@ class BacktestPlanningEventTest(unittest.TestCase):
         )
         self.assertNotIn("high", second_event.full_tick_snapshot["000001.SZ.QMT"])
         self.assertNotIn("low", second_event.full_tick_snapshot["000001.SZ.QMT"])
-        self.assertLess(heartbeats[1].ts_init, second_event.ts_init)
+        second_day_quotes = heartbeats[2:]
+        self.assertTrue(all(second_event.ts_init < quote.ts_init for quote in second_day_quotes))
+        self.assertEqual(
+            {float(quote.bid_price) for quote in second_day_quotes},
+            {11.0, 21.0},
+        )
         expected_execution_ts = exchange_timestamp_ns(
             second_date,
             EXECUTION_BAR_TIME,
             self.timezone_name,
         )
         self.assertEqual(execution_bars["000001.SZ"][1].ts_init, expected_execution_ts)
-        self.assertGreater(execution_bars["000001.SZ"][1].ts_init, second_event.ts_init)
+        self.assertGreater(execution_bars["000001.SZ"][1].ts_init, second_day_quotes[0].ts_init)
 
     def test_suspended_instrument_uses_status_without_an_execution_bar(self) -> None:
         first_date = date(2026, 7, 7)
@@ -327,7 +332,7 @@ class BacktestPlanningEventTest(unittest.TestCase):
             self.assertEqual(planner.requests[1].current_holdings[0].quantity, 100)
             self.assertFalse(strategy.config.subscribe_bars)
             self.assertFalse(strategy.config.process_targets_on_timer)
-            self.assertEqual(strategy.config.unfilled_timeout_secs, 0)
+            self.assertEqual(strategy.config.execution_windows, "14:30-14:55")
         finally:
             engine.dispose()
 

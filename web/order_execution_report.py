@@ -190,9 +190,24 @@ def query_order_execution(
                broker_event_time, CAST(broker_event_ns AS CHAR) AS broker_event_ns,
                broker_time_kind, local_event_time,
                CAST(local_event_ns AS CHAR) AS local_event_ns,
-               local_received_time, persisted_at, reconciliation, reason
+               local_received_time, persisted_at, reconciliation, signal_date,
+               target_qty, target_version, reason, book_snapshot, raw_info
         FROM live_order_event WHERE {identity}
         ORDER BY local_received_time, local_event_ns, event_id
+        """,
+        params,
+    )
+    decisions = mysql.query(
+        f"""
+        SELECT trade_date, decision_id, parent_decision_id, intent_id,
+               order_chain_id, client_order_id, trigger_client_order_id,
+               decision_type, decision_status, reason_code, instrument_id,
+               stock_code, side, signal_date, target_version, target_qty,
+               current_qty, delta_qty, order_qty, order_price, policy_name,
+               context_version, context, decision_time,
+               CAST(decision_ns AS CHAR) AS decision_ns, persisted_at
+        FROM live_order_decision WHERE {identity}
+        ORDER BY decision_time, decision_ns, decision_id
         """,
         params,
     )
@@ -204,6 +219,7 @@ def query_order_execution(
             broker_trades,
             local_orders,
             events,
+            decisions,
         )
     else:
         start_at, end_at = parse_report_window(trading_date, start, end)
@@ -235,6 +251,7 @@ def query_order_execution(
             "orders": jsonable_rows(local_orders),
             "trades": jsonable_rows(local_trades),
             "events": jsonable_rows(events),
+            "decisions": jsonable_rows(decisions),
         },
         "market": {"minutes": minutes, "ticks": ticks},
         "diagnostics": diagnostics,
@@ -253,6 +270,7 @@ def _automatic_window(
     broker_trades: list[dict[str, Any]],
     local_orders: list[dict[str, Any]],
     events: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
 ) -> tuple[datetime, datetime]:
     session_start, session_end = parse_report_window(trading_date, None, None)
     values: list[datetime] = []
@@ -273,6 +291,10 @@ def _automatic_window(
         value = _as_datetime(row.get("local_received_time")) or _as_datetime(
             row.get("local_event_time"),
         )
+        if value is not None:
+            values.append(value)
+    for row in decisions:
+        value = _as_datetime(row.get("decision_time"))
         if value is not None:
             values.append(value)
     if not values:

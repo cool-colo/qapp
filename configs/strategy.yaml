@@ -29,14 +29,18 @@ holding_days: 10           # backtest rebalance cadence (unused by live target-t
 initial_cash: 1000000
 
 # --- Order lifecycle / cash gating ---
-unfilled_timeout_secs: 3.0
-resubmit_check_interval_secs: 1.0  # open-order timeout/convergence check cadence
+resubmit_check_interval_secs: 0.5  # convergence and cancel-validation cadence
 process_targets_interval_secs: 2.0 # daily target-processing trigger cadence
-buy_offset_bps: 50.0              # first BUY quote: open + 50 bps (0.5%)
-sell_offset_bps: 50.0             # first SELL quote: open - 50 bps (0.5%)
-# Price direction is primary; traded volume and standard five-level order-book
-# imbalance confirm its magnitude but can never reverse it.
-price_trend_effect_enabled: false  # false: keep calculating/recording, but do not alter price or timeout
+submission_book_max_age_secs: 4.0  # skip submission and warn when the book is older
+cancel_book_max_age_secs: 4.0      # skip cancel validation when the book is older
+same_side_price_improvement_threshold: 20  # below this price, quote at same-side best
+price_mismatch_cancel_delay_secs: 30.0
+partial_fill_cancel_grace_secs: 180.0
+partial_fill_notional_threshold: 20000
+small_leaves_notional_threshold: 20000
+# Price-trend fields remain execution diagnostics; same-side pricing and cancel
+# eligibility are governed exclusively by the book/mismatch settings above.
+price_trend_effect_enabled: false
 price_trend_window_secs: 10.0
 price_trend_threshold_bps: 20.0
 price_trend_max_bps: 40.0
@@ -69,8 +73,10 @@ excluded_name_prefixes:
 # --- Exchange windows (timezone stays on CLI: --exchange-timezone) ---
 trading_windows: "09:29-11:30,13:00-14:55"
 exchange_trading_windows: "09:30-11:30,13:00-14:55"
-# Measure the first 09:25 quote/depth probe every day. When enabled, submit once at
-# 09:30 minus the capped measured delay and the fixed additional advance.
+execution_windows: "14:30-14:55"
+exchange_execution_windows: "14:30-14:55"
+# Retained latency-probe settings. The 14:30 execution window is authoritative;
+# even when enabled, a pre-open trigger cannot submit outside that window.
 preopen_latency_execution_enabled: false
 preopen_latency_max_advance_ms: 3000
 preopen_latency_fixed_advance_ms: 50

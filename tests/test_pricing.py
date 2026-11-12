@@ -10,6 +10,8 @@ from nautilus_trader.model.identifiers import InstrumentId
 from strategies.pricing import OpenOffsetBuyPriceStrategy
 from strategies.pricing import OpenOffsetSellPriceStrategy
 from strategies.pricing import PriceContext
+from strategies.pricing import SameSideBestBuyPriceStrategy
+from strategies.pricing import SameSideBestSellPriceStrategy
 from strategies.pricing import base_offset
 from strategies.pricing import walk_book
 
@@ -56,6 +58,48 @@ class BaseOffsetTest(unittest.TestCase):
     def test_tick_floor_wins_when_proportional_is_tiny(self) -> None:
         # 10 * 5bps = 0.005 < tick 0.01
         self.assertAlmostEqual(base_offset(10.0, 0.01, 5.0), 0.01)
+
+
+class SameSideBestPriceStrategyTest(unittest.TestCase):
+    def test_buy_below_threshold_uses_best_bid_without_improvement(self) -> None:
+        pricer = SameSideBestBuyPriceStrategy(
+            price_improvement_threshold=20.0,
+            logger=LOGGER,
+        )
+        self.assertAlmostEqual(pricer.compute(buy_ctx(best_bid=10.23)), 10.23)
+
+    def test_sell_below_threshold_uses_best_ask_without_improvement(self) -> None:
+        pricer = SameSideBestSellPriceStrategy(
+            price_improvement_threshold=20.0,
+            logger=LOGGER,
+        )
+        self.assertAlmostEqual(pricer.compute(sell_ctx(best_ask=10.23)), 10.23)
+
+    def test_price_at_threshold_improves_by_one_tick(self) -> None:
+        buy_pricer = SameSideBestBuyPriceStrategy(
+            price_improvement_threshold=20.0,
+            logger=LOGGER,
+        )
+        sell_pricer = SameSideBestSellPriceStrategy(
+            price_improvement_threshold=20.0,
+            logger=LOGGER,
+        )
+        self.assertAlmostEqual(buy_pricer.compute(buy_ctx(best_bid=20.0)), 20.01)
+        self.assertAlmostEqual(sell_pricer.compute(sell_ctx(best_ask=20.0)), 19.99)
+
+    def test_missing_same_side_best_has_no_price(self) -> None:
+        self.assertIsNone(
+            SameSideBestBuyPriceStrategy(
+                price_improvement_threshold=20.0,
+                logger=LOGGER,
+            ).compute(buy_ctx()),
+        )
+        self.assertIsNone(
+            SameSideBestSellPriceStrategy(
+                price_improvement_threshold=20.0,
+                logger=LOGGER,
+            ).compute(sell_ctx()),
+        )
 
 
 class WalkBookTest(unittest.TestCase):

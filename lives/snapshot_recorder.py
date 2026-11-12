@@ -55,6 +55,7 @@ from backtests.result_writers.live_records import SOURCE_LIVE
 from backtests.result_writers.live_records import WHOLE_MARKET
 from backtests.result_writers.live_records import WHOLE_MARKET_SCHEMA_VERSION
 from backtests.result_writers.live_records import LiveAssetSnapshotRecord
+from backtests.result_writers.live_records import LiveOrderDecisionRecord
 from backtests.result_writers.live_records import LiveOrderEventRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
@@ -65,7 +66,9 @@ from backtests.result_writers.live_records import LiveTradeRecord
 from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
 from lives.order_event_persistence import AsyncOrderEventWriter
 from lives.order_event_persistence import OrderEventWrite
+from lives.order_decision_persistence import AsyncOrderDecisionWriter
 from strategies.target_quantities import DepthBookSnapshot
+from strategies.target_quantities import OrderDecisionEvent
 from strategies.target_quantities import PreopenLatencySample
 
 
@@ -130,6 +133,7 @@ class SnapshotRecorder(Actor):
         fetch_open_prices: Any | None = None,
         event_reporter: Callable[[str, str, dict[str, Any]], None] | None = None,
         order_event_writer: AsyncOrderEventWriter | None = None,
+        order_decision_writer: AsyncOrderDecisionWriter | None = None,
     ) -> None:
         super().__init__(config)
         self._writer = writer
@@ -146,6 +150,12 @@ class SnapshotRecorder(Actor):
             logger=self.log,
             now=lambda: datetime.now(ZoneInfo(config.timezone_name)).replace(tzinfo=None),
         )
+        self._order_decision_writer = order_decision_writer or AsyncOrderDecisionWriter(
+            writer,
+            logger=self.log,
+            now=lambda: datetime.now(ZoneInfo(config.timezone_name)).replace(tzinfo=None),
+        )
+        self._seen_order_decision_ids: set[str] = set()
         self._latency_write_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="preopen-latency-write",
@@ -162,7 +172,11 @@ class SnapshotRecorder(Actor):
 
     def on_start(self) -> None:
         self._order_event_writer.start()
+        self._order_decision_writer.start()
         self._subscribe_order_events()
+        self._strategy.add_order_decision_listener(self._on_order_decision)
+        for event in tuple(self._strategy.order_decision_events):
+            self._on_order_decision(event)
         if self._before_time is not None:
             self._schedule_daily(self._BEFORE_ALERT, self._before_time, self._on_before_timer)
         if self._after_time is not None:
@@ -172,10 +186,17 @@ class SnapshotRecorder(Actor):
         self._catch_up_on_start()
 
     def on_stop(self) -> None:
+        self._strategy.remove_order_decision_listener(self._on_order_decision)
         if not self._order_event_writer.stop(timeout_secs=10.0):
             metrics = self._order_event_writer.metrics()
             self.log.error(
                 "order-event persistence did not drain before shutdown: "
+                f"pending={metrics['pending_count']} last_error={metrics['last_error']}",
+            )
+        if not self._order_decision_writer.stop(timeout_secs=10.0):
+            metrics = self._order_decision_writer.metrics()
+            self.log.error(
+                "order-decision persistence did not drain before shutdown: "
                 f"pending={metrics['pending_count']} last_error={metrics['last_error']}",
             )
         self._latency_write_executor.shutdown(wait=False)
@@ -191,6 +212,10 @@ class SnapshotRecorder(Actor):
     def order_event_persistence_metrics(self) -> dict[str, Any]:
         """Return side-effect-free queue health for node/status integrations."""
         return self._order_event_writer.metrics()
+
+    def order_decision_persistence_metrics(self) -> dict[str, Any]:
+        """Return side-effect-free decision queue health."""
+        return self._order_decision_writer.metrics()
 
     def persist_preopen_latency_sample(self, sample: PreopenLatencySample) -> None:
         """Queue one first-wins latency probe without blocking the strategy callback."""
@@ -1177,6 +1202,47 @@ class SnapshotRecorder(Actor):
             return {}
 
     # ---- order / trade events ------------------------------------------------
+
+    def _on_order_decision(self, event: OrderDecisionEvent) -> None:
+        """Materialize and enqueue one strategy decision without blocking trading."""
+        if event.decision_id in self._seen_order_decision_ids:
+            return
+        try:
+            decision_time = self._ns_to_naive(event.decision_ns) or self._now_naive()
+            record = LiveOrderDecisionRecord(
+                trade_date=event.trading_date,
+                account_id=self.config.account_id,
+                trader_id=self.config.trader_id,
+                decision_id=event.decision_id,
+                parent_decision_id=event.parent_decision_id,
+                intent_id=event.intent_id,
+                order_chain_id=event.order_chain_id,
+                client_order_id=event.client_order_id,
+                trigger_client_order_id=event.trigger_client_order_id,
+                decision_type=event.decision_type,
+                decision_status=event.decision_status,
+                reason_code=event.reason_code,
+                instrument_id=event.instrument_id,
+                stock_code=self._stock_code(event.instrument_id),
+                side=event.side,
+                signal_date=event.signal_date,
+                target_version=event.target_version,
+                target_qty=self._int_or_none(event.target_qty),
+                current_qty=self._int_or_none(event.current_qty),
+                delta_qty=self._int_or_none(event.delta_qty),
+                order_qty=self._int_or_none(event.order_qty),
+                order_price=self._decimal_or_none(event.order_price),
+                policy_name=event.policy_name,
+                context_version=event.context_version,
+                context=event.context,
+                decision_time=decision_time,
+                decision_ns=event.decision_ns,
+                persisted_at=self._now_naive(),
+            )
+            self._order_decision_writer.submit(record)
+            self._seen_order_decision_ids.add(event.decision_id)
+        except Exception as exc:
+            self.log.warning(f"order decision enqueue failed: {exc}")
 
     def _subscribe_order_events(self) -> None:
         msgbus = getattr(self, "msgbus", None)

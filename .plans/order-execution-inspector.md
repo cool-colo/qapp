@@ -88,9 +88,9 @@ stock/date index and ordered by local receive time, local event nanoseconds, the
 - optional `tick_limit` (bounded server-side)
 
 When both timestamps are omitted, the backend derives a bounded window beginning five
-minutes before the earliest order/lifecycle timestamp and ending at least thirty
-minutes later or five minutes after the latest terminal/fill timestamp. With no order
-records it uses the full session.
+minutes before the earliest order/lifecycle/strategy-decision timestamp and ending at
+least thirty minutes later or five minutes after the latest relevant timestamp. With
+no records it uses the full session.
 
 It returns source-separated data:
 

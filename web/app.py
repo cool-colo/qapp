@@ -1132,7 +1132,7 @@ def realtime_trade_summary(
     trader: str,
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
-    """Today's buy/sell turnover relative to the before-trading total asset."""
+    """Today's observed live fills, turnover and open-price slippage."""
     mysql = _mysql(data, source)
     trading_date = date.today().isoformat()
     params = {
@@ -1165,6 +1165,79 @@ def realtime_trade_summary(
         FROM live_trade_realtime
         WHERE {_ACCOUNT_KEYS}
           AND trade_date = %(trade_date)s
+          AND EXISTS (
+              SELECT 1
+              FROM live_order_event e
+              WHERE e.account_id = live_trade_realtime.account_id
+                AND e.trader_id = live_trade_realtime.trader_id
+                AND e.trade_date = live_trade_realtime.trade_date
+                AND e.client_order_id = live_trade_realtime.client_order_id
+                AND e.trade_id = live_trade_realtime.trade_id
+                AND e.event_type = 'OrderFilled'
+                AND e.reconciliation = FALSE
+          )
+        """,
+        params,
+    )
+    slippage_rows = mysql.query(
+        f"""
+        SELECT
+            COALESCE(t.stock_code, o.stock_code) AS stock_code,
+            UPPER(t.side) AS side,
+            COUNT(DISTINCT t.client_order_id) AS order_count,
+            COUNT(*) AS trade_count,
+            SUM(t.quantity) AS traded_qty,
+            SUM(t.price * t.quantity) AS traded_amount,
+            SUM(o.open_price * t.quantity) / NULLIF(SUM(t.quantity), 0)
+                AS avg_open_price,
+            SUM(t.price * t.quantity) / NULLIF(SUM(t.quantity), 0)
+                AS avg_trade_price,
+            SUM(
+                CASE
+                    WHEN UPPER(t.side) = 'BUY'
+                        THEN (t.price - o.open_price) * t.quantity
+                    WHEN UPPER(t.side) = 'SELL'
+                        THEN (o.open_price - t.price) * t.quantity
+                    ELSE 0
+                END
+            ) AS slippage_amount,
+            SUM(
+                CASE
+                    WHEN UPPER(t.side) = 'BUY'
+                        THEN (t.price - o.open_price) * t.quantity
+                    WHEN UPPER(t.side) = 'SELL'
+                        THEN (o.open_price - t.price) * t.quantity
+                    ELSE 0
+                END
+            ) / NULLIF(SUM(t.price * t.quantity), 0) * 10000 AS slippage_bps
+        FROM live_trade_realtime t
+        JOIN live_order_realtime o
+          ON o.account_id = t.account_id
+         AND o.trader_id = t.trader_id
+         AND o.trade_date = t.trade_date
+         AND o.client_order_id = t.client_order_id
+        WHERE t.account_id = %(account_id)s
+          AND t.trader_id = %(trader_id)s
+          AND t.trade_date = %(trade_date)s
+          AND o.open_price IS NOT NULL
+          AND o.open_price > 0
+          AND t.price IS NOT NULL
+          AND t.quantity IS NOT NULL
+          AND t.quantity > 0
+          AND UPPER(t.side) IN ('BUY', 'SELL')
+          AND EXISTS (
+              SELECT 1
+              FROM live_order_event e
+              WHERE e.account_id = t.account_id
+                AND e.trader_id = t.trader_id
+                AND e.trade_date = t.trade_date
+                AND e.client_order_id = t.client_order_id
+                AND e.trade_id = t.trade_id
+                AND e.event_type = 'OrderFilled'
+                AND e.reconciliation = FALSE
+          )
+        GROUP BY COALESCE(t.stock_code, o.stock_code), UPPER(t.side)
+        ORDER BY COALESCE(t.stock_code, o.stock_code), UPPER(t.side)
         """,
         params,
     )
@@ -1179,6 +1252,16 @@ def realtime_trade_summary(
     sell_amount = as_decimal(trade_row.get("sell_amount"))
     total_amount = buy_amount + sell_amount
     usable_asset = total_asset is not None and total_asset > 0
+
+    def slippage_summary(side: str | None = None) -> dict[str, Decimal | None]:
+        rows = [row for row in slippage_rows if side is None or str(row.get("side", "")).upper() == side]
+        amount = sum((as_decimal(row.get("slippage_amount")) for row in rows), Decimal(0))
+        traded_amount = sum((as_decimal(row.get("traded_amount")) for row in rows), Decimal(0))
+        return {
+            "amount": amount,
+            "bps": amount / traded_amount * Decimal(10000) if traded_amount else None,
+        }
+
     summary = {
         "trade_date": trading_date,
         "total_asset": total_asset,
@@ -1188,6 +1271,16 @@ def realtime_trade_summary(
         "sell_rate": sell_amount / total_asset if usable_asset else None,
         "total_amount": total_amount,
         "total_rate": total_amount / total_asset if usable_asset else None,
+        "slippage": {
+            "total": {key: jsonable(value) for key, value in slippage_summary().items()},
+            "buy": {
+                key: jsonable(value) for key, value in slippage_summary("BUY").items()
+            },
+            "sell": {
+                key: jsonable(value) for key, value in slippage_summary("SELL").items()
+            },
+            "stocks": jsonable_rows(slippage_rows),
+        },
     }
     return {key: jsonable(value) for key, value in summary.items()}
 
@@ -1286,6 +1379,146 @@ def strategy_targets(
             row["name"] = row.get("stock_name") or ""
     payload["targets"] = targets
     return payload
+
+
+def build_pending_trade_projection(
+    target_payload: dict[str, Any],
+    tick_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Value the unfinished target book at today's open and latest price.
+
+    Positive ``loss_amount`` means executing now is worse than executing at the
+    open: buys cost more, or sells receive less. Negative values mean the latest
+    price is favorable. Gross buy + sell notional is used for both loss-rate
+    denominators so buy and sell cash flows cannot cancel each other out.
+    """
+
+    def decimal_price(value: Any) -> Decimal | None:
+        if value is None:
+            return None
+        try:
+            price = Decimal(str(value))
+        except (ValueError, TypeError):
+            return None
+        return price if price > 0 else None
+
+    ticks = {
+        str(row["stock_code"]): row
+        for row in tick_payload.get("ticks") or []
+        if row.get("stock_code")
+    }
+    trades: list[dict[str, Any]] = []
+    for target in target_payload.get("targets") or []:
+        stock_code = str(target["stock_code"])
+        current_qty = int(target["current_qty"])
+        target_qty = int(target["target_qty"])
+        qty_delta = target_qty - current_qty
+        if qty_delta == 0:
+            continue
+
+        side = "BUY" if qty_delta > 0 else "SELL"
+        trade_qty = abs(qty_delta)
+        tick = ticks.get(stock_code, {})
+        open_price = decimal_price(tick.get("open"))
+        current_price = decimal_price(tick.get("last_price"))
+        priced = open_price is not None and current_price is not None
+        open_amount = open_price * trade_qty if priced else None
+        current_amount = current_price * trade_qty if priced else None
+        if priced:
+            price_change = current_price / open_price - Decimal(1)
+            loss_amount = (
+                (current_price - open_price) * trade_qty
+                if side == "BUY"
+                else (open_price - current_price) * trade_qty
+            )
+        else:
+            price_change = None
+            loss_amount = None
+
+        trades.append(
+            {
+                "stock_code": stock_code,
+                "name": target.get("name") or target.get("stock_name") or "",
+                "side": side,
+                "current_qty": current_qty,
+                "target_qty": target_qty,
+                "trade_qty": trade_qty,
+                "open_price": float(open_price) if open_price is not None else None,
+                "current_price": float(current_price) if current_price is not None else None,
+                "price_change": float(price_change) if price_change is not None else None,
+                "open_amount": float(open_amount) if open_amount is not None else None,
+                "current_amount": float(current_amount) if current_amount is not None else None,
+                "loss_amount": float(loss_amount) if loss_amount is not None else None,
+                "frozen": bool(target.get("frozen")),
+                "frozen_reason": target.get("frozen_reason"),
+            }
+        )
+
+    def summarize(side: str | None = None) -> dict[str, Any]:
+        rows = [row for row in trades if side is None or row["side"] == side]
+        priced_rows = [row for row in rows if row["loss_amount"] is not None]
+        open_amount = sum(
+            (Decimal(str(row["open_amount"])) for row in priced_rows),
+            Decimal(0),
+        )
+        current_amount = sum(
+            (Decimal(str(row["current_amount"])) for row in priced_rows),
+            Decimal(0),
+        )
+        loss_amount = sum(
+            (Decimal(str(row["loss_amount"])) for row in priced_rows),
+            Decimal(0),
+        )
+        return {
+            "stock_count": len(rows),
+            "priced_count": len(priced_rows),
+            "open_amount": float(open_amount),
+            "current_amount": float(current_amount),
+            "loss_amount": float(loss_amount),
+            "loss_rate_open": float(loss_amount / open_amount) if open_amount else None,
+            "loss_rate_current": (
+                float(loss_amount / current_amount) if current_amount else None
+            ),
+        }
+
+    buy = summarize("BUY")
+    sell = summarize("SELL")
+    total = summarize()
+    total["open_net_cash"] = buy["open_amount"] - sell["open_amount"]
+    total["current_net_cash"] = buy["current_amount"] - sell["current_amount"]
+    return {
+        "trade_date": tick_payload.get("trade_date"),
+        "target_date": target_payload.get("target_date"),
+        "target_version": target_payload.get("target_version"),
+        "count": len(trades),
+        "unpriced_count": len(trades) - total["priced_count"],
+        "trades": trades,
+        "buy": buy,
+        "sell": sell,
+        "total": total,
+    }
+
+
+@app.get("/api/realtime/pending-trades")
+def realtime_pending_trades(
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Unfinished target trades valued at the open and current market price."""
+    client = _node_api(data, account, trader)
+    try:
+        target_payload = client.get("/strategy/targets")
+        tick_payload = client.get("/realtime/whole_market_ticks")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    targets = data.attach_names(target_payload.get("targets") or [])
+    for row in targets:
+        if not row.get("name"):
+            row["name"] = row.get("stock_name") or ""
+    target_payload["targets"] = targets
+    return build_pending_trade_projection(target_payload, tick_payload)
 
 
 @app.get("/api/control/state")

@@ -5,6 +5,7 @@ import inspect
 import random
 import threading
 import time
+import uuid
 from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +32,6 @@ from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
-from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue
@@ -42,9 +42,9 @@ from strategies.convergence import ConvergenceTrigger
 from strategies.execution_reconciliation import ExecutionStateReconciler
 from strategies.order_splitter import LimitOrderQuantityRules
 from strategies.order_splitter import NotionalOrderSplitter
-from strategies.pricing import OpenOffsetBuyPriceStrategy
-from strategies.pricing import OpenOffsetSellPriceStrategy
 from strategies.pricing import PriceContext
+from strategies.pricing import SameSideBestBuyPriceStrategy
+from strategies.pricing import SameSideBestSellPriceStrategy
 from strategies.trading_control import TradingController
 
 # QMT repurposes the full-tick ``open_int`` field as a real-time market-status code
@@ -137,6 +137,44 @@ class TargetQuantityOrderEvent:
 
 
 @dataclass(frozen=True)
+class OrderDecisionEvent:
+    """One append-only strategy decision, independent of broker lifecycle facts."""
+
+    decision_id: str
+    trading_date: date
+    decision_ns: int
+    intent_id: str
+    decision_type: str
+    decision_status: str
+    reason_code: str
+    instrument_id: str
+    parent_decision_id: str | None = None
+    order_chain_id: str | None = None
+    client_order_id: str | None = None
+    trigger_client_order_id: str | None = None
+    side: str | None = None
+    signal_date: date | None = None
+    target_version: str | None = None
+    target_qty: Decimal | None = None
+    current_qty: Decimal | None = None
+    delta_qty: Decimal | None = None
+    order_qty: Decimal | None = None
+    order_price: Decimal | None = None
+    policy_name: str | None = None
+    context_version: int = 1
+    context: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OrderDecisionLineage:
+    intent_id: str
+    order_chain_id: str
+    client_order_id: str
+    instrument_id: str
+    side: OrderSide
+
+
+@dataclass(frozen=True)
 class IntentContext:
     instrument_id: str
     target_qty: Decimal
@@ -144,6 +182,7 @@ class IntentContext:
     delta_qty: Decimal
     price_context: PriceContext | None
     pricer_class: str | None
+    intent_id: str
     details: dict[str, Any] = field(default_factory=dict)
 
     def record(self, **details: Any) -> None:
@@ -158,6 +197,7 @@ class IntentContext:
             "current_qty": self.current_qty,
             "delta_qty": self.delta_qty,
             "pricer_class": self.pricer_class,
+            "intent_id": self.intent_id,
             "price_context": self._price_context_snapshot(),
         }
         result.update(self.details)
@@ -217,6 +257,7 @@ class TargetOrderIntent:
     quantity: Decimal
     price: Any
     context: IntentContext
+    replacement: OrderDecisionLineage | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +266,28 @@ class TodayFillSnapshot:
     sell_qty: Decimal
     fill_count: int
     latest_ts_event: int
+
+
+@dataclass
+class OrderQuoteState:
+    """Market-data state used to price and later consider canceling one order."""
+
+    source_ts_event: int | None
+    source_ts_init: int | None
+    source_same_side_best: Decimal | None
+    mismatch_since_ns: int | None = None
+    recovered: bool = False
+    last_decision_state: str | None = None
+
+
+@dataclass(frozen=True)
+class OrderFillStats:
+    filled_notional: Decimal = Decimal("0")
+    latest_fill_ts_init: int | None = None
+    event_filled_qty: Decimal = Decimal("0")
+    order_filled_qty: Decimal | None = None
+    history_complete: bool = True
+    history_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -309,10 +372,18 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     timezone_name: str = "Asia/Shanghai"
     trading_windows: str = "09:29-11:30,13:00-14:55"
     exchange_trading_windows: str = "09:30-11:30,13:00-14:55"
+    execution_windows: str = "14:30-14:55"
+    exchange_execution_windows: str = "14:30-14:55"
     stop_time: str | None = "14:55"
     initial_last_closes: dict[str, float] | None = None
-    unfilled_timeout_secs: float = 3.0
-    resubmit_check_interval_secs: float = 1.0
+    resubmit_check_interval_secs: float = 0.5
+    submission_book_max_age_secs: float = 4.0
+    cancel_book_max_age_secs: float = 4.0
+    same_side_price_improvement_threshold: Decimal = Decimal("20")
+    price_mismatch_cancel_delay_secs: float = 30.0
+    partial_fill_cancel_grace_secs: float = 300.0
+    partial_fill_notional_threshold: Decimal = Decimal("30000")
+    small_leaves_notional_threshold: Decimal = Decimal("20000")
     # A broker sellable-position denial that lands shortly after this strategy
     # cancels its own sell for the same instrument is treated as a transient
     # freeze-release race (the broker has not yet released the shares frozen by
@@ -328,11 +399,6 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     cancel_reconverge_delay_secs: float = 0.1
     cash_buffer_percent: float = 0.01
     target_cash_buffer_percent: float = 0.05
-    buy_offset_bps: float = 50.0
-    sell_offset_bps: float = 50.0
-    buy_max_price_bps: float = 100.0
-    buy_cancel_threshold: int = 1
-    sell_cancel_threshold: int = 1
     price_trend_effect_enabled: bool = True
     price_trend_window_secs: float = 10.0
     price_trend_threshold_bps: float = 20.0
@@ -407,6 +473,7 @@ class TargetQuantityStrategy(Strategy):
     def __init__(self, config: TargetQuantityStrategyConfig) -> None:
         super().__init__(config)
         self._validate_price_trend_config(config)
+        self._validate_execution_config(config)
         if int(config.preopen_latency_max_advance_ms) < 0:
             raise ValueError("preopen_latency_max_advance_ms must be non-negative")
         if int(config.preopen_latency_fixed_advance_ms) < 0:
@@ -435,18 +502,22 @@ class TargetQuantityStrategy(Strategy):
         self._order_target_versions: dict[str, str] = {}
         self._order_signal_dates: dict[str, date] = {}
         self._order_intent_contexts: dict[str, IntentContext] = {}
+        self._execution_intent_ids: dict[tuple[str, str], str] = {}
+        self._order_decision_lineages: dict[str, OrderDecisionLineage] = {}
+        self._pending_replacements: dict[str, OrderDecisionLineage] = {}
+        self._order_decision_listeners: list[Callable[[OrderDecisionEvent], None]] = []
         self._order_splitter = NotionalOrderSplitter(config.order_slice_notional)
-        self._buy_pricer = OpenOffsetBuyPriceStrategy(
-            offset_bps=float(config.buy_offset_bps),
-            max_price_bps=float(config.buy_max_price_bps),
-            cancel_threshold=int(config.buy_cancel_threshold),
+        price_improvement_threshold = float(config.same_side_price_improvement_threshold)
+        self._buy_pricer = SameSideBestBuyPriceStrategy(
+            price_improvement_threshold=price_improvement_threshold,
             logger=self.log,
         )
-        self._sell_pricer = OpenOffsetSellPriceStrategy(
-            offset_bps=float(config.sell_offset_bps),
-            cancel_threshold=int(config.sell_cancel_threshold),
+        self._sell_pricer = SameSideBestSellPriceStrategy(
+            price_improvement_threshold=price_improvement_threshold,
             logger=self.log,
         )
+        self._order_quote_states: dict[str, OrderQuoteState] = {}
+        self._stale_book_warning_ts: dict[str, int] = {}
         # Today's open price per instrument (first bar of the trading date wins).
         self._today_open: dict[str, float] = {}
         # Instruments whose _today_open came from an authoritative source (real
@@ -474,15 +545,13 @@ class TargetQuantityStrategy(Strategy):
         self._price_trend_samples: dict[str, deque[PriceTrendSample]] = {}
         self._subscribed_order_book_depth_instruments: set[str] = set()
         self._sleep = time.sleep
-        # Side-specific cancel counts per instrument; reset daily and on fill.
-        self._cancel_count_buy: dict[str, int] = {}
-        self._cancel_count_sell: dict[str, int] = {}
         self._trading_day: date | None = None
         # Latest quote tick event timestamp. The order gate requires both the
         # local clock and the exchange event timestamp to be inside their
         # configured windows, preventing stale/pre-open quotes from unlocking
         # trading purely because local time has advanced.
         self._last_quote_tick_ts_event: int = 0
+        self._last_market_data_ts_event: int = 0
         self._quote_tick_window_probe_ids = {
             str(instrument_id)
             for instrument_id in config.quote_tick_window_probe_instrument_ids
@@ -547,6 +616,7 @@ class TargetQuantityStrategy(Strategy):
         self._last_account_sizing_snapshot: str | None = None
         self.target_events: list[TargetQuantityTargetEvent] = []
         self.order_events: list[TargetQuantityOrderEvent] = []
+        self.order_decision_events: list[OrderDecisionEvent] = []
 
     @staticmethod
     def _validate_price_trend_config(config: TargetQuantityStrategyConfig) -> None:
@@ -567,6 +637,23 @@ class TargetQuantityStrategy(Strategy):
             raise ValueError("price_trend_min_timeout_multiplier must be in (0, 1]")
         if float(config.price_trend_max_offset_multiplier) < 1.0:
             raise ValueError("price_trend_max_offset_multiplier must be at least 1")
+
+    @staticmethod
+    def _validate_execution_config(config: TargetQuantityStrategyConfig) -> None:
+        non_negative = {
+            "submission_book_max_age_secs": config.submission_book_max_age_secs,
+            "cancel_book_max_age_secs": config.cancel_book_max_age_secs,
+            "same_side_price_improvement_threshold": (
+                config.same_side_price_improvement_threshold
+            ),
+            "price_mismatch_cancel_delay_secs": config.price_mismatch_cancel_delay_secs,
+            "partial_fill_cancel_grace_secs": config.partial_fill_cancel_grace_secs,
+            "partial_fill_notional_threshold": config.partial_fill_notional_threshold,
+            "small_leaves_notional_threshold": config.small_leaves_notional_threshold,
+        }
+        for name, value in non_negative.items():
+            if Decimal(str(value)) < 0:
+                raise ValueError(f"{name} must be non-negative")
 
     def configure_pre_open_reconciliation(
         self,
@@ -674,7 +761,7 @@ class TargetQuantityStrategy(Strategy):
         self._subscribe_quote_tick_window_probes()
         self._schedule_preopen_latency_alert()
         interval_secs = float(self.config.resubmit_check_interval_secs)
-        if float(self.config.unfilled_timeout_secs) > 0 and interval_secs > 0:
+        if interval_secs > 0:
             self.clock.set_timer(
                 name="TARGET-WEIGHT-CONVERGE",
                 interval=timedelta(seconds=interval_secs),
@@ -1651,10 +1738,13 @@ class TargetQuantityStrategy(Strategy):
         self._market_status = {}
         self._whole_market_status = {}
         self._depth_books = {}
+        self._order_quote_states = {}
+        self._execution_intent_ids = {}
+        self._order_decision_lineages = {}
+        self._pending_replacements = {}
+        self._stale_book_warning_ts = {}
         self._price_trend_samples = {}
         self._depth_converged_today = False
-        self._cancel_count_buy = {}
-        self._cancel_count_sell = {}
         self._recent_sell_cancel_ts = {}
         if (
             self._preopen_latency_sample is not None
@@ -1665,6 +1755,8 @@ class TargetQuantityStrategy(Strategy):
         # window gate.
         if self._event_trading_date(self._last_quote_tick_ts_event) != trading_date:
             self._last_quote_tick_ts_event = 0
+        if self._event_trading_date(self._last_market_data_ts_event) != trading_date:
+            self._last_market_data_ts_event = 0
 
     def _update_price_state(
         self,
@@ -1849,6 +1941,12 @@ class TargetQuantityStrategy(Strategy):
         bids = self._ladder_levels(depth.bids)
         asks = self._ladder_levels(depth.asks)
         depth_ts_event = int(depth.ts_event)
+        if depth_ts_event <= 0:
+            raise ValueError(f"Order-book depth ts_event must be positive, got {depth_ts_event}")
+        self._last_market_data_ts_event = max(
+            self._last_market_data_ts_event,
+            depth_ts_event,
+        )
         self._capture_preopen_latency_sample(
             source="order_book_depth",
             instrument_id=str(depth.instrument_id),
@@ -1987,15 +2085,14 @@ class TargetQuantityStrategy(Strategy):
         instrument_id_text = str(getattr(event, "instrument_id", ""))
         order_side = getattr(event, "order_side", None)
         self._forget_submitted_order(client_order_id)
+        try:
+            filled_order = self.cache.order(event.client_order_id)
+        except Exception:
+            filled_order = None
+        if filled_order is not None and not self._is_active_order(filled_order):
+            self._forget_order_quote_state(client_order_id)
         self._deferred_buys.pop(instrument_id_text, None)
         self._insufficient_funds.discard(instrument_id_text)
-        # Reset the filled side's cancel count so the next convergence cycle for
-        # this instrument starts pricing at the base offset again.
-        if instrument_id_text:
-            if order_side == OrderSide.BUY:
-                self._cancel_count_buy.pop(instrument_id_text, None)
-            elif order_side == OrderSide.SELL:
-                self._cancel_count_sell.pop(instrument_id_text, None)
         # A SELL fill frees cash. Re-converge immediately so deferred / cash-backed-off
         # buys are retried now instead of waiting for the periodic timer (up to
         # resubmit_check_interval_secs). BUY fills already reach target for their
@@ -2039,11 +2136,15 @@ class TargetQuantityStrategy(Strategy):
 
     def on_order_canceled(self, event: Any) -> None:
         client_order_id = str(event.client_order_id)
+        replacement = self._order_decision_lineages.get(client_order_id)
         self._forget_submitted_order(client_order_id)
+        self._forget_order_quote_state(client_order_id)
         # Record when we cancel our own SELL so a sellable-position denial that
         # races the broker's freeze-release can be recognised as transient.
         instrument_id_text = str(getattr(event, "instrument_id", ""))
         if instrument_id_text:
+            if replacement is not None:
+                self._pending_replacements[instrument_id_text] = replacement
             order = self.cache.order(event.client_order_id)
             if order is not None and order.side == OrderSide.SELL:
                 self._recent_sell_cancel_ts[instrument_id_text] = self.clock.timestamp_ns()
@@ -2074,6 +2175,7 @@ class TargetQuantityStrategy(Strategy):
                 current_date=self._clock_date(),
                 trigger=ConvergenceTrigger.CANCEL,
                 delay_secs=float(self.config.cancel_reconverge_delay_secs),
+                replacement=replacement,
             ),
         )
 
@@ -2082,6 +2184,7 @@ class TargetQuantityStrategy(Strategy):
         current_date: date,
         trigger: ConvergenceTrigger,
         delay_secs: float = 0.0,
+        replacement: OrderDecisionLineage | None = None,
     ) -> None:
         # Runs on the node event loop. `delay_secs` is used only by the cancel path
         # (see on_order_canceled) to let a racing OrderFilled settle first; other
@@ -2089,7 +2192,11 @@ class TargetQuantityStrategy(Strategy):
         # a converge already in progress makes this a no-op rather than stacking.
         if delay_secs > 0:
             await asyncio.sleep(delay_secs)
-        self._converge_to_target(current_date=current_date, trigger=trigger)
+        self._converge_to_target(
+            current_date=current_date,
+            trigger=trigger,
+            replacement=replacement,
+        )
 
     def on_order_denied(self, event: Any) -> None:
         self._handle_order_not_accepted(event)
@@ -2102,6 +2209,7 @@ class TargetQuantityStrategy(Strategy):
         instrument_id_text = str(getattr(event, "instrument_id", ""))
         reason = str(getattr(event, "reason", "") or "")
         self._forget_submitted_order(client_order_id)
+        self._forget_order_quote_state(client_order_id)
         self._rejected_order_ids.add(client_order_id)
         if _is_insufficient_funds(reason):
             # A rejection replayed by execution reconciliation on restart carries its
@@ -2187,13 +2295,12 @@ class TargetQuantityStrategy(Strategy):
         current_date: date,
         trigger: ConvergenceTrigger,
         ts_event: int | None = None,
+        replacement: OrderDecisionLineage | None = None,
     ) -> bool:
         """Run convergence after passing its window gate and acquiring its lock."""
         if self._trading_paused and not trigger.bypasses_pause:
             return False
-        window_open = self._within_trading_window(ts_event)
-        if trigger.allows_preopen_window:
-            window_open = window_open or self._within_preopen_latency_window(current_date)
+        window_open = self._within_execution_window(ts_event)
         if not window_open:
             return False
         # A manual convergence must not be silently dropped when the trading thread
@@ -2205,7 +2312,11 @@ class TargetQuantityStrategy(Strategy):
         if not acquired:
             return False
         try:
-            self._converge_to_target_locked(current_date=current_date, trigger=trigger)
+            self._converge_to_target_locked(
+                current_date=current_date,
+                trigger=trigger,
+                replacement=replacement,
+            )
         finally:
             self._converge_lock.release()
         return True
@@ -2214,6 +2325,7 @@ class TargetQuantityStrategy(Strategy):
         self,
         current_date: date,
         trigger: ConvergenceTrigger,
+        replacement: OrderDecisionLineage | None = None,
     ) -> None:
         trigger_value = trigger.value
         if not self._target_version:
@@ -2272,10 +2384,21 @@ class TargetQuantityStrategy(Strategy):
             if instrument_id_text in self._frozen_instruments:
                 skip_frozen.append(instrument_id_text)
                 continue
-            intent = self._target_order_intent(instrument_id_text, target_qty)
+            instrument_replacement = (
+                replacement
+                if replacement is not None
+                and replacement.instrument_id == instrument_id_text
+                else self._pending_replacements.get(instrument_id_text)
+            )
+            intent = self._target_order_intent(
+                instrument_id_text,
+                target_qty,
+                replacement=instrument_replacement,
+            )
             if intent is None:
                 current_qty = self._current_quantity(InstrumentId.from_str(instrument_id_text))
                 if current_qty == Decimal(str(target_qty)):
+                    self._pending_replacements.pop(instrument_id_text, None)
                     skip_on_target.append(instrument_id_text)
                 else:
                     skip_intent_error.append(instrument_id_text)
@@ -2469,10 +2592,7 @@ class TargetQuantityStrategy(Strategy):
         return True
 
     def _reconcile_unfilled_orders(self, trading_date: date) -> None:
-        timeout_secs = float(self.config.unfilled_timeout_secs)
-        if timeout_secs <= 0:
-            return
-        now = self.clock.timestamp_ns()
+        now = int(self.clock.timestamp_ns())
         try:
             open_orders = self.cache.orders_open(strategy_id=self.id)
         except Exception:
@@ -2487,20 +2607,149 @@ class TargetQuantityStrategy(Strategy):
                     continue
             except Exception:
                 pass
-            anchor_ts = self._unfilled_timeout_anchor_ts(order)
-            trend = self._execution_trend(instrument_id_text, order.side, now_ns=now)
-            effective_timeout_secs = timeout_secs * trend.timeout_multiplier
-            timeout_ns = int(effective_timeout_secs * 1_000_000_000)
-            if anchor_ts is None or now - anchor_ts < timeout_ns:
-                continue
             if self._at_price_limit(order):
                 continue
-            # A buy already resting at its max-buy-price cap is left to fill if the
-            # market comes back down; do not cancel it (so its cancel count never
-            # grows and the price never escalates past the cap).
-            if self._at_buy_price_cap(order):
+
+            instrument = self.cache.instrument(order.instrument_id)
+            if instrument is None:
+                self.log.warning(
+                    f"Cannot evaluate cancel for {client_order_id}: missing instrument "
+                    f"{instrument_id_text}",
+                )
                 continue
+            state = self._order_quote_states.get(client_order_id)
+            if state is None:
+                state = OrderQuoteState(
+                    source_ts_event=None,
+                    source_ts_init=None,
+                    source_same_side_best=None,
+                    recovered=True,
+                )
+                self._order_quote_states[client_order_id] = state
+            leaves_qty = self._decimal_quantity(order.leaves_qty)
+            price_context = self._build_price_context(
+                instrument,
+                order.instrument_id,
+                order.side,
+                leaves_qty,
+            )
+            book_valid, book_reason, book_age_ms = self._execution_book_validation(
+                price_context,
+                max_age_secs=self.config.cancel_book_max_age_secs,
+                purpose="cancel check",
+            )
+            if not book_valid:
+                self._record_cancel_decision(
+                    trading_date=trading_date,
+                    order=order,
+                    state=state,
+                    decision_type="CANCEL_SUPPRESSED",
+                    decision_status="suppressed",
+                    reason_code=book_reason,
+                    decision_ns=now,
+                    price_context=price_context,
+                    book_reason=book_reason,
+                    book_age_ms=book_age_ms,
+                )
+                continue
+            current_ts_event = int(price_context.ts_event or 0)
+            if state.source_ts_event is not None and current_ts_event == state.source_ts_event:
+                self._record_cancel_decision(
+                    trading_date=trading_date,
+                    order=order,
+                    state=state,
+                    decision_type="CANCEL_SUPPRESSED",
+                    decision_status="suppressed",
+                    reason_code="same_book_event",
+                    decision_ns=now,
+                    price_context=price_context,
+                    book_reason=book_reason,
+                    book_age_ms=book_age_ms,
+                )
+                continue
+
+            current_best = (
+                price_context.best_bid
+                if order.side == OrderSide.BUY
+                else price_context.best_ask
+            )
+            if current_best is None:
+                self._record_cancel_decision(
+                    trading_date=trading_date,
+                    order=order,
+                    state=state,
+                    decision_type="CANCEL_SUPPRESSED",
+                    decision_status="suppressed",
+                    reason_code="missing_same_side_best",
+                    decision_ns=now,
+                    price_context=price_context,
+                    book_reason=book_reason,
+                    book_age_ms=book_age_ms,
+                )
+                continue
+            order_price = Decimal(str(order.price))
+            current_best_price = Decimal(str(current_best))
+            half_tick = Decimal(str(instrument.price_increment)) / Decimal("2")
+            source_best_unchanged = (
+                state.source_same_side_best is not None
+                and abs(current_best_price - state.source_same_side_best) <= half_tick
+            )
+            if abs(current_best_price - order_price) <= half_tick or source_best_unchanged:
+                had_mismatch = state.mismatch_since_ns is not None
+                state.mismatch_since_ns = None
+                self._record_cancel_decision(
+                    trading_date=trading_date,
+                    order=order,
+                    state=state,
+                    decision_type=("MISMATCH_CLEARED" if had_mismatch else "CANCEL_SUPPRESSED"),
+                    decision_status=("cleared" if had_mismatch else "suppressed"),
+                    reason_code=(
+                        "source_best_unchanged"
+                        if source_best_unchanged
+                        else "order_at_current_best"
+                    ),
+                    decision_ns=now,
+                    price_context=price_context,
+                    book_reason=book_reason,
+                    book_age_ms=book_age_ms,
+                )
+                continue
+            if state.mismatch_since_ns is None:
+                state.mismatch_since_ns = now
+                self._record_cancel_decision(
+                    trading_date=trading_date,
+                    order=order,
+                    state=state,
+                    decision_type="MISMATCH_STARTED",
+                    decision_status="observing",
+                    reason_code="same_side_price_mismatch",
+                    decision_ns=now,
+                    price_context=price_context,
+                    book_reason=book_reason,
+                    book_age_ms=book_age_ms,
+                )
+                continue
+            mismatch_age_ns = now - state.mismatch_since_ns
+            cancel_delay_ns = int(
+                float(self.config.price_mismatch_cancel_delay_secs) * 1_000_000_000,
+            )
+            if mismatch_age_ns < cancel_delay_ns:
+                continue
+
             if self._partial_buy_has_untradeable_remainder(order):
+                self._record_cancel_decision(
+                    trading_date=trading_date,
+                    order=order,
+                    state=state,
+                    decision_type="CANCEL_SUPPRESSED",
+                    decision_status="suppressed",
+                    reason_code="invalid_replacement_quantity",
+                    decision_ns=now,
+                    price_context=price_context,
+                    book_reason=book_reason,
+                    book_age_ms=book_age_ms,
+                    mismatch_age_ns=mismatch_age_ns,
+                )
                 self.log.warning(
                     "Keeping partially filled BUY open because its replacement "
                     "quantity would be invalid: "
@@ -2510,9 +2759,118 @@ class TargetQuantityStrategy(Strategy):
                     f"leaves_qty={order.leaves_qty}",
                 )
                 continue
+
+            fill_stats = self._cancel_fill_stats(order)
+            if not fill_stats.history_complete:
+                decision = self._record_cancel_decision(
+                    trading_date=trading_date,
+                    order=order,
+                    state=state,
+                    decision_type="CANCEL_SUPPRESSED",
+                    decision_status="suppressed",
+                    reason_code="partial_fill_history_unavailable",
+                    decision_ns=now,
+                    price_context=price_context,
+                    book_reason=book_reason,
+                    book_age_ms=book_age_ms,
+                    mismatch_age_ns=mismatch_age_ns,
+                    fill_stats=fill_stats,
+                    error=fill_stats.history_error,
+                )
+                if decision is not None:
+                    self.log.error(
+                        "Keeping order open because its fill history cannot be verified: "
+                        f"client_order_id={client_order_id}, "
+                        f"instrument_id={instrument_id_text}, "
+                        f"order_filled_qty={fill_stats.order_filled_qty}, "
+                        f"event_filled_qty={fill_stats.event_filled_qty}, "
+                        f"error={fill_stats.history_error}",
+                    )
+                continue
+            leaves_notional = leaves_qty * order_price
+            if leaves_notional < Decimal(str(self.config.small_leaves_notional_threshold)):
+                self._record_cancel_decision(
+                    trading_date=trading_date,
+                    order=order,
+                    state=state,
+                    decision_type="CANCEL_SUPPRESSED",
+                    decision_status="suppressed",
+                    reason_code="small_leaves_notional",
+                    decision_ns=now,
+                    price_context=price_context,
+                    book_reason=book_reason,
+                    book_age_ms=book_age_ms,
+                    mismatch_age_ns=mismatch_age_ns,
+                    fill_stats=fill_stats,
+                    leaves_notional=leaves_notional,
+                )
+                continue
+            partial_fill_threshold = Decimal(
+                str(self.config.partial_fill_notional_threshold),
+            )
+            grace_ns = int(
+                float(self.config.partial_fill_cancel_grace_secs) * 1_000_000_000,
+            )
+            if (
+                Decimal("0") < fill_stats.filled_notional < partial_fill_threshold
+                and fill_stats.latest_fill_ts_init is not None
+                and now - fill_stats.latest_fill_ts_init < grace_ns
+            ):
+                self._record_cancel_decision(
+                    trading_date=trading_date,
+                    order=order,
+                    state=state,
+                    decision_type="CANCEL_SUPPRESSED",
+                    decision_status="suppressed",
+                    reason_code="partial_fill_grace",
+                    decision_ns=now,
+                    price_context=price_context,
+                    book_reason=book_reason,
+                    book_age_ms=book_age_ms,
+                    mismatch_age_ns=mismatch_age_ns,
+                    fill_stats=fill_stats,
+                    leaves_notional=leaves_notional,
+                )
+                continue
+
+            cancel_decision = self._record_cancel_decision(
+                trading_date=trading_date,
+                order=order,
+                state=state,
+                decision_type="CANCEL_REQUESTED",
+                decision_status="requested",
+                reason_code="same_side_price_mismatch",
+                decision_ns=now,
+                price_context=price_context,
+                book_reason=book_reason,
+                book_age_ms=book_age_ms,
+                mismatch_age_ns=mismatch_age_ns,
+                fill_stats=fill_stats,
+                leaves_notional=leaves_notional,
+            )
             try:
                 self.cancel_order(order)
             except Exception as exc:
+                self._record_cancel_decision(
+                    trading_date=trading_date,
+                    order=order,
+                    state=state,
+                    decision_type="CANCEL_FAILED",
+                    decision_status="failed",
+                    reason_code="cancel_order_exception",
+                    decision_ns=now,
+                    price_context=price_context,
+                    book_reason=book_reason,
+                    book_age_ms=book_age_ms,
+                    mismatch_age_ns=mismatch_age_ns,
+                    fill_stats=fill_stats,
+                    leaves_notional=leaves_notional,
+                    parent_decision_id=(
+                        None if cancel_decision is None else cancel_decision.decision_id
+                    ),
+                    error=str(exc),
+                    deduplicate=False,
+                )
                 self.log.warning(f"cancel_order failed for {client_order_id}: {exc}")
                 continue
             intent_context = self._order_intent_contexts.get(client_order_id)
@@ -2522,28 +2880,21 @@ class TargetQuantityStrategy(Strategy):
                     target_qty=self._target_quantities.get(instrument_id_text, Decimal("0")),
                 )
             intent_context.record(
-                cancel_reason="unfilled_timeout",
+                cancel_reason="same_side_price_mismatch",
                 canceled_order_id=client_order_id,
-                price_return_bps=trend.price_return_bps,
-                volume_confirmation=trend.volume_confirmation,
-                book_imbalance=trend.book_imbalance,
-                confirmation_score=trend.confirmation_score,
-                trend_bps=trend.trend_bps,
-                trend_severity=trend.severity,
-                price_trend_effect_enabled=self.config.price_trend_effect_enabled,
-                effective_timeout_secs=effective_timeout_secs,
-                timeout_multiplier=trend.timeout_multiplier,
-                offset_multiplier=trend.offset_multiplier,
+                source_book_ts_event=state.source_ts_event,
+                source_same_side_best=state.source_same_side_best,
+                current_book_ts_event=current_ts_event,
+                current_same_side_best=current_best_price,
+                order_price=order_price,
+                mismatch_age_secs=mismatch_age_ns / 1_000_000_000,
+                recovered_order=state.recovered,
+                book_validation=book_reason,
+                book_age_ms=book_age_ms,
+                filled_notional=fill_stats.filled_notional,
+                leaves_notional=leaves_notional,
             )
             self._forget_submitted_order(client_order_id)
-            if order.side == OrderSide.BUY:
-                self._cancel_count_buy[instrument_id_text] = (
-                    self._cancel_count_buy.get(instrument_id_text, 0) + 1
-                )
-            else:
-                self._cancel_count_sell[instrument_id_text] = (
-                    self._cancel_count_sell.get(instrument_id_text, 0) + 1
-                )
             self._record_order(
                 trading_date=trading_date,
                 instrument_id=instrument_id_text,
@@ -2551,31 +2902,157 @@ class TargetQuantityStrategy(Strategy):
                 quantity=0,
                 target_qty=self._target_quantities.get(instrument_id_text, Decimal("0")),
                 status="canceled",
-                reason="unfilled_timeout",
+                reason="same_side_price_mismatch",
                 order_id=client_order_id,
                 intent_context=intent_context,
             )
 
-    @staticmethod
-    def _unfilled_timeout_anchor_ts(order: Any) -> int | None:
-        # Use locally generated wall-clock ``ts_init`` values rather than venue
-        # ``ts_event`` values. BigQMT/QMT clocks can lag the local machine, and a
-        # stale venue timestamp can make a newly accepted order appear timed out.
-        #
-        # Shortage: ``ts_init`` is generated after the venue event reaches this
-        # process, so this measures a conservative lower bound of venue-side order
-        # age. The order may remain open slightly longer than the configured
-        # timeout. For exact venue age, BigQMT must expose a queryable current
-        # venue clock/order timestamp so the offset can be calibrated; otherwise a
-        # conservative latency allowance can bound the extra wait.
-        activity_timestamps = [
-            int(event.ts_init)
-            for event in order.events
-            if isinstance(event, (OrderAccepted, OrderFilled))
-        ]
-        if not activity_timestamps:
+    def _record_cancel_decision(
+        self,
+        *,
+        trading_date: date,
+        order: Any,
+        state: OrderQuoteState,
+        decision_type: str,
+        decision_status: str,
+        reason_code: str,
+        decision_ns: int,
+        price_context: PriceContext,
+        book_reason: str,
+        book_age_ms: float | None,
+        mismatch_age_ns: int | None = None,
+        fill_stats: OrderFillStats | None = None,
+        leaves_notional: Decimal | None = None,
+        parent_decision_id: str | None = None,
+        error: str | None = None,
+        deduplicate: bool = True,
+    ) -> OrderDecisionEvent | None:
+        state_key = f"{decision_type}:{reason_code}"
+        if deduplicate and state.last_decision_state == state_key:
             return None
-        return max(activity_timestamps)
+        state.last_decision_state = state_key
+        client_order_id = str(order.client_order_id)
+        instrument_id_text = str(order.instrument_id)
+        intent_context = self._order_intent_contexts.get(client_order_id)
+        if intent_context is None:
+            intent_context = self._intent_context_from_order(
+                order=order,
+                target_qty=self._target_quantities.get(instrument_id_text, Decimal("0")),
+            )
+        lineage = self._order_decision_lineages.get(client_order_id)
+        if lineage is None:
+            lineage = OrderDecisionLineage(
+                intent_id=intent_context.intent_id,
+                order_chain_id=client_order_id,
+                client_order_id=client_order_id,
+                instrument_id=instrument_id_text,
+                side=order.side,
+            )
+            self._order_decision_lineages[client_order_id] = lineage
+        current_best = (
+            price_context.best_bid
+            if order.side == OrderSide.BUY
+            else price_context.best_ask
+        )
+        stats = fill_stats or self._cancel_fill_stats(order)
+        cancel_context: dict[str, Any] = {
+            "source_book": {
+                "ts_event": state.source_ts_event,
+                "ts_init": state.source_ts_init,
+                "same_side_best": state.source_same_side_best,
+            },
+            "current_book": {
+                "ts_event": price_context.ts_event,
+                "ts_init": price_context.ts_init,
+                "same_side_best": current_best,
+                "book_validation": book_reason,
+                "book_age_ms": book_age_ms,
+            },
+            "order_price": order.price,
+            "mismatch_since_ns": state.mismatch_since_ns,
+            "mismatch_age_ms": (
+                None if mismatch_age_ns is None else mismatch_age_ns / 1_000_000
+            ),
+            "filled_notional": stats.filled_notional,
+            "event_filled_qty": stats.event_filled_qty,
+            "order_filled_qty": stats.order_filled_qty,
+            "latest_fill_ts_init": stats.latest_fill_ts_init,
+            "fill_history_complete": stats.history_complete,
+            "fill_history_error": stats.history_error,
+            "leaves_notional": leaves_notional,
+            "recovered_order": state.recovered,
+            "thresholds": {
+                "cancel_delay_secs": self.config.price_mismatch_cancel_delay_secs,
+                "cancel_check_interval_secs": self.config.resubmit_check_interval_secs,
+                "cancel_book_max_age_secs": self.config.cancel_book_max_age_secs,
+                "partial_fill_grace_secs": self.config.partial_fill_cancel_grace_secs,
+                "partial_fill_notional_threshold": self.config.partial_fill_notional_threshold,
+                "small_leaves_notional_threshold": self.config.small_leaves_notional_threshold,
+            },
+        }
+        if error is not None:
+            cancel_context["error"] = error
+        return self._emit_order_decision(
+            trading_date=trading_date,
+            intent_context=intent_context,
+            decision_type=decision_type,
+            decision_status=decision_status,
+            reason_code=reason_code,
+            decision_ns=decision_ns,
+            lineage=lineage,
+            client_order_id=client_order_id,
+            parent_decision_id=parent_decision_id,
+            order_qty=self._decimal_quantity(order.leaves_qty),
+            order_price=order.price,
+            policy_name="SameSidePriceMismatchCancelPolicy",
+            context={"cancel": cancel_context},
+        )
+
+    def _order_fill_stats(self, order: Any) -> OrderFillStats:
+        filled_notional = Decimal("0")
+        event_filled_qty = Decimal("0")
+        latest_fill_ts_init: int | None = None
+        for event in order.events:
+            if not isinstance(event, OrderFilled):
+                continue
+            quantity = Decimal(str(event.last_qty.as_decimal()))
+            price = Decimal(str(event.last_px.as_decimal()))
+            if quantity <= 0 or price <= 0:
+                raise ValueError(
+                    "OrderFilled must have positive last_qty and last_px "
+                    f"(client_order_id={order.client_order_id})",
+                )
+            event_filled_qty += quantity
+            filled_notional += quantity * price
+            ts_init = int(event.ts_init)
+            if ts_init > 0:
+                latest_fill_ts_init = max(latest_fill_ts_init or 0, ts_init)
+        return OrderFillStats(
+            filled_notional=filled_notional,
+            latest_fill_ts_init=latest_fill_ts_init,
+            event_filled_qty=event_filled_qty,
+        )
+
+    def _cancel_fill_stats(self, order: Any) -> OrderFillStats:
+        """Read Nautilus interfaces strictly; classify only semantic history gaps."""
+        order_filled_qty = Decimal(str(order.filled_qty.as_decimal()))
+        stats = self._order_fill_stats(order)
+        history_error = None
+        if stats.event_filled_qty != order_filled_qty:
+            history_error = (
+                "fill quantity mismatch: "
+                f"order={order_filled_qty}, events={stats.event_filled_qty}"
+            )
+        elif order_filled_qty > 0 and stats.latest_fill_ts_init is None:
+            history_error = "positive filled_qty has no fill event ts_init"
+        return OrderFillStats(
+            filled_notional=stats.filled_notional,
+            latest_fill_ts_init=stats.latest_fill_ts_init,
+            event_filled_qty=stats.event_filled_qty,
+            order_filled_qty=order_filled_qty,
+            history_complete=history_error is None,
+            history_error=history_error,
+        )
 
     def _partial_buy_has_untradeable_remainder(self, order: Any) -> bool:
         if order.side != OrderSide.BUY:
@@ -2720,7 +3197,12 @@ class TargetQuantityStrategy(Strategy):
                 self._deferred_buys[instrument_id] = target_qty
                 intent.context.record(cash_gate="deferred", defer_reason="no_slice_submitted")
 
-    def _target_order_intent(self, instrument_id_text: str, target_qty: Decimal) -> TargetOrderIntent | None:
+    def _target_order_intent(
+        self,
+        instrument_id_text: str,
+        target_qty: Decimal,
+        replacement: OrderDecisionLineage | None = None,
+    ) -> TargetOrderIntent | None:
         instrument_id = InstrumentId.from_str(instrument_id_text)
         current_qty = self._current_quantity(instrument_id)
         target_qty = Decimal(str(target_qty))
@@ -2735,6 +3217,11 @@ class TargetQuantityStrategy(Strategy):
                 return None
             side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
             quantity = abs(delta_qty)
+        if replacement is not None and replacement.side != side:
+            pending = self._pending_replacements.get(instrument_id_text)
+            if pending is not None and pending.client_order_id == replacement.client_order_id:
+                self._pending_replacements.pop(instrument_id_text, None)
+            replacement = None
 
         instrument = self.cache.instrument(instrument_id)
         if instrument is None:
@@ -2745,7 +3232,37 @@ class TargetQuantityStrategy(Strategy):
 
         price_context = self._build_price_context(instrument, instrument_id, side, quantity)
         pricer = self._pricer_for_side(side)
-        raw_price = pricer.compute(price_context)
+        book_valid, book_reason, book_age_ms = self._execution_book_validation(
+            price_context,
+            max_age_secs=self.config.submission_book_max_age_secs,
+            purpose="order submission",
+        )
+        same_side_best = (
+            price_context.best_bid
+            if side == OrderSide.BUY
+            else price_context.best_ask
+        )
+        improvement_threshold = Decimal(
+            str(self.config.same_side_price_improvement_threshold),
+        )
+        price_improvement_applied = (
+            book_valid
+            and same_side_best is not None
+            and Decimal(str(same_side_best)) >= improvement_threshold
+        )
+        raw_price = pricer.compute(price_context) if book_valid else None
+        computed_price = raw_price
+        price_clamp_reason = None
+        if raw_price is not None and raw_price > 0:
+            up_limit, down_limit = self._price_limits(instrument_id_text)
+            if side == OrderSide.BUY and up_limit is not None:
+                if raw_price > up_limit:
+                    price_clamp_reason = "exchange_up_limit"
+                raw_price = min(raw_price, up_limit)
+            elif side == OrderSide.SELL and down_limit is not None:
+                if raw_price < down_limit:
+                    price_clamp_reason = "exchange_down_limit"
+                raw_price = max(raw_price, down_limit)
         price = None if raw_price is None or raw_price <= 0 else instrument.make_price(raw_price)
         context = IntentContext(
             instrument_id=instrument_id_text,
@@ -2754,21 +3271,64 @@ class TargetQuantityStrategy(Strategy):
             delta_qty=delta_qty,
             price_context=price_context,
             pricer_class=pricer.__class__.__name__,
+            intent_id=(
+                replacement.intent_id
+                if replacement is not None
+                else self._execution_intent_id(instrument_id_text)
+            ),
         )
         context.record(
             side=side.name,
             intent_quantity=quantity,
             limit_price=price,
+            computed_price=computed_price,
+            price_clamp_reason=price_clamp_reason,
             target_version=self._target_version,
+            book_validation=book_reason,
+            book_age_ms=book_age_ms,
+            submission_book_max_age_secs=self.config.submission_book_max_age_secs,
+            same_side_best=same_side_best,
+            same_side_price_improvement_threshold=improvement_threshold,
+            price_improvement_applied=price_improvement_applied,
         )
         if price is None:
-            self.log.error(
-                f"Cannot create target order intent for {instrument_id_text}: missing limit price "
+            price_skip_reason = (
+                book_reason
+                if not book_valid
+                else (
+                    "missing_same_side_best"
+                    if same_side_best is None
+                    else "invalid_computed_price"
+                )
+            )
+            self._emit_order_decision(
+                trading_date=self._clock_date(),
+                intent_context=context,
+                decision_type="PRICE_SKIPPED",
+                decision_status="skipped",
+                reason_code=price_skip_reason,
+                lineage=replacement,
+                trigger_client_order_id=(
+                    replacement.client_order_id if replacement is not None else None
+                ),
+                order_qty=quantity,
+                policy_name=pricer.__class__.__name__,
+            )
+            self.log.warning(
+                f"Cannot create target order intent for {instrument_id_text}: no executable price "
                 f"side={side.name} quantity={quantity} target_qty={target_qty} current_qty={current_qty} "
                 f"intent_context={context.log_text()}",
             )
             return None
-        return TargetOrderIntent(instrument_id, instrument, side, quantity, price, context)
+        return TargetOrderIntent(
+            instrument_id,
+            instrument,
+            side,
+            quantity,
+            price,
+            context,
+            replacement,
+        )
 
     def _order_slices(self, intent: TargetOrderIntent) -> list[Decimal]:
         rules = LimitOrderQuantityRules.from_instrument(intent.instrument)
@@ -2808,6 +3368,7 @@ class TargetQuantityStrategy(Strategy):
             delta_qty=target_qty - current_qty,
             price_context=price_context,
             pricer_class=pricer_class,
+            intent_id=self._execution_intent_id(instrument_id_text),
         )
         context.record(
             side=getattr(side, "name", str(side)),
@@ -2949,13 +3510,67 @@ class TargetQuantityStrategy(Strategy):
             quantity=intent.instrument.make_qty(quantity),
             price=intent.price,
         )
-        intent.context.record(order_id=str(order.client_order_id))
-        self._track_submitted_order(order, intent.context)
+        client_order_id = str(order.client_order_id)
+        intent.context.record(order_id=client_order_id)
+        replacement = intent.replacement
+        lineage = OrderDecisionLineage(
+            intent_id=intent.context.intent_id,
+            order_chain_id=(
+                replacement.order_chain_id
+                if replacement is not None
+                else uuid.uuid4().hex
+            ),
+            client_order_id=client_order_id,
+            instrument_id=str(intent.instrument_id),
+            side=intent.side,
+        )
+        self._track_submitted_order(order, intent.context, lineage)
+        submit_decision = self._emit_order_decision(
+            trading_date=trading_date,
+            intent_context=intent.context,
+            decision_type=(
+                "REPLACEMENT_SUBMIT" if replacement is not None else "SUBMIT_REQUESTED"
+            ),
+            decision_status="requested",
+            reason_code=("cancel_reconverge" if replacement is not None else reason),
+            lineage=lineage,
+            client_order_id=client_order_id,
+            trigger_client_order_id=(
+                replacement.client_order_id if replacement is not None else None
+            ),
+            order_qty=quantity,
+            order_price=intent.price,
+        )
         try:
             self.submit_order(order)
-        except Exception:
-            self._forget_submitted_order(str(order.client_order_id))
+        except Exception as exc:
+            self._emit_order_decision(
+                trading_date=trading_date,
+                intent_context=intent.context,
+                decision_type="SUBMIT_FAILED",
+                decision_status="failed",
+                reason_code="submit_order_exception",
+                lineage=lineage,
+                client_order_id=client_order_id,
+                trigger_client_order_id=(
+                    replacement.client_order_id if replacement is not None else None
+                ),
+                parent_decision_id=submit_decision.decision_id,
+                order_qty=quantity,
+                order_price=intent.price,
+                context={"error": str(exc)},
+            )
+            self._forget_submitted_order(client_order_id)
+            self._forget_order_quote_state(client_order_id)
+            self._order_decision_lineages.pop(client_order_id, None)
             raise
+        if replacement is not None:
+            pending = self._pending_replacements.get(str(intent.instrument_id))
+            if (
+                pending is not None
+                and pending.client_order_id == replacement.client_order_id
+            ):
+                self._pending_replacements.pop(str(intent.instrument_id), None)
         side_text = "buy" if intent.side == OrderSide.BUY else "sell"
         self._record_order(
             trading_date,
@@ -3194,16 +3809,40 @@ class TargetQuantityStrategy(Strategy):
         except Exception:
             return Decimal(str(quantity))
 
-    def _track_submitted_order(self, order: Any, intent_context: IntentContext) -> None:
+    def _track_submitted_order(
+        self,
+        order: Any,
+        intent_context: IntentContext,
+        lineage: OrderDecisionLineage,
+    ) -> None:
         client_order_id = str(order.client_order_id)
         self._order_target_versions[client_order_id] = self._target_version
         self._order_signal_dates[client_order_id] = self._target_signal_date
         self._order_intent_contexts[client_order_id] = intent_context
+        self._order_decision_lineages[client_order_id] = lineage
+        price_context = intent_context.price_context
+        same_side_best = None
+        if price_context is not None:
+            raw_best = (
+                price_context.best_bid
+                if price_context.side == OrderSide.BUY
+                else price_context.best_ask
+            )
+            if raw_best is not None:
+                same_side_best = Decimal(str(raw_best))
+        self._order_quote_states[client_order_id] = OrderQuoteState(
+            source_ts_event=None if price_context is None else price_context.ts_event,
+            source_ts_init=None if price_context is None else price_context.ts_init,
+            source_same_side_best=same_side_best,
+        )
 
     def _forget_submitted_order(self, client_order_id: str) -> None:
         self._order_target_versions.pop(client_order_id, None)
         self._order_signal_dates.pop(client_order_id, None)
         self._order_intent_contexts.pop(client_order_id, None)
+
+    def _forget_order_quote_state(self, client_order_id: str) -> None:
+        self._order_quote_states.pop(client_order_id, None)
 
     def _active_orders(
         self,
@@ -3250,6 +3889,13 @@ class TargetQuantityStrategy(Strategy):
         quantity: Decimal | None = None,
     ) -> Any | None:
         ctx = self._build_price_context(instrument, instrument_id, side, quantity)
+        valid, _reason, _age_ms = self._execution_book_validation(
+            ctx,
+            max_age_secs=self.config.submission_book_max_age_secs,
+            purpose="order submission",
+        )
+        if not valid:
+            return None
         pricer = self._pricer_for_side(side)
         raw = pricer.compute(ctx)
         if raw is None or raw <= 0:
@@ -3260,6 +3906,55 @@ class TargetQuantityStrategy(Strategy):
         elif side == OrderSide.SELL and down_limit is not None:
             raw = max(raw, down_limit)
         return instrument.make_price(raw)
+
+    def _execution_book_validation(
+        self,
+        ctx: PriceContext,
+        *,
+        max_age_secs: float,
+        purpose: str,
+    ) -> tuple[bool, str, float | None]:
+        instrument_id_text = str(ctx.instrument_id)
+        ts_event = int(ctx.ts_event or 0)
+        if ts_event <= 0:
+            return (False, "missing_ts_event", None)
+        try:
+            event_time = pd.Timestamp(ts_event, unit="ns", tz="UTC").tz_convert(
+                self.config.timezone_name,
+            )
+        except Exception:
+            return (False, "invalid_ts_event", None)
+        if event_time.date() != self._clock_date():
+            return (False, "wrong_trading_date", None)
+        if self._time_window_index(
+            event_time.time(),
+            self.config.exchange_execution_windows,
+        ) is None:
+            return (False, "outside_execution_window", None)
+
+        now_ns = int(self.clock.timestamp_ns())
+        age_ns = now_ns - ts_event
+        age_ms = age_ns / 1_000_000.0
+        max_age_ns = int(float(max_age_secs) * 1_000_000_000)
+        if age_ns < 0:
+            return (False, "future_ts_event", age_ms)
+        if age_ns > max_age_ns:
+            warning_key = f"{purpose}:{instrument_id_text}"
+            if self._stale_book_warning_ts.get(warning_key) != ts_event:
+                self._stale_book_warning_ts[warning_key] = ts_event
+                self.log.warning(
+                    f"Skipping {purpose} on stale order book: "
+                    f"instrument_id={instrument_id_text}, ts_event={ts_event}, "
+                    f"age_ms={age_ms:.3f}, "
+                    f"max_age_secs={max_age_secs}",
+                )
+            return (False, "stale_order_book", age_ms)
+        self._stale_book_warning_ts.pop(f"{purpose}:{instrument_id_text}", None)
+        if ctx.side == OrderSide.BUY and (ctx.best_bid is None or ctx.best_bid <= 0):
+            return (False, "missing_best_bid", age_ms)
+        if ctx.side == OrderSide.SELL and (ctx.best_ask is None or ctx.best_ask <= 0):
+            return (False, "missing_best_ask", age_ms)
+        return (True, "valid", age_ms)
 
     def _build_price_context(
         self,
@@ -3277,10 +3972,6 @@ class TargetQuantityStrategy(Strategy):
         # resting liquidity with the requested order quantity.
         bids = self._book_lots_to_shares(book.bids)
         asks = self._book_lots_to_shares(book.asks)
-        if side == OrderSide.BUY:
-            cancel_count = self._cancel_count_buy.get(instrument_id_text, 0)
-        else:
-            cancel_count = self._cancel_count_sell.get(instrument_id_text, 0)
         trend = self._execution_trend(instrument_id_text, side)
         return PriceContext(
             instrument_id=instrument_id,
@@ -3289,7 +3980,7 @@ class TargetQuantityStrategy(Strategy):
             last_close=self._last_close.get(instrument_id_text),
             tick=tick,
             quantity=Decimal(str(quantity)) if quantity is not None else Decimal("0"),
-            cancel_count=cancel_count,
+            cancel_count=0,
             best_bid=book.best_bid,
             best_ask=book.best_ask,
             ts_event=book.ts_event,
@@ -3374,31 +4065,6 @@ class TargetQuantityStrategy(Strategy):
             if price > 0 and size > 0:
                 result.append((price, size))
         return result
-
-    def _at_buy_price_cap(self, order: Any) -> bool:
-        """
-        True when a BUY order is resting at (or above) the buy strategy's max-buy
-        price cap. Such orders are not cancelled by the reconciler.
-        """
-        if order.side != OrderSide.BUY:
-            return False
-        order_price = getattr(order, "price", None)
-        if order_price is None:
-            return False
-        instrument_id = getattr(order, "instrument_id", None)
-        if instrument_id is None:
-            return False
-        instrument = self.cache.instrument(instrument_id)
-        if instrument is None:
-            return False
-        ctx = self._build_price_context(instrument, instrument_id, OrderSide.BUY, None)
-        cap = self._buy_pricer.max_buy_price(ctx)
-        if cap is None:
-            return False
-        try:
-            return float(order_price) >= cap - float(instrument.price_increment) / 2.0
-        except Exception:
-            return False
 
     def _target_quantity(self, instrument_id_text: str) -> Decimal:
         """The committed target share count for an instrument (0 when none set)."""
@@ -3662,6 +4328,7 @@ class TargetQuantityStrategy(Strategy):
         if ts_event <= 0:
             raise ValueError(f"Quote tick ts_event must be positive, got {ts_event}")
         self._last_quote_tick_ts_event = ts_event
+        self._last_market_data_ts_event = max(self._last_market_data_ts_event, ts_event)
 
     def _capture_preopen_latency_sample(
         self,
@@ -3820,21 +4487,6 @@ class TargetQuantityStrategy(Strategy):
             trigger=ConvergenceTrigger.PREOPEN_LATENCY,
         )
 
-    def _within_preopen_latency_window(self, current_date: date) -> bool:
-        sample = self._preopen_latency_sample
-        if (
-            not bool(self.config.preopen_latency_execution_enabled)
-            or sample is None
-            or sample.trade_date != current_date
-            or current_date != self._clock_date()
-        ):
-            return False
-        try:
-            now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
-        except Exception:
-            return False
-        return _PREOPEN_LATENCY_EVENT_START <= now < _PREOPEN_LATENCY_EVENT_END
-
     def _within_pre_open_quote_log_window(self) -> bool:
         try:
             now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
@@ -3870,6 +4522,13 @@ class TargetQuantityStrategy(Strategy):
         except Exception:
             return 0
         return self._time_window_index(now, self.config.trading_windows)
+
+    def _local_execution_window_index(self) -> int | None:
+        try:
+            now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
+        except Exception:
+            return None
+        return self._time_window_index(now, self.config.execution_windows)
 
     def _within_trading_time(self) -> bool:
         """True when the clock is inside a scheduled trading session (time only).
@@ -3912,6 +4571,28 @@ class TargetQuantityStrategy(Strategy):
             return False
         return self._within_exchange_trading_time(ts_event, session_index=local_window_index)
 
+    def _within_execution_window(self, ts_event: int | None = None) -> bool:
+        """Require both local time and current market event time in the order window."""
+        local_window_index = self._local_execution_window_index()
+        if local_window_index is None:
+            return False
+        event_ts = int(ts_event or 0) or self._last_market_data_ts_event
+        if event_ts <= 0:
+            return False
+        try:
+            event_time = pd.Timestamp(event_ts, unit="ns", tz="UTC").tz_convert(
+                self.config.timezone_name,
+            )
+        except Exception:
+            return False
+        if event_time.date() != self._clock_date():
+            return False
+        event_window_index = self._time_window_index(
+            event_time.time(),
+            self.config.exchange_execution_windows,
+        )
+        return event_window_index == local_window_index
+
     def _stop_time_reached(self) -> bool:
         stop_time = self.config.stop_time
         if not stop_time:
@@ -3928,6 +4609,92 @@ class TargetQuantityStrategy(Strategy):
             return pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).date()
         except Exception:
             return date.today()
+
+    def add_order_decision_listener(
+        self,
+        listener: Callable[[OrderDecisionEvent], None],
+    ) -> None:
+        if listener not in self._order_decision_listeners:
+            self._order_decision_listeners.append(listener)
+
+    def remove_order_decision_listener(
+        self,
+        listener: Callable[[OrderDecisionEvent], None],
+    ) -> None:
+        if listener in self._order_decision_listeners:
+            self._order_decision_listeners.remove(listener)
+
+    def _execution_intent_id(self, instrument_id_text: str) -> str:
+        key = (self._target_version, instrument_id_text)
+        intent_id = self._execution_intent_ids.get(key)
+        if intent_id is None:
+            intent_id = uuid.uuid4().hex
+            self._execution_intent_ids[key] = intent_id
+        return intent_id
+
+    def _emit_order_decision(
+        self,
+        *,
+        trading_date: date,
+        intent_context: IntentContext,
+        decision_type: str,
+        decision_status: str,
+        reason_code: str,
+        decision_ns: int | None = None,
+        lineage: OrderDecisionLineage | None = None,
+        client_order_id: str | None = None,
+        trigger_client_order_id: str | None = None,
+        parent_decision_id: str | None = None,
+        order_qty: Decimal | None = None,
+        order_price: Any | None = None,
+        policy_name: str | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> OrderDecisionEvent:
+        resolved_client_order_id = client_order_id
+        resolved_trigger_order_id = trigger_client_order_id
+        order_chain_id = None
+        if lineage is not None:
+            order_chain_id = lineage.order_chain_id
+        side = intent_context.details.get("side")
+        if side is None and lineage is not None:
+            side = lineage.side.name
+        payload = dict(intent_context.snapshot())
+        if context:
+            payload.update(context)
+        timestamp_ns = int(decision_ns or self.clock.timestamp_ns())
+        event = OrderDecisionEvent(
+            decision_id=uuid.uuid4().hex,
+            trading_date=trading_date,
+            decision_ns=timestamp_ns,
+            intent_id=intent_context.intent_id,
+            decision_type=decision_type,
+            decision_status=decision_status,
+            reason_code=reason_code,
+            instrument_id=intent_context.instrument_id,
+            parent_decision_id=parent_decision_id,
+            order_chain_id=order_chain_id,
+            client_order_id=resolved_client_order_id,
+            trigger_client_order_id=resolved_trigger_order_id,
+            side=None if side is None else str(side).lower(),
+            signal_date=self._target_signal_date,
+            target_version=self._target_version or None,
+            target_qty=intent_context.target_qty,
+            current_qty=intent_context.current_qty,
+            delta_qty=intent_context.delta_qty,
+            order_qty=order_qty,
+            order_price=(None if order_price is None else Decimal(str(order_price))),
+            policy_name=policy_name or intent_context.pricer_class,
+            context=payload,
+        )
+        self.order_decision_events.append(event)
+        for listener in tuple(self._order_decision_listeners):
+            try:
+                listener(event)
+            except Exception as exc:
+                self.log.warning(
+                    f"order decision listener failed for {event.decision_id}: {exc}",
+                )
+        return event
 
     def _record_target(
         self,

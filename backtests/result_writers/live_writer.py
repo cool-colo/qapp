@@ -14,6 +14,7 @@ from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveAssetSnapshotRecord
 from backtests.result_writers.live_records import LiveOrderEventRecord
+from backtests.result_writers.live_records import LiveOrderDecisionRecord
 from backtests.result_writers.live_records import LiveOrderRecord
 from backtests.result_writers.live_records import LivePositionSnapshotRecord
 from backtests.result_writers.live_records import LivePreopenLatencyProbeRecord
@@ -396,6 +397,52 @@ CREATE TABLE IF NOT EXISTS `live_order_event` (
       (`account_id`,`trader_id`,`trade_date`,`stock_code`,`local_received_time`),
   KEY `ix_order_event_client`
       (`account_id`,`trader_id`,`trade_date`,`client_order_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `live_order_decision` (
+  `id`                      BIGINT        NOT NULL AUTO_INCREMENT,
+  `trade_date`              DATE          NOT NULL,
+  `account_id`              VARCHAR(64)   NOT NULL,
+  `trader_id`               VARCHAR(64)   NOT NULL,
+  `decision_id`             VARCHAR(64)   NOT NULL,
+  `parent_decision_id`      VARCHAR(64)   NULL,
+  `intent_id`               VARCHAR(64)   NOT NULL,
+  `order_chain_id`          VARCHAR(64)   NULL,
+  `client_order_id`         VARCHAR(64)   NULL,
+  `trigger_client_order_id` VARCHAR(64)   NULL,
+  `decision_type`           VARCHAR(32)   NOT NULL,
+  `decision_status`         VARCHAR(24)   NOT NULL,
+  `reason_code`             VARCHAR(64)   NOT NULL,
+  `instrument_id`           VARCHAR(32)   NOT NULL,
+  `stock_code`              VARCHAR(16)   NULL,
+  `side`                    VARCHAR(8)    NULL,
+  `signal_date`             DATE          NULL,
+  `target_version`          VARCHAR(128)  NULL,
+  `target_qty`              BIGINT        NULL,
+  `current_qty`             BIGINT        NULL,
+  `delta_qty`               BIGINT        NULL,
+  `order_qty`               BIGINT        NULL,
+  `order_price`             DECIMAL(20,4) NULL,
+  `policy_name`             VARCHAR(64)   NULL,
+  `context_version`         INT           NOT NULL DEFAULT 1,
+  `context`                 JSON          NULL,
+  `decision_time`           DATETIME(6)   NOT NULL,
+  `decision_ns`             BIGINT        NOT NULL,
+  `persisted_at`            DATETIME(6)   NOT NULL,
+  `schema_version`          INT           NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_order_decision` (`account_id`,`trader_id`,`decision_id`),
+  KEY `ix_decision_client`
+      (`account_id`,`trader_id`,`trade_date`,`client_order_id`,`decision_time`),
+  KEY `ix_decision_trigger`
+      (`account_id`,`trader_id`,`trade_date`,`trigger_client_order_id`),
+  KEY `ix_decision_chain`
+      (`account_id`,`trader_id`,`trade_date`,`order_chain_id`,`decision_time`),
+  KEY `ix_decision_intent`
+      (`account_id`,`trader_id`,`trade_date`,`intent_id`,`decision_time`),
+  KEY `ix_decision_stock_time`
+      (`account_id`,`trader_id`,`trade_date`,`stock_code`,`decision_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
     """
@@ -1081,6 +1128,30 @@ class LiveSnapshotWriter:
                 cursor.execute(order_sql, order_params)
                 if trade_command is not None:
                     cursor.execute(*trade_command)
+                self._commit_if_needed(connection)
+            except Exception:
+                self._rollback_if_needed(connection)
+                raise
+            finally:
+                self._close_cursor(cursor)
+        finally:
+            connection.close()
+
+    def write_order_decision(self, record: LiveOrderDecisionRecord) -> None:
+        """Append one idempotent strategy decision without mutating order facts."""
+        row = self._order_decision_row(record)
+        columns = list(row)
+        sql = (
+            "INSERT INTO `live_order_decision` "
+            f"({', '.join(self._quote_identifier(column) for column in columns)}) "
+            f"VALUES ({', '.join(['%s'] * len(columns))}) "
+            "ON DUPLICATE KEY UPDATE `decision_id` = VALUES(`decision_id`)"
+        )
+        connection = self._engine.raw_connection()
+        try:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(sql, tuple(row[column] for column in columns))
                 self._commit_if_needed(connection)
             except Exception:
                 self._rollback_if_needed(connection)
@@ -1777,6 +1848,40 @@ class LiveSnapshotWriter:
             "reason": record.reason,
             "book_snapshot": _json_dumps(record.book_snapshot),
             "raw_info": _json_dumps(record.raw_info),
+            "schema_version": record.schema_version,
+        }
+
+    @staticmethod
+    def _order_decision_row(record: LiveOrderDecisionRecord) -> dict[str, Any]:
+        return {
+            "trade_date": record.trade_date,
+            "account_id": record.account_id,
+            "trader_id": record.trader_id,
+            "decision_id": record.decision_id,
+            "parent_decision_id": record.parent_decision_id,
+            "intent_id": record.intent_id,
+            "order_chain_id": record.order_chain_id,
+            "client_order_id": record.client_order_id,
+            "trigger_client_order_id": record.trigger_client_order_id,
+            "decision_type": record.decision_type,
+            "decision_status": record.decision_status,
+            "reason_code": record.reason_code,
+            "instrument_id": record.instrument_id,
+            "stock_code": record.stock_code,
+            "side": record.side,
+            "signal_date": record.signal_date,
+            "target_version": record.target_version,
+            "target_qty": record.target_qty,
+            "current_qty": record.current_qty,
+            "delta_qty": record.delta_qty,
+            "order_qty": record.order_qty,
+            "order_price": record.order_price,
+            "policy_name": record.policy_name,
+            "context_version": record.context_version,
+            "context": _json_dumps(record.context),
+            "decision_time": record.decision_time,
+            "decision_ns": record.decision_ns,
+            "persisted_at": record.persisted_at,
             "schema_version": record.schema_version,
         }
 

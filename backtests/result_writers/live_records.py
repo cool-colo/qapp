@@ -245,6 +245,41 @@ class LiveOrderEventRecord:
 
 
 @dataclass(frozen=True)
+class LiveOrderDecisionRecord:
+    """Append-only strategy decision linked to zero or one concrete order."""
+
+    trade_date: date
+    account_id: str
+    trader_id: str
+    decision_id: str
+    intent_id: str
+    decision_type: str
+    decision_status: str
+    reason_code: str
+    instrument_id: str
+    decision_time: datetime
+    decision_ns: int
+    persisted_at: datetime
+    parent_decision_id: str | None = None
+    order_chain_id: str | None = None
+    client_order_id: str | None = None
+    trigger_client_order_id: str | None = None
+    stock_code: str | None = None
+    side: str | None = None
+    signal_date: date | None = None
+    target_version: str | None = None
+    target_qty: int | None = None
+    current_qty: int | None = None
+    delta_qty: int | None = None
+    order_qty: int | None = None
+    order_price: Decimal | None = None
+    policy_name: str | None = None
+    context_version: int = 1
+    context: JsonMapping | None = None
+    schema_version: int = 1
+
+
+@dataclass(frozen=True)
 class LiveTradeRecord:
     trade_date: date
     write_time: datetime

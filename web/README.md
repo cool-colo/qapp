@@ -6,7 +6,10 @@ A local, read-only dashboard for the live trading data this repo persists:
   key/value card next to a **资产构成** pie of 持仓市值 / 可用资金 / 冻结资金. The
   交易 sub-page reads today's `live_trade_realtime` fills from MySQL and shows buy,
   sell, and total turnover amounts and their rates against today's
-  `before_trading` `live_asset_snapshot.total_asset`.
+  `before_trading` `live_asset_snapshot.total_asset`. The **待交易估算** sub-page lists
+  only unfinished target quantities and compares executing them at the latest price
+  versus today's open, including side-aware loss amount and open/current-notional
+  loss rates.
 - **按日快照** — asset / positions / target portfolio / orders / trades for a chosen
   date + phase. Each stock row links to its **个股 K 线** view.
 - **随时间** — time series: pick one or more metrics from a checkbox list (asset
@@ -142,6 +145,7 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `DELETE /api/change_records/{id}` | body: `{pin}` (required) |
 | `GET /api/realtime/trade-summary` | `source, account, trader` |
 | `GET /api/realtime/positions` | `account, trader` |
+| `GET /api/realtime/pending-trades` | `account, trader` |
 | `GET /api/strategy/targets` | `account, trader` |
 | `GET /api/control/state` | `account, trader` |
 | `POST /api/control/suspend` | `account, trader` |

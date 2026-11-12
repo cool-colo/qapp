@@ -259,8 +259,45 @@ table.kv-asset td { min-width: 140px; }
 .trade-summary-metrics div { display: flex; flex-direction: column; gap: 5px; }
 .trade-summary-metrics span { color: var(--muted); font-size: 12px; }
 .trade-summary-metrics b { color: var(--text); font-size: 18px; }
+.trade-slippage-title {
+  margin: 24px 20px 10px; color: var(--text); font-size: 14px; font-weight: 700;
+}
+.trade-slippage-table { margin: 0 20px 20px; width: calc(100% - 40px); }
+.pending-section-title {
+  margin: 20px 20px 10px; color: var(--text); font-size: 14px; font-weight: 700;
+}
+.pending-comparison-wrap {
+  margin: 0 20px; overflow-x: auto; border: 1px solid var(--border); border-radius: 8px;
+}
+table.pending-comparison { min-width: 680px; font-size: 13px; }
+table.pending-comparison th, table.pending-comparison td { padding: 10px 14px; }
+table.pending-comparison tbody th { position: static; color: var(--muted); }
+table.pending-comparison th.pending-buy { color: var(--up); }
+table.pending-comparison th.pending-sell { color: var(--down); }
+table.pending-comparison th:last-child, table.pending-comparison td:last-child {
+  background: rgba(76, 141, 255, 0.07); font-weight: 600;
+}
+.pending-loss-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr));
+  gap: 14px; margin: 0 20px 14px;
+}
+.pending-loss-card {
+  display: flex; flex-direction: column; gap: 7px; min-width: 0;
+  padding: 16px; background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; border-top: 3px solid var(--accent);
+}
+.pending-loss-card.primary { border-top-color: #f5a524; }
+.pending-loss-card span { color: var(--muted); font-size: 12px; }
+.pending-loss-card b { color: var(--text); font-size: 24px; }
+.pending-loss-card b.pos { color: var(--up); }
+.pending-loss-card b.neg { color: var(--down); }
+.pending-loss-card small { color: var(--muted); line-height: 1.5; }
+.pending-loss-note {
+  margin: 0 20px 10px; color: var(--muted); font-size: 12px; line-height: 1.6;
+}
 @media (max-width: 900px) {
   .trade-summary-grid { grid-template-columns: 1fr; }
+  .pending-loss-grid { grid-template-columns: 1fr; }
 }
 
 /* Click-to-sort headers + a per-column filter funnel (hover / active). */

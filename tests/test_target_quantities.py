@@ -7,6 +7,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import date
+from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import MagicMock
 
@@ -29,9 +30,11 @@ from strategies.convergence import ConvergenceTrigger
 from strategies.target_quantities import TargetQuantityStrategy
 from strategies.target_quantities import TickSnapshot
 from strategies.target_quantities import NotionalOrderSplitter
+from strategies.target_quantities import OrderDecisionLineage
+from strategies.target_quantities import OrderQuoteState
 from strategies.target_quantities import PriceTrendSample
-from strategies.pricing import OpenOffsetBuyPriceStrategy
-from strategies.pricing import OpenOffsetSellPriceStrategy
+from strategies.pricing import SameSideBestBuyPriceStrategy
+from strategies.pricing import SameSideBestSellPriceStrategy
 
 
 INST_A = InstrumentId.from_str("000001.SZ.QMT")
@@ -152,12 +155,14 @@ class FakeOrder:
     status: OrderStatus = OrderStatus.INITIALIZED
     is_pending_cancel: bool = False
     ts_last: int = 0
-    filled_qty: Decimal = Decimal("0")
+    filled_qty: FakeMoney | Decimal = Decimal("0")
     leaves_qty: Decimal | None = None
     events: list = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.filled_qty, FakeMoney):
+            self.filled_qty = FakeMoney(self.filled_qty)
         if self.leaves_qty is None:
             self.leaves_qty = self.quantity
 
@@ -340,15 +345,15 @@ class TestableTargetQuantityStrategy:
     _price_limit_reason = TargetQuantityStrategy._price_limit_reason
     _target_achieved = TargetQuantityStrategy._target_achieved
     _reconcile_unfilled_orders = TargetQuantityStrategy._reconcile_unfilled_orders
+    _order_fill_stats = TargetQuantityStrategy._order_fill_stats
+    _cancel_fill_stats = TargetQuantityStrategy._cancel_fill_stats
+    _record_cancel_decision = TargetQuantityStrategy._record_cancel_decision
     _record_price_trend_sample = TargetQuantityStrategy._record_price_trend_sample
     _volume_direction_confirmation = staticmethod(
         TargetQuantityStrategy._volume_direction_confirmation,
     )
     _five_level_book_imbalance = TargetQuantityStrategy._five_level_book_imbalance
     _execution_trend = TargetQuantityStrategy._execution_trend
-    _unfilled_timeout_anchor_ts = staticmethod(
-        TargetQuantityStrategy._unfilled_timeout_anchor_ts,
-    )
     _partial_buy_has_untradeable_remainder = (
         TargetQuantityStrategy._partial_buy_has_untradeable_remainder
     )
@@ -370,16 +375,21 @@ class TestableTargetQuantityStrategy:
     _decimal_quantity = staticmethod(TargetQuantityStrategy._decimal_quantity)
     _track_submitted_order = TargetQuantityStrategy._track_submitted_order
     _forget_submitted_order = TargetQuantityStrategy._forget_submitted_order
+    _forget_order_quote_state = TargetQuantityStrategy._forget_order_quote_state
+    _execution_intent_id = TargetQuantityStrategy._execution_intent_id
+    _emit_order_decision = TargetQuantityStrategy._emit_order_decision
+    add_order_decision_listener = TargetQuantityStrategy.add_order_decision_listener
+    remove_order_decision_listener = TargetQuantityStrategy.remove_order_decision_listener
     _active_orders = TargetQuantityStrategy._active_orders
     _is_active_order = TargetQuantityStrategy._is_active_order
     _pricer_for_side = TargetQuantityStrategy._pricer_for_side
     _limit_price = TargetQuantityStrategy._limit_price
+    _execution_book_validation = TargetQuantityStrategy._execution_book_validation
     _build_price_context = TargetQuantityStrategy._build_price_context
     _quote_snapshot = TargetQuantityStrategy._quote_snapshot
     _book_snapshot = TargetQuantityStrategy._book_snapshot
     _book_lots_to_shares = staticmethod(TargetQuantityStrategy._book_lots_to_shares)
     _ladder_levels = staticmethod(TargetQuantityStrategy._ladder_levels)
-    _at_buy_price_cap = TargetQuantityStrategy._at_buy_price_cap
     _target_quantity = TargetQuantityStrategy._target_quantity
     _portfolio_value = TargetQuantityStrategy._portfolio_value
     _nautilus_portfolio_equity = TargetQuantityStrategy._nautilus_portfolio_equity
@@ -400,7 +410,9 @@ class TestableTargetQuantityStrategy:
     _time_window_index = staticmethod(TargetQuantityStrategy._time_window_index)
     _time_in_windows = staticmethod(TargetQuantityStrategy._time_in_windows)
     _local_trading_window_index = TargetQuantityStrategy._local_trading_window_index
+    _local_execution_window_index = TargetQuantityStrategy._local_execution_window_index
     _within_trading_window = TargetQuantityStrategy._within_trading_window
+    _within_execution_window = TargetQuantityStrategy._within_execution_window
     _within_trading_time = TargetQuantityStrategy._within_trading_time
     _within_exchange_trading_time = TargetQuantityStrategy._within_exchange_trading_time
     _within_pre_open_quote_log_window = TargetQuantityStrategy._within_pre_open_quote_log_window
@@ -411,7 +423,6 @@ class TestableTargetQuantityStrategy:
     _build_preopen_latency_sample = TargetQuantityStrategy._build_preopen_latency_sample
     _schedule_preopen_latency_alert = TargetQuantityStrategy._schedule_preopen_latency_alert
     _on_preopen_latency_timer = TargetQuantityStrategy._on_preopen_latency_timer
-    _within_preopen_latency_window = TargetQuantityStrategy._within_preopen_latency_window
     investable_total_asset = TargetQuantityStrategy.investable_total_asset
     _clock_date = TargetQuantityStrategy._clock_date
     _record_target = TargetQuantityStrategy._record_target
@@ -522,7 +533,8 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             initial_cash=Decimal(str(equity)),
             target_cash_buffer_percent=target_cash_buffer_percent,
             cash_buffer_percent=0.0,
-            unfilled_timeout_secs=1.0,
+            submission_book_max_age_secs=120.0,
+            cancel_book_max_age_secs=120.0,
             stop_time=None,
             order_slice_notional=Decimal(str(order_slice_notional)),
             require_account_cash=require_account_cash,
@@ -555,18 +567,25 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._order_target_versions = {}
         strategy._order_signal_dates = {}
         strategy._order_intent_contexts = {}
+        strategy._execution_intent_ids = {}
+        strategy._order_decision_lineages = {}
+        strategy._pending_replacements = {}
+        strategy._order_decision_listeners = []
         strategy._order_splitter = NotionalOrderSplitter(Decimal(str(order_slice_notional)))
-        strategy._buy_pricer = OpenOffsetBuyPriceStrategy(
-            offset_bps=strategy.config.buy_offset_bps,
-            max_price_bps=strategy.config.buy_max_price_bps,
-            cancel_threshold=strategy.config.buy_cancel_threshold,
+        strategy._buy_pricer = SameSideBestBuyPriceStrategy(
+            price_improvement_threshold=float(
+                strategy.config.same_side_price_improvement_threshold,
+            ),
             logger=strategy.log,
         )
-        strategy._sell_pricer = OpenOffsetSellPriceStrategy(
-            offset_bps=strategy.config.sell_offset_bps,
-            cancel_threshold=strategy.config.sell_cancel_threshold,
+        strategy._sell_pricer = SameSideBestSellPriceStrategy(
+            price_improvement_threshold=float(
+                strategy.config.same_side_price_improvement_threshold,
+            ),
             logger=strategy.log,
         )
+        strategy._order_quote_states = {}
+        strategy._stale_book_warning_ts = {}
         initial_prices = prices or {INST_A: 10.0, INST_B: 20.0, INST_C: 25.0}
         initial_open_prices = initial_prices if open_prices is None else open_prices
         strategy._today_open = {
@@ -591,7 +610,16 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         )
         strategy._whole_market_final_success_dates = set()
         strategy._whole_market_fetch_observers = []
-        strategy._depth_books = {}
+        book_ts = china_ts_ns("2026-07-02 14:30:00")
+        strategy._depth_books = {
+            str(instrument_id): depth_book_snapshot(
+                [(price, 1000000.0)],
+                [(price, 1000000.0)],
+                ts_event=book_ts,
+                ts_init=book_ts,
+            )
+            for instrument_id, price in initial_prices.items()
+        }
         strategy._depth_event_probe_date = None
         strategy._depth_event_probe_instrument_id = None
         strategy._depth_event_probe_ts_event = None
@@ -599,8 +627,6 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._subscribed_order_book_depth_instruments = set()
         strategy._sleep_calls = []
         strategy._sleep = lambda seconds: strategy._sleep_calls.append(seconds)
-        strategy._cancel_count_buy = {}
-        strategy._cancel_count_sell = {}
         strategy._trading_day = None
         strategy._quote_tick_window_probe_ids = set()
         strategy._subscribed_quote_tick_probe_instruments = set()
@@ -608,7 +634,10 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._preopen_latency_persister = None
         # Seed a current in-window exchange event timestamp; these tests exercise
         # convergence behavior, not the trading-window gate.
-        strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 10:00:00")
+        strategy.clock.now = pd.Timestamp("2026-07-02 06:30:01", tz="UTC")
+        strategy.clock.ts = china_ts_ns("2026-07-02 14:30:01") - 1_000_000_000
+        strategy._last_quote_tick_ts_event = book_ts
+        strategy._last_market_data_ts_event = book_ts
         strategy._convergence_suspended = False
         strategy._trading_paused = False
         strategy._target_updates_paused = False
@@ -638,6 +667,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._last_account_sizing_snapshot = None
         strategy.target_events = []
         strategy.order_events = []
+        strategy.order_decision_events = []
         strategy.requested_instruments = []
         strategy.subscribed_bars = []
         strategy.subscribed_quote_ticks = []
@@ -661,7 +691,6 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             instrument_ids=[INST_A],
             bar_types={str(INST_A): bar_type},
             subscribe_bars=False,
-            unfilled_timeout_secs=1.0,
             resubmit_check_interval_secs=10.0,
         )
         strategy._bar_types = {str(INST_A): bar_type}
@@ -700,6 +729,18 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             ),
         )
 
+    def test_default_cancel_validation_timer_runs_every_500ms(self) -> None:
+        strategy = self.make_strategy()
+
+        strategy.on_start()
+
+        timer = next(
+            timer
+            for timer in strategy.clock.timers
+            if timer["name"] == "TARGET-WEIGHT-CONVERGE"
+        )
+        self.assertEqual(timer["interval"], timedelta(milliseconds=500))
+
     def test_on_start_can_disable_market_data_subscriptions(self) -> None:
         bar_type = BarType.from_str(f"{INST_A}-1-MINUTE-LAST-EXTERNAL")
         strategy = self.make_strategy()
@@ -710,7 +751,6 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             subscribe_quote_ticks=False,
             subscribe_trade_ticks=False,
             subscribe_order_book_depth=False,
-            unfilled_timeout_secs=1.0,
             resubmit_check_interval_secs=10.0,
         )
         strategy._bar_types = {str(INST_A): bar_type}
@@ -737,7 +777,6 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             subscribe_quote_ticks=False,
             subscribe_trade_ticks=False,
             quote_tick_window_probe_instrument_ids=(INST_A, INST_B),
-            unfilled_timeout_secs=1.0,
             resubmit_check_interval_secs=10.0,
         )
         strategy._quote_tick_window_probe_ids = {str(INST_A), str(INST_B)}
@@ -928,13 +967,13 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertFalse(
             strategy._converge_to_target(trading_date, ConvergenceTrigger.TIMER),
         )
-        self.assertTrue(
+        self.assertFalse(
             strategy._converge_to_target(
                 trading_date,
                 ConvergenceTrigger.PREOPEN_LATENCY,
             ),
         )
-        self.assertEqual(calls, [(trading_date, ConvergenceTrigger.PREOPEN_LATENCY)])
+        self.assertEqual(calls, [])
 
     def test_quote_tick_0929_does_not_unlock_exchange_window(self) -> None:
         strategy = self.make_strategy()
@@ -969,6 +1008,19 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertTrue(strategy._within_trading_time())
         self.assertFalse(strategy._within_exchange_trading_time())
         self.assertFalse(strategy._within_trading_window())
+
+    def test_execution_window_opens_only_at_1430(self) -> None:
+        strategy = self.make_strategy()
+        morning_ts = china_ts_ns("2026-07-02 10:00:00")
+        strategy.clock.now = pd.Timestamp("2026-07-02 02:00:00", tz="UTC")
+        strategy._last_market_data_ts_event = morning_ts
+        self.assertTrue(strategy._within_trading_window(morning_ts))
+        self.assertFalse(strategy._within_execution_window(morning_ts))
+
+        execution_ts = china_ts_ns("2026-07-02 14:30:00")
+        strategy.clock.now = pd.Timestamp("2026-07-02 06:30:00", tz="UTC")
+        strategy._last_market_data_ts_event = execution_ts
+        self.assertTrue(strategy._within_execution_window(execution_ts))
 
     def test_quote_tick_0930_unlocks_exchange_window(self) -> None:
         strategy = self.make_strategy()
@@ -1152,12 +1204,9 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             if args and str(args[0]).startswith("Target convergence summary ")
         ]
         self.assertEqual(len(summary_logs), 1)
-        self.assertIn("intent_error=1", summary_logs[0])
-        self.assertIn(f"intent_error_instruments=[{INST_A}]", summary_logs[0])
-        self.assertIn("sell_targets=0 buy_targets=0", summary_logs[0])
-        self.assertEqual(strategy.submitted_orders, [])
-        error_logs = [args[0] for args, _kwargs in strategy.log.errors]
-        self.assertTrue(any("missing limit price" in message for message in error_logs))
+        self.assertIn("intent_error=0", summary_logs[0])
+        self.assertIn("sell_targets=0 buy_targets=1", summary_logs[0])
+        self.assertEqual(len(strategy.submitted_orders), 1)
 
     def test_convergence_summary_logs_cash_gap_for_buy_candidates(self) -> None:
         strategy = self.make_strategy(
@@ -1264,10 +1313,10 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy.update_target_quantities({INST_A: 95000}, date(2026, 7, 2), "large")
 
         self.assertEqual([order.quantity for order in strategy.submitted_orders], [
-            Decimal("29800"),
-            Decimal("29800"),
-            Decimal("29800"),
-            Decimal("5600"),
+            Decimal("30000"),
+            Decimal("30000"),
+            Decimal("30000"),
+            Decimal("5000"),
         ])
 
     def test_target_helpers_value_position_with_today_open_not_last_close(self) -> None:
@@ -1350,6 +1399,28 @@ class TargetQuantityStrategyTest(unittest.TestCase):
                 self.assertEqual(strategy.submitted_orders, [])
                 self.assertEqual(strategy.order_events[-1].reason, "invalid_order_quantity")
 
+    def test_submission_failure_clears_all_per_order_state(self) -> None:
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        intent = strategy._target_order_intent(str(INST_A), Decimal("1000"))
+
+        def fail_submission(_order) -> None:
+            raise RuntimeError("venue unavailable")
+
+        strategy.submit_order = fail_submission
+
+        with self.assertRaisesRegex(RuntimeError, "venue unavailable"):
+            strategy._submit_order_quantity(
+                date(2026, 7, 2),
+                intent,
+                Decimal("1000"),
+                "submission_failure",
+            )
+
+        self.assertNotIn("O-1", strategy._order_target_versions)
+        self.assertNotIn("O-1", strategy._order_signal_dates)
+        self.assertNotIn("O-1", strategy._order_intent_contexts)
+        self.assertNotIn("O-1", strategy._order_quote_states)
+
     def test_star_liquidation_can_sell_entire_subminimum_balance(self) -> None:
         strategy = self.make_star_strategy(
             positions={INST_A: Decimal("100")}, prices={INST_A: 400.0},
@@ -1407,9 +1478,13 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         calls = []
         original = strategy._target_order_intent
 
-        def counting_intent(instrument_id_text: str, target_qty: Decimal):
+        def counting_intent(
+            instrument_id_text: str,
+            target_qty: Decimal,
+            replacement=None,
+        ):
             calls.append((instrument_id_text, Decimal(str(target_qty))))
-            return original(instrument_id_text, target_qty)
+            return original(instrument_id_text, target_qty, replacement=replacement)
 
         strategy._target_order_intent = counting_intent
 
@@ -1431,8 +1506,15 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         order_context = strategy.order_events[0].extra["intent_context"]
         self.assertEqual(target_context["target_qty"], Decimal("1200"))
         self.assertEqual(target_context["current_qty"], Decimal("0"))
-        self.assertEqual(target_context["pricer_class"], "OpenOffsetBuyPriceStrategy")
+        self.assertEqual(target_context["pricer_class"], "SameSideBestBuyPriceStrategy")
         self.assertEqual(target_context["price_context"]["open_price"], 10.0)
+        self.assertEqual(target_context["same_side_best"], 10.0)
+        self.assertEqual(
+            target_context["same_side_price_improvement_threshold"],
+            Decimal("20"),
+        )
+        self.assertFalse(target_context["price_improvement_applied"])
+        self.assertEqual(target_context["submission_book_max_age_secs"], 120.0)
         self.assertEqual(order_context["slice_index"], 0)
         self.assertEqual(order_context["clamped_quantity"], Decimal("1200"))
         self.assertEqual(order_context["submitted_quantity"], Decimal("1200"))
@@ -1444,7 +1526,27 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         ]
         self.assertEqual(len(record_logs), 1)
         self.assertIn("intent_context=", record_logs[0])
-        self.assertIn("OpenOffsetBuyPriceStrategy", record_logs[0])
+        self.assertIn("SameSideBestBuyPriceStrategy", record_logs[0])
+
+    def test_submit_decision_links_to_concrete_order(self) -> None:
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+
+        strategy.update_target_quantities(
+            {INST_A: 1200},
+            date(2026, 7, 2),
+            "decision_link",
+        )
+
+        order = strategy.submitted_orders[0]
+        decision = next(
+            event
+            for event in strategy.order_decision_events
+            if event.decision_type == "SUBMIT_REQUESTED"
+        )
+        self.assertEqual(decision.client_order_id, str(order.client_order_id))
+        self.assertIsNotNone(decision.intent_id)
+        self.assertIsNotNone(decision.order_chain_id)
+        self.assertIsNone(decision.trigger_client_order_id)
 
     def test_sell_clamp_is_recorded_in_intent_context(self) -> None:
         strategy = self.make_strategy(
@@ -1537,7 +1639,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         strategy.update_target_quantities({INST_A: 95000}, date(2026, 7, 2), "partial")
 
-        self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("29800")])
+        self.assertEqual([order.quantity for order in strategy.submitted_orders], [Decimal("30000")])
         self.assertEqual(strategy._deferred_buys, {str(INST_A): Decimal("95000")})
 
     def test_buy_cash_gate_reserves_open_buy_notional(self) -> None:
@@ -2109,7 +2211,6 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_price_context_converts_book_lots_to_shares_before_walk(self) -> None:
         strategy = self.make_strategy(open_prices={INST_A: 11.91})
         instrument_id = str(INST_A)
-        strategy._cancel_count_buy[instrument_id] = 1
         strategy._depth_books[instrument_id] = depth_book_snapshot(
             [(11.97, 16.0), (11.95, 15.0)],
             [(11.98, 95.0), (11.99, 49.0), (12.00, 16.0), (12.01, 13.0), (12.04, 2.0)],
@@ -2128,7 +2229,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(context.asks[-1], (12.04, 200.0))
         self.assertEqual(context.ts_event, 19_000_000_000)
         self.assertEqual(context.ts_init, 20_000_000_000)
-        self.assertAlmostEqual(strategy._buy_pricer.compute(context), 11.99)
+        self.assertAlmostEqual(strategy._buy_pricer.compute(context), 11.97)
 
     def test_depth_event_probe_logs_one_instrument_changes_only_before_0935(self) -> None:
         strategy = self.make_strategy()
@@ -2174,7 +2275,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_depth_event_time_drives_inner_convergence_with_stale_quote_time(self) -> None:
         trading_date = date(2026, 7, 2)
         strategy = self.make_strategy(prices={INST_A: 10.0})
-        strategy.clock.now = pd.Timestamp("2026-07-02 01:30:02", tz="UTC")
+        strategy.clock.now = pd.Timestamp("2026-07-02 06:30:02", tz="UTC")
         strategy._trading_day = trading_date
         strategy._depth_converged_today = False
         strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 09:25:00")
@@ -2182,20 +2283,18 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._target_version = "depth-event-time"
 
         strategy.on_order_book_depth(
-            self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 09:30:02"),
+            self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 14:30:02"),
         )
 
         self.assertTrue(strategy._depth_converged_today)
         self.assertEqual(len(strategy.submitted_orders), 1)
         self.assertEqual(strategy.submitted_orders[0].instrument_id, INST_A)
-        # First-order pricing uses the configured 50 bps open offset; depth is
-        # used only after the first cancel.
-        self.assertEqual(strategy.submitted_orders[0].price, Decimal("10.05"))
+        self.assertEqual(strategy.submitted_orders[0].price, Decimal("9.99"))
 
     def test_depth_converged_flag_stays_false_when_convergence_does_not_start(self) -> None:
         trading_date = date(2026, 7, 2)
         strategy = self.make_strategy(prices={INST_A: 10.0})
-        strategy.clock.now = pd.Timestamp("2026-07-02 01:30:02", tz="UTC")
+        strategy.clock.now = pd.Timestamp("2026-07-02 06:30:02", tz="UTC")
         strategy._trading_day = trading_date
         strategy._depth_converged_today = False
         strategy._last_quote_tick_ts_event = china_ts_ns("2026-07-02 09:25:00")
@@ -2204,7 +2303,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._converge_lock.acquire()
         try:
             strategy.on_order_book_depth(
-                self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 09:30:02"),
+                self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 14:30:02"),
             )
         finally:
             strategy._converge_lock.release()
@@ -2213,7 +2312,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(strategy.submitted_orders, [])
 
         strategy.on_order_book_depth(
-            self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 09:30:03"),
+            self._make_depth(INST_A, 9.99, 10.05, "2026-07-02 14:30:03"),
         )
 
         self.assertTrue(strategy._depth_converged_today)
@@ -2658,9 +2757,9 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._roll_trading_day(date(2026, 7, 3))
         self.assertIsNone(strategy._market_status_for(str(INST_A)))
 
-    def test_buy_price_uses_gap_up_open_not_stale_seed(self) -> None:
-        # End-to-end: after a full-tick refresh, a gap-up open drives the buy
-        # limit price (open + offset), not a stale previously-cached value.
+    def test_buy_price_uses_best_bid_not_open(self) -> None:
+        # The refreshed open remains available for sizing and audit, but execution
+        # pricing uses only the current best bid; low-priced stocks do not improve a tick.
         strategy = self.make_strategy(open_prices={INST_A: 42.14})
         strategy._trading_day = date(2026, 7, 2)
         strategy._authoritative_open = set()
@@ -2669,9 +2768,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         instrument = strategy.cache.instrument(INST_A)
         price = strategy._limit_price(instrument, INST_A, OrderSide.BUY, Decimal("100"))
 
-        # buy price = open + max(open*offset_bps/1e4, tick); far above the stale 42.14.
-        self.assertGreater(float(price), 53.0)
-        self.assertLessEqual(float(price), 53.09 + 53.09 * strategy.config.buy_max_price_bps / 10_000.0)
+        self.assertEqual(price, Decimal("10.00"))
 
     def test_limit_reason_uses_full_tick_last_price_without_bar_updates(self) -> None:
         strategy = self.make_strategy(
@@ -2692,6 +2789,13 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             open_prices={INST_A: 32.84},
             fields={INST_A: {"UpStopPrice": 32.84}},
         )
+        book_ts = china_ts_ns("2026-07-02 14:30:00")
+        strategy._depth_books[str(INST_A)] = depth_book_snapshot(
+            [(32.90, 1000.0)],
+            [(32.91, 1000.0)],
+            ts_event=book_ts,
+            ts_init=book_ts,
+        )
 
         price = strategy._limit_price(
             strategy.cache.instrument(INST_A),
@@ -2702,64 +2806,103 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         self.assertEqual(price, Decimal("32.84"))
 
-    def test_reconcile_increments_side_specific_cancel_count(self) -> None:
+    def test_reconcile_skips_when_book_event_matches_submission_event(self) -> None:
         trading_date = date(2026, 7, 2)
         strategy = self.make_strategy(prices={INST_A: 10.0})
-        strategy._today_open = {str(INST_A): 10.0}
+        strategy.update_target_quantities({INST_A: 3000}, trading_date, "same-event")
+        order = strategy.submitted_orders[0]
+        strategy.clock.ts += 60_000_000_000
+
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [])
+        self.assertIsNone(strategy._order_quote_states[str(order.client_order_id)].mismatch_since_ns)
+
+    def test_reconcile_cancels_after_continuous_price_mismatch(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
         order = FakeOrder(
-            client_order_id="S-1",
+            client_order_id="B-MISMATCH",
             instrument_id=INST_A,
-            side=OrderSide.SELL,
-            quantity=Decimal("100"),
-            price=Decimal("9.99"),
+            side=OrderSide.BUY,
+            quantity=Decimal("3000"),
+            price=Decimal("10.02"),
             status=OrderStatus.ACCEPTED,
-            ts_last=1,
-            events=[MagicMock(spec=OrderAccepted, ts_init=1)],
         )
         strategy.cache.open_orders.append(order)
 
         strategy._reconcile_unfilled_orders(trading_date)
-
-        self.assertEqual(strategy.canceled_orders, [order])
-        self.assertEqual(strategy._cancel_count_sell, {str(INST_A): 1})
-        self.assertEqual(strategy._cancel_count_buy, {})
-
-    def test_reconcile_uses_shorter_timeout_for_adverse_trend(self) -> None:
-        trading_date = date(2026, 7, 2)
-        strategy = self.make_strategy(prices={INST_A: 10.0})
-        strategy.config = TargetQuantityStrategyConfig(
-            instrument_ids=[INST_A],
-            bar_types={},
-            unfilled_timeout_secs=10.0,
-            price_trend_min_timeout_multiplier=0.3,
-            stop_time=None,
-        )
-        strategy._price_trend_samples[str(INST_A)] = deque(
-            [
-                PriceTrendSample(1_000_000_000, 10.00, 100),
-                PriceTrendSample(11_000_000_000, 10.05, 1_000),
-            ],
-        )
-        accepted = MagicMock(spec=OrderAccepted, ts_init=7_000_000_000)
-        order = FakeOrder(
-            client_order_id="B-TREND",
-            instrument_id=INST_A,
-            side=OrderSide.BUY,
-            quantity=Decimal("100"),
-            price=Decimal("10.01"),
-            status=OrderStatus.ACCEPTED,
-            ts_last=1,
-            events=[accepted],
-        )
-        strategy.cache.open_orders.append(order)
-        strategy.clock.ts = 12_000_000_000
-
+        self.assertEqual(strategy.canceled_orders, [])
+        strategy.clock.ts += 31_000_000_000
         strategy._reconcile_unfilled_orders(trading_date)
 
         self.assertEqual(strategy.canceled_orders, [order])
         context = strategy.order_events[-1].extra["intent_context"]
-        self.assertAlmostEqual(context["effective_timeout_secs"], 3.0)
-        self.assertEqual(context["trend_severity"], 1.0)
+        self.assertEqual(context["cancel_reason"], "same_side_price_mismatch")
+        self.assertTrue(context["recovered_order"])
+
+    def test_replacement_submit_links_to_canceled_order_chain(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy._target_version = "v-1"
+        strategy._target_quantities = {str(INST_A): Decimal("3000")}
+        order = FakeOrder(
+            client_order_id="B-MISMATCH",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("3000"),
+            price=Decimal("10.02"),
+            status=OrderStatus.ACCEPTED,
+        )
+        strategy.cache.open_orders.append(order)
+
+        strategy._reconcile_unfilled_orders(trading_date)
+        strategy.clock.ts += 31_000_000_000
+        strategy._reconcile_unfilled_orders(trading_date)
+        lineage = strategy._order_decision_lineages["B-MISMATCH"]
+        replacement = strategy._target_order_intent(
+            str(INST_A),
+            Decimal("3000"),
+            replacement=lineage,
+        )
+        self.assertIsNotNone(replacement)
+
+        strategy._submit_order_quantity(
+            trading_date,
+            replacement,
+            Decimal("3000"),
+            "replacement",
+        )
+
+        decision = strategy.order_decision_events[-1]
+        self.assertEqual(decision.decision_type, "REPLACEMENT_SUBMIT")
+        self.assertEqual(decision.trigger_client_order_id, "B-MISMATCH")
+        self.assertEqual(decision.order_chain_id, lineage.order_chain_id)
+        self.assertNotEqual(decision.client_order_id, "B-MISMATCH")
+
+    def test_skipped_replacement_has_no_concrete_client_order_id(self) -> None:
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy._depth_books.pop(str(INST_A))
+        lineage = OrderDecisionLineage(
+            intent_id="intent-1",
+            order_chain_id="chain-1",
+            client_order_id="B-CANCELED",
+            instrument_id=str(INST_A),
+            side=OrderSide.BUY,
+        )
+
+        intent = strategy._target_order_intent(
+            str(INST_A),
+            Decimal("3000"),
+            replacement=lineage,
+        )
+
+        self.assertIsNone(intent)
+        decision = strategy.order_decision_events[-1]
+        self.assertEqual(decision.decision_type, "PRICE_SKIPPED")
+        self.assertIsNone(decision.client_order_id)
+        self.assertEqual(decision.trigger_client_order_id, "B-CANCELED")
+        self.assertEqual(decision.order_chain_id, "chain-1")
 
     def test_price_trend_state_resets_on_trading_day_roll(self) -> None:
         strategy = self.make_strategy()
@@ -2789,58 +2932,280 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "price_trend_max_bps"):
             TargetQuantityStrategy._validate_price_trend_config(config)
 
-    def test_reconcile_does_not_cancel_buy_at_max_price_cap(self) -> None:
+    def test_reconcile_matching_best_price_clears_mismatch_timer(self) -> None:
         trading_date = date(2026, 7, 2)
         strategy = self.make_strategy(prices={INST_A: 10.0})
-        strategy._today_open = {str(INST_A): 10.0}
-        # cap = 10 + max(10*100bps=0.10, 0.01) = 10.10; order resting at the cap
         order = FakeOrder(
             client_order_id="B-1",
             instrument_id=INST_A,
             side=OrderSide.BUY,
-            quantity=Decimal("100"),
-            price=Decimal("10.10"),
-            status=OrderStatus.ACCEPTED,
-            ts_last=1,
-            events=[MagicMock(spec=OrderAccepted, ts_init=1)],
-        )
-        strategy.cache.open_orders.append(order)
-
-        strategy._reconcile_unfilled_orders(trading_date)
-
-        self.assertEqual(strategy.canceled_orders, [])
-        self.assertEqual(strategy._cancel_count_buy, {})
-
-    def test_reconcile_timeout_starts_from_latest_partial_fill(self) -> None:
-        trading_date = date(2026, 7, 2)
-        strategy = self.make_star_strategy(prices={INST_A: 10.0})
-        strategy._today_open = {str(INST_A): 10.0}
-        accepted_event = MagicMock(spec=OrderAccepted)
-        accepted_event.ts_init = 800_000_000
-        fill_event = MagicMock(spec=OrderFilled)
-        fill_event.ts_init = 900_000_000
-        fill_event.ts_event = 1
-        order = FakeOrder(
-            client_order_id="B-1",
-            instrument_id=INST_A,
-            side=OrderSide.BUY,
-            quantity=Decimal("1288"),
+            quantity=Decimal("3000"),
             price=Decimal("10.00"),
             status=OrderStatus.ACCEPTED,
-            ts_last=1,
-            filled_qty=Decimal("1088"),
-            leaves_qty=Decimal("200"),
-            events=[accepted_event, fill_event],
         )
         strategy.cache.open_orders.append(order)
+        strategy._order_quote_states["B-1"] = OrderQuoteState(
+            source_ts_event=china_ts_ns("2026-07-02 14:29:59"),
+            source_ts_init=china_ts_ns("2026-07-02 14:29:59"),
+            source_same_side_best=Decimal("9.99"),
+            mismatch_since_ns=strategy.clock.ts - 60_000_000_000,
+        )
 
-        strategy.clock.ts = 0
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [])
+        self.assertIsNone(strategy._order_quote_states["B-1"].mismatch_since_ns)
+
+    def test_reconcile_unchanged_source_best_clears_mismatch_timer(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        order = FakeOrder(
+            client_order_id="B-1",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("3000"),
+            price=Decimal("10.01"),
+            status=OrderStatus.ACCEPTED,
+        )
+        strategy.cache.open_orders.append(order)
+        strategy._order_quote_states["B-1"] = OrderQuoteState(
+            source_ts_event=china_ts_ns("2026-07-02 14:29:59"),
+            source_ts_init=china_ts_ns("2026-07-02 14:29:59"),
+            source_same_side_best=Decimal("10.00"),
+            mismatch_since_ns=strategy.clock.ts - 60_000_000_000,
+        )
+
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [])
+        self.assertIsNone(strategy._order_quote_states["B-1"].mismatch_since_ns)
+
+    def test_reconcile_partial_fill_grace_anchors_to_latest_fill(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_star_strategy(prices={INST_A: 10.0})
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            cancel_book_max_age_secs=600.0,
+            partial_fill_cancel_grace_secs=300.0,
+            stop_time=None,
+        )
+        fill_ts = strategy.clock.ts - 60_000_000_000
+        fill_event = MagicMock(spec=OrderFilled)
+        fill_event.last_qty = FakeMoney("1000")
+        fill_event.last_px = FakeMoney("10")
+        fill_event.ts_init = fill_ts
+        order = FakeOrder(
+            client_order_id="B-1",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("5000"),
+            price=Decimal("10.02"),
+            status=OrderStatus.ACCEPTED,
+            filled_qty=Decimal("1000"),
+            leaves_qty=Decimal("4000"),
+            events=[fill_event],
+        )
+        strategy.cache.open_orders.append(order)
+        strategy._order_quote_states["B-1"] = OrderQuoteState(
+            source_ts_event=None,
+            source_ts_init=None,
+            source_same_side_best=None,
+            mismatch_since_ns=strategy.clock.ts - 60_000_000_000,
+            recovered=True,
+        )
+
         strategy._reconcile_unfilled_orders(trading_date)
         self.assertEqual(strategy.canceled_orders, [])
 
-        strategy.clock.ts = 2_000_000_000
+        strategy.clock.ts = fill_ts + 301_000_000_000
         strategy._reconcile_unfilled_orders(trading_date)
         self.assertEqual(strategy.canceled_orders, [order])
+
+    def test_reconcile_fails_closed_when_partial_fill_history_is_incomplete(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_star_strategy(prices={INST_A: 10.0})
+        order = FakeOrder(
+            client_order_id="B-INCOMPLETE-FILLS",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("5000"),
+            price=Decimal("10.02"),
+            status=OrderStatus.PARTIALLY_FILLED,
+            filled_qty=Decimal("1000"),
+            leaves_qty=Decimal("4000"),
+            events=[],
+        )
+        strategy.cache.open_orders.append(order)
+        strategy._order_quote_states[order.client_order_id] = OrderQuoteState(
+            source_ts_event=None,
+            source_ts_init=None,
+            source_same_side_best=None,
+            mismatch_since_ns=strategy.clock.ts - 60_000_000_000,
+            recovered=True,
+        )
+
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [])
+        decision = strategy.order_decision_events[-1]
+        self.assertEqual(decision.decision_type, "CANCEL_SUPPRESSED")
+        self.assertEqual(decision.reason_code, "partial_fill_history_unavailable")
+        self.assertFalse(decision.context["cancel"]["fill_history_complete"])
+        self.assertIn("fill quantity mismatch", decision.context["cancel"]["fill_history_error"])
+
+    def test_cancel_fill_stats_propagates_nautilus_interface_errors(self) -> None:
+        strategy = self.make_strategy()
+        order = FakeOrder(
+            client_order_id="B-MALFORMED",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+        )
+        order.filled_qty = Decimal("0")
+
+        with self.assertRaises(AttributeError):
+            strategy._cancel_fill_stats(order)
+
+    def test_order_fill_stats_propagates_fill_event_interface_errors(self) -> None:
+        strategy = self.make_strategy()
+        fill_event = MagicMock(spec=OrderFilled)
+        fill_event.last_qty = FakeMoney("100")
+        fill_event.last_px = Decimal("10")
+        fill_event.ts_init = strategy.clock.ts
+        order = FakeOrder(
+            client_order_id="B-MALFORMED-FILL",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            filled_qty=Decimal("100"),
+            events=[fill_event],
+        )
+
+        with self.assertRaises(AttributeError):
+            strategy._order_fill_stats(order)
+
+    def test_reconcile_keeps_small_remaining_notional_open(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        order = FakeOrder(
+            client_order_id="B-SMALL",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("1000"),
+            price=Decimal("10.02"),
+            status=OrderStatus.ACCEPTED,
+        )
+        strategy.cache.open_orders.append(order)
+        strategy._order_quote_states["B-SMALL"] = OrderQuoteState(
+            source_ts_event=None,
+            source_ts_init=None,
+            source_same_side_best=None,
+            mismatch_since_ns=strategy.clock.ts - 60_000_000_000,
+            recovered=True,
+        )
+
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [])
+
+    def test_stale_execution_book_is_rejected_and_warned_once(self) -> None:
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            submission_book_max_age_secs=4.0,
+            stop_time=None,
+        )
+        strategy.clock.ts = china_ts_ns("2026-07-02 14:30:10")
+        context = strategy._build_price_context(
+            strategy.cache.instrument(INST_A),
+            INST_A,
+            OrderSide.BUY,
+            Decimal("100"),
+        )
+
+        first = strategy._execution_book_validation(
+            context,
+            max_age_secs=strategy.config.submission_book_max_age_secs,
+            purpose="order submission",
+        )
+        second = strategy._execution_book_validation(
+            context,
+            max_age_secs=strategy.config.submission_book_max_age_secs,
+            purpose="order submission",
+        )
+
+        self.assertEqual(first[1], "stale_order_book")
+        self.assertFalse(first[0])
+        self.assertFalse(second[0])
+        stale_warnings = [
+            args[0]
+            for args, _kwargs in strategy.log.warnings
+            if args and "stale order book" in args[0]
+        ]
+        self.assertEqual(len(stale_warnings), 1)
+        self.assertIn("Skipping order submission", stale_warnings[0])
+        self.assertIn("max_age_secs=4.0", stale_warnings[0])
+
+    def test_submission_book_is_valid_at_four_seconds_and_stale_afterward(self) -> None:
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy.clock.ts = china_ts_ns("2026-07-02 14:30:03")
+        context = strategy._build_price_context(
+            strategy.cache.instrument(INST_A),
+            INST_A,
+            OrderSide.BUY,
+            Decimal("100"),
+        )
+        strategy.clock.ts = int(context.ts_event) + 3_000_000_000
+
+        at_limit = strategy._execution_book_validation(
+            context,
+            max_age_secs=4.0,
+            purpose="order submission",
+        )
+        over_limit = strategy._execution_book_validation(
+            context,
+            max_age_secs=4.0,
+            purpose="order submission",
+        )
+
+        self.assertTrue(at_limit[0])
+        self.assertFalse(over_limit[0])
+        self.assertEqual(over_limit[1], "stale_order_book")
+
+    def test_stale_cancel_book_suppresses_cancel_validation(self) -> None:
+        trading_date = date(2026, 7, 2)
+        strategy = self.make_strategy(prices={INST_A: 10.0})
+        strategy.config = TargetQuantityStrategyConfig(
+            instrument_ids=[INST_A],
+            bar_types={},
+            cancel_book_max_age_secs=4.0,
+            stop_time=None,
+        )
+        strategy.clock.ts = china_ts_ns("2026-07-02 14:30:10")
+        order = FakeOrder(
+            client_order_id="B-STALE-CANCEL",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("3000"),
+            price=Decimal("10.02"),
+            status=OrderStatus.ACCEPTED,
+        )
+        strategy.cache.open_orders.append(order)
+
+        strategy._reconcile_unfilled_orders(trading_date)
+
+        self.assertEqual(strategy.canceled_orders, [])
+        decision = strategy.order_decision_events[-1]
+        self.assertEqual(decision.reason_code, "stale_order_book")
+        self.assertEqual(decision.context["cancel"]["thresholds"]["cancel_book_max_age_secs"], 4.0)
+        self.assertEqual(decision.context["cancel"]["thresholds"]["cancel_check_interval_secs"], 0.5)
+        self.assertTrue(
+            any(
+                "Skipping cancel check" in args[0]
+                for args, _kwargs in strategy.log.warnings
+                if args
+            ),
+        )
 
     def test_reconcile_does_not_timeout_order_without_local_acceptance(self) -> None:
         trading_date = date(2026, 7, 2)
@@ -2856,7 +3221,13 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             ts_last=1,
         )
         strategy.cache.open_orders.append(order)
-        strategy.clock.ts = 2_000_000_000
+        strategy._order_quote_states["B-1"] = OrderQuoteState(
+            source_ts_event=None,
+            source_ts_init=None,
+            source_same_side_best=None,
+            mismatch_since_ns=strategy.clock.ts - 60_000_000_000,
+            recovered=True,
+        )
 
         strategy._reconcile_unfilled_orders(trading_date)
 
@@ -2871,7 +3242,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             instrument_id=INST_A,
             side=OrderSide.BUY,
             quantity=Decimal("1200"),
-            price=Decimal("10.00"),
+            price=Decimal("10.02"),
             status=OrderStatus.ACCEPTED,
             ts_last=1,
             filled_qty=Decimal("1088"),
@@ -2879,21 +3250,39 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             events=[MagicMock(spec=OrderAccepted, ts_init=1)],
         )
         strategy.cache.open_orders.append(order)
-        strategy.clock.ts = 2_000_000_000
+        strategy._order_quote_states["B-1"] = OrderQuoteState(
+            source_ts_event=None,
+            source_ts_init=None,
+            source_same_side_best=None,
+            mismatch_since_ns=strategy.clock.ts - 60_000_000_000,
+            recovered=True,
+        )
 
         strategy._reconcile_unfilled_orders(trading_date)
 
         self.assertEqual(strategy.canceled_orders, [])
-        self.assertEqual(strategy._cancel_count_buy, {})
         self.assertIn(
             "replacement quantity would be invalid",
             strategy.log.warnings[0][0][0],
         )
 
-    def test_order_fill_resets_filled_side_cancel_count(self) -> None:
+    def test_partial_fill_keeps_order_quote_state(self) -> None:
         strategy = self.make_strategy()
-        strategy._cancel_count_buy = {str(INST_A): 4}
-        strategy._cancel_count_sell = {str(INST_A): 2}
+        order = FakeOrder(
+            client_order_id="O-1",
+            instrument_id=INST_A,
+            side=OrderSide.BUY,
+            quantity=Decimal("3000"),
+            filled_qty=Decimal("1000"),
+            leaves_qty=Decimal("2000"),
+            status=OrderStatus.PARTIALLY_FILLED,
+        )
+        strategy.cache.all_orders.append(order)
+        strategy._order_quote_states["O-1"] = OrderQuoteState(
+            source_ts_event=1,
+            source_ts_init=2,
+            source_same_side_best=Decimal("10"),
+        )
         event = type(
             "FillEvent",
             (),
@@ -2902,8 +3291,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         strategy.on_order_filled(event)
 
-        self.assertEqual(strategy._cancel_count_buy, {})
-        self.assertEqual(strategy._cancel_count_sell, {str(INST_A): 2})
+        self.assertIn("O-1", strategy._order_quote_states)
 
 
 if __name__ == "__main__":

@@ -279,7 +279,7 @@ function activateNavItem(btn, { load = true } = {}) {
   if (tab === "offline") tab = "report";
   const panel = $(`#tab-${tab}`);
   if (panel) panel.classList.add("active");
-  // 实时信息 has 持仓 / 资产 / 交易 sub-panels; a nav-sub click selects which one shows.
+  // 实时信息 has 持仓 / 资产 / 交易 / 待交易估算 sub-panels; a nav-sub click selects it.
   // A click on the parent (no data-sub) defaults to 持仓.
   if (tab === "realtime") showRealtimeSub(btn.dataset.sub || "positions");
   if (tab === "stratinfo") showStratInfoSub(btn.dataset.sub || "signals");
@@ -318,7 +318,7 @@ function restoreActiveNav() {
   if (btn) activateNavItem(btn, { load: false });
 }
 
-// Toggle between the 持仓 / 资产 / 交易 sub-panels.
+// Toggle between the 实时信息 sub-panels.
 function showRealtimeSub(sub) {
   $$(".rt-sub-panel").forEach((p) => p.classList.remove("active"));
   const target = $(`#rt-${sub}`);
@@ -1825,12 +1825,16 @@ function tradeSeries(rows, source) {
 function renderOrderExecution(payload) {
   const layers = selectedOrderExecutionLayers();
   const minutes = payload.market.minutes || [], ticks = payload.market.ticks || [];
+  const decisions = payload.local.decisions || [];
+  const decisionLane = (row) => row.client_order_id || row.trigger_client_order_id ||
+    `未生成订单 · ${row.instrument_id || row.stock_code || "策略决策"}`;
   const rangeStart = oeTime(payload.range.start);
   const rangeEnd = oeTime(payload.range.end);
   const clientIds = Array.from(new Set([
     ...payload.broker.orders.map((row) => row.client_order_id),
     ...payload.local.orders.map((row) => row.client_order_id),
     ...payload.local.events.map((row) => row.client_order_id),
+    ...decisions.map(decisionLane),
   ])).filter(Boolean);
   const series = [];
   if (layers.has("minute")) series.push(minuteCandleSeries(minutes));
@@ -1878,6 +1882,23 @@ function renderOrderExecution(payload) {
           `本地事件 ${escapeHtml(row.local_event_time || "-")}<br>本地接收 ${escapeHtml(row.local_received_time || "-")}`;
       } },
     });
+    series.push({
+      name: "策略决策", type: "scatter", xAxisIndex: 1, yAxisIndex: 1,
+      symbol: "diamond", symbolSize: 11,
+      data: decisions.map((row) => ({
+        value: [oeTime(row.decision_time), decisionLane(row)],
+        meta: row,
+        itemStyle: { color: row.decision_status === "failed" ? "#ef5350" : "#f6c85f" },
+      })).filter((item) => item.value[0] !== null),
+      tooltip: { formatter: (p) => {
+        const row = p.data.meta;
+        return `<b>${escapeHtml(row.decision_type)}</b><br>` +
+          `${escapeHtml(row.client_order_id || "未生成订单")} · ${escapeHtml(row.decision_status)}<br>` +
+          `原因 ${escapeHtml(row.reason_code)}<br>` +
+          `触发订单 ${escapeHtml(row.trigger_client_order_id || "-")}<br>` +
+          `链 ${escapeHtml(row.order_chain_id || "-")}`;
+      } },
+    });
   }
   const title = `${payload.stock_code}${payload.stock_name ? " " + payload.stock_name : ""} · ${payload.trade_date}`;
   const option = {
@@ -1916,7 +1937,10 @@ function renderOrderExecution(payload) {
     discrepancies: (row.discrepancies || []).join(", "),
   }));
   renderTable("#orderexec-diagnostics", diagnostics, { defaultSort: {} });
-  renderTable("#orderexec-events", payload.local.events, { defaultSort: {} });
+  renderTable("#orderexec-events", [
+    ...decisions.map((row) => ({ record_type: "decision", ...row })),
+    ...payload.local.events.map((row) => ({ record_type: "lifecycle_event", ...row })),
+  ], { defaultSort: {} });
   renderTable("#orderexec-broker", [
     ...payload.broker.orders.map((row) => ({ record_type: "order", ...row })),
     ...payload.broker.trades.map((row) => ({ record_type: "trade", ...row })),
@@ -2491,9 +2515,46 @@ function renderRealtimeTradeSummary(summary) {
   const assetText = summary.total_asset === null || summary.total_asset === undefined
     ? "未找到当日 before_trading 总资产，比例暂不可用"
     : `盘前总资产 ${fmt(summary.total_asset)}`;
+  const slippage = summary.slippage || {};
+  const slippageGroups = [
+    ["total", "总滑点", slippage.total],
+    ["buy", "总买入滑点", slippage.buy],
+    ["sell", "总卖出滑点", slippage.sell],
+  ];
+  const slippageCards = slippageGroups.map(([kind, label, item]) =>
+    `<div class="trade-summary-card ${kind}">
+       <div class="trade-summary-title">${label}</div>
+       <div class="trade-summary-metrics">
+         <div><span>滑点金额</span><b>${fmt(item && item.amount)}</b></div>
+         <div><span>滑点</span><b>${item && item.bps !== null && item.bps !== undefined ? fmt(item.bps) + " bp" : "—"}</b></div>
+       </div>
+     </div>`
+  ).join("");
   el.innerHTML =
     `<div class="trade-summary-meta">${escapeHtml(summary.trade_date)} · ${assetText}</div>` +
-    `<div class="trade-summary-grid">${cards}</div>`;
+    `<div class="trade-summary-grid">${cards}</div>` +
+    `<div class="trade-slippage-title">滑点（正值表示成交价相对开盘价更差）</div>` +
+    `<div class="trade-summary-grid">${slippageCards}</div>` +
+    `<div id="rt-slippage-table" class="table-wrap trade-slippage-table"></div>`;
+  renderTable("#rt-slippage-table", slippage.stocks || [], {
+    columns: [
+      "stock_code", "side", "order_count", "trade_count", "traded_qty",
+      "traded_amount", "avg_open_price", "avg_trade_price",
+      "slippage_amount", "slippage_bps",
+    ],
+    headers: {
+      stock_code: "证券代码", side: "方向", order_count: "委托数",
+      trade_count: "成交笔数", traded_qty: "成交数量", traded_amount: "成交金额",
+      avg_open_price: "加权开盘价", avg_trade_price: "加权成交价",
+      slippage_amount: "滑点金额", slippage_bps: "滑点(bp)",
+    },
+    intCols: new Set(["order_count", "trade_count", "traded_qty"]),
+    linkStock: true,
+    stockInfoDate: summary.trade_date,
+    cellFn: (col, value) => col === "side"
+      ? `<td class="text ${String(value).toLowerCase() === "buy" ? "pos" : "neg"}">${String(value).toUpperCase() === "BUY" ? "买入" : "卖出"}</td>`
+      : undefined,
+  });
 }
 
 async function loadRealtimeTradeSummary() {
@@ -2502,6 +2563,106 @@ async function loadRealtimeTradeSummary() {
     renderRealtimeTradeSummary(summary);
   } catch (e) {
     $("#rt-trades").innerHTML = '<div class="empty">获取失败</div>';
+    toast(e.message);
+  }
+}
+
+// 待交易估算 — only unfinished target quantities. The backend joins the live
+// target book with the node's whole-market tick snapshot and applies the side-aware
+// loss convention: BUY=(current-open)*qty, SELL=(open-current)*qty.
+function renderPendingTradeProjection(payload) {
+  const el = $("#rt-pending");
+  if (!payload || !payload.trades || payload.trades.length === 0) {
+    el.innerHTML = '<div class="empty">当前目标已全部达成，无待交易股票</div>';
+    return;
+  }
+  const buy = payload.buy || {};
+  const sell = payload.sell || {};
+  const total = payload.total || {};
+  const lossClass = (value) => value > 0 ? "pos" : value < 0 ? "neg" : "";
+  const missing = payload.unpriced_count
+    ? ` · ${payload.unpriced_count} 只缺少有效开盘价或现价，未计入汇总`
+    : "";
+  el.innerHTML =
+    `<div class="trade-summary-meta">交易日 ${escapeHtml(payload.trade_date || "—")} · ` +
+      `目标版本 ${escapeHtml(payload.target_version || "—")}${missing}</div>` +
+    `<div class="pending-section-title">买卖汇总对比</div>` +
+    `<div class="pending-comparison-wrap">
+       <table class="pending-comparison">
+         <thead><tr><th class="text">指标</th><th class="pending-buy">买入</th><th class="pending-sell">卖出</th><th>汇总结果</th></tr></thead>
+         <tbody>
+           <tr><th class="text">待交易股票</th><td>${buy.stock_count || 0} 只</td><td>${sell.stock_count || 0} 只</td><td>${total.stock_count || 0} 只（合计）</td></tr>
+           <tr><th class="text">开盘价执行金额</th><td>${fmt(buy.open_amount)}</td><td>${fmt(sell.open_amount)}</td><td>${fmt(total.open_net_cash)}（买入－卖出）</td></tr>
+           <tr><th class="text">现价执行金额</th><td>${fmt(buy.current_amount)}</td><td>${fmt(sell.current_amount)}</td><td>${fmt(total.current_net_cash)}（买入－卖出）</td></tr>
+           <tr><th class="text">相对开盘损失</th><td class="${lossClass(buy.loss_amount)}">${fmt(buy.loss_amount)}</td><td class="${lossClass(sell.loss_amount)}">${fmt(sell.loss_amount)}</td><td class="${lossClass(total.loss_amount)}">${fmt(total.loss_amount)}（合计）</td></tr>
+         </tbody>
+       </table>
+     </div>` +
+    `<div class="pending-section-title">总损失</div>` +
+    `<div class="pending-loss-grid">
+       <div class="pending-loss-card primary">
+         <span>总损失金额</span>
+         <b class="${lossClass(total.loss_amount)}">${fmt(total.loss_amount)}</b>
+         <small>现价买入减卖出，相对开盘价多占用的资金</small>
+       </div>
+       <div class="pending-loss-card">
+         <span>损失 / 开盘价总额</span>
+         <b>${pct(total.loss_rate_open)}</b>
+         <small>分母 ${fmt(total.open_amount)}</small>
+       </div>
+       <div class="pending-loss-card">
+         <span>损失 / 现价总额</span>
+         <b>${pct(total.loss_rate_current)}</b>
+         <small>分母 ${fmt(total.current_amount)}</small>
+       </div>
+     </div>` +
+    `<div class="pending-loss-note">正损失表示按现价执行比按开盘价执行更差；` +
+      `比例分母为全部待买与待卖股票的总交易金额，不做买卖金额抵消。</div>` +
+    `<div class="pending-section-title">待交易股票</div>` +
+    `<div id="rt-pending-table" class="table-wrap trade-slippage-table"></div>`;
+
+  renderTable("#rt-pending-table", payload.trades, {
+    columns: [
+      "side", "stock_code", "name", "current_qty", "target_qty", "trade_qty",
+      "open_price", "current_price", "price_change", "open_amount",
+      "current_amount", "loss_amount",
+    ],
+    headers: {
+      side: "方向", stock_code: "证券代码", name: "证券名称",
+      current_qty: "当前数量", target_qty: "目标数量", trade_qty: "待交易数量",
+      open_price: "开盘价", current_price: "现价", price_change: "现价较开盘",
+      open_amount: "开盘价执行金额", current_amount: "现价执行金额",
+      loss_amount: "损失金额",
+    },
+    intCols: new Set(["current_qty", "target_qty", "trade_qty"]),
+    rateCols: new Set(["price_change"]),
+    signCols: new Set(["price_change", "loss_amount"]),
+    linkStock: true,
+    stockInfoDate: payload.trade_date,
+    cellFn: (col, value, row) => {
+      if (col === "side") {
+        const buy = String(value).toUpperCase() === "BUY";
+        return `<td class="text ${buy ? "pos" : "neg"}">${buy ? "买入" : "卖出"}</td>`;
+      }
+      if (col === "name" && row.frozen) {
+        return `<td class="text" title="${escapeHtml(row.frozen_reason || "冻结")}">${escapeHtml(value || "")} ❄</td>`;
+      }
+      return undefined;
+    },
+  });
+}
+
+async function loadPendingTradeProjection() {
+  if (!state.account) return;
+  if (!hasNodeApi()) {
+    nodeApiHint("#rt-pending");
+    return;
+  }
+  try {
+    const payload = await api("/api/realtime/pending-trades", accountParams());
+    renderPendingTradeProjection(payload);
+  } catch (e) {
+    $("#rt-pending").innerHTML = '<div class="empty">获取失败</div>';
     toast(e.message);
   }
 }
@@ -2546,6 +2707,11 @@ async function loadRealtime() {
   const activeSub = document.querySelector("#tab-realtime .rt-sub-panel.active");
   if (activeSub && activeSub.id === "rt-trades") {
     await loadRealtimeTradeSummary();
+    $("#rt-updated").textContent = "更新于 " + new Date().toLocaleTimeString();
+    return;
+  }
+  if (activeSub && activeSub.id === "rt-pending") {
+    await loadPendingTradeProjection();
     $("#rt-updated").textContent = "更新于 " + new Date().toLocaleTimeString();
     return;
   }

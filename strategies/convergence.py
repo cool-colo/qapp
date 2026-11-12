@@ -27,7 +27,3 @@ class ConvergenceTrigger(str, Enum):
     @property
     def waits_for_lock(self) -> bool:
         return self.is_manual
-
-    @property
-    def allows_preopen_window(self) -> bool:
-        return self is self.PREOPEN_LATENCY
