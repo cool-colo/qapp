@@ -202,6 +202,8 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
                 self.log.warning(f"Could not summarize DingTalk event {event_name}: {exc}")
 
     def _on_process_targets_timer(self, _event: Any) -> None:
+        if self.config.auction_enabled:
+            self.process_opening_auction()
         if not self._within_trading_window():
             return
         trading_date = self._clock_date()
@@ -502,8 +504,20 @@ def build_target_model_node(
             order_book_depth_log_sample_rate=params.order_book_depth_log_sample_rate,
             trading_windows=params.trading_windows,
             exchange_trading_windows=params.exchange_trading_windows,
+            auction_enabled=params.auction_enabled,
+            auction_prepare_time=params.auction_prepare_time,
+            auction_submit_time=params.auction_submit_time,
+            auction_submit_cutoff=params.auction_submit_cutoff,
+            auction_reference_max_age_secs=params.auction_reference_max_age_secs,
+            auction_buy_offset_bps=params.auction_buy_offset_bps,
+            auction_sell_offset_bps=params.auction_sell_offset_bps,
+            auction_commission_rate=params.auction_commission_rate,
+            auction_minimum_fee=params.auction_minimum_fee,
+            auction_partial_min_notional=params.auction_partial_min_notional,
             execution_windows=params.execution_windows,
             exchange_execution_windows=params.exchange_execution_windows,
+            cancel_windows=params.cancel_windows,
+            exchange_cancel_windows=params.exchange_cancel_windows,
             preopen_latency_execution_enabled=params.preopen_latency_execution_enabled,
             preopen_latency_max_advance_ms=params.preopen_latency_max_advance_ms,
             preopen_latency_fixed_advance_ms=params.preopen_latency_fixed_advance_ms,

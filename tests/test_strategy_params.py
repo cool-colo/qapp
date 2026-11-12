@@ -12,6 +12,8 @@ class StrategyParamsPriceTrendTest(unittest.TestCase):
         self.assertEqual(params.resubmit_check_interval_secs, 0.5)
         self.assertEqual(params.process_targets_interval_secs, 2.0)
         self.assertEqual(params.execution_windows, "14:30-14:55")
+        self.assertEqual(params.cancel_windows, "09:30-11:30,13:00-14:57")
+        self.assertEqual(params.exchange_cancel_windows, "09:30-11:30,13:00-14:57")
         self.assertEqual(params.submission_book_max_age_secs, 4.0)
         self.assertEqual(params.cancel_book_max_age_secs, 4.0)
         self.assertEqual(params.same_side_price_improvement_threshold, 20)

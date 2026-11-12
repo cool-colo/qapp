@@ -75,11 +75,32 @@ trading_windows: "09:29-11:30,13:00-14:55"
 exchange_trading_windows: "09:30-11:30,13:00-14:55"
 execution_windows: "14:30-14:55"
 exchange_execution_windows: "14:30-14:55"
+# Independent cancel windows: inclusive start, exclusive end (seconds supported).
+# Cancellation checks continue after stop_time; replacements keep execution_windows.
+# 14:56:59 can cancel; 14:57:00 cannot cancel during the closing auction.
+cancel_windows: "09:30-11:30,13:00-14:57"
+exchange_cancel_windows: "09:30-11:30,13:00-14:57"
 # Retained latency-probe settings. The 14:30 execution window is authoritative;
 # even when enabled, a pre-open trigger cannot submit outside that window.
 preopen_latency_execution_enabled: false
 preopen_latency_max_advance_ms: 3000
 preopen_latency_fixed_advance_ms: 50
+
+# --- Opening call auction (off by default) ---
+# Uses all available account cash, prediction-rank priority, and fixed daily targets.
+# Auction indicative price must come from fresh equal best bid/ask levels.
+# Auction submissions use their own window; continuous orders obey execution_windows.
+# Cancels obey cancel_windows, never before 09:30.
+auction_enabled: false
+auction_prepare_time: "09:24:01"
+auction_submit_time: "09:24:50"
+auction_submit_cutoff: "09:24:59"
+auction_reference_max_age_secs: 4.0
+auction_buy_offset_bps: 50.0
+auction_sell_offset_bps: 50.0
+auction_commission_rate: 0.000085  # 万 0.85, both buys and sells
+auction_minimum_fee: 5.0
+auction_partial_min_notional: 58000  # Partial notional > threshold; remaining target >= threshold.
 
 # --- Full-tick snapshot ---
 full_tick_refresh_secs: 1.0

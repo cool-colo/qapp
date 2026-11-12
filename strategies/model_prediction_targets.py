@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 from datetime import date
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 from typing import Callable
 
@@ -27,6 +28,8 @@ from strategies.model_target_planners import TargetContext
 from strategies.model_target_planners import TargetInfo
 from strategies.model_target_planners import build_model_target_planner
 from strategies.model_target_planners import normalize_stock_code
+from strategies.opening_auction import AuctionReference
+from strategies.opening_auction import auction_time
 from strategies.target_quantities import TargetQuantityStrategy
 from strategies.target_quantities import TargetQuantityStrategyConfig
 from strategies.target_quantities import bar_date
@@ -80,6 +83,10 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
 
     def __init__(self, config: TargetModelPredictionsStrategyConfig) -> None:
         super().__init__(config)
+        self._auction_replay_model = None
+        self._planning_price_inputs: dict[str, AuctionReference] | None = None
+        self._frozen_auction_plans: dict[date, ModelTargetPlan] = {}
+        self._auction_frozen_dates: set[date] = set()
         if int(config.consecutive_up_limit_days) < 0:
             raise ValueError("consecutive_up_limit_days must be non-negative")
         if not 0.0 <= float(config.max_open_gap_up) <= 1.0:
@@ -272,7 +279,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             today = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).date()
         except Exception:
             return
-        self._processed_dates.discard(today)
+        if not (self.config.auction_enabled and today in self._auction_frozen_dates):
+            self._processed_dates.discard(today)
         if self._within_trading_window():
             self._process_trading_day_once(today, "refresh")
 
@@ -295,6 +303,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             )
 
     def _on_process_targets_timer(self, _event: Any) -> None:
+        if self.config.auction_enabled:
+            self.process_opening_auction()
         if self._within_trading_window():
             trading_date = self._clock_date()
             self._process_trading_day_once(trading_date, "timer")
@@ -302,7 +312,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
     def _process_trading_day_once(self, trading_date: date, trigger: str) -> bool:
         if trading_date in self._processed_dates:
             return False
-        self._process_trading_day(trading_date)
+        if self._process_trading_day(trading_date) is False:
+            return False
         self._processed_dates.add(trading_date)
         self.log.info(
             f"processed model target day from {trigger}: date={trading_date}",
@@ -310,7 +321,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         )
         return True
 
-    def _process_trading_day(self, trading_date: date) -> None:
+    def _process_trading_day(self, trading_date: date) -> bool:
         loaded_target = self._live_target_portfolio_target(trading_date)
         if loaded_target is not None:
             quantities, reason, version, signal_date = loaded_target
@@ -321,7 +332,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 version=version,
                 signal_date=signal_date,
             )
-            return
+            return True
         plan = self.compute_daily_target_plan(trading_date)
         persister = self._live_target_plan_persister
         if plan.persistable and persister is not None:
@@ -331,10 +342,10 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 persisted = persister(plan)
             except Exception as exc:
                 self.log.warning(f"could not persist generated live target plan: {exc}")
-                return
+                return False
             if not persisted:
                 self.log.warning("generated live target plan was not persisted; target not applied")
-                return
+                return False
         # The risk-manager planner commits explicit share counts (固定目标股数); the
         # executor trades toward those quantities. Weights on the plan are audit-only
         # and are not consulted for execution.
@@ -345,6 +356,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             version=self._plan_version(plan),
             signal_date=plan.signal_date,
         )
+
+        return True
 
     def _live_target_portfolio_target(
         self,
@@ -364,6 +377,21 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             )
             return None
         quantities, reason, version = self._target_quantities_from_live_target_rows(rows)
+        if self.config.auction_enabled:
+            import json
+
+            auction_rows = False
+            for row in rows:
+                extra = row.get("extra") or {}
+                if isinstance(extra, str):
+                    extra = json.loads(extra)
+                if extra.get("execution_phase") == "opening_auction":
+                    auction_rows = True
+                    rank = extra.get("prediction_rank")
+                    if rank is not None:
+                        self._auction_prediction_ranks[str(row["instrument_id"])] = int(rank)
+            if auction_rows:
+                self._auction_frozen_dates.add(trading_date)
         self._log_live_target_portfolio_info(
             f"loaded live target portfolio: date={trading_date} signal_date={signal_date} "
             f"frozen_qty={len(quantities)} version={version}",
@@ -408,7 +436,95 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             raise RuntimeError("live_target_portfolio rows contain no target_qty values")
         return quantities, reason, version
 
-    def compute_daily_target_plan(self, trading_date: date) -> ModelTargetPlan:
+    def process_opening_auction(self) -> None:
+        now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
+        trading_date = now.date()
+        if (not self.config.auction_enabled or trading_date not in self._trading_dates
+                or not auction_time(self.config.auction_prepare_time) <= now.time()
+                < auction_time(self.config.auction_submit_cutoff)
+                or self._trading_paused or self._target_updates_paused):
+            return
+        self._roll_trading_day(trading_date)
+        if self._awaiting_pre_open_reconcile():
+            return
+        signal_date = self._resolve_signal_date(trading_date)
+        subscription_ids = self._held_instrument_ids() | {
+            str(self._instrument_by_stock[signal["stock_code"]])
+            for signal in self._signals_by_date.get(signal_date, [])
+            if signal["stock_code"] in self._instrument_by_stock
+        }
+        if self.config.subscribe_order_book_depth:
+            self._refresh_order_book_depth_subscriptions({i: Decimal("0") for i in subscription_ids})
+        if trading_date not in self._auction_frozen_dates:
+            # Use untruncated prediction ranks for held stocks as well as buys.
+            self._auction_prediction_ranks = {
+                str(self._instrument_by_stock[stock_code]): rank
+                for stock_code, rank in self._prediction_ranks_by_date.get(signal_date, {}).items()
+                if stock_code in self._instrument_by_stock
+            }
+            loaded = self._live_target_portfolio_target(trading_date)
+            if loaded is not None:
+                quantities, reason, version, signal_date = loaded
+                # An existing non-auction target must not be silently reinterpreted.
+                if trading_date not in self._auction_frozen_dates:
+                    return
+                self.update_target_quantities(quantities, target_date=trading_date,
+                                              reason=reason, version=version, signal_date=signal_date)
+            else:
+                references = {i: ref for i in self._stock_by_instrument
+                              if (ref := self.auction_reference(i)) is not None}
+                held = self._held_instrument_ids()
+                if not references or any(
+                    i not in references and not (self._is_suspended_status(i)
+                    or self._stock_code_for_instrument(i) in self._suspended_by_date.get(trading_date, set()))
+                    for i in held
+                ):
+                    return
+                try:
+                    plan = self.compute_daily_target_plan(trading_date, planning_prices=references)
+                    if not plan.persistable:
+                        return
+                    persister = self._live_target_plan_persister
+                    if persister is not None and not persister(plan):
+                        return
+                except Exception as exc:
+                    self.log.warning(f"Opening auction planning failed: {exc}")
+                    return
+                if pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time() >= auction_time(self.config.auction_submit_cutoff):
+                    self.log.warning("Opening auction planning missed submission cutoff")
+                    return
+                self._frozen_auction_plans[trading_date] = plan
+                self._auction_frozen_dates.add(trading_date)
+                self._auction_prediction_ranks.update({
+                    target.instrument_id: target.target_context.prediction_rank
+                    for target in plan.targets if target.target_context.prediction_rank is not None
+                })
+                self.update_target_quantities(self._target_quantities_from_plan(plan),
+                                              target_date=trading_date, reason=plan.reason,
+                                              version=self._plan_version(plan), signal_date=plan.signal_date)
+            self._processed_dates.add(trading_date)
+        self.execute_opening_auction()
+
+    def compute_daily_target_plan(
+        self, trading_date: date, *, planning_prices: dict[str, AuctionReference] | None = None,
+    ) -> ModelTargetPlan:
+        if self.config.auction_enabled and trading_date in self._frozen_auction_plans:
+            return self._frozen_auction_plans[trading_date]
+        if planning_prices is not None:
+            if not self.config.auction_enabled:
+                raise ValueError("Auction planning prices require auction_enabled")
+            now_ns = int(self.clock.timestamp_ns())
+            if any(not ref.is_fresh(now_ns, self.config.timezone_name,
+                                    self.config.auction_reference_max_age_secs)
+                   for ref in planning_prices.values()):
+                raise ValueError("Auction planning prices contain stale or future data")
+        self._planning_price_inputs = planning_prices
+        try:
+            return self._compute_daily_target_plan(trading_date)
+        finally:
+            self._planning_price_inputs = None
+
+    def _compute_daily_target_plan(self, trading_date: date) -> ModelTargetPlan:
         """
         Build the day's target request and return the resulting plan
         **without submitting orders or accepting the target**.
@@ -706,6 +822,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         return None
 
     def _exit_price_with_source(self, instrument_id_text: str) -> tuple[float | None, str | None]:
+        if self.config.auction_enabled and self._planning_price_inputs is not None:
+            reference = self._planning_price_inputs.get(instrument_id_text)
+            return (None, None) if reference is None else (reference.price, reference.source)
         open_price = self._today_open_price(instrument_id_text)
         if open_price is not None:
             return open_price, "open"
@@ -731,6 +850,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         )
 
     def _today_open_price(self, instrument_id_text: str) -> float | None:
+        if self.config.auction_enabled and self._planning_price_inputs is not None:
+            reference = self._planning_price_inputs.get(instrument_id_text)
+            return None if reference is None else reference.price
         open_price = self._today_open.get(instrument_id_text)
         if open_price is None or open_price <= 0:
             return None
@@ -907,6 +1029,15 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     target_context=TargetContext(
                         price=request.open_prices.get(target.instrument_id),
                         price_source=price_source,
+                        price_ts_event=(None if self._planning_price_inputs is None
+                                        or target.instrument_id not in self._planning_price_inputs
+                                        else self._planning_price_inputs[target.instrument_id].ts_event),
+                        price_ts_init=(None if self._planning_price_inputs is None
+                                       or target.instrument_id not in self._planning_price_inputs
+                                       else self._planning_price_inputs[target.instrument_id].ts_init),
+                        prediction_rank=(candidate.rank if candidate is not None else
+                                         self._prediction_ranks_by_date.get(request.signal_date, {}).get(
+                                             target.stock_code)),
                         score=None if candidate is None else float(candidate.score),
                         expected_return=(
                             None
@@ -1584,6 +1715,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         return None
 
     def _open_price_with_source(self, instrument_id_text: str) -> tuple[float | None, str | None]:
+        if self.config.auction_enabled and self._planning_price_inputs is not None:
+            reference = self._planning_price_inputs.get(instrument_id_text)
+            return (None, None) if reference is None else (reference.price, reference.source)
         """
         Resolve the sizing price for an instrument and where it came from.
 

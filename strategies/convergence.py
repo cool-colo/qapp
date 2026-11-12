@@ -14,6 +14,7 @@ class ConvergenceTrigger(str, Enum):
     TIMER = "timer"
     MANUAL_SELL = "manual_sell"
     MANUAL_SELL_ALL = "manual_sell_all"
+    OPENING_AUCTION = "opening_auction"
     PREOPEN_LATENCY = "preopen_latency"
 
     @property

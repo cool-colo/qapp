@@ -1018,6 +1018,12 @@ class SnapshotRecorder(Actor):
                 "risk_model_id": self._strategy.config.risk_manager_risk_model_id,
                 "alpha_model_id": self._strategy.config.alpha_model_id,
             }
+            if target_context.price_source == "auction_indicative":
+                extra.update(execution_phase="opening_auction",
+                             reference_price=target_context.price,
+                             reference_ts_event=target_context.price_ts_event,
+                             reference_ts_init=target_context.price_ts_init,
+                             prediction_rank=target_context.prediction_rank)
             if target_context.recent_target_date is not None:
                 extra["recent_buy_date"] = target_context.recent_target_date.isoformat()
             if target_context.recent_holding_days is not None:

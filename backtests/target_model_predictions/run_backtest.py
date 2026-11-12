@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import uuid
@@ -84,7 +85,9 @@ class DailyPlanningEvent(Data):
         previous_closes: dict[str, float],
         ts_event: int,
         ts_init: int,
+        allow_planning: bool = True,
     ) -> None:
+        self.allow_planning = allow_planning
         self.trading_date = trading_date
         self.full_tick_snapshot = full_tick_snapshot
         self.previous_closes = previous_closes
@@ -102,6 +105,44 @@ class DailyPlanningEvent(Data):
 
 class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
     """Target-model strategy driven by explicit daily planning events, not bars."""
+
+    def __init__(self, config: TargetModelPredictionsStrategyConfig) -> None:
+        super().__init__(config)
+        self._tick_missing_opens: dict[date, tuple[str, ...]] = {}
+
+    def _price_limits(self, instrument_id_text: str) -> tuple[float | None, float | None]:
+        if self._auction_replay_model is None:
+            return super()._price_limits(instrument_id_text)
+        # Historical daily limits belong to replay, never the shared live strategy.
+        row = self._daily_stock_data.get((self._stock_code_for_instrument(instrument_id_text),
+                                          self._clock_date()))
+        return (None, None) if row is None else (row.up_limit, row.down_limit)
+
+    def _process_trading_day_once(self, trading_date: date, trigger: str) -> bool:
+        if trading_date in self._processed_dates:
+            return False
+        if self._auction_replay_model is not None:
+            signal_date = self._resolve_signal_date(trading_date)
+            required = self._held_instrument_ids() | {
+                str(self._instrument_by_stock[signal["stock_code"]])
+                for signal in self._signals_by_date.get(signal_date, [])
+                if signal["stock_code"] in self._instrument_by_stock
+                and self._entry_skip_reason(signal["stock_code"], trading_date) is None
+            }
+            suspended = self._suspended_by_date.get(trading_date, set())
+            missing = sorted(i for i in required
+                             if self._stock_code_for_instrument(i) not in suspended
+                             and not self._is_suspended_status(i)
+                             and self._today_open_price(i) is None)
+            if missing:
+                # Gate every entry point, including inherited timers and refreshes.
+                # Missing data never freezes a partially populated comparison plan.
+                if self._tick_missing_opens.get(trading_date) != tuple(missing):
+                    self._tick_missing_opens[trading_date] = tuple(missing)
+                    self.log.warning(f"Tick planning deferred: date={trading_date}, missing_opens={missing}")
+                return False
+            self._tick_missing_opens.pop(trading_date, None)
+        return super()._process_trading_day_once(trading_date, trigger)
 
     def on_start(self) -> None:
         super().on_start()
@@ -132,7 +173,10 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
             subscribe_new_bars=False,
         )
         self.apply_full_tick_snapshot(data.full_tick_snapshot, "backtest_planning")
-        self._process_trading_day_once(data.trading_date, "planning_event")
+        if self.config.auction_enabled:
+            self.process_opening_auction()
+        if data.allow_planning:
+            self._process_trading_day_once(data.trading_date, "planning_event")
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
         super().on_quote_tick(tick)
@@ -221,6 +265,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trader-id", default=env("BACKTEST_TRADER_ID", "BACKTESTER-001"))
     parser.add_argument("--log-level", default=env("BACKTEST_LOG_LEVEL", "INFO"))
+    tick_source = parser.add_mutually_exclusive_group()
+    tick_source.add_argument("--tick-table", default=env("BACKTEST_TICK_TABLE"),
+                             help="RiceQuant ordinary tick table, e.g. ricequant_stock_tick.")
+    tick_source.add_argument("--tick-file", default=env("BACKTEST_TICK_FILE"),
+                        help="Historical auction/quote CSV; enables tick replay instead of synthetic daily fills.")
+    parser.add_argument("--tick-data-latency-ms", type=float, default=0.0,
+                        help="Simulated receive delay for RiceQuant exchange timestamps; ingest time is not receive time.")
+    parser.add_argument("--compare-auction", action="store_true",
+                        help="Run a second tick replay with auction execution disabled and report comparison.")
+    parser.add_argument("--auction-participation-rate", type=float, default=0.01)
+    parser.add_argument("--submission-latency-ms", type=float, default=0.0)
+    parser.add_argument("--cancel-latency-ms", type=float, default=100.0)
+    parser.add_argument("--commission-rate", type=float, default=None,
+                        help="Brokerage rate; defaults to auction_commission_rate from strategy YAML.")
+    parser.add_argument("--minimum-commission", type=float, default=None,
+                        help="Minimum brokerage per order; defaults to auction_minimum_fee from strategy YAML.")
+    parser.add_argument("--stamp-duty-rate", type=float, default=0.0005)
     parser.add_argument("--strict-data", action="store_true")
     parser.add_argument("--print-signals", action="store_true")
     parser.add_argument("--load-only", action="store_true")
@@ -232,6 +293,26 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not args.config:
         parser.error("--config is required, or set STRATEGY_CONFIG_FILE (see configs/strategy.yaml)")
+    params = StrategyParams.from_yaml(args.config)
+    if args.commission_rate is None:
+        args.commission_rate = params.auction_commission_rate
+    if args.minimum_commission is None:
+        args.minimum_commission = params.auction_minimum_fee
+    if args.tick_file and args.tick_table:
+        parser.error("select only one tick source: --tick-file or --tick-table")
+    if params.auction_enabled and not (args.tick_file or args.tick_table):
+        parser.error("auction_enabled requires --tick-file or --tick-table; daily bars cannot simulate opening auction")
+    if not 0 < args.auction_participation_rate <= 1:
+        parser.error("--auction-participation-rate must be in (0, 1]")
+    if any(not math.isfinite(value) or value < 0 for value in (
+        args.submission_latency_ms, args.cancel_latency_ms, args.tick_data_latency_ms,
+        args.commission_rate, args.minimum_commission, args.stamp_duty_rate,
+    )):
+        parser.error("replay latency and fees must be finite and non-negative")
+    if args.compare_auction and not (args.tick_file or args.tick_table):
+        parser.error("--compare-auction requires --tick-file or --tick-table")
+    if args.compare_auction and not params.auction_enabled:
+        parser.error("--compare-auction requires auction_enabled: true in strategy config")
     return args
 
 
@@ -452,12 +533,89 @@ def prepare_backtest_event_data(
     return planning_events, heartbeats, normalized_bars
 
 
+def prepare_tick_replay_event_data(args, rows, instruments_by_stock):
+    from backtests.data_providers.historical_ticks import validate_final_auction_results
+
+    validate_final_auction_results(rows, args.exchange_timezone)
+    events = []
+    quotes = []
+    batches = {}
+    for row in rows:
+        instrument = instruments_by_stock[row.symbol]
+        trading_date = pd.Timestamp(row.ts_event, unit="ns", tz="UTC").tz_convert(
+            args.exchange_timezone).date()
+        quotes.append(QuoteTick(
+            instrument.id, instrument.make_price(row.bid_price), instrument.make_price(row.ask_price),
+            instrument.make_qty(row.bid_size), instrument.make_qty(row.ask_size),
+            row.ts_event, row.ts_init,
+        ))
+        # Apply all observations received together before daily planning. A
+        # per-symbol event would freeze a plan with only the first actual open.
+        key = (row.ts_init, trading_date)
+        batch = batches.setdefault(key, dict(snapshot={}, previous_closes={},
+                                             ts_event=0, allow_planning=False))
+        batch["snapshot"][str(instrument.id)] = {
+            "open": row.open_price, "last_price": row.bid_price,
+            "last_close": row.previous_close,
+            "open_int": 12 if row.kind == "indicative" else 13,
+        }
+        batch["previous_closes"][str(instrument.id)] = row.previous_close
+        batch["ts_event"] = max(batch["ts_event"], row.ts_event)
+        batch["allow_planning"] |= row.kind != "indicative"
+    for (ts_init, trading_date), batch in sorted(batches.items()):
+        event = DailyPlanningEvent(
+            trading_date, batch["snapshot"], batch["previous_closes"],
+            batch["ts_event"], ts_init, allow_planning=batch["allow_planning"],
+        )
+        events.append(CustomData(DataType(DailyPlanningEvent), event))
+    return events, quotes
+
+
+def prepare_tick_replay_depth_data(rows, instruments_by_stock):
+    """Construct a one-level simulated book from ordinary ticks, without L2 data."""
+    from nautilus_trader.model.data import BookOrder, OrderBookDepth10
+    from nautilus_trader.model.enums import OrderSide
+
+    depths = []
+    for sequence, row in enumerate(rows, 1):
+        instrument = instruments_by_stock[row.symbol]
+        depths.append(OrderBookDepth10(
+            instrument.id,
+            [BookOrder(OrderSide.BUY, instrument.make_price(row.bid_price),
+                       instrument.make_qty(row.bid_size), 1)],
+            [BookOrder(OrderSide.SELL, instrument.make_price(row.ask_price),
+                       instrument.make_qty(row.ask_size), 2)],
+            [1], [1], 0, sequence, row.ts_event, row.ts_init,
+        ))
+    return depths
+
+
+def load_tick_replay_data(args, bundle, bars_by_stock):
+    if args.exchange_timezone != "Asia/Shanghai":
+        raise ValueError("A-share tick replay requires Asia/Shanghai exchange timezone")
+    symbols = {
+        signal.stock_code for signals in bundle.signals_by_date.values() for signal in signals
+        if signal.stock_code in bars_by_stock
+    }
+    if args.tick_table:
+        from backtests.data_providers.ricequant_ticks import ClickHouseRicequantTickDataProvider
+        return ClickHouseRicequantTickDataProvider(
+            build_connection(args), args.tick_table, args.tick_data_latency_ms,
+        ).load(start=args.start, end=args.end, symbols=symbols)
+    from backtests.data_providers.historical_ticks import HistoricalTickDataProvider
+    return HistoricalTickDataProvider().load(
+        args.tick_file, start=args.start, end=args.end, symbols=symbols,
+        timezone=args.exchange_timezone,
+    )
+
+
 def build_engine(
     args: argparse.Namespace,
     bundle: PredictionDataBundle,
     bar_types: dict[str, Any],
     bars_by_stock: dict[str, list[Any]],
     daily_stock_data: tuple[DailyStockData, ...],
+    *, auction_enabled: bool | None = None,
 ) -> tuple[Any, BacktestTargetModelPredictionsStrategy, dict[str, list[Bar]]]:
     from nautilus_trader.adapters.qmt.common import parse_equity
     from nautilus_trader.adapters.qmt.common import qmt_symbol_to_instrument_id
@@ -468,11 +626,20 @@ def build_engine(
     from nautilus_trader.config import RiskEngineConfig
     from nautilus_trader.model.currencies import CNY
     from nautilus_trader.model.enums import AccountType
+    from nautilus_trader.model.enums import BookType
     from nautilus_trader.model.enums import OmsType
     from nautilus_trader.model.identifiers import TraderId
     from nautilus_trader.model.objects import Money
 
     params = StrategyParams.from_yaml(args.config)
+    from dataclasses import replace
+
+    if args.tick_file or args.tick_table:
+        # Reserve the same brokerage charged by replay when CLI overrides YAML.
+        params = replace(params, auction_commission_rate=args.commission_rate,
+                         auction_minimum_fee=args.minimum_commission)
+    if auction_enabled is not None:
+        params = replace(params, auction_enabled=auction_enabled)
 
     engine = BacktestEngine(
         config=BacktestEngineConfig(
@@ -482,6 +649,34 @@ def build_engine(
         ),
     )
     params.log(engine.logger, source=args.config)
+    historical_ticks = None
+    replay_model = None
+    replay_options = {}
+    if args.tick_file or args.tick_table:
+        from backtests.target_model_predictions.auction_simulation import AuctionReplayFillModel
+        from backtests.target_model_predictions.auction_simulation import AuctionReplayModule
+        from backtests.target_model_predictions.auction_simulation import AShareReplayFeeModel
+        from nautilus_trader.backtest.models import LatencyModel
+
+        historical_ticks = load_tick_replay_data(args, bundle, bars_by_stock)
+        replay_model = AuctionReplayFillModel(engine.kernel.clock.timestamp_ns,
+                                             args.auction_participation_rate)
+        rows = {(str(qmt_symbol_to_instrument_id(row.symbol)), row.ts_init): row
+                for row in historical_ticks}
+        if len(rows) != len(historical_ticks):
+            raise ValueError("Historical replay contains ambiguous symbol/receive timestamps")
+        replay_options = dict(
+            fill_model=replay_model,
+            modules=[AuctionReplayModule(replay_model, rows)],
+            fee_model=AShareReplayFeeModel(args.commission_rate, args.minimum_commission,
+                                          args.stamp_duty_rate),
+            latency_model=LatencyModel(base_latency_nanos=0, insert_latency_nanos=int(args.submission_latency_ms * 1e6),
+                                       cancel_latency_nanos=int(args.cancel_latency_ms * 1e6)),
+            trade_execution=False, liquidity_consumption=True,
+            book_type=BookType.L2_MBP,
+        )
+    elif params.auction_enabled:
+        raise ValueError("auction_enabled requires tick replay data")
     engine.add_venue(
         venue=QMT_VENUE,
         oms_type=OmsType.NETTING,
@@ -489,7 +684,8 @@ def build_engine(
         base_currency=CNY,
         starting_balances=[Money(args.starting_cash, CNY)],
         default_leverage=Decimal(1),
-        bar_execution=True,
+        bar_execution=historical_ticks is None,
+        **replay_options,
     )
 
     loaded_stock_codes = sorted(bars_by_stock)
@@ -520,22 +716,32 @@ def build_engine(
         config_bar_types[str(instrument_id)] = bar_types[stock_code]
         instrument_stock_codes[str(instrument_id)] = stock_code
 
-    planning_events, heartbeats, execution_bars_by_stock = prepare_backtest_event_data(
-        args=args,
-        bundle=bundle,
-        bars_by_stock=bars_by_stock,
-        instruments_by_stock=instruments_by_stock,
-    )
+    if historical_ticks is None:
+        planning_events, heartbeats, execution_bars_by_stock = prepare_backtest_event_data(
+            args=args,
+            bundle=bundle,
+            bars_by_stock=bars_by_stock,
+            instruments_by_stock=instruments_by_stock,
+        )
+    else:
+        planning_events, heartbeats = prepare_tick_replay_event_data(
+            args, historical_ticks, instruments_by_stock,
+        )
+        # Daily bars are retained solely for independent closing valuation.
+        execution_bars_by_stock = bars_by_stock
     execution_bars = [
         bar
         for stock_code in loaded_stock_codes
         for bar in execution_bars_by_stock[stock_code]
     ]
+    if historical_ticks is not None:
+        engine.add_data(prepare_tick_replay_depth_data(historical_ticks, instruments_by_stock), sort=False)
     if heartbeats:
         engine.add_data(heartbeats, sort=False)
     if planning_events:
         engine.add_data(planning_events, client_id=PLANNING_CLIENT_ID, sort=False)
-    engine.add_data(execution_bars, sort=False)
+    if historical_ticks is None:
+        engine.add_data(execution_bars, sort=False)
     engine.sort_data()
 
     strategy = BacktestTargetModelPredictionsStrategy(
@@ -583,8 +789,20 @@ def build_engine(
             exit_non_targets=params.exit_non_targets,
             trading_windows=params.trading_windows,
             exchange_trading_windows=params.exchange_trading_windows,
+            auction_enabled=params.auction_enabled,
+            auction_prepare_time=params.auction_prepare_time,
+            auction_submit_time=params.auction_submit_time,
+            auction_submit_cutoff=params.auction_submit_cutoff,
+            auction_reference_max_age_secs=params.auction_reference_max_age_secs,
+            auction_buy_offset_bps=params.auction_buy_offset_bps,
+            auction_sell_offset_bps=params.auction_sell_offset_bps,
+            auction_commission_rate=params.auction_commission_rate,
+            auction_minimum_fee=params.auction_minimum_fee,
+            auction_partial_min_notional=params.auction_partial_min_notional,
             execution_windows=params.execution_windows,
             exchange_execution_windows=params.exchange_execution_windows,
+            cancel_windows=params.cancel_windows,
+            exchange_cancel_windows=params.exchange_cancel_windows,
             stop_time=params.stop_time,
             require_account_cash=True,
             submission_book_max_age_secs=params.submission_book_max_age_secs,
@@ -610,6 +828,7 @@ def build_engine(
             subscribe_order_book_depth=False,
         ),
     )
+    strategy._auction_replay_model = replay_model
     engine.add_strategy(strategy)
     return engine, strategy, execution_bars_by_stock
 
@@ -792,6 +1011,11 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.order_slice_notional": params.order_slice_notional,
         "strategy.execution_windows": params.execution_windows,
         "strategy.exchange_execution_windows": params.exchange_execution_windows,
+        "strategy.cancel_windows": params.cancel_windows,
+        "strategy.exchange_cancel_windows": params.exchange_cancel_windows,
+        "strategy.auction_commission_rate": params.auction_commission_rate,
+        "strategy.auction_minimum_fee": params.auction_minimum_fee,
+        "strategy.auction_partial_min_notional": params.auction_partial_min_notional,
         "strategy.submission_book_max_age_secs": params.submission_book_max_age_secs,
         "strategy.cancel_book_max_age_secs": params.cancel_book_max_age_secs,
         "strategy.same_side_price_improvement_threshold": (
@@ -936,6 +1160,8 @@ def build_complete_report(
     bars_by_stock: dict[str, list[Any]],
 ) -> dict[str, pd.DataFrame]:
     raw_reports = REPORT_PROCESSOR.raw_engine_reports(engine)
+    if strategy._auction_replay_model is not None:
+        raw_reports["fills"] = engine.trader.generate_fills_report()
     fills_report = raw_reports["fills"]
     daily_portfolio, daily_positions = reconstruct_daily_portfolio(
         args=args,
@@ -943,12 +1169,18 @@ def build_complete_report(
         fills_report=fills_report,
         bars_by_stock=bars_by_stock,
     )
+    replay_reports = {}
+    if strategy._auction_replay_model is not None:
+        from backtests.target_model_predictions.auction_simulation import auction_execution_report
+        replay_reports["auction_execution"] = auction_execution_report(
+            engine, strategy, strategy._auction_replay_model)
     return REPORT_PROCESSOR.complete_report(
         engine=engine,
         daily_portfolio=daily_portfolio,
         daily_positions=daily_positions,
         raw_reports=raw_reports,
         extra_reports={
+            **replay_reports,
             "signals": strategy_signal_frame(strategy),
             "targets": strategy_target_frame(strategy),
             "strategy_orders": strategy_order_frame(strategy),
@@ -983,6 +1215,7 @@ def reconstruct_daily_portfolio(
             quantity = fill["quantity"]
             price = fill["price"]
             amount = quantity * price
+            cash -= fill["commission"]
             current_qty = positions.get(stock_code, Decimal("0"))
             if fill["side"] == "buy":
                 cash -= amount
@@ -1088,7 +1321,7 @@ def fills_by_exchange_date(
             continue
         trading_date = pd.Timestamp(event_time).tz_convert(args.exchange_timezone).date()
         side = side_text(first_value(row, "side", "order_side", default=""))
-        quantity = Decimal(str(int_or_zero(first_value(row, "filled_qty", "quantity", "qty", default=0))))
+        quantity = Decimal(str(int_or_zero(first_value(row, "last_qty", "filled_qty", "quantity", "qty", default=0))))
         price = decimal_or_zero(first_value(row, "avg_px", "last_px", "price", default=0))
         if quantity <= 0 or price <= 0:
             continue
@@ -1098,6 +1331,7 @@ def fills_by_exchange_date(
                 "side": side,
                 "quantity": quantity,
                 "price": price,
+                "commission": Decimal(str(first_value(row, "commission", default=0)).split()[0].replace(",", "")),
             },
         )
     return result
@@ -1247,6 +1481,11 @@ def main() -> None:
         end_date=args.end,
     )
     if args.load_only:
+        if args.tick_file or args.tick_table:
+            ticks = load_tick_replay_data(args, bundle, bars_by_stock)
+            print(f"Loaded {len(ticks)} usable historical ticks for "
+                  f"{len({tick.symbol for tick in ticks})} instruments; "
+                  f"final_auction_results={sum(tick.kind == 'auction' for tick in ticks)}.")
         return
 
     writer = build_result_writer(args)
@@ -1277,6 +1516,33 @@ def main() -> None:
             strategy,
             execution_bars_by_stock,
         )
+        if args.compare_auction:
+            baseline_engine, baseline_strategy, baseline_bars = build_engine(
+                args, bundle, bar_types, bars_by_stock, daily_stock_data, auction_enabled=False,
+            )
+            try:
+                baseline_engine.run()
+                baseline_report = build_complete_report(args, baseline_engine, baseline_strategy, baseline_bars)
+                combined = []
+                for label, report in [("auction", complete_report), ("continuous_only", baseline_report)]:
+                    portfolio = report["daily_portfolio"]
+                    row = portfolio.iloc[-1]
+                    outcomes = report["auction_execution"]
+                    combined.append(dict(
+                        scenario=label, final_equity=row["total_equity"], final_cash=row["cash"],
+                        final_net_value=row["net_value"],
+                        auction_filled_amount=0 if outcomes.empty else outcomes.auction_filled_amount.sum(),
+                        auction_submitted_quantity=0 if outcomes.empty else outcomes.submitted_quantity.sum(),
+                        auction_filled_quantity=0 if outcomes.empty else outcomes.auction_filled_quantity.sum(),
+                        participation_rate=args.auction_participation_rate,
+                        submission_latency_ms=args.submission_latency_ms,
+                        cancel_latency_ms=args.cancel_latency_ms,
+                        tick_data_latency_ms=args.tick_data_latency_ms,
+                    ))
+                complete_report["auction_comparison"] = pd.DataFrame(combined)
+                complete_report["continuous_only_daily_portfolio"] = baseline_report["daily_portfolio"]
+            finally:
+                baseline_engine.dispose()
         complete_report = apply_benchmark_to_reports(args, connection, complete_report)
         tearsheet_path = REPORT_PROCESSOR.write_tearsheet(args, engine, complete_report)
         if tearsheet_path:

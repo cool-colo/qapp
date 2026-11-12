@@ -74,6 +74,9 @@ trading_windows: "09:29-11:30,13:00-14:55"
 exchange_trading_windows: "09:30-11:30,13:00-14:55"
 execution_windows: "14:30-14:55"
 exchange_execution_windows: "14:30-14:55"
+# Cancellation is independent of submission windows; end times are exclusive.
+cancel_windows: "09:30-11:30,13:00-14:57"
+exchange_cancel_windows: "09:30-11:30,13:00-14:57"
 # Retained latency-probe settings; they cannot bypass the execution window.
 preopen_latency_execution_enabled: false
 preopen_latency_max_advance_ms: 3000

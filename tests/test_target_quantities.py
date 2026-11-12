@@ -413,6 +413,7 @@ class TestableTargetQuantityStrategy:
     _local_execution_window_index = TargetQuantityStrategy._local_execution_window_index
     _within_trading_window = TargetQuantityStrategy._within_trading_window
     _within_execution_window = TargetQuantityStrategy._within_execution_window
+    _within_cancel_window = TargetQuantityStrategy._within_cancel_window
     _within_trading_time = TargetQuantityStrategy._within_trading_time
     _within_exchange_trading_time = TargetQuantityStrategy._within_exchange_trading_time
     _within_pre_open_quote_log_window = TargetQuantityStrategy._within_pre_open_quote_log_window

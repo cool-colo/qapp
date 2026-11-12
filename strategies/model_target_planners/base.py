@@ -12,6 +12,9 @@ from nautilus_trader.model.enums import MarketStatusAction
 class TargetContext:
     price: float | None = None
     price_source: str | None = None
+    price_ts_event: int | None = None
+    price_ts_init: int | None = None
+    prediction_rank: int | None = None
     score: float | None = None
     expected_return: float | None = None
     current_qty: int | None = None
@@ -49,7 +52,7 @@ class ModelTargetCandidate:
     instrument_id: str
     stock_code: str
     score: float
-    open_price: float | None = None  # pre-market open (falls back to prev close upstream)
+    open_price: float | None = None  # sizing reference; provenance is recorded on the plan
     expected_return: float | None = None  # daily_model_predictions.pred_return_live
     rank: int | None = None  # original prediction rank (score-desc, 1-based)
 

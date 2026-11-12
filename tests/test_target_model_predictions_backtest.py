@@ -32,6 +32,7 @@ from nautilus_trader.model.data import Bar
 from strategies.model_target_planners import ModelTargetPlan
 from strategies.model_target_planners import TargetContext
 from strategies.model_target_planners import TargetInfo
+from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 
 
@@ -83,6 +84,14 @@ class BacktestPlanningEventTest(unittest.TestCase):
             ts_init=timestamp_ns,
         )
 
+    def _strategy(self):
+        return BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategyConfig(
+            instrument_ids=[], bar_types={}, instrument_stock_codes={}, signals_by_date={},
+            prediction_ranks_by_date={}, trading_dates=[], listed_dates={}, st_by_date={},
+            suspended_by_date={}, target_weight_planner="risk_manager", alpha_model_id="test",
+            risk_manager_base_url="http://127.0.0.1:1", risk_manager_risk_model_id="test",
+        ))
+
     def test_planning_event_applies_snapshot_then_processes_once(self) -> None:
         trading_date = date(2026, 7, 8)
         timestamp_ns = exchange_timestamp_ns(
@@ -95,9 +104,7 @@ class BacktestPlanningEventTest(unittest.TestCase):
             ts_event=timestamp_ns,
             ts_init=timestamp_ns,
         )
-        strategy = BacktestTargetModelPredictionsStrategy.__new__(
-            BacktestTargetModelPredictionsStrategy,
-        )
+        strategy = self._strategy()
         strategy._roll_trading_day = MagicMock()
         strategy.refresh_target_instruments = MagicMock()
         strategy.apply_full_tick_snapshot = MagicMock()
@@ -122,9 +129,7 @@ class BacktestPlanningEventTest(unittest.TestCase):
         )
 
     def test_strategy_subscribes_to_the_planning_data_client(self) -> None:
-        strategy = BacktestTargetModelPredictionsStrategy.__new__(
-            BacktestTargetModelPredictionsStrategy,
-        )
+        strategy = self._strategy()
         strategy.subscribe_data = MagicMock()
 
         with patch.object(TargetModelPredictionsStrategy, "on_start"):
@@ -252,6 +257,8 @@ class BacktestPlanningEventTest(unittest.TestCase):
         }
         args = SimpleNamespace(
             config="configs/strategy.yaml",
+            tick_file=None,
+            tick_table=None,
             start=first_trade_date.isoformat(),
             end=second_trade_date.isoformat(),
             exchange_timezone=self.timezone_name,

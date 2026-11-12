@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import random
 import threading
 import time
@@ -38,9 +39,16 @@ from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.trading.strategy import Strategy
 
 from strategies.async_scheduling import AsyncAwaitableScheduler
+from strategies.cancellation import A_SHARE_CANCEL_WINDOWS
+from strategies.cancellation import cancel_window_index
+from strategies.cancellation import validate_cancel_config
+from strategies.opening_auction import AuctionReference
+from strategies.opening_auction import auction_time
+from strategies.opening_auction import validate_auction_config
 from strategies.convergence import ConvergenceTrigger
 from strategies.execution_reconciliation import ExecutionStateReconciler
 from strategies.order_splitter import LimitOrderQuantityRules
+from strategies.order_splitter import AuctionOrderSplitter
 from strategies.order_splitter import NotionalOrderSplitter
 from strategies.pricing import PriceContext
 from strategies.pricing import SameSideBestBuyPriceStrategy
@@ -374,6 +382,8 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     exchange_trading_windows: str = "09:30-11:30,13:00-14:55"
     execution_windows: str = "14:30-14:55"
     exchange_execution_windows: str = "14:30-14:55"
+    cancel_windows: str = "09:30-11:30,13:00-14:57"
+    exchange_cancel_windows: str = "09:30-11:30,13:00-14:57"
     stop_time: str | None = "14:55"
     initial_last_closes: dict[str, float] | None = None
     resubmit_check_interval_secs: float = 0.5
@@ -421,6 +431,18 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     preopen_latency_execution_enabled: bool = False
     preopen_latency_max_advance_ms: int = 3000
     preopen_latency_fixed_advance_ms: int = 50
+    # Opening call auction; independent of continuous execution windows.
+    auction_enabled: bool = False
+    auction_prepare_time: str = "09:24:01"
+    auction_submit_time: str = "09:24:50"
+    auction_submit_cutoff: str = "09:24:59"
+    auction_reference_max_age_secs: float = 4.0
+    auction_buy_offset_bps: float = 50.0
+    auction_sell_offset_bps: float = 50.0
+    auction_commission_rate: float = 0.000085
+    auction_minimum_fee: float = 5.0
+    auction_partial_min_notional: Decimal = Decimal("58000")
+
     full_tick_refresh_secs: float = 1.0
     full_tick_prefetch_time: str | None = "09:27"
     # Whole-market (京沪深A) full-tick snapshot cadence. Intraday it is kept only in
@@ -472,6 +494,20 @@ class TargetQuantityStrategy(Strategy):
 
     def __init__(self, config: TargetQuantityStrategyConfig) -> None:
         super().__init__(config)
+        validate_cancel_config(config)
+        validate_auction_config(config)
+        self._auction_references: dict[str, AuctionReference] = {}
+        self._auction_attempted: set[str] = set()
+        self._auction_execution_active = False
+        self._auction_prediction_ranks: dict[str, int] = {}
+        self._auction_order_splitter = AuctionOrderSplitter(
+            Decimal(str(config.auction_commission_rate)), Decimal(str(config.auction_minimum_fee)),
+            config.auction_partial_min_notional,
+        )
+        self._auction_budget: Decimal | None = None
+        self._auction_committed_cost = Decimal("0")
+        self._auction_buy_committed_notional = Decimal("0")
+        self._auction_sell_committed_cost = Decimal("0")
         self._validate_price_trend_config(config)
         self._validate_execution_config(config)
         if int(config.preopen_latency_max_advance_ms) < 0:
@@ -876,7 +912,11 @@ class TargetQuantityStrategy(Strategy):
         self._run_full_tick_fetch(trigger="prefetch")
 
     def _on_full_tick_refresh_timer(self, _event: Any) -> None:
-        if not self._within_trading_window():
+        now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
+        auction_prepare = (self.config.auction_enabled
+                           and auction_time(self.config.auction_prepare_time) <= now
+                           < auction_time(self.config.auction_submit_cutoff))
+        if not auction_prepare and not self._within_trading_window():
             return
         self._run_full_tick_fetch(trigger="refresh")
 
@@ -1255,6 +1295,10 @@ class TargetQuantityStrategy(Strategy):
             # is invalid.
             if tick.last_close is not None and tick.last_close > 0:
                 self._last_close[str(instrument_id)] = float(tick.last_close)
+            if (self.config.auction_enabled
+                    and pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
+                    < auction_time("09:25")):
+                continue
             open_price = self._full_tick_open(fields)
             if open_price is None:
                 self.log.warning(f"full-tick snapshot contains invalid open price for {instrument_id} ({trigger})")
@@ -1739,6 +1783,14 @@ class TargetQuantityStrategy(Strategy):
         if trading_date == self._trading_day:
             return
         self._trading_day = trading_date
+        if self.config.auction_enabled:
+            self._auction_references = {}
+            self._auction_attempted = set()
+            self._auction_budget = None
+            self._auction_committed_cost = Decimal("0")
+            self._auction_buy_committed_notional = Decimal("0")
+            self._auction_sell_committed_cost = Decimal("0")
+            self._auction_prediction_ranks = {}
         self._today_open = {}
         self._authoritative_open = set()
         self._market_status = {}
@@ -1973,6 +2025,9 @@ class TargetQuantityStrategy(Strategy):
             ts_event=int(depth.ts_event),
             ts_init=int(depth.ts_init),
         )
+        if self.config.auction_enabled and bids and asks and bids[0][0] == asks[0][0]:
+            self.capture_auction_reference(str(depth.instrument_id), bids[0][0],
+                                           depth_ts_event, int(depth.ts_init))
         self._log_depth_event_probe(depth, depth_ts_event)
         # On the first depth callback of each trading day, converge immediately so
         # orders are submitted as early as possible (priced against real depth)
@@ -2297,6 +2352,183 @@ class TargetQuantityStrategy(Strategy):
         except Exception as exc:
             self.log.warning(f"target convergence failed: {exc}")
 
+    def capture_auction_reference(
+        self, instrument_id: str, price: float, ts_event: int, ts_init: int,
+    ) -> None:
+        if not self.config.auction_enabled:
+            return
+        event_date = self._event_trading_date(ts_event)
+        if event_date != self._clock_date():
+            return
+        self._roll_trading_day(event_date)
+        reference = AuctionReference(float(price), int(ts_event), int(ts_init))
+        if reference.is_fresh(int(self.clock.timestamp_ns()), self.config.timezone_name,
+                              self.config.auction_reference_max_age_secs):
+            previous = self._auction_references.get(instrument_id)
+            if previous is None or reference.ts_event >= previous.ts_event:
+                self._auction_references[instrument_id] = reference
+
+    def auction_reference(self, instrument_id: str) -> AuctionReference | None:
+        reference = self._auction_references.get(instrument_id)
+        if reference is None or not reference.is_fresh(
+            int(self.clock.timestamp_ns()), self.config.timezone_name,
+            self.config.auction_reference_max_age_secs,
+        ):
+            return None
+        return reference
+
+    def _within_auction_submit_time(self) -> bool:
+        now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
+        return (self.config.auction_enabled
+                and auction_time(self.config.auction_submit_time) <= now
+                < auction_time(self.config.auction_submit_cutoff))
+
+    def cancel_order(self, order, client_id=None, params=None) -> None:
+        if not self._within_cancel_window():
+            self.log.warning(f"Cancel suppressed outside cancellation window: {order.client_order_id}")
+            return
+        super().cancel_order(order, client_id=client_id, params=params)
+
+    def cancel_orders(self, orders, client_id=None, params=None) -> None:
+        if not self._within_cancel_window():
+            self.log.warning("Batch cancel suppressed outside cancellation window")
+            return
+        super().cancel_orders(orders, client_id=client_id, params=params)
+
+    def cancel_all_orders(self, instrument_id, order_side=OrderSide.NO_ORDER_SIDE,
+                          client_id=None, params=None) -> None:
+        if not self._within_cancel_window():
+            self.log.warning("Cancel all suppressed outside cancellation window")
+            return
+        super().cancel_all_orders(instrument_id, order_side=order_side,
+                                  client_id=client_id, params=params)
+
+    def execute_opening_auction(self) -> bool:
+        if not self._within_auction_submit_time():
+            return False
+        self._auction_execution_active = True
+        try:
+            return self._converge_to_target(self._clock_date(), ConvergenceTrigger.OPENING_AUCTION)
+        finally:
+            self._auction_execution_active = False
+
+    def _initialize_auction_budget(self, current_date: date, free_cash: Decimal) -> None:
+        """Recover same-day auction commitments before capturing a fixed budget."""
+        previous_buy_notional = Decimal("0")
+        for order in self.cache.orders(strategy_id=self.id):
+            day = pd.Timestamp(order.ts_init, unit="ns", tz="UTC").tz_convert(
+                self.config.timezone_name).date()
+            if day != current_date or "opening_auction" not in (order.tags or []):
+                continue
+            notional = order.quantity.as_decimal() * order.price.as_decimal()
+            cost = notional + self._auction_order_splitter.commission(notional)
+            self._auction_attempted.add(str(order.instrument_id))
+            if order.side == OrderSide.BUY:
+                previous_buy_notional += notional
+                self._auction_buy_committed_notional += notional
+                self._auction_committed_cost += cost
+            else:
+                self._auction_sell_committed_cost += cost
+        # Before 09:25 there are no auction fills. Add acknowledged buy locks back
+        # to available cash to reconstruct the initial budget across a restart.
+        self._auction_budget = max(Decimal("0"), (free_cash + previous_buy_notional)
+                                   * Decimal(str(1.0 - self.config.cash_buffer_percent)))
+
+    def _submit_auction_orders(self, current_date: date,
+                               buy_intents: dict[str, TargetOrderIntent],
+                               sell_intents: dict[str, TargetOrderIntent], reason: str) -> None:
+        # No estimated auction sale proceeds fund buys. Await buy acknowledgments
+        # before snapshotting account cash or allocating either side's quota.
+        if self.cache.orders_inflight(strategy_id=self.id, side=OrderSide.BUY):
+            return
+        free_cash = self._nautilus_free_cash()
+        if free_cash is None:
+            return
+        if self._auction_budget is None:
+            self._initialize_auction_budget(current_date, free_cash)
+        self._submit_auction_side(current_date, buy_intents, OrderSide.BUY, reason)
+        if self._auction_buy_committed_notional > 0:
+            self._submit_auction_side(current_date, sell_intents, OrderSide.SELL, reason)
+
+    def _submit_auction_side(self, current_date: date, intents: dict[str, TargetOrderIntent],
+                             side: OrderSide, reason: str) -> None:
+        ranks = {instrument_id: self._auction_prediction_ranks.get(instrument_id)
+                 for instrument_id in intents}
+        ranked = self._auction_order_splitter.ranked_ids(ranks, side)
+        for instrument_id in ranked:
+            if not self._within_auction_submit_time():
+                break
+            if instrument_id in self._auction_attempted:
+                continue
+            intent = intents[instrument_id]
+            committed = (self._auction_committed_cost if side == OrderSide.BUY
+                         else self._auction_sell_committed_cost)
+            side_budget = (self._auction_budget if side == OrderSide.BUY
+                           else self._auction_buy_committed_notional)
+            remaining = max(Decimal("0"), side_budget - committed)
+            if side == OrderSide.BUY:
+                free_cash = self._nautilus_free_cash()
+                if free_cash is None:
+                    return
+                remaining = min(remaining, max(Decimal("0"), free_cash))
+            quantity = intent.quantity
+            allow_odd_lot = False
+            if side == OrderSide.SELL:
+                quantity = self._clamp_sell_quantity(current_date, intent.instrument_id,
+                                                     quantity, reason, intent.context)
+                if quantity is None or quantity <= 0:
+                    continue
+                allow_odd_lot = quantity == intent.context.details["sellable_qty"]
+            allocation = self._auction_order_splitter.allocate(
+                intent.instrument, quantity, Decimal(str(intent.price)), remaining,
+                allow_odd_lot=allow_odd_lot,
+            )
+            intent.context.record(
+                auction_budget=self._auction_budget, auction_side_budget_remaining=remaining,
+                auction_side_budget=side_budget,
+                prediction_rank=ranks[instrument_id], splitter="AuctionOrderSplitter",
+                auction_allocation_reason=allocation.reason,
+                auction_allocated_notional=allocation.notional,
+                auction_estimated_commission=allocation.commission,
+                auction_partial_min_notional=self.config.auction_partial_min_notional,
+            )
+            self._record_target(current_date, instrument_id, intent.context.target_qty, reason,
+                                intent.context)
+            if not allocation.quantities:
+                self._record_order(current_date, instrument_id, side.name.lower(), 0,
+                                   intent.context.target_qty, "skipped", allocation.reason,
+                                   intent.context)
+                if side == OrderSide.BUY:
+                    self._deferred_buys[instrument_id] = intent.context.target_qty
+                continue
+            submitted_quantity = Decimal("0")
+            for index, requested in enumerate(allocation.quantities, 1):
+                if not self._within_auction_submit_time():
+                    break
+                price = Decimal(str(intent.price))
+                expected_cost = requested * price + self._auction_order_splitter.commission(requested * price)
+                if side == OrderSide.BUY:
+                    free_cash = self._nautilus_free_cash()
+                    if free_cash is None or free_cash < expected_cost:
+                        break
+                if not self._submit_order_quantity(current_date, intent, requested, reason,
+                                                   slice_index=index, slice_count=len(allocation.quantities)):
+                    break
+                quantity = Decimal(str(intent.context.details["submitted_quantity"]))
+                notional = quantity * price
+                cost = notional + self._auction_order_splitter.commission(notional)
+                submitted_quantity += quantity
+                if side == OrderSide.BUY:
+                    self._auction_committed_cost += cost
+                    self._auction_buy_committed_notional += notional
+                else:
+                    self._auction_sell_committed_cost += cost
+                self._auction_attempted.add(instrument_id)
+            if side == OrderSide.BUY and submitted_quantity < intent.quantity:
+                self._deferred_buys[instrument_id] = intent.context.target_qty
+            elif side == OrderSide.BUY:
+                self._deferred_buys.pop(instrument_id, None)
+
     def _converge_to_target(
         self,
         current_date: date,
@@ -2307,8 +2539,12 @@ class TargetQuantityStrategy(Strategy):
         """Run convergence after passing its window gate and acquiring its lock."""
         if self._trading_paused and not trigger.bypasses_pause:
             return False
-        window_open = self._within_execution_window(ts_event)
-        if not window_open:
+        submission_open = (self._within_auction_submit_time()
+                           if trigger == ConvergenceTrigger.OPENING_AUCTION
+                           else self._within_execution_window(ts_event))
+        cancellation_open = (trigger != ConvergenceTrigger.OPENING_AUCTION
+                             and self._within_cancel_window(ts_event))
+        if not submission_open and not cancellation_open:
             return False
         # A manual convergence must not be silently dropped when the trading thread
         # holds the lock. Ordinary and pre-open triggers remain non-blocking.
@@ -2319,6 +2555,10 @@ class TargetQuantityStrategy(Strategy):
         if not acquired:
             return False
         try:
+            if cancellation_open and not self._awaiting_pre_open_reconcile():
+                self._reconcile_unfilled_orders(current_date)
+            if not submission_open:
+                return True
             self._converge_to_target_locked(
                 current_date=current_date,
                 trigger=trigger,
@@ -2370,7 +2610,6 @@ class TargetQuantityStrategy(Strategy):
             )
             return
         self._log_account_sizing_snapshot(trigger_value)
-        self._reconcile_unfilled_orders(current_date)
         open_order_instruments = self._open_order_instruments()
         desired = self._desired_quantities()
         sell_intents: dict[str, TargetOrderIntent] = {}
@@ -2385,6 +2624,9 @@ class TargetQuantityStrategy(Strategy):
         skip_on_target: list[str] = []
         skip_intent_error: list[str] = []
         for instrument_id_text, target_qty in desired.items():
+            if (self.config.auction_enabled and self._auction_execution_active
+                    and instrument_id_text in self._auction_attempted):
+                continue
             if instrument_id_text in open_order_instruments:
                 skip_open_order.append(instrument_id_text)
                 continue
@@ -2416,7 +2658,8 @@ class TargetQuantityStrategy(Strategy):
                 trading_date=current_date,
             )
             limit_reason = self._price_limit_reason(instrument_id_text, intent.side)
-            if limit_reason is not None and str(self.config.limit_stop_mode) == "freeze_symbol":
+            if (not (self.config.auction_enabled and self._auction_execution_active)
+                    and limit_reason is not None and str(self.config.limit_stop_mode) == "freeze_symbol"):
                 intent.context.record(limit_reason=limit_reason, action="freeze_symbol")
                 self._frozen_instruments[instrument_id_text] = limit_reason
                 self._deferred_buys.pop(instrument_id_text, None)
@@ -2453,21 +2696,15 @@ class TargetQuantityStrategy(Strategy):
             skip_intent_error=skip_intent_error,
         )
 
-        for instrument_id_text, intent in sorted(sell_intents.items()):
-            self._record_target(
-                current_date,
-                instrument_id_text,
-                intent.context.target_qty,
-                self._target_reason,
-                intent.context,
-            )
-            self._submit_target_quantity(
-                current_date,
-                intent,
-                self._target_reason,
-            )
-        if buy_intents:
-            self._submit_buys_within_cash(current_date, buy_intents, self._target_reason)
+        if self.config.auction_enabled and self._auction_execution_active:
+            self._submit_auction_orders(current_date, buy_intents, sell_intents, self._target_reason)
+        else:
+            for instrument_id_text, intent in sorted(sell_intents.items()):
+                self._record_target(current_date, instrument_id_text, intent.context.target_qty,
+                                    self._target_reason, intent.context)
+                self._submit_target_quantity(current_date, intent, self._target_reason)
+            if buy_intents:
+                self._submit_buys_within_cash(current_date, buy_intents, self._target_reason)
 
         if self._target_achieved():
             self._achieved_versions.add(self._target_version)
@@ -2599,6 +2836,8 @@ class TargetQuantityStrategy(Strategy):
         return True
 
     def _reconcile_unfilled_orders(self, trading_date: date) -> None:
+        if not self._within_cancel_window():
+            return
         now = int(self.clock.timestamp_ns())
         try:
             open_orders = self.cache.orders_open(strategy_id=self.id)
@@ -2644,6 +2883,7 @@ class TargetQuantityStrategy(Strategy):
                 price_context,
                 max_age_secs=self.config.cancel_book_max_age_secs,
                 purpose="cancel check",
+                for_cancel=True,
             )
             if not book_valid:
                 self._record_cancel_decision(
@@ -3237,6 +3477,31 @@ class TargetQuantityStrategy(Strategy):
             )
             return None
 
+        if self.config.auction_enabled and self._auction_execution_active:
+            reference = self.auction_reference(instrument_id_text)
+            if reference is None or self._is_suspended_status(instrument_id_text):
+                return None
+            offset_bps = (self.config.auction_buy_offset_bps if side == OrderSide.BUY
+                          else self.config.auction_sell_offset_bps)
+            offset = max(reference.price * offset_bps / 10000, float(instrument.price_increment))
+            raw = reference.price + offset if side == OrderSide.BUY else reference.price - offset
+            up_limit, down_limit = self._price_limits(instrument_id_text)
+            if (up_limit is None or down_limit is None
+                    or not all(math.isfinite(p) and p > 0 for p in (up_limit, down_limit))
+                    or down_limit > up_limit):
+                self.log.warning(f"Auction skipped: missing price limits for {instrument_id_text}")
+                return None
+            raw = min(up_limit, max(down_limit, raw))
+            if raw <= 0:
+                return None
+            context = IntentContext(instrument_id_text, target_qty, current_qty, delta_qty,
+                                    None, "AuctionOffset", self._execution_intent_id(instrument_id_text))
+            context.record(execution_phase="opening_auction", reference_price=reference.price,
+                           reference_ts_event=reference.ts_event, reference_ts_init=reference.ts_init,
+                           price_source=reference.source, target_version=self._target_version,
+                           prediction_rank=self._auction_prediction_ranks.get(instrument_id_text))
+            return TargetOrderIntent(instrument_id, instrument, side, quantity,
+                                     instrument.make_price(raw), context)
         price_context = self._build_price_context(instrument, instrument_id, side, quantity)
         pricer = self._pricer_for_side(side)
         book_valid, book_reason, book_age_ms = self._execution_book_validation(
@@ -3286,6 +3551,7 @@ class TargetQuantityStrategy(Strategy):
         )
         context.record(
             side=side.name,
+            execution_phase="continuous",
             intent_quantity=quantity,
             limit_price=price,
             computed_price=computed_price,
@@ -3464,6 +3730,9 @@ class TargetQuantityStrategy(Strategy):
         slice_index: int | None = None,
         slice_count: int | None = None,
     ) -> bool:
+        if (self.config.auction_enabled and self._auction_execution_active
+                and not self._within_auction_submit_time()):
+            return False
         target_qty = intent.context.target_qty
         intent.context.record(
             submit_path="order_quantity",
@@ -3516,6 +3785,8 @@ class TargetQuantityStrategy(Strategy):
             order_side=intent.side,
             quantity=intent.instrument.make_qty(quantity),
             price=intent.price,
+            **({"tags": ["opening_auction"]}
+               if self.config.auction_enabled and self._auction_execution_active else {}),
         )
         client_order_id = str(order.client_order_id)
         intent.context.record(order_id=client_order_id)
@@ -3548,6 +3819,8 @@ class TargetQuantityStrategy(Strategy):
             order_qty=quantity,
             order_price=intent.price,
         )
+        if self.config.auction_enabled and self._auction_execution_active:
+            self._auction_attempted.add(str(intent.instrument_id))
         try:
             self.submit_order(order)
         except Exception as exc:
@@ -3639,8 +3912,14 @@ class TargetQuantityStrategy(Strategy):
         # (which would zero out the fill-based estimate). Fall back to the fill-based estimate
         # in backtest or when no venue report has arrived yet. In both cases still subtract this
         # strategy's own open sells so we do not double-count in-flight sell orders.
-        venue_can_use = self.venue_sellable_quantity(instrument_id_text)
-        if venue_can_use is not None:
+        auction_execution = self.config.auction_enabled and self._auction_execution_active
+        venue_can_use = None if auction_execution else self.venue_sellable_quantity(instrument_id_text)
+        if auction_execution:
+            # The auction is the first trading operation of the day: starting
+            # holdings are sellable. Still reserve this strategy's own new sells.
+            sellable_base = current_qty
+            sellable_source = "auction_starting_position"
+        elif venue_can_use is not None:
             sellable_base = venue_can_use
             sellable_source = "broker_can_use_volume"
         else:
@@ -3920,6 +4199,7 @@ class TargetQuantityStrategy(Strategy):
         *,
         max_age_secs: float,
         purpose: str,
+        for_cancel: bool = False,
     ) -> tuple[bool, str, float | None]:
         instrument_id_text = str(ctx.instrument_id)
         ts_event = int(ctx.ts_event or 0)
@@ -3933,10 +4213,10 @@ class TargetQuantityStrategy(Strategy):
             return (False, "invalid_ts_event", None)
         if event_time.date() != self._clock_date():
             return (False, "wrong_trading_date", None)
-        if self._time_window_index(
-            event_time.time(),
-            self.config.exchange_execution_windows,
-        ) is None:
+        if for_cancel:
+            if not self._within_cancel_window(ts_event):
+                return (False, "outside_cancel_window", None)
+        elif self._time_window_index(event_time.time(), self.config.exchange_execution_windows) is None:
             return (False, "outside_execution_window", None)
 
         now_ns = int(self.clock.timestamp_ns())
@@ -4334,6 +4614,9 @@ class TargetQuantityStrategy(Strategy):
         ts_event = int(tick.ts_event)
         if ts_event <= 0:
             raise ValueError(f"Quote tick ts_event must be positive, got {ts_event}")
+        if self.config.auction_enabled and float(tick.bid_price) == float(tick.ask_price):
+            self.capture_auction_reference(str(tick.instrument_id), float(tick.bid_price),
+                                           ts_event, int(tick.ts_init))
         self._last_quote_tick_ts_event = ts_event
         self._last_market_data_ts_event = max(self._last_market_data_ts_event, ts_event)
 
@@ -4599,6 +4882,20 @@ class TargetQuantityStrategy(Strategy):
             self.config.exchange_execution_windows,
         )
         return event_window_index == local_window_index
+
+    def _within_cancel_window(self, ts_event: int | None = None) -> bool:
+        """Require local and same-session exchange time in [start, end) cancel windows."""
+        now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
+        local_session = cancel_window_index(now.time(), A_SHARE_CANCEL_WINDOWS)
+        if local_session is None or cancel_window_index(now.time(), self.config.cancel_windows) is None:
+            return False
+        event_ts = int(ts_event or 0) or self._last_market_data_ts_event
+        if event_ts <= 0 or event_ts > int(self.clock.timestamp_ns()):
+            return False
+        event = pd.Timestamp(event_ts, unit="ns", tz="UTC").tz_convert(self.config.timezone_name)
+        return (event.date() == now.date()
+                and cancel_window_index(event.time(), A_SHARE_CANCEL_WINDOWS) == local_session
+                and cancel_window_index(event.time(), self.config.exchange_cancel_windows) is not None)
 
     def _stop_time_reached(self) -> bool:
         stop_time = self.config.stop_time

@@ -103,9 +103,23 @@ class StrategyParams:
     exchange_trading_windows: str = "09:30-11:30,13:00-14:55"
     execution_windows: str = "14:30-14:55"
     exchange_execution_windows: str = "14:30-14:55"
+    cancel_windows: str = "09:30-11:30,13:00-14:57"
+    exchange_cancel_windows: str = "09:30-11:30,13:00-14:57"
     preopen_latency_execution_enabled: bool = False
     preopen_latency_max_advance_ms: int = 3000
     preopen_latency_fixed_advance_ms: int = 50
+
+    # Opening call auction; independent of continuous execution windows.
+    auction_enabled: bool = False
+    auction_prepare_time: str = "09:24:01"
+    auction_submit_time: str = "09:24:50"
+    auction_submit_cutoff: str = "09:24:59"
+    auction_reference_max_age_secs: float = 4.0
+    auction_buy_offset_bps: float = 50.0
+    auction_sell_offset_bps: float = 50.0
+    auction_commission_rate: float = 0.000085
+    auction_minimum_fee: float = 5.0
+    auction_partial_min_notional: Decimal = Decimal("58000")
 
     # Full-tick snapshot
     full_tick_refresh_secs: float = 1.0
@@ -130,6 +144,11 @@ class StrategyParams:
     order_book_depth_log_sample_rate: float = 0.0
 
     def __post_init__(self) -> None:
+        from strategies.cancellation import validate_cancel_config
+        from strategies.opening_auction import validate_auction_config
+
+        validate_cancel_config(self)
+        validate_auction_config(self)
         if int(self.consecutive_up_limit_days) < 0:
             raise ValueError("consecutive_up_limit_days must be non-negative")
         if not 0.0 <= float(self.max_open_gap_up) <= 1.0:

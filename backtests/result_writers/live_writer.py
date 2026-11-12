@@ -1453,6 +1453,7 @@ class LiveSnapshotWriter:
             "is_locked",
             "reason",
             "snapshot_type",
+            "extra",
         ]
         base_sql = (
             f"SELECT {', '.join('`' + c + '`' for c in columns)} "
