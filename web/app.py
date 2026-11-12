@@ -1488,6 +1488,9 @@ def build_pending_trade_projection(
     total["current_net_cash"] = buy["current_amount"] - sell["current_amount"]
     return {
         "trade_date": tick_payload.get("trade_date"),
+        "snapshot_time": tick_payload.get("snapshot_time"),
+        "refresh_interval_secs": tick_payload.get("refresh_interval_secs"),
+        "missing_stock_codes": tick_payload.get("missing_stock_codes") or [],
         "target_date": target_payload.get("target_date"),
         "target_version": target_payload.get("target_version"),
         "count": len(trades),
@@ -1509,7 +1512,23 @@ def realtime_pending_trades(
     client = _node_api(data, account, trader)
     try:
         target_payload = client.get("/strategy/targets")
-        tick_payload = client.get("/realtime/whole_market_ticks")
+        pending_codes = [
+            str(row["stock_code"])
+            for row in target_payload.get("targets") or []
+            if int(row["target_qty"]) != int(row["current_qty"])
+        ]
+        tick_payload = (
+            client.get(
+                "/realtime/ticks",
+                {"stock_codes": ",".join(pending_codes)},
+            )
+            if pending_codes
+            else {
+                "trade_date": target_payload.get("target_date"),
+                "ticks": [],
+                "missing_stock_codes": [],
+            }
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

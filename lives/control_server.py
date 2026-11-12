@@ -8,7 +8,9 @@ node, the running strategy, and the MySQL control writer. It exposes:
 - a **real-time positions** view (资金账号/证券/持仓/盈亏 columns) assembled entirely
   from the Nautilus ``Cache``/``Portfolio`` plus the strategy's in-memory price
   state — never a direct QMT proxy poll, honoring the repo convention that
-  business reads go through Nautilus first; and
+  business reads go through Nautilus first;
+- a bounded **on-demand tick** view for explicitly requested stock codes, sourced
+  from the strategy's per-second in-memory full-tick snapshot; and
 - **trading control** — suspend/resume and manual sell (all-sellable or a single
   stock) — driven through ``strategy.trading_controller``.
 
@@ -32,6 +34,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qs
+from urllib.parse import urlsplit
 
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import OrderFilled
@@ -837,6 +841,63 @@ class LiveControlServer:
             "ticks": rows,
         }
 
+    def _realtime_ticks_payload(self, stock_codes: list[str]) -> dict:
+        """Return latest per-second in-memory ticks for explicitly requested stocks.
+
+        This is a generic, bounded Nautilus-first read. It never triggers a broker
+        request and never scans or returns the whole-market snapshot. Callers receive
+        an explicit missing-code list when a requested stock is outside the strategy's
+        configured/active universe or has no applied full-tick value yet.
+        """
+        rows: list[dict[str, Any]] = []
+        missing: list[str] = []
+        seen: set[str] = set()
+        for requested_code in stock_codes:
+            requested = str(requested_code).strip().upper()
+            if not requested or requested in seen:
+                continue
+            seen.add(requested)
+            instrument_id = self._strategy.instrument_id_for_stock_code(requested)
+            if instrument_id is None:
+                missing.append(requested)
+                continue
+            instrument_id_text = str(instrument_id)
+            tick = self._strategy.tick_snapshot_for(instrument_id_text)
+            if tick is None:
+                missing.append(requested)
+                continue
+            rows.append(
+                {
+                    "stock_code": self._stock_code(instrument_id_text).upper(),
+                    "open": _float_or_none(tick.open),
+                    "last_price": _float_or_none(tick.last_price),
+                    "last_close": _float_or_none(tick.last_close),
+                    "high": _float_or_none(tick.high),
+                    "low": _float_or_none(tick.low),
+                    "amount": _float_or_none(tick.amount),
+                    "volume": tick.volume,
+                    "price_source": "market_status",
+                },
+            )
+
+        updated_at_ns = self._strategy.market_snapshot_updated_at_ns()
+        snapshot_time = None
+        if updated_at_ns is not None and updated_at_ns > 0:
+            snapshot_time = datetime.fromtimestamp(
+                updated_at_ns / 1_000_000_000,
+                tz=timezone.utc,
+            ).isoformat()
+        return {
+            "trade_date": str(self._strategy.control_clock_date()),
+            "server_time": datetime.now(timezone.utc).isoformat(),
+            "snapshot_time": snapshot_time,
+            "refresh_interval_secs": float(self._strategy.config.full_tick_refresh_secs),
+            "requested_count": len(seen),
+            "count": len(rows),
+            "missing_stock_codes": missing,
+            "ticks": rows,
+        }
+
     # ---- control actions -----------------------------------------------------
 
     def _set_paused(self, paused: bool) -> dict:
@@ -970,7 +1031,8 @@ class LiveControlServer:
                 return True
 
             def do_GET(self) -> None:  # noqa: N802
-                path = self.path.split("?", 1)[0].rstrip("/") or "/"
+                parsed = urlsplit(self.path)
+                path = parsed.path.rstrip("/") or "/"
                 try:
                     if path == "/health/live":
                         self._send(200, {"status": "alive"})
@@ -994,6 +1056,21 @@ class LiveControlServer:
                         self._send(200, server._strategy_targets_payload())
                     elif path == "/realtime/whole_market_ticks":
                         self._send(200, server._whole_market_ticks_payload())
+                    elif path == "/realtime/ticks":
+                        query = parse_qs(parsed.query)
+                        stock_codes = [
+                            code.strip()
+                            for value in query.get("stock_codes", [])
+                            for code in value.split(",")
+                            if code.strip()
+                        ]
+                        if not stock_codes:
+                            self._send(400, {"error": "stock_codes is required"})
+                            return
+                        if len(stock_codes) > 500:
+                            self._send(400, {"error": "stock_codes exceeds limit 500"})
+                            return
+                        self._send(200, server._realtime_ticks_payload(stock_codes))
                     elif path == "/realtime/closed_debug":
                         self._send(200, server._closed_debug_payload())
                     elif path == "/realtime/fills_debug":

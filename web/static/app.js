@@ -2580,11 +2580,18 @@ function renderPendingTradeProjection(payload) {
   const sell = payload.sell || {};
   const total = payload.total || {};
   const lossClass = (value) => value > 0 ? "pos" : value < 0 ? "neg" : "";
+  const snapshotTime = payload.snapshot_time
+    ? new Date(payload.snapshot_time).toLocaleTimeString()
+    : "—";
+  const refreshText = payload.refresh_interval_secs !== null && payload.refresh_interval_secs !== undefined
+    ? `${fmt(payload.refresh_interval_secs)} 秒刷新`
+    : "刷新周期未知";
   const missing = payload.unpriced_count
     ? ` · ${payload.unpriced_count} 只缺少有效开盘价或现价，未计入汇总`
     : "";
   el.innerHTML =
     `<div class="trade-summary-meta">交易日 ${escapeHtml(payload.trade_date || "—")} · ` +
+      `行情批次 ${escapeHtml(snapshotTime)} · ${escapeHtml(refreshText)} · ` +
       `目标版本 ${escapeHtml(payload.target_version || "—")}${missing}</div>` +
     `<div class="pending-section-title">买卖汇总对比</div>` +
     `<div class="pending-comparison-wrap">

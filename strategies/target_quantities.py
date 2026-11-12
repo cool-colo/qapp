@@ -526,6 +526,7 @@ class TargetQuantityStrategy(Strategy):
         # Latest normalized full tick per instrument. ``market_status`` on each value
         # is derived from QMT's repurposed ``open_int`` field. Reset daily.
         self._market_status: dict[str, TickSnapshot] = {}
+        self._market_status_updated_at_ns: int | None = None
         # Latest whole-market (京沪深A) full tick per instrument id — same shape as
         # ``_market_status`` but covers the entire A-share universe, not just the
         # strategy's traded instruments. Intraday, latest-wins; reset daily. Not used
@@ -1260,6 +1261,7 @@ class TargetQuantityStrategy(Strategy):
                 continue
             if self._set_authoritative_open(str(instrument_id), trading_date, open_price):
                 updated += 1
+        self._market_status_updated_at_ns = snapshot_ts_ns
         if updated:
             self.log.info(
                 f"applied authoritative opens from full-tick ({trigger}): "
@@ -1290,6 +1292,10 @@ class TargetQuantityStrategy(Strategy):
     def tick_snapshot_for(self, instrument_id: str) -> TickSnapshot | None:
         """Return the latest normalized full tick for ``instrument_id``."""
         return self._market_status.get(instrument_id)
+
+    def market_snapshot_updated_at_ns(self) -> int | None:
+        """Return when the latest per-target full-tick batch was applied."""
+        return self._market_status_updated_at_ns
 
     def whole_market_snapshot(self) -> dict[str, TickSnapshot]:
         """Return the latest whole-market (京沪深A) full-tick snapshot.
@@ -1736,6 +1742,7 @@ class TargetQuantityStrategy(Strategy):
         self._today_open = {}
         self._authoritative_open = set()
         self._market_status = {}
+        self._market_status_updated_at_ns = None
         self._whole_market_status = {}
         self._depth_books = {}
         self._order_quote_states = {}

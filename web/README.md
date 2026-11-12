@@ -9,7 +9,9 @@ A local, read-only dashboard for the live trading data this repo persists:
   `before_trading` `live_asset_snapshot.total_asset`. The **待交易估算** sub-page lists
   only unfinished target quantities and compares executing them at the latest price
   versus today's open, including side-aware loss amount and open/current-notional
-  loss rates.
+  loss rates. It requests only those stock codes from the node's generic
+  `/realtime/ticks?stock_codes=...` API, backed by the per-second strategy market
+  snapshot; it does not download the whole-market snapshot.
 - **按日快照** — asset / positions / target portfolio / orders / trades for a chosen
   date + phase. Each stock row links to its **个股 K 线** view.
 - **随时间** — time series: pick one or more metrics from a checkbox list (asset

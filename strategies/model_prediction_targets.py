@@ -221,6 +221,11 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             self._instrument_by_stock[stock_code] = instrument_id
         return stock_code
 
+    def instrument_id_for_stock_code(self, stock_code: str) -> InstrumentId | None:
+        """Resolve a normalized stock code through the configured Nautilus universe."""
+        normalized = normalize_stock_code(stock_code)
+        return self._instrument_by_stock.get(normalized)
+
     def refresh_reference_data(
         self,
         instrument_ids: list[InstrumentId],

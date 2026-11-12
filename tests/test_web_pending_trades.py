@@ -12,11 +12,11 @@ class FakeNodeApi:
         self.ticks = ticks
         self.calls = []
 
-    def get(self, path):
-        self.calls.append(path)
+    def get(self, path, params=None):
+        self.calls.append((path, params))
         if path == "/strategy/targets":
             return self.targets
-        if path == "/realtime/whole_market_ticks":
+        if path == "/realtime/ticks":
             return self.ticks
         raise AssertionError(path)
 
@@ -64,6 +64,9 @@ class PendingTradeProjectionTest(unittest.TestCase):
         }
         self.ticks = {
             "trade_date": "2026-11-12",
+            "snapshot_time": "2026-11-12T02:00:00+00:00",
+            "refresh_interval_secs": 1.0,
+            "missing_stock_codes": [],
             "ticks": [
                 {"stock_code": "000001.SZ", "open": 10, "last_price": 11},
                 {"stock_code": "600000.SH", "open": 20, "last_price": 18},
@@ -114,10 +117,18 @@ class PendingTradeProjectionTest(unittest.TestCase):
 
         self.assertEqual(
             node.calls,
-            ["/strategy/targets", "/realtime/whole_market_ticks"],
+            [
+                ("/strategy/targets", None),
+                (
+                    "/realtime/ticks",
+                    {"stock_codes": "000001.SZ,600000.SH"},
+                ),
+            ],
         )
         self.assertEqual(result["target_version"], "target-v1")
         self.assertEqual(result["trades"][0]["name"], "买入股票")
+        self.assertEqual(result["snapshot_time"], "2026-11-12T02:00:00+00:00")
+        self.assertEqual(result["refresh_interval_secs"], 1.0)
 
 
 if __name__ == "__main__":
