@@ -82,6 +82,20 @@ preopen_latency_execution_enabled: false
 preopen_latency_max_advance_ms: 3000
 preopen_latency_fixed_advance_ms: 50
 
+# --- Opening call auction ---
+# Auction submissions use their own window; continuous orders obey execution_windows.
+# Indicative prices require fresh equal best bid/ask levels; no cancels before 09:30.
+auction_enabled: true
+auction_prepare_time: "09:24:01"
+auction_submit_time: "09:24:50"
+auction_submit_cutoff: "09:24:59"
+auction_reference_max_age_secs: 4.0
+auction_buy_offset_bps: 50.0
+auction_sell_offset_bps: 50.0
+auction_commission_rate: 0.000085  # 万 0.85, both buys and sells
+auction_minimum_fee: 5.0
+auction_partial_min_notional: 58000  # Partial notional > threshold; remaining target >= threshold.
+
 # --- Full-tick snapshot ---
 full_tick_refresh_secs: 1.0
 full_tick_prefetch_time: "09:27"

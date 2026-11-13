@@ -110,7 +110,7 @@ class StrategyParams:
     preopen_latency_fixed_advance_ms: int = 50
 
     # Opening call auction; independent of continuous execution windows.
-    auction_enabled: bool = False
+    auction_enabled: bool = True
     auction_prepare_time: str = "09:24:01"
     auction_submit_time: str = "09:24:50"
     auction_submit_cutoff: str = "09:24:59"

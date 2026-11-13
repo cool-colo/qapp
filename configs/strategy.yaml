@@ -86,12 +86,12 @@ preopen_latency_execution_enabled: false
 preopen_latency_max_advance_ms: 3000
 preopen_latency_fixed_advance_ms: 50
 
-# --- Opening call auction (off by default) ---
+# --- Opening call auction (on by default) ---
 # Uses all available account cash, prediction-rank priority, and fixed daily targets.
 # Auction indicative price must come from fresh equal best bid/ask levels.
 # Auction submissions use their own window; continuous orders obey execution_windows.
 # Cancels obey cancel_windows, never before 09:30.
-auction_enabled: false
+auction_enabled: true
 auction_prepare_time: "09:24:01"
 auction_submit_time: "09:24:50"
 auction_submit_cutoff: "09:24:59"
