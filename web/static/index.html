@@ -299,7 +299,17 @@
         </div>
         <div id="rt-asset" class="rt-sub-panel table-wrap"></div>
         <div id="rt-trades" class="rt-sub-panel"></div>
-        <div id="rt-pending" class="rt-sub-panel"></div>
+        <div id="rt-pending" class="rt-sub-panel">
+          <div id="rt-pending-projection"></div>
+          <div class="pending-section-title">盘前计划交易损失（bp）</div>
+          <div class="pending-loss-note">固定交易数量＝盘前目标－盘前持仓；盘前持有但不在目标中的股票按清仓计算，成交后仍纳入估算。<br />损失 bp＝[买入数量×（分钟收盘价－开盘价）＋卖出数量×（开盘价－分钟收盘价）] / 买卖开盘总金额×10000。正值表示损失，负值表示价格改善。</div>
+          <div id="rt-trade-loss-meta" class="trade-summary-meta"></div>
+          <div id="rt-trade-loss-chart" class="chart"></div>
+          <div id="rt-pending-stocks" hidden>
+            <div class="pending-section-title">待交易股票</div>
+            <div id="rt-pending-table" class="table-wrap trade-slippage-table"></div>
+          </div>
+        </div>
       </section>
 
       <!-- ============ Strategy info tab (策略信息) ============ -->

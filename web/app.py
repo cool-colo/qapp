@@ -7,11 +7,12 @@ static ECharts frontend mounted at ``/``. Bind to 127.0.0.1 (see web/run.sh).
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -20,6 +21,7 @@ from pydantic import BaseModel
 
 from web import change_records, compare_presets
 from web import order_execution_report
+from web import trade_loss_report
 from web.config import AppConfig, load_config
 from web.db import DataAccess, MySqlSource, NodeApiClient, jsonable, jsonable_rows, quote_literal
 from web.returns_report import (
@@ -1538,6 +1540,28 @@ def realtime_pending_trades(
             row["name"] = row.get("stock_name") or ""
     target_payload["targets"] = targets
     return build_pending_trade_projection(target_payload, tick_payload)
+
+
+@app.get("/api/realtime/trade-loss")
+def realtime_trade_loss(
+    source: str,
+    account: str,
+    trader: str,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Fixed preopen rebalance quantities valued at each realtime minute close."""
+    try:
+        return trade_loss_report.query_minute_trade_loss(
+            _mysql(data, source),
+            data.clickhouse,
+            account=account,
+            trader=trader,
+            trading_date=datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/control/state")

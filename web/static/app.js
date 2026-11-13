@@ -2571,8 +2571,10 @@ async function loadRealtimeTradeSummary() {
 // target book with the node's whole-market tick snapshot and applies the side-aware
 // loss convention: BUY=(current-open)*qty, SELL=(open-current)*qty.
 function renderPendingTradeProjection(payload) {
-  const el = $("#rt-pending");
+  const el = $("#rt-pending-projection");
+  $("#rt-pending-stocks").hidden = !payload || !payload.trades || payload.trades.length === 0;
   if (!payload || !payload.trades || payload.trades.length === 0) {
+    $("#rt-pending-table").innerHTML = "";
     el.innerHTML = '<div class="empty">当前目标已全部达成，无待交易股票</div>';
     return;
   }
@@ -2624,9 +2626,7 @@ function renderPendingTradeProjection(payload) {
        </div>
      </div>` +
     `<div class="pending-loss-note">正损失表示按现价执行比按开盘价执行更差；` +
-      `比例分母为全部待买与待卖股票的总交易金额，不做买卖金额抵消。</div>` +
-    `<div class="pending-section-title">待交易股票</div>` +
-    `<div id="rt-pending-table" class="table-wrap trade-slippage-table"></div>`;
+      `比例分母为全部待买与待卖股票的总交易金额，不做买卖金额抵消。</div>`;
 
   renderTable("#rt-pending-table", payload.trades, {
     columns: [
@@ -2644,6 +2644,7 @@ function renderPendingTradeProjection(payload) {
     intCols: new Set(["current_qty", "target_qty", "trade_qty"]),
     rateCols: new Set(["price_change"]),
     signCols: new Set(["price_change", "loss_amount"]),
+    defaultSort: { col: "side", dir: "asc" },
     linkStock: true,
     stockInfoDate: payload.trade_date,
     cellFn: (col, value, row) => {
@@ -2659,19 +2660,96 @@ function renderPendingTradeProjection(payload) {
   });
 }
 
-async function loadPendingTradeProjection() {
-  if (!state.account) return;
+function renderMinuteTradeLoss(payload, error = null) {
+  const chart = getChart("rt-trade-loss-chart");
+  const meta = $("#rt-trade-loss-meta");
+  const statusMessages = {
+    missing_preopen_target: "暂无当天盘前目标快照",
+    missing_preopen_positions: "暂无当天盘前持仓快照",
+    no_trades: "盘前目标与持仓一致，无计划交易",
+  };
+  const points = payload ? payload.points || [] : [];
+  const hasValues = points.some((point) => point.loss_bps !== null);
+  if (error || !payload || statusMessages[payload.status] || !hasValues) {
+    meta.textContent = payload
+      ? `交易日 ${payload.trade_date} · 固定清单 ${payload.stock_count} 只`
+      : "";
+    const missing = payload ? payload.missing_open_stock_codes || [] : [];
+    if (missing.length) meta.textContent += ` · 缺少开盘价：${missing.join("、")}`;
+    const message = error || (payload && statusMessages[payload.status]) ||
+      (missing.length ? "缺少计划交易股票开盘价" :
+        points.length ? "分钟行情未覆盖全部计划交易股票" : "暂无当天实时分钟行情");
+    chart.setOption({ title: { text: message, left: "center", top: "center", textStyle: { fontSize: 14, color: "#9ca3af" } } }, true);
+    return;
+  }
+  const latest = points.filter((point) => point.loss_bps !== null).at(-1);
+  const gaps = points.filter((point) => point.loss_bps === null).length;
+  meta.textContent = `交易日 ${payload.trade_date} · 固定买入 ${payload.buy_count} 只 / 卖出 ${payload.sell_count} 只` +
+    ` · 开盘交易总额 ${fmt(payload.open_amount)} · ${latest.ts.slice(11, 16)} 损失 ${fmt(latest.loss_bps)} bp` +
+    (gaps ? ` · ${gaps} 个分钟缺价，曲线留空` : "");
+  chart.setOption({
+    tooltip: {
+      trigger: "axis",
+      formatter: (items) => {
+        if (!items.length) return "";
+        const point = points[items[0].dataIndex];
+        if (point.loss_bps === null) return `${escapeHtml(point.ts)}<br>缺价：${point.priced_count}/${payload.stock_count} 只有效行情`;
+        return `${escapeHtml(point.ts)}<br>交易损失：${fmt(point.loss_bps)} bp` +
+          `<br>损失金额：${fmt(point.loss_amount)}` +
+          `<br>买入损失：${fmt(point.buy_loss_amount)} · 卖出损失：${fmt(point.sell_loss_amount)}`;
+      },
+    },
+    grid: { left: 75, right: 35, top: 35, bottom: 75 },
+    xAxis: { type: "category", data: points.map((point) => point.ts.slice(11, 16)), boundaryGap: false },
+    yAxis: { type: "value", name: "交易损失 (bp)", axisLabel: { formatter: "{value} bp" } },
+    dataZoom: [{ type: "inside" }, { type: "slider", bottom: 15 }],
+    series: [{
+      name: "交易损失", type: "line", showSymbol: false, connectNulls: false,
+      data: points.map((point) => point.loss_bps),
+      lineStyle: { width: 2, color: "#f5a524" }, itemStyle: { color: "#f5a524" },
+      markLine: { silent: true, symbol: "none", label: { show: false }, data: [{ yAxis: 0 }] },
+    }],
+  }, true);
+}
+
+function pendingAccountMatches(params) {
+  return state.account && params.source === state.source &&
+    params.account === state.account.account_id && params.trader === state.account.trader_id;
+}
+
+async function loadPendingTradeSnapshot(params) {
   if (!hasNodeApi()) {
-    nodeApiHint("#rt-pending");
+    $("#rt-pending-stocks").hidden = true;
+    nodeApiHint("#rt-pending-projection");
     return;
   }
   try {
-    const payload = await api("/api/realtime/pending-trades", accountParams());
+    const payload = await api("/api/realtime/pending-trades", params);
+    if (!pendingAccountMatches(params)) return;
     renderPendingTradeProjection(payload);
   } catch (e) {
-    $("#rt-pending").innerHTML = '<div class="empty">获取失败</div>';
+    if (!pendingAccountMatches(params)) return;
+    $("#rt-pending-stocks").hidden = true;
+    $("#rt-pending-projection").innerHTML = '<div class="empty">获取失败</div>';
     toast(e.message);
   }
+}
+
+async function loadMinuteTradeLoss(params) {
+  try {
+    const payload = await api("/api/realtime/trade-loss", params);
+    if (pendingAccountMatches(params)) renderMinuteTradeLoss(payload);
+  } catch (e) {
+    if (!pendingAccountMatches(params)) return;
+    renderMinuteTradeLoss(null, "交易损失曲线获取失败");
+    toast(e.message);
+  }
+}
+
+async function loadPendingTradeProjection() {
+  if (!state.account) return;
+  const params = accountParams();
+  await Promise.all([loadPendingTradeSnapshot(params), loadMinuteTradeLoss(params)]);
 }
 
 async function sellStock(code, name, qty) {
