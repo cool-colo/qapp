@@ -528,7 +528,9 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             for instrument_id in (INST_A, INST_B, INST_C)
         }
         strategy = TestableTargetQuantityStrategy()
+        # These fixtures exercise continuous execution; auction replay has its own tests.
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A, INST_B, INST_C],
             bar_types={},
             initial_cash=Decimal(str(equity)),
@@ -689,6 +691,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         bar_type = BarType.from_str(f"{INST_A}-1-MINUTE-LAST-EXTERNAL")
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={str(INST_A): bar_type},
             subscribe_bars=False,
@@ -746,6 +749,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         bar_type = BarType.from_str(f"{INST_A}-1-MINUTE-LAST-EXTERNAL")
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={str(INST_A): bar_type},
             subscribe_bars=False,
@@ -772,6 +776,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_on_start_subscribes_quote_tick_window_probes_when_quote_ticks_disabled(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A, INST_B, INST_C],
             bar_types={},
             subscribe_bars=False,
@@ -798,6 +803,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         bar_type = BarType.from_str(f"{INST_B}-1-MINUTE-LAST-EXTERNAL")
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A, INST_B, INST_C],
             bar_types={},
             subscribe_bars=False,
@@ -813,6 +819,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         bar_type = BarType.from_str(f"{INST_B}-1-MINUTE-LAST-EXTERNAL")
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             subscribe_bars=False,
@@ -831,6 +838,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_trade_tick_logging_uses_sample_rate_like_quote_ticks(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             trade_tick_log_sample_rate=1.0,
@@ -857,6 +865,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_quote_tick_0925_logs_but_does_not_unlock_window(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             subscribe_quote_ticks=False,
@@ -892,6 +901,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_preopen_latency_first_sample_wins_and_caps_advance(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             subscribe_quote_ticks=False,
@@ -943,6 +953,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         trading_date = date(2026, 7, 2)
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             preopen_latency_execution_enabled=True,
@@ -979,6 +990,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_quote_tick_0929_does_not_unlock_exchange_window(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             subscribe_quote_ticks=False,
@@ -1026,6 +1038,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_quote_tick_0930_unlocks_exchange_window(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             subscribe_quote_ticks=False,
@@ -1058,6 +1071,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_morning_quote_tick_does_not_unlock_afternoon_window(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             trading_windows="09:29-11:30,13:00-14:55",
@@ -2168,6 +2182,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_order_book_depth_logs_all_during_open_and_close_windows(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             order_book_depth_log_sample_rate=0.0,
@@ -2193,6 +2208,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_order_book_depth_uses_sampling_outside_full_log_windows(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             order_book_depth_log_sample_rate=0.0,
@@ -2451,6 +2467,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_execution_trend_can_be_observed_without_affecting_execution(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             price_trend_effect_enabled=False,
@@ -2924,6 +2941,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
     def test_price_trend_config_validation_fails_fast(self) -> None:
         config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[],
             bar_types={},
             price_trend_threshold_bps=40.0,
@@ -2985,6 +3003,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         trading_date = date(2026, 7, 2)
         strategy = self.make_star_strategy(prices={INST_A: 10.0})
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             cancel_book_max_age_secs=600.0,
@@ -3111,6 +3130,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_stale_execution_book_is_rejected_and_warned_once(self) -> None:
         strategy = self.make_strategy(prices={INST_A: 10.0})
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             submission_book_max_age_secs=4.0,
@@ -3177,6 +3197,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         trading_date = date(2026, 7, 2)
         strategy = self.make_strategy(prices={INST_A: 10.0})
         strategy.config = TargetQuantityStrategyConfig(
+            auction_enabled=False,
             instrument_ids=[INST_A],
             bar_types={},
             cancel_book_max_age_secs=4.0,

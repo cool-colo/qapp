@@ -303,7 +303,9 @@ class BacktestPlanningEventTest(unittest.TestCase):
                 "RISK_MANAGER_RISK_MODEL_ID": "test",
             },
         ):
-            engine, strategy, _ = build_engine(args, bundle, bar_types, bars_by_stock, ())
+            engine, strategy, _ = build_engine(
+                args, bundle, bar_types, bars_by_stock, (), auction_enabled=False,
+            )
 
         class CapturingPlanner:
             def __init__(self) -> None:
