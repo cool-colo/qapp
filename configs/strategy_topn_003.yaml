@@ -72,8 +72,8 @@ excluded_name_prefixes:
 # --- Exchange windows (timezone stays on CLI: --exchange-timezone) ---
 trading_windows: "09:29-11:30,13:00-14:55"
 exchange_trading_windows: "09:30-11:30,13:00-14:55"
-execution_windows: "09:40-10:00"
-exchange_execution_windows: "09:40-10:00"
+execution_windows: "13:00-14:56"
+exchange_execution_windows: "13:00-14:56"
 # Cancellation is independent of submission windows; end times are exclusive.
 cancel_windows: "09:30-11:30,13:00-14:57"
 exchange_cancel_windows: "09:30-11:30,13:00-14:57"

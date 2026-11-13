@@ -24,6 +24,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 
 from strategies.async_scheduling import AsyncAwaitableScheduler
 from strategies.execution_reconciliation import ExecutionStateReconciler
+from strategies.execution_timing import ExecutionTiming
 from strategies.target_quantities import DepthBookSnapshot
 from strategies.target_quantities import TargetQuantityStrategyConfig
 from strategies.convergence import ConvergenceTrigger
@@ -329,6 +330,9 @@ class TestableTargetQuantityStrategy:
     _is_historical_event = TargetQuantityStrategy._is_historical_event
     _is_transient_sellable_denial = TargetQuantityStrategy._is_transient_sellable_denial
     _converge_to_target = TargetQuantityStrategy._converge_to_target
+    _run_convergence = TargetQuantityStrategy._run_convergence
+    _schedule_convergence = TargetQuantityStrategy._schedule_convergence
+    _emit_convergence = TargetQuantityStrategy._emit_convergence
     _converge_to_target_locked = TargetQuantityStrategy._converge_to_target_locked
     _converge_async = TargetQuantityStrategy._converge_async
     _awaiting_pre_open_reconcile = TargetQuantityStrategy._awaiting_pre_open_reconcile
@@ -646,6 +650,15 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._target_updates_paused = False
         strategy._fetch_executor = None
         strategy._converge_lock = threading.Lock()
+        # Instrumentation observes the fake clock without advancing it; only the
+        # trading methods advance this deliberately stepwise fixture clock.
+        strategy._execution_timing = ExecutionTiming(lambda: strategy.clock.ts)
+        # Keep emitted events only in tests; production writes a JSON log line.
+        strategy.convergence_events = []
+        strategy._emit_convergence = lambda event: (
+            strategy.convergence_events.append(event) if event is not None else None
+        )
+        strategy._quote_observations = {}
         strategy._async_scheduler = AsyncAwaitableScheduler()
         strategy._execution_state_reconciler = ExecutionStateReconciler(
             timezone_name=strategy.config.timezone_name,

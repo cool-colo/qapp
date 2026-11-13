@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from typing import Callable
 from urllib.parse import urlsplit
 from urllib.parse import urlunsplit
 
@@ -131,7 +132,9 @@ def derive_ws_url(http_url: str) -> str:
     return urlunsplit((scheme, parsed.netloc, parsed.path, "", ""))
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+    configure_parser: Callable[[argparse.ArgumentParser], None] | None = None,
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the model-prediction strategy as a long-running Nautilus live node via QMT.",
     )
@@ -393,6 +396,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Build and dispose the node without connecting or running.",
     )
+    if configure_parser is not None:
+        configure_parser(parser)
     args = parser.parse_args()
     if not args.config:
         parser.error("--config is required, or set STRATEGY_CONFIG_FILE (see configs/strategy.yaml)")

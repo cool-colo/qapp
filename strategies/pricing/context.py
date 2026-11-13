@@ -31,6 +31,10 @@ class PriceContext:
     # Source market-data timestamps for the captured bid/ask ladder.
     ts_event: int | None = None
     ts_init: int | None = None
+    observed_ns: int | None = None
+    captured_ns: int | None = None
+    book_source: str | None = None
+    observed_to_capture_ns: int | None = None
     # (price, size) levels, best-first. May be empty (e.g. backtest with no book).
     bids: list[tuple[float, float]] = field(default_factory=list)
     asks: list[tuple[float, float]] = field(default_factory=list)

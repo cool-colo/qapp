@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import math
 import random
 import threading
@@ -39,6 +40,10 @@ from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.trading.strategy import Strategy
 
 from strategies.async_scheduling import AsyncAwaitableScheduler
+from strategies.execution_timing import ConvergenceEvent
+from strategies.execution_timing import ConvergenceTiming
+from strategies.execution_timing import ExecutionTiming
+from strategies.execution_timing import TimingPoint
 from strategies.cancellation import A_SHARE_CANCEL_WINDOWS
 from strategies.cancellation import cancel_window_index
 from strategies.cancellation import validate_cancel_config
@@ -89,6 +94,9 @@ class DepthBookSnapshot:
     asks: tuple[tuple[float, float], ...]
     ts_event: int
     ts_init: int
+    observed_ns: int | None = None
+    observed_monotonic_ns: int | None = None
+    source: str = "depth"
 
     @property
     def best_bid(self) -> float | None:
@@ -230,6 +238,10 @@ class IntentContext:
             "best_ask": ctx.best_ask,
             "ts_event": ctx.ts_event,
             "ts_init": ctx.ts_init,
+            "observed_ns": ctx.observed_ns,
+            "captured_ns": ctx.captured_ns,
+            "book_source": ctx.book_source,
+            "observed_to_capture_ns": ctx.observed_to_capture_ns,
             "bids": ctx.bids,
             "asks": ctx.asks,
             "price_return_bps": ctx.price_return_bps,
@@ -497,6 +509,7 @@ class TargetQuantityStrategy(Strategy):
         validate_cancel_config(config)
         validate_auction_config(config)
         self._auction_references: dict[str, AuctionReference] = {}
+        self._auction_reference_captured: dict[str, TimingPoint] = {}
         self._auction_attempted: set[str] = set()
         self._auction_execution_active = False
         self._auction_prediction_ranks: dict[str, int] = {}
@@ -529,6 +542,8 @@ class TargetQuantityStrategy(Strategy):
         self._frozen_instruments: dict[str, str] = {}
         self._deferred_buys: dict[str, Decimal] = {}
         self._converge_lock = threading.Lock()
+        self._execution_timing = ExecutionTiming(lambda: int(self.clock.timestamp_ns()))
+        self._quote_observations: dict[str, tuple[int, int, int, int]] = {}
         self._rejected_order_ids: set[str] = set()
         self._insufficient_funds: set[str] = set()
         # Set in on_start; guards against reconciliation-replayed historical events
@@ -1785,6 +1800,7 @@ class TargetQuantityStrategy(Strategy):
         self._trading_day = trading_date
         if self.config.auction_enabled:
             self._auction_references = {}
+            self._auction_reference_captured = {}
             self._auction_attempted = set()
             self._auction_budget = None
             self._auction_committed_cost = Decimal("0")
@@ -1966,6 +1982,10 @@ class TargetQuantityStrategy(Strategy):
         )
 
     def on_quote_tick(self, tick: QuoteTick) -> None:
+        observed = self._execution_timing.point()
+        self._quote_observations[str(tick.instrument_id)] = (
+            int(tick.ts_event), int(tick.ts_init), observed.timestamp_ns, observed.monotonic_ns,
+        )
         self._note_quote_tick(tick)
         self._capture_preopen_latency_sample(
             source="quote_tick",
@@ -1997,6 +2017,7 @@ class TargetQuantityStrategy(Strategy):
         )
 
     def on_order_book_depth(self, depth: OrderBookDepth10) -> None:
+        observed = self._execution_timing.point()
         bids = self._ladder_levels(depth.bids)
         asks = self._ladder_levels(depth.asks)
         depth_ts_event = int(depth.ts_event)
@@ -2024,6 +2045,8 @@ class TargetQuantityStrategy(Strategy):
             asks=tuple(asks),
             ts_event=int(depth.ts_event),
             ts_init=int(depth.ts_init),
+            observed_ns=observed.timestamp_ns,
+            observed_monotonic_ns=observed.monotonic_ns,
         )
         if self.config.auction_enabled and bids and asks and bids[0][0] == asks[0][0]:
             self.capture_auction_reference(str(depth.instrument_id), bids[0][0],
@@ -2189,11 +2212,9 @@ class TargetQuantityStrategy(Strategy):
             # calling it inline) lets the event queue drain any events already enqueued
             # behind this fill before the converge runs, so it sees settled position
             # state. The non-blocking lock in _converge_to_target still applies.
-            self._async_scheduler.schedule(
-                self._converge_async(
-                    current_date=self._clock_date(),
-                    trigger=ConvergenceTrigger.SELL_FILL,
-                ),
+            self._schedule_convergence(
+                current_date=self._clock_date(),
+                trigger=ConvergenceTrigger.SELL_FILL,
             )
 
     def on_order_canceled(self, event: Any) -> None:
@@ -2232,14 +2253,50 @@ class TargetQuantityStrategy(Strategy):
                 f"({instrument_id_text}); periodic timer will converge once live",
             )
             return
-        self._async_scheduler.schedule(
-            self._converge_async(
-                current_date=self._clock_date(),
-                trigger=ConvergenceTrigger.CANCEL,
-                delay_secs=float(self.config.cancel_reconverge_delay_secs),
-                replacement=replacement,
-            ),
+        self._schedule_convergence(
+            current_date=self._clock_date(),
+            trigger=ConvergenceTrigger.CANCEL,
+            delay_secs=float(self.config.cancel_reconverge_delay_secs),
+            replacement=replacement,
         )
+
+    def _schedule_convergence(
+        self,
+        current_date: date,
+        trigger: ConvergenceTrigger,
+        delay_secs: float = 0.0,
+        replacement: OrderDecisionLineage | None = None,
+        *,
+        timer_event_ns: int | None = None,
+    ) -> Any:
+        # Capture before creating/scheduling the coroutine: coroutine entry is too
+        # late to observe time spent waiting for the node event loop.
+        timing = self._execution_timing.request(
+            current_date, trigger.value, scheduled=True, delay_secs=delay_secs,
+        )
+        if timer_event_ns is not None:
+            timing.context["timer_event_ns"] = timer_event_ns
+        coroutine = self._converge_async(
+            current_date, trigger, delay_secs, replacement, timing=timing,
+        )
+        try:
+            task = self._async_scheduler.schedule(coroutine)
+        except Exception as exc:
+            coroutine.close()
+            timing.status, timing.reason = "failed", "schedule_exception"
+            timing.context["error_type"] = type(exc).__name__
+            self._emit_convergence(self._execution_timing.finish(timing))
+            raise
+
+        def on_done(future: Any) -> None:
+            if future.cancelled():
+                event = self._execution_timing.finish(timing, cancel_unstarted=True)
+                if event is not None:
+                    coroutine.close()
+                    self._emit_convergence(event)
+
+        task.add_done_callback(on_done)
+        return task
 
     async def _converge_async(
         self,
@@ -2247,18 +2304,34 @@ class TargetQuantityStrategy(Strategy):
         trigger: ConvergenceTrigger,
         delay_secs: float = 0.0,
         replacement: OrderDecisionLineage | None = None,
+        *,
+        timing: ConvergenceTiming | None = None,
     ) -> None:
-        # Runs on the node event loop. `delay_secs` is used only by the cancel path
-        # (see on_order_canceled) to let a racing OrderFilled settle first; other
-        # callers pass 0. `_converge_to_target` still takes the non-blocking lock, so
-        # a converge already in progress makes this a no-op rather than stacking.
-        if delay_secs > 0:
-            await asyncio.sleep(delay_secs)
-        self._converge_to_target(
-            current_date=current_date,
-            trigger=trigger,
-            replacement=replacement,
+        timing = timing or self._execution_timing.request(
+            current_date, trigger.value, delay_secs=delay_secs,
         )
+        if not self._execution_timing.start(timing):
+            return
+        try:
+            # Preserve the cancel/fill settlement delay and measure it separately
+            # from initial task queueing and synchronous convergence execution.
+            if delay_secs > 0:
+                await asyncio.sleep(delay_secs)
+            self._converge_to_target(
+                current_date=current_date,
+                trigger=trigger,
+                replacement=replacement,
+                timing=timing,
+            )
+        except asyncio.CancelledError:
+            timing.status, timing.reason = "cancelled", "task_cancelled"
+            raise
+        except Exception as exc:
+            timing.status, timing.reason = "failed", "execution_exception"
+            timing.context["error_type"] = type(exc).__name__
+            raise
+        finally:
+            self._emit_convergence(self._execution_timing.finish(timing))
 
     def on_order_denied(self, event: Any) -> None:
         self._handle_order_not_accepted(event)
@@ -2343,11 +2416,10 @@ class TargetQuantityStrategy(Strategy):
         # non-blocking lock in _converge_to_target still makes an overlapping cycle a
         # no-op rather than stacking.
         try:
-            self._async_scheduler.schedule(
-                self._converge_async(
-                    current_date=self._clock_date(),
-                    trigger=ConvergenceTrigger.TIMER,
-                ),
+            self._schedule_convergence(
+                current_date=self._clock_date(),
+                trigger=ConvergenceTrigger.TIMER,
+                timer_event_ns=int(_event.ts_event) if _event is not None else None,
             )
         except Exception as exc:
             self.log.warning(f"target convergence failed: {exc}")
@@ -2357,6 +2429,7 @@ class TargetQuantityStrategy(Strategy):
     ) -> None:
         if not self.config.auction_enabled:
             return
+        captured = self._execution_timing.point()
         event_date = self._event_trading_date(ts_event)
         if event_date != self._clock_date():
             return
@@ -2367,6 +2440,7 @@ class TargetQuantityStrategy(Strategy):
             previous = self._auction_references.get(instrument_id)
             if previous is None or reference.ts_event >= previous.ts_event:
                 self._auction_references[instrument_id] = reference
+                self._auction_reference_captured[instrument_id] = captured
 
     def auction_reference(self, instrument_id: str) -> AuctionReference | None:
         reference = self._auction_references.get(instrument_id)
@@ -2535,16 +2609,47 @@ class TargetQuantityStrategy(Strategy):
         trigger: ConvergenceTrigger,
         ts_event: int | None = None,
         replacement: OrderDecisionLineage | None = None,
+        *,
+        timing: ConvergenceTiming | None = None,
+    ) -> bool:
+        owned = timing is None
+        if timing is None:
+            timing = self._execution_timing.request(current_date, trigger.value)
+            self._execution_timing.start(timing)
+        with self._execution_timing.activate(timing):
+            self._execution_timing.mark("execution_started")
+            timing.context["target_version"] = self._target_version
+            if ts_event is not None:
+                timing.context["trigger_ts_event"] = ts_event
+            try:
+                return self._run_convergence(current_date, trigger, ts_event, replacement)
+            except Exception as exc:
+                timing.status, timing.reason = "failed", "execution_exception"
+                timing.context["error_type"] = type(exc).__name__
+                raise
+            finally:
+                if owned:
+                    self._emit_convergence(self._execution_timing.finish(timing))
+
+    def _run_convergence(
+        self,
+        current_date: date,
+        trigger: ConvergenceTrigger,
+        ts_event: int | None = None,
+        replacement: OrderDecisionLineage | None = None,
     ) -> bool:
         """Run convergence after passing its window gate and acquiring its lock."""
         if self._trading_paused and not trigger.bypasses_pause:
+            self._execution_timing.skip("trading_paused")
             return False
         submission_open = (self._within_auction_submit_time()
                            if trigger == ConvergenceTrigger.OPENING_AUCTION
                            else self._within_execution_window(ts_event))
         cancellation_open = (trigger != ConvergenceTrigger.OPENING_AUCTION
                              and self._within_cancel_window(ts_event))
+        self._execution_timing.mark("window_checked")
         if not submission_open and not cancellation_open:
+            self._execution_timing.skip("outside_execution_window")
             return False
         # A manual convergence must not be silently dropped when the trading thread
         # holds the lock. Ordinary and pre-open triggers remain non-blocking.
@@ -2553,11 +2658,15 @@ class TargetQuantityStrategy(Strategy):
         else:
             acquired = self._converge_lock.acquire(blocking=False)
         if not acquired:
+            self._execution_timing.skip("lock_busy")
             return False
+        self._execution_timing.mark("lock_acquired")
         try:
             if cancellation_open and not self._awaiting_pre_open_reconcile():
                 self._reconcile_unfilled_orders(current_date)
+            self._execution_timing.mark("cancel_check_finished")
             if not submission_open:
+                self._execution_timing.active.reason = "cancellation_only"
                 return True
             self._converge_to_target_locked(
                 current_date=current_date,
@@ -2576,9 +2685,11 @@ class TargetQuantityStrategy(Strategy):
     ) -> None:
         trigger_value = trigger.value
         if not self._target_version:
+            self._execution_timing.skip("no_target_version")
             self.log.warning("target convergence skipped: no target version set")
             return
         if self._awaiting_pre_open_reconcile():
+            self._execution_timing.skip("awaiting_reconciliation")
             # On restart the kernel rebuilds the cache, but the broker's authoritative
             # sellable/position view (mass status) arrives a little later via the
             # strategy-side pre-open reconcile. Converging in that window trades against
@@ -2592,6 +2703,7 @@ class TargetQuantityStrategy(Strategy):
             )
             return
         if self._target_version in self._achieved_versions:
+            self._execution_timing.skip("target_already_achieved")
             self.log.info(
                 f"target convergence skipped: already achieved version={self._target_version}",
                 color=LogColor.GREEN,
@@ -2603,15 +2715,18 @@ class TargetQuantityStrategy(Strategy):
             if exhausted_date == current_date
         }
         if self._stop_time_reached():
+            self._execution_timing.skip("stop_time_reached")
             self.log.info(
                 f"target convergence stopped by stop_time={self.config.stop_time} "
                 f"version={self._target_version}",
                 color=LogColor.BLUE,
             )
             return
+        self._execution_timing.mark("account_scan_started")
         self._log_account_sizing_snapshot(trigger_value)
         open_order_instruments = self._open_order_instruments()
         desired = self._desired_quantities()
+        self._execution_timing.mark("account_scan_finished")
         sell_intents: dict[str, TargetOrderIntent] = {}
         buy_intents: dict[str, TargetOrderIntent] = {}
         # Per-instrument classification tally for the convergence summary log below.
@@ -2684,6 +2799,11 @@ class TargetQuantityStrategy(Strategy):
                 intent.context.record(action="skip", skip_reason="unsupported_side")
                 skip_intent_error.append(instrument_id_text)
 
+        self._execution_timing.mark("intents_finished")
+        self._execution_timing.active.context.update(
+            desired_count=len(desired), sell_intent_count=len(sell_intents),
+            buy_intent_count=len(buy_intents),
+        )
         self._log_convergence_summary(
             trigger=trigger_value,
             desired_count=len(desired),
@@ -2696,15 +2816,19 @@ class TargetQuantityStrategy(Strategy):
             skip_intent_error=skip_intent_error,
         )
 
+        self._execution_timing.mark("summary_finished")
         if self.config.auction_enabled and self._auction_execution_active:
             self._submit_auction_orders(current_date, buy_intents, sell_intents, self._target_reason)
+            self._execution_timing.mark("auction_submit_finished")
         else:
             for instrument_id_text, intent in sorted(sell_intents.items()):
                 self._record_target(current_date, instrument_id_text, intent.context.target_qty,
                                     self._target_reason, intent.context)
                 self._submit_target_quantity(current_date, intent, self._target_reason)
+            self._execution_timing.mark("sells_finished")
             if buy_intents:
                 self._submit_buys_within_cash(current_date, buy_intents, self._target_reason)
+            self._execution_timing.mark("buys_finished")
 
         if self._target_achieved():
             self._achieved_versions.add(self._target_version)
@@ -2713,6 +2837,8 @@ class TargetQuantityStrategy(Strategy):
                 f"count={len(self._target_quantities)}",
                 color=LogColor.GREEN,
             )
+
+        self._execution_timing.mark("achievement_check_finished")
 
     def _desired_quantities(self) -> dict[str, Decimal]:
         desired = dict(self._target_quantities)
@@ -3214,6 +3340,9 @@ class TargetQuantityStrategy(Strategy):
                 "same_side_best": current_best,
                 "book_validation": book_reason,
                 "book_age_ms": book_age_ms,
+                "observed_ns": price_context.observed_ns,
+                "captured_ns": price_context.captured_ns,
+                "book_source": price_context.book_source,
             },
             "order_price": order.price,
             "mismatch_since_ns": state.mismatch_since_ns,
@@ -3450,6 +3579,8 @@ class TargetQuantityStrategy(Strategy):
         target_qty: Decimal,
         replacement: OrderDecisionLineage | None = None,
     ) -> TargetOrderIntent | None:
+        intent_started = self._execution_timing.point()
+        execution_timing = {"intent_started_ns": intent_started.timestamp_ns}
         instrument_id = InstrumentId.from_str(instrument_id_text)
         current_qty = self._current_quantity(instrument_id)
         target_qty = Decimal(str(target_qty))
@@ -3496,18 +3627,44 @@ class TargetQuantityStrategy(Strategy):
                 return None
             context = IntentContext(instrument_id_text, target_qty, current_qty, delta_qty,
                                     None, "AuctionOffset", self._execution_intent_id(instrument_id_text))
+            captured = self._auction_reference_captured.get(instrument_id_text)
+            if captured is not None:
+                execution_timing.update(
+                    reference_captured_ns=captured.timestamp_ns,
+                    reference_to_intent_ns=intent_started.monotonic_ns - captured.monotonic_ns,
+                )
             context.record(execution_phase="opening_auction", reference_price=reference.price,
                            reference_ts_event=reference.ts_event, reference_ts_init=reference.ts_init,
                            price_source=reference.source, target_version=self._target_version,
                            prediction_rank=self._auction_prediction_ranks.get(instrument_id_text))
+            pricing_finished = self._execution_timing.point()
+            execution_timing.update(
+                pricing_finished_ns=pricing_finished.timestamp_ns,
+                intent_duration_ns=pricing_finished.monotonic_ns - intent_started.monotonic_ns,
+            )
+            context.record(execution_timing=execution_timing)
             return TargetOrderIntent(instrument_id, instrument, side, quantity,
                                      instrument.make_price(raw), context)
+        book_context_started = self._execution_timing.point()
         price_context = self._build_price_context(instrument, instrument_id, side, quantity)
+        book_context_finished = self._execution_timing.point()
+        execution_timing.update(
+            book_context_started_ns=book_context_started.timestamp_ns,
+            book_context_finished_ns=book_context_finished.timestamp_ns,
+            book_context_duration_ns=book_context_finished.monotonic_ns - book_context_started.monotonic_ns,
+        )
         pricer = self._pricer_for_side(side)
+        validation_started = self._execution_timing.point()
         book_valid, book_reason, book_age_ms = self._execution_book_validation(
             price_context,
             max_age_secs=self.config.submission_book_max_age_secs,
             purpose="order submission",
+            timing=execution_timing,
+        )
+        validation_finished = self._execution_timing.point()
+        execution_timing.update(
+            validation_finished_ns=validation_finished.timestamp_ns,
+            validation_duration_ns=validation_finished.monotonic_ns - validation_started.monotonic_ns,
         )
         same_side_best = (
             price_context.best_bid
@@ -3522,6 +3679,7 @@ class TargetQuantityStrategy(Strategy):
             and same_side_best is not None
             and Decimal(str(same_side_best)) >= improvement_threshold
         )
+        pricing_started = self._execution_timing.point()
         raw_price = pricer.compute(price_context) if book_valid else None
         computed_price = raw_price
         price_clamp_reason = None
@@ -3536,6 +3694,12 @@ class TargetQuantityStrategy(Strategy):
                     price_clamp_reason = "exchange_down_limit"
                 raw_price = max(raw_price, down_limit)
         price = None if raw_price is None or raw_price <= 0 else instrument.make_price(raw_price)
+        pricing_finished = self._execution_timing.point()
+        execution_timing.update(
+            pricing_started_ns=pricing_started.timestamp_ns,
+            pricing_finished_ns=pricing_finished.timestamp_ns,
+            pricing_duration_ns=pricing_finished.monotonic_ns - pricing_started.monotonic_ns,
+        )
         context = IntentContext(
             instrument_id=instrument_id_text,
             target_qty=target_qty,
@@ -3552,6 +3716,7 @@ class TargetQuantityStrategy(Strategy):
         context.record(
             side=side.name,
             execution_phase="continuous",
+            execution_timing=execution_timing,
             intent_quantity=quantity,
             limit_price=price,
             computed_price=computed_price,
@@ -3563,6 +3728,11 @@ class TargetQuantityStrategy(Strategy):
             same_side_best=same_side_best,
             same_side_price_improvement_threshold=improvement_threshold,
             price_improvement_applied=price_improvement_applied,
+        )
+        intent_finished = self._execution_timing.point()
+        execution_timing.update(
+            intent_finished_ns=intent_finished.timestamp_ns,
+            intent_duration_ns=intent_finished.monotonic_ns - intent_started.monotonic_ns,
         )
         if price is None:
             price_skip_reason = (
@@ -3730,6 +3900,11 @@ class TargetQuantityStrategy(Strategy):
         slice_index: int | None = None,
         slice_count: int | None = None,
     ) -> bool:
+        slice_started = self._execution_timing.point()
+        # Each slice owns its timing map, while sharing the immutable price inputs.
+        execution_timing = dict(intent.context.details.get("execution_timing", {}))
+        execution_timing.update(slice_started_ns=slice_started.timestamp_ns)
+        intent.context.record(execution_timing=execution_timing)
         if (self.config.auction_enabled and self._auction_execution_active
                 and not self._within_auction_submit_time()):
             return False
@@ -3788,6 +3963,11 @@ class TargetQuantityStrategy(Strategy):
             **({"tags": ["opening_auction"]}
                if self.config.auction_enabled and self._auction_execution_active else {}),
         )
+        order_created = self._execution_timing.point()
+        execution_timing.update(
+            order_created_ns=order_created.timestamp_ns,
+            slice_prepare_duration_ns=order_created.monotonic_ns - slice_started.monotonic_ns,
+        )
         client_order_id = str(order.client_order_id)
         intent.context.record(order_id=client_order_id)
         replacement = intent.replacement
@@ -3803,6 +3983,7 @@ class TargetQuantityStrategy(Strategy):
             side=intent.side,
         )
         self._track_submitted_order(order, intent.context, lineage)
+        decision_started = self._execution_timing.point()
         submit_decision = self._emit_order_decision(
             trading_date=trading_date,
             intent_context=intent.context,
@@ -3819,11 +4000,30 @@ class TargetQuantityStrategy(Strategy):
             order_qty=quantity,
             order_price=intent.price,
         )
+        decision_finished = self._execution_timing.point()
         if self.config.auction_enabled and self._auction_execution_active:
             self._auction_attempted.add(str(intent.instrument_id))
+        submission_timing = {
+            "client_order_id": client_order_id,
+            "decision_id": submit_decision.decision_id,
+            "slice_index": slice_index,
+            "slice_count": slice_count,
+            "decision_emit_duration_ns": decision_finished.monotonic_ns - decision_started.monotonic_ns,
+        }
+        cycle = self._execution_timing.active
+        if cycle is not None:
+            cycle.context.setdefault("submissions", []).append(submission_timing)
+        submit_started = self._execution_timing.point()
+        submission_timing["submit_started_ns"] = submit_started.timestamp_ns
         try:
             self.submit_order(order)
         except Exception as exc:
+            submission_timing["status"] = "failed"
+            submit_finished = self._execution_timing.point()
+            submission_timing.update(
+                submit_finished_ns=submit_finished.timestamp_ns,
+                submit_duration_ns=submit_finished.monotonic_ns - submit_started.monotonic_ns,
+            )
             self._emit_order_decision(
                 trading_date=trading_date,
                 intent_context=intent.context,
@@ -3844,6 +4044,14 @@ class TargetQuantityStrategy(Strategy):
             self._forget_order_quote_state(client_order_id)
             self._order_decision_lineages.pop(client_order_id, None)
             raise
+        finally:
+            if "submit_finished_ns" not in submission_timing:
+                submit_finished = self._execution_timing.point()
+                submission_timing.update(
+                    submit_finished_ns=submit_finished.timestamp_ns,
+                    submit_duration_ns=submit_finished.monotonic_ns - submit_started.monotonic_ns,
+                )
+        submission_timing["status"] = "returned"
         if replacement is not None:
             pending = self._pending_replacements.get(str(intent.instrument_id))
             if (
@@ -4200,7 +4408,10 @@ class TargetQuantityStrategy(Strategy):
         max_age_secs: float,
         purpose: str,
         for_cancel: bool = False,
+        timing: dict[str, Any] | None = None,
     ) -> tuple[bool, str, float | None]:
+        if timing is not None:
+            timing["validation_started_ns"] = self._execution_timing.point().timestamp_ns
         instrument_id_text = str(ctx.instrument_id)
         ts_event = int(ctx.ts_event or 0)
         if ts_event <= 0:
@@ -4220,6 +4431,8 @@ class TargetQuantityStrategy(Strategy):
             return (False, "outside_execution_window", None)
 
         now_ns = int(self.clock.timestamp_ns())
+        if timing is not None:
+            timing["validation_ns"] = now_ns
         age_ns = now_ns - ts_event
         age_ms = age_ns / 1_000_000.0
         max_age_ns = int(float(max_age_secs) * 1_000_000_000)
@@ -4253,6 +4466,7 @@ class TargetQuantityStrategy(Strategy):
         instrument_id_text = str(instrument_id)
         tick = float(instrument.price_increment)
         book = self._book_snapshot(instrument_id)
+        captured = self._execution_timing.point()
         # QMT/BigQMT stock depth reports level volume in hands (手), while target
         # and order quantities are shares. Keep the captured book raw for market
         # diagnostics, but normalize the pricing context before walk-book compares
@@ -4272,6 +4486,13 @@ class TargetQuantityStrategy(Strategy):
             best_ask=book.best_ask,
             ts_event=book.ts_event,
             ts_init=book.ts_init,
+            observed_ns=book.observed_ns,
+            captured_ns=captured.timestamp_ns,
+            book_source=book.source,
+            observed_to_capture_ns=(
+                captured.monotonic_ns - book.observed_monotonic_ns
+                if book.observed_monotonic_ns is not None else None
+            ),
             bids=bids,
             asks=asks,
             price_return_bps=trend.price_return_bps,
@@ -4296,7 +4517,7 @@ class TargetQuantityStrategy(Strategy):
         except Exception:
             quote = None
         if quote is None:
-            return DepthBookSnapshot(bids=(), asks=(), ts_event=0, ts_init=0)
+            return DepthBookSnapshot(bids=(), asks=(), ts_event=0, ts_init=0, source="missing")
         try:
             bid_price = float(quote.bid_price)
             if bid_price > 0:
@@ -4309,11 +4530,17 @@ class TargetQuantityStrategy(Strategy):
                 best_ask = ask_price
         except Exception:
             pass
+        observation = self._quote_observations.get(str(instrument_id))
+        if observation is not None and observation[:2] != (int(quote.ts_event), int(quote.ts_init)):
+            observation = None
         return DepthBookSnapshot(
             bids=((best_bid, 0.0),) if best_bid is not None else (),
             asks=((best_ask, 0.0),) if best_ask is not None else (),
             ts_event=int(quote.ts_event),
             ts_init=int(quote.ts_init),
+            observed_ns=observation[2] if observation is not None else None,
+            observed_monotonic_ns=observation[3] if observation is not None else None,
+            source="quote",
         )
 
     def _book_snapshot(
@@ -4914,6 +5141,15 @@ class TargetQuantityStrategy(Strategy):
         except Exception:
             return date.today()
 
+    def _emit_convergence(self, event: ConvergenceEvent | None) -> None:
+        if event is None:
+            return
+        self.log.info(
+            "live_convergence " + json.dumps(
+                event.log_payload(str(self.id)), ensure_ascii=False, separators=(",", ":"),
+            ),
+        )
+
     def add_order_decision_listener(
         self,
         listener: Callable[[OrderDecisionEvent], None],
@@ -4965,6 +5201,12 @@ class TargetQuantityStrategy(Strategy):
         payload = dict(intent_context.snapshot())
         if context:
             payload.update(context)
+        # Copy the mutable per-intent timing map so later order slices cannot
+        # rewrite a decision that has already been emitted/enqueued.
+        payload["execution_timing"] = {
+            **payload.get("execution_timing", {}),
+            **self._execution_timing.decision_context(),
+        }
         timestamp_ns = int(decision_ns or self.clock.timestamp_ns())
         event = OrderDecisionEvent(
             decision_id=uuid.uuid4().hex,

@@ -9,6 +9,7 @@ snapshot recorder, reconciliation and monitoring are shared, unchanged.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -55,7 +56,7 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean value, got {value!r}")
 
 
-def _apply_bigqmt_args(args: Any) -> None:
+def _apply_bigqmt_args(args: Any, *, tick_trace_enabled: bool | None = None) -> None:
     """
     Attach Big QMT RPC-bridge transport settings to args from the environment.
 
@@ -77,6 +78,10 @@ def _apply_bigqmt_args(args: Any) -> None:
     args.rpc_timeout_secs = float(_env("BIGQMT_RPC_TIMEOUT_SECONDS", "30.0"))
     args.bigqmt_account_cash_offset = float(_env("BIGQMT_ACCOUNT_CASH_OFFSET", "0"))
     args.bigqmt_use_quote_push = _env_bool("BIGQMT_USE_QUOTE_PUSH", False)
+    args.bigqmt_tick_trace_enabled = (
+        _env_bool("BIGQMT_TICK_TRACE_ENABLED", False)
+        if tick_trace_enabled is None else tick_trace_enabled
+    )
     args.bigqmt_market_poll_enabled = _env_bool(
         "BIGQMT_MARKET_POLL_ENABLED",
         not args.bigqmt_use_quote_push,
@@ -98,6 +103,20 @@ def _apply_bigqmt_args(args: Any) -> None:
         args.account_id = _env("BIGQMT_ACCOUNT_ID", "")
 
 
+def _add_bigqmt_trace_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--bigqmt-tick-trace",
+        dest="bigqmt_tick_trace_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Publish and asynchronously log BigQMT tick timestamps. "
+            "Env: BIGQMT_TICK_TRACE_ENABLED (default off); CLI overrides env. "
+            "Requires the quote push feed."
+        ),
+    )
+
+
 def parse_args():
     original_argv = sys.argv[:]
     load_env(
@@ -113,7 +132,7 @@ def parse_args():
             os.environ["QMT_ACCOUNT_ID"] = bigqmt_account
     try:
         sys.argv = original_argv
-        args = legacy.parse_args()
+        args = legacy.parse_args(configure_parser=_add_bigqmt_trace_args)
     finally:
         sys.argv = original_argv
     args.log_file_name = _resolve_daily_log_file_name(args.log_file_name, args.exchange_timezone)
@@ -122,7 +141,7 @@ def parse_args():
     except ValueError as exc:
         raise SystemExit(f"invalid configured HH:MM time: {exc}") from exc
     _apply_snapshot_args(args)
-    _apply_bigqmt_args(args)
+    _apply_bigqmt_args(args, tick_trace_enabled=args.bigqmt_tick_trace_enabled)
     args.broker_name = "BigQMT"
     return args
 
@@ -160,6 +179,7 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
                 transport=args.transport,
                 rpc_timeout_secs=args.rpc_timeout_secs,
                 use_quote_push=args.bigqmt_use_quote_push,
+                tick_trace_enabled=args.bigqmt_tick_trace_enabled,
                 poll_enabled=args.bigqmt_market_poll_enabled,
                 poll_interval_secs=args.poll_interval_secs,
                 quote_push_stale_after_secs=args.bigqmt_quote_push_stale_secs,
@@ -191,7 +211,14 @@ def build_node(args: Any, loader: legacy.LivePredictionDataLoader):
             timeout_connection_secs=600.0,
         )
 
-    return build_target_model_node(args, loader, _make_venue_clients, _add_snapshot_recorder)
+    def _add_recorders(recorder_args: Any, node: Any, strategy: Any, *sources: Any) -> None:
+        _add_snapshot_recorder(recorder_args, node, strategy, *sources)
+        if recorder_args.bigqmt_tick_trace_enabled:
+            from lives.tick_trace_logging import BigQMTTickTraceLogger
+
+            node.trader.add_actor(BigQMTTickTraceLogger())
+
+    return build_target_model_node(args, loader, _make_venue_clients, _add_recorders)
 
 
 def main() -> None:
