@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from web import change_records, compare_presets
 from web import order_execution_report
 from web import trade_loss_report
+from web.realtime_minute_report import query_realtime_minutes
 from web.config import AppConfig, load_config
 from web.db import DataAccess, MySqlSource, NodeApiClient, jsonable, jsonable_rows, quote_literal
 from web.returns_report import (
@@ -1551,17 +1552,36 @@ def realtime_trade_loss(
 ) -> dict[str, Any]:
     """Fixed preopen rebalance quantities valued at each realtime minute close."""
     try:
-        return trade_loss_report.query_minute_trade_loss(
+        payload = trade_loss_report.query_minute_trade_loss(
             _mysql(data, source),
             data.clickhouse,
             account=account,
             trader=trader,
             trading_date=datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat(),
         )
+        payload["trades"] = data.attach_names(payload["trades"])
+        return payload
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/realtime/minutes")
+def realtime_minutes(
+    stock_code: str,
+    trade_date: str | None = None,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    day = trade_date or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    try:
+        payload = query_realtime_minutes(data.clickhouse, stock_code, day)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload["stock_name"] = data.resolve_names([payload["stock_code"]]).get(payload["stock_code"], "")
+    return payload
 
 
 @app.get("/api/control/state")
