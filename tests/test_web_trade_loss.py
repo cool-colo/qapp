@@ -232,6 +232,9 @@ def test_endpoint_uses_shanghai_day_and_source_without_a_node_api():
             assert source == "simulation"
             return self.reader
 
+        def attach_names(self, rows):
+            return [{**row, "stock_name": "测试股票"} for row in rows]
+
     data = FakeData()
     with patch("web.app.datetime") as clock:
         clock.now.return_value = datetime(2026, 11, 13, 0, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -239,3 +242,37 @@ def test_endpoint_uses_shanghai_day_and_source_without_a_node_api():
         clock.now.assert_called_once_with(ZoneInfo("Asia/Shanghai"))
     assert result["trade_date"] == "2026-11-13"
     assert result["stock_count"] == 3
+    assert result["trades"][0]["stock_name"] == "测试股票"
+
+
+def test_stock_weights_include_both_sides_and_contributions_sum_to_total():
+    result = build_minute_trade_loss(build_preopen_trade_book(TARGETS, POSITIONS), MINUTES)
+    stocks = {stock["stock_code"]: stock for stock in result["stock_series"]}
+    assert sum(stock["weight"] for stock in stocks.values()) == pytest.approx(1)
+    assert stocks["000001.SZ"]["weight"] == pytest.approx(1000 / 4500)
+    assert stocks["300002.SZ"]["weight"] == pytest.approx(1500 / 4500)
+    assert stocks["600000.SH"]["weight"] == pytest.approx(2000 / 4500)
+    assert stocks["000001.SZ"]["points"][0]["price_change_bps"] == 1000
+    assert stocks["600000.SH"]["points"][0]["price_change_bps"] == -1000
+    assert stocks["600000.SH"]["points"][0]["weighted_loss_bps"] == pytest.approx(2000 / 4500 * 1000)
+    for index, total in enumerate(result["points"]):
+        assert sum(stock["points"][index]["weighted_loss_bps"] for stock in stocks.values()) == pytest.approx(total["loss_bps"])
+
+
+def test_missing_stock_minute_preserves_other_weights_and_contributions():
+    minutes = [row for row in MINUTES if not (row["order_book_id"] == "300002.XSHE" and "09:32" in row["ts"])]
+    result = build_minute_trade_loss(build_preopen_trade_book(TARGETS, POSITIONS), minutes)
+    stocks = {stock["stock_code"]: stock for stock in result["stock_series"]}
+    assert result["points"][1]["loss_bps"] is None
+    assert stocks["300002.SZ"]["points"][1]["weighted_loss_bps"] is None
+    assert stocks["000001.SZ"]["points"][1]["weighted_loss_bps"] == pytest.approx(-1000 * 1000 / 4500)
+    assert stocks["000001.SZ"]["weight"] == pytest.approx(1000 / 4500)
+
+
+def test_missing_open_keeps_individual_raw_bp_but_never_reweights_remaining_stocks():
+    minutes = [row for row in MINUTES if row["order_book_id"] != "300002.XSHE"]
+    result = build_minute_trade_loss(build_preopen_trade_book(TARGETS, POSITIONS), minutes)
+    assert all(stock["weight"] is None for stock in result["stock_series"])
+    buy = result["stock_series"][0]
+    assert buy["points"][0]["price_change_bps"] == 1000
+    assert buy["points"][0]["weighted_loss_bps"] is None

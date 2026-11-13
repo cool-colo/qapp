@@ -22,8 +22,13 @@ A local, read-only dashboard for the live trading data this repo persists:
   prices leave gaps rather than changing the book or denominator. Missing preopen
   snapshots are shown explicitly; an empty position book requires a zero-market-value
   preopen asset snapshot. The curve loads independently of the live-node view.
+  Two checkboxes overlay each stock's price change bp (right axis) and its weighted,
+  side-aware contribution to total loss bp (left axis). The stock picker changes
+  visibility only: weights always use all planned buy and sell opening notionals.
+  Weighted contributions sum to the total curve, including stop-loss exits.
 - **按日快照** — asset / positions / target portfolio / orders / trades for a chosen
-  date + phase. Each stock row links to its **个股 K 线** view.
+  date + phase. Hovering or clicking a stock code opens a menu for **个股 K 线**
+  and **实时分钟线**; keyboard focus supports the same menu.
 - **随时间** — time series: pick one or more metrics from a checkbox list (asset
   columns or return-report columns) and a date range; x = date, one line per selected
   column. Rate columns move to a right-hand % axis when mixed with magnitude columns,
@@ -36,6 +41,10 @@ A local, read-only dashboard for the live trading data this repo persists:
   account's **buy (red ↑) / sell (green ↓)** fills overlaid as markers. Changing a date
   or the 显示买卖点 option redraws right away (as it does in **对比**, where a date change
   re-plots whenever at least one series is added).
+- **实时分钟线** — minute close-price line or minute candles from
+  `ricequant_stock_minute_realtime`, with market volume below and opening-price bp
+  in the tooltip. The page defaults to today in Asia/Shanghai, supports a date
+  selector and optional 15-second refresh, and is available without a live-node API.
 - **委托执行** — broker-authoritative `live_order`/`live_trade` records overlaid with
   local Nautilus lifecycle events and RiceQuant minute/tick prices. A checkbox
   multi-select controls minute candles, tick/BBO, broker orders/trades, and local
@@ -158,7 +167,8 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/realtime/trade-summary` | `source, account, trader` |
 | `GET /api/realtime/positions` | `account, trader` |
 | `GET /api/realtime/pending-trades` | `account, trader` |
-| `GET /api/realtime/trade-loss` | `source, account, trader` (today in Asia/Shanghai) |
+| `GET /api/realtime/trade-loss` | `source, account, trader` (today in Asia/Shanghai; aggregate and per-stock bp/weights) |
+| `GET /api/realtime/minutes` | `stock_code, trade_date?` (default today in Asia/Shanghai) |
 | `GET /api/strategy/targets` | `account, trader` |
 | `GET /api/control/state` | `account, trader` |
 | `POST /api/control/suspend` | `account, trader` |

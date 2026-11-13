@@ -47,6 +47,7 @@
         <button class="nav-item" data-tab="compare">对比</button>
         <button class="nav-item" data-tab="orderexec">委托执行</button>
         <button class="nav-item" data-tab="kline">个股 K 线</button>
+        <button class="nav-item" data-tab="minute">实时分钟线</button>
         <button class="nav-item" data-tab="rline">信号R线</button>
         <button class="nav-item" data-tab="changes">变更记录</button>
         <div class="nav-group" data-group="control">
@@ -241,6 +242,21 @@
         <div id="kline-chart" class="chart chart-tall"></div>
       </section>
 
+      <section id="tab-minute" class="tab-panel">
+        <div class="subbar">
+          <div class="subbar-controls">
+            <button id="minute-back" class="back-btn" hidden>← 返回</button>
+            <label>股票代码 <input type="text" id="minute-code" placeholder="000001.SZ" /></label>
+            <label>日期 <input type="date" id="minute-date" /></label>
+            <label class="inline"><input type="checkbox" id="minute-candles" /> 分钟 K 线</label>
+            <button id="minute-refresh">刷新</button>
+            <label class="inline"><input type="checkbox" id="minute-auto" checked /> 自动刷新(15s)</label>
+          </div>
+        </div>
+        <div id="minute-meta" class="trade-summary-meta"></div>
+        <div id="minute-chart" class="chart chart-tall"></div>
+      </section>
+
       <!-- ============ 信号R线 tab (per-stock signal rank/score) ============ -->
       <section id="tab-rline" class="tab-panel">
         <div class="subbar">
@@ -304,6 +320,18 @@
           <div class="pending-section-title">盘前计划交易损失（bp）</div>
           <div class="pending-loss-note">固定交易数量＝盘前目标－盘前持仓；盘前持有但不在目标中的股票按清仓计算，成交后仍纳入估算。<br />损失 bp＝[买入数量×（分钟收盘价－开盘价）＋卖出数量×（开盘价－分钟收盘价）] / 买卖开盘总金额×10000。正值表示损失，负值表示价格改善。</div>
           <div id="rt-trade-loss-meta" class="trade-summary-meta"></div>
+          <div class="subbar trade-loss-controls">
+            <div class="subbar-controls">
+              <label class="inline"><input type="checkbox" id="rt-loss-raw" /> 逐股价格变动 bp（右轴）</label>
+              <label class="inline"><input type="checkbox" id="rt-loss-weighted" /> 逐股加权损失贡献 bp</label>
+              <div class="multi-select" id="rt-loss-stocks-ms">
+                <button type="button" id="rt-loss-stocks-toggle">选择股票</button>
+                <div class="ms-panel" id="rt-loss-stocks-panel"></div>
+              </div>
+              <span class="hint">权重＝单股开盘交易金额 / 全部计划买卖开盘总额，选择展示股票不会改变权重。</span>
+            </div>
+          </div>
+          <div class="pending-loss-note">价格变动 bp＝（分钟收盘价 / 开盘价－1）×10000；加权贡献＝价格变动 bp×权重，卖出取反。全部股票的加权贡献之和等于总损失 bp。</div>
           <div id="rt-trade-loss-chart" class="chart"></div>
           <div id="rt-pending-stocks" hidden>
             <div class="pending-section-title">待交易股票</div>
@@ -485,6 +513,7 @@
 
   <div id="toast"></div>
   <script src="/stock_hover.js"></script>
+  <script src="/stock_menu.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

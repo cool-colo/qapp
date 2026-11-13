@@ -234,6 +234,7 @@ function refreshActiveTab() {
   else if (tab === "compare") { if (cmpSeries.length) plotCompare(); }
   else if (tab === "orderexec") { if ($("#oe-code").value.trim()) plotOrderExecution(); }
   else if (tab === "kline") { if ($("#kline-code").value.trim()) plotKline(); }
+  else if (tab === "minute") plotRealtimeMinute(true);
   else if (tab === "rline") { if ($("#rline-code").value.trim()) plotRline(); }
   else if (tab === "realtime") loadRealtime();
   else if (tab === "stratinfo") loadStratInfo();
@@ -294,6 +295,7 @@ function activateNavItem(btn, { load = true } = {}) {
     else if (tab === "control") { loadControl(); loadTargets(); }
     else if (tab === "dqc") loadDqc();
     else if (tab === "changes") loadChangeRecords();
+    else if (tab === "minute") plotRealtimeMinute(true);
   }
   setTimeout(resizeCharts, 0);
 }
@@ -367,6 +369,7 @@ function captureJumpOrigin() {
 function updateBackButtons() {
   $("#kline-back").hidden = !jumpOrigin;
   $("#rline-back").hidden = !jumpOrigin;
+  $("#minute-back").hidden = !jumpOrigin;
 }
 function goBackFromChart() {
   const origin = jumpOrigin;
@@ -381,6 +384,7 @@ function goBackFromChart() {
 }
 $("#kline-back").addEventListener("click", goBackFromChart);
 $("#rline-back").addEventListener("click", goBackFromChart);
+$("#minute-back").addEventListener("click", goBackFromChart);
 
 // Sidebar collapse / expand.
 $("#sidebar-toggle").addEventListener("click", () => {
@@ -501,7 +505,8 @@ function renderTable(container, rows, opts = {}) {
     // row.stock_code (present on every linkable row via attach_names).
     if (allowLink && linkStock && row && row.stock_code) {
       if (c === "stock_code") {
-        disp = `<a class="klink" data-code="${row.stock_code}">${disp || row.stock_code}</a>`;
+        const stockDate = String(opts.stockInfoDate || row.trade_date || "").slice(0, 10);
+        disp = `<a class="klink" role="button" tabindex="0" aria-haspopup="menu" aria-expanded="false" data-code="${escapeHtml(row.stock_code)}" data-stock-date="${escapeHtml(stockDate)}">${disp || escapeHtml(row.stock_code)}</a>`;
       } else if (c === "stock_name" || c === "name") {
         const stockDate = String(opts.stockInfoDate || row.trade_date || "").slice(0, 10);
         disp = `<a class="rlink stock-hover-trigger" data-code="${row.stock_code}" data-stock-date="${stockDate}">${disp || row.stock_code}</a>`;
@@ -584,8 +589,7 @@ function renderTable(container, rows, opts = {}) {
     table.querySelectorAll("th .filter-btn").forEach((btn) => {
       btn.parentElement.classList.toggle("has-filter", filterActive(state.filters[btn.dataset.filterCol]));
     });
-    // 6. rebind row-level handlers (klinks always; caller extras via onRender)
-    el.querySelectorAll("a.klink").forEach((a) => a.addEventListener("click", () => openKline(a.dataset.code)));
+    // Stock-code menus use delegated handlers; names still open signal charts.
     el.querySelectorAll("a.rlink").forEach((a) => a.addEventListener("click", () => openRline(a.dataset.code)));
     if (opts.onRender) opts.onRender(el);
   }
@@ -2007,10 +2011,10 @@ function defaultKlineRange() {
 }
 // Jumping from a snapshot link: anchor the window on the snapshot's date —
 // end = that date, start = 6 months before it.
-function openKline(stockCode) {
+function openKline(stockCode, tradingDate = null) {
   captureJumpOrigin();
   $("#kline-code").value = stockCode;
-  const anchor = $("#snap-date").value;
+  const anchor = tradingDate || $("#snap-date").value;
   if (anchor) {
     $("#kline-end").value = anchor;
     $("#kline-start").value = monthsBefore(anchor, 6);
@@ -2179,6 +2183,122 @@ $("#kline-plot").addEventListener("click", () => plotKline());
   $(sel).addEventListener("change", () => plotKline(true));
 });
 $("#kline-marks").addEventListener("change", () => plotKline(true));
+
+// ---------------------------------------------------------------------------
+// Realtime minute tab — independent minute prices and market volume
+// ---------------------------------------------------------------------------
+let realtimeMinuteData = null, realtimeMinuteDraw = 0;
+function shanghaiTodayISO() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+}
+function emptyChart(id, message) {
+  getChart(id).setOption({ title: { text: message, left: "center", top: "center", textStyle: { fontSize: 14, color: "#9ca3af" } } }, true);
+}
+function openRealtimeMinute(stockCode) {
+  captureJumpOrigin();
+  $("#minute-code").value = stockCode;
+  $("#minute-date").value = shanghaiTodayISO();
+  $$(".nav-group").forEach((group) => group.classList.remove("open"));
+  $$(".nav-item").forEach((button) => button.classList.remove("active"));
+  $$(".tab-panel").forEach((panel) => panel.classList.remove("active"));
+  document.querySelector('.nav-item[data-tab="minute"]').classList.add("active");
+  $("#tab-minute").classList.add("active");
+  updateBackButtons();
+  setTimeout(plotRealtimeMinute, 0);
+}
+function renderRealtimeMinute(payload) {
+  const bars = payload.bars || [];
+  const last = bars.filter((bar) => bar.close !== null).at(-1);
+  $("#minute-meta").textContent = `${payload.stock_name || ""} ${payload.stock_code} · ${payload.trade_date}` +
+    ` · 开盘 ${fmt(payload.open_price)}` +
+    (last ? ` · ${last.ts.slice(11, 16)} 收盘 ${fmt(last.close)} · 较开盘 ${fmt(last.price_change_bps)} bp` : "");
+  if (!bars.length) { emptyChart("minute-chart", "暂无该日实时分钟行情"); return; }
+  const byTime = new Map(bars.map((bar) => [bar.ts.slice(11, 16), bar]));
+  const times = [];
+  for (const [start, end] of [[9 * 60 + 31, 11 * 60 + 30], [13 * 60 + 1, 15 * 60]]) {
+    for (let minute = start; minute <= end; minute++) {
+      times.push(`${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`);
+    }
+  }
+  if (byTime.has("09:30")) times.unshift("09:30");
+  if (byTime.has("13:00")) times.splice(times.indexOf("13:01"), 0, "13:00");
+  const candles = $("#minute-candles").checked;
+  const priceSeries = candles ? {
+    name: "分钟 K 线", type: "candlestick",
+    data: times.map((ts) => {
+      const bar = byTime.get(ts);
+      return bar ? [bar.open, bar.close, bar.low, bar.high].map((value) => value === null ? "-" : value) : ["-", "-", "-", "-"];
+    }),
+    itemStyle: { color: "#ef5350", color0: "#26a69a", borderColor: "#ef5350", borderColor0: "#26a69a" },
+  } : {
+    name: "分钟收盘价", type: "line", showSymbol: false, connectNulls: false,
+    data: times.map((ts) => byTime.get(ts)?.close ?? null), lineStyle: { width: 2, color: "#4c8dff" },
+  };
+  if (payload.open_price !== null) priceSeries.markLine = {
+    silent: true, symbol: "none", data: [{ name: "开盘价", yAxis: payload.open_price }],
+    label: { formatter: "开盘 {c}" }, lineStyle: { color: "#9ca3af", type: "dashed" },
+  };
+  getChart("minute-chart").setOption({
+    animation: false,
+    tooltip: {
+      trigger: "axis", axisPointer: { type: "cross" },
+      formatter: (items) => {
+        if (!items.length) return "";
+        const ts = times[items[0].dataIndex], bar = byTime.get(ts);
+        if (!bar) return `${ts}<br>暂无分钟行情`;
+        return `${escapeHtml(payload.stock_name || payload.stock_code)} · ${payload.trade_date} ${ts}` +
+          `<br>开 ${fmt(bar.open)} · 高 ${fmt(bar.high)} · 低 ${fmt(bar.low)} · 收 ${fmt(bar.close)}` +
+          `<br>较当日开盘 ${fmt(bar.price_change_bps)} bp` +
+          `<br>成交量 ${fmt(bar.volume)} 股 · 成交额 ${fmt(bar.total_turnover)} 元`;
+      },
+    },
+    axisPointer: { link: [{ xAxisIndex: "all" }] },
+    grid: [{ left: 75, right: 65, top: 40, height: "59%" }, { left: 75, right: 65, top: "74%", height: "13%" }],
+    xAxis: [
+      { type: "category", data: times, boundaryGap: candles, axisLabel: { show: false } },
+      { type: "category", data: times, gridIndex: 1, boundaryGap: candles },
+    ],
+    yAxis: [{ type: "value", scale: true, name: "价格（元）" }, { type: "value", gridIndex: 1, name: "成交量（股）", splitNumber: 2 }],
+    dataZoom: [{ type: "inside", xAxisIndex: [0, 1] }, { type: "slider", xAxisIndex: [0, 1], bottom: 10 }],
+    series: [priceSeries, {
+      name: "成交量", type: "bar", xAxisIndex: 1, yAxisIndex: 1,
+      data: times.map((ts) => {
+        const bar = byTime.get(ts);
+        return { value: bar?.volume ?? null, itemStyle: { color: bar && bar.close >= bar.open ? "#ef535088" : "#26a69a88" } };
+      }),
+    }],
+  }, true);
+}
+async function plotRealtimeMinute(auto = false) {
+  const draw = ++realtimeMinuteDraw;
+  const code = $("#minute-code").value.trim(), day = $("#minute-date").value;
+  if (!code || !day) {
+    realtimeMinuteData = null;
+    $("#minute-meta").textContent = "";
+    emptyChart("minute-chart", "请输入股票代码并选择日期");
+    if (!auto) toast("请填写股票代码与日期");
+    return;
+  }
+  try {
+    const payload = await api("/api/realtime/minutes", { stock_code: code, trade_date: day });
+    if (draw !== realtimeMinuteDraw) return;
+    realtimeMinuteData = payload;
+    renderRealtimeMinute(payload);
+  } catch (error) {
+    if (draw !== realtimeMinuteDraw) return;
+    realtimeMinuteData = null;
+    $("#minute-meta").textContent = "";
+    emptyChart("minute-chart", "实时分钟行情获取失败");
+    toast(error.message);
+  }
+}
+$("#minute-date").value = shanghaiTodayISO();
+$("#minute-refresh").addEventListener("click", () => plotRealtimeMinute());
+["#minute-code", "#minute-date"].forEach((selector) => $(selector).addEventListener("change", () => plotRealtimeMinute(true)));
+$("#minute-candles").addEventListener("change", () => { if (realtimeMinuteData) renderRealtimeMinute(realtimeMinuteData); });
+setInterval(() => {
+  if ($("#tab-minute").classList.contains("active") && $("#minute-auto").checked && $("#minute-code").value.trim()) plotRealtimeMinute(true);
+}, 15000);
 
 // ---------------------------------------------------------------------------
 // 信号R线 tab — per-stock daily signal rank/score with buy/sell markers
@@ -2660,16 +2780,39 @@ function renderPendingTradeProjection(payload) {
   });
 }
 
+const minuteLossView = { key: null, selected: new Set(), payload: null };
+const STOCK_LINE_COLORS = ["#4c8dff", "#26a69a", "#ef5350", "#ab8bea", "#f4a261", "#6ec6d5", "#e78ac3", "#a6d854", "#e5c494", "#80b1d3"];
+function updateLossStockPicker(payload) {
+  const stocks = payload ? payload.stock_series || [] : [];
+  const names = new Map((payload ? payload.trades || [] : []).map((trade) => [trade.stock_code, trade.stock_name || trade.name || ""]));
+  $("#rt-loss-stocks-panel").innerHTML = `<div class="ms-list">${stocks.map((stock) =>
+    `<label class="ms-opt"><input type="checkbox" value="${escapeHtml(stock.stock_code)}" ${minuteLossView.selected.has(stock.stock_code) ? "checked" : ""}/>` +
+    `<span>${stock.side === "BUY" ? "买入" : "卖出"} ${escapeHtml(names.get(stock.stock_code) || "")} ${escapeHtml(stock.stock_code)}` +
+    `<small>计划 ${fmt(stock.trade_qty)} 股 · 权重 ${pct(stock.weight)}</small></span></label>`
+  ).join("")}</div><div class="ms-actions"><button type="button" data-act="all">全选</button><button type="button" data-act="none">清空</button></div>`;
+  $("#rt-loss-stocks-toggle").textContent = `展示股票 ${stocks.filter((stock) => minuteLossView.selected.has(stock.stock_code)).length}/${stocks.length}`;
+}
+
 function renderMinuteTradeLoss(payload, error = null) {
   const chart = getChart("rt-trade-loss-chart");
   const meta = $("#rt-trade-loss-meta");
+  const key = payload && state.account ? `${state.source}|${accountKey(state.account)}|${payload.trade_date}` : null;
+  const sameBook = key === minuteLossView.key;
+  if (!sameBook || !(minuteLossView.payload?.stock_series || []).length) minuteLossView.selected = new Set((payload ? payload.stock_series || [] : []).map((stock) => stock.stock_code));
+  minuteLossView.key = key;
+  minuteLossView.payload = payload;
+  updateLossStockPicker(payload);
+  const raw = $("#rt-loss-raw").checked, weighted = $("#rt-loss-weighted").checked;
   const statusMessages = {
     missing_preopen_target: "暂无当天盘前目标快照",
     missing_preopen_positions: "暂无当天盘前持仓快照",
     no_trades: "盘前目标与持仓一致，无计划交易",
   };
   const points = payload ? payload.points || [] : [];
-  const hasValues = points.some((point) => point.loss_bps !== null);
+  const stocks = payload ? payload.stock_series || [] : [];
+  const hasValues = points.some((point) => point.loss_bps !== null) || stocks.some((stock) =>
+    minuteLossView.selected.has(stock.stock_code) && stock.points.some((point) =>
+      raw && point.price_change_bps !== null || weighted && point.weighted_loss_bps !== null));
   if (error || !payload || statusMessages[payload.status] || !hasValues) {
     meta.textContent = payload
       ? `交易日 ${payload.trade_date} · 固定清单 ${payload.stock_count} 只`
@@ -2685,32 +2828,86 @@ function renderMinuteTradeLoss(payload, error = null) {
   const latest = points.filter((point) => point.loss_bps !== null).at(-1);
   const gaps = points.filter((point) => point.loss_bps === null).length;
   meta.textContent = `交易日 ${payload.trade_date} · 固定买入 ${payload.buy_count} 只 / 卖出 ${payload.sell_count} 只` +
-    ` · 开盘交易总额 ${fmt(payload.open_amount)} · ${latest.ts.slice(11, 16)} 损失 ${fmt(latest.loss_bps)} bp` +
+    ` · 开盘交易总额 ${fmt(payload.open_amount)}` +
+    (latest ? ` · ${latest.ts.slice(11, 16)} 损失 ${fmt(latest.loss_bps)} bp` : " · 总损失暂无完整行情") +
     (gaps ? ` · ${gaps} 个分钟缺价，曲线留空` : "");
+  const series = [{
+    name: "总交易损失", type: "line", showSymbol: false, connectNulls: false,
+    data: points.map((point) => point.loss_bps),
+    lineStyle: { width: 3, color: "#f5a524" }, itemStyle: { color: "#f5a524" },
+    markLine: { silent: true, symbol: "none", label: { show: false }, data: [{ yAxis: 0 }] },
+  }];
+  const details = new Map();
+  const names = new Map((payload.trades || []).map((trade) => [trade.stock_code, trade.stock_name || trade.name || ""]));
+  stocks.forEach((stock, index) => {
+    if (!minuteLossView.selected.has(stock.stock_code)) return;
+    const label = `${names.get(stock.stock_code) || ""} ${stock.stock_code} ${stock.side === "BUY" ? "买" : "卖"}`.trim();
+    const color = STOCK_LINE_COLORS[index % STOCK_LINE_COLORS.length];
+    for (const [enabled, field, suffix, axis] of [[raw, "price_change_bps", "价格变动", 1], [weighted, "weighted_loss_bps", "加权贡献", 0]]) {
+      if (!enabled) continue;
+      const name = `${label} · ${suffix}`;
+      details.set(name, stock);
+      series.push({
+        name, type: "line", showSymbol: false, connectNulls: false, yAxisIndex: axis,
+        data: stock.points.map((point) => point[field]),
+        lineStyle: { width: 1.5, type: axis === 1 ? "dashed" : "solid", color }, itemStyle: { color },
+      });
+    }
+  });
+  const zoom = sameBook ? chart.getOption().dataZoom || [] : [];
   chart.setOption({
+    animation: false,
+    legend: { type: "scroll", top: 8, data: series.map((line) => line.name) },
     tooltip: {
       trigger: "axis",
       formatter: (items) => {
         if (!items.length) return "";
         const point = points[items[0].dataIndex];
-        if (point.loss_bps === null) return `${escapeHtml(point.ts)}<br>缺价：${point.priced_count}/${payload.stock_count} 只有效行情`;
-        return `${escapeHtml(point.ts)}<br>交易损失：${fmt(point.loss_bps)} bp` +
-          `<br>损失金额：${fmt(point.loss_amount)}` +
-          `<br>买入损失：${fmt(point.buy_loss_amount)} · 卖出损失：${fmt(point.sell_loss_amount)}`;
+        const heading = point.loss_bps === null
+          ? `${escapeHtml(point.ts)}<br>缺价：${point.priced_count}/${payload.stock_count} 只有效行情`
+          : `${escapeHtml(point.ts)}<br>总交易损失：${fmt(point.loss_bps)} bp · ${fmt(point.loss_amount)} 元`;
+        const lines = items.filter((item) => details.has(item.seriesName)).sort((a, b) => Math.abs(Number(b.value)) - Math.abs(Number(a.value)));
+        return heading + lines.map((item) => {
+          const stock = details.get(item.seriesName), value = stock.points[item.dataIndex];
+          return `<br>${item.marker}${escapeHtml(item.seriesName)}：${fmt(item.value)} bp` +
+            `（收盘 ${fmt(value.close)}，开盘 ${fmt(stock.open_price)}，权重 ${pct(stock.weight)}）`;
+        }).join("");
       },
     },
-    grid: { left: 75, right: 35, top: 35, bottom: 75 },
+    grid: { left: 85, right: raw ? 95 : 35, top: 65, bottom: 75 },
     xAxis: { type: "category", data: points.map((point) => point.ts.slice(11, 16)), boundaryGap: false },
-    yAxis: { type: "value", name: "交易损失 (bp)", axisLabel: { formatter: "{value} bp" } },
-    dataZoom: [{ type: "inside" }, { type: "slider", bottom: 15 }],
-    series: [{
-      name: "交易损失", type: "line", showSymbol: false, connectNulls: false,
-      data: points.map((point) => point.loss_bps),
-      lineStyle: { width: 2, color: "#f5a524" }, itemStyle: { color: "#f5a524" },
-      markLine: { silent: true, symbol: "none", label: { show: false }, data: [{ yAxis: 0 }] },
-    }],
+    yAxis: [
+      { type: "value", name: "损失 / 贡献 (bp)", axisLabel: { formatter: "{value} bp" } },
+      { type: "value", name: "价格变动 (bp)", position: "right", show: raw, axisLabel: { formatter: "{value} bp" }, splitLine: { show: false } },
+    ],
+    dataZoom: [
+      { type: "inside", start: zoom[0]?.start ?? 0, end: zoom[0]?.end ?? 100 },
+      { type: "slider", bottom: 15, start: zoom[0]?.start ?? 0, end: zoom[0]?.end ?? 100 },
+    ],
+    series,
   }, true);
 }
+
+$("#rt-loss-stocks-toggle").addEventListener("click", (event) => {
+  event.stopPropagation(); $("#rt-loss-stocks-ms").classList.toggle("open");
+});
+$("#rt-loss-stocks-panel").addEventListener("change", () => {
+  minuteLossView.selected = new Set($$("#rt-loss-stocks-panel input:checked").map((input) => input.value));
+  if (minuteLossView.payload) renderMinuteTradeLoss(minuteLossView.payload);
+});
+$("#rt-loss-stocks-panel").addEventListener("click", (event) => {
+  const act = event.target.dataset.act;
+  if (!act) return;
+  event.preventDefault();
+  minuteLossView.selected = new Set(act === "all" ? (minuteLossView.payload?.stock_series || []).map((stock) => stock.stock_code) : []);
+  if (minuteLossView.payload) renderMinuteTradeLoss(minuteLossView.payload);
+});
+["#rt-loss-raw", "#rt-loss-weighted"].forEach((selector) => $(selector).addEventListener("change", () => {
+  if (minuteLossView.payload) renderMinuteTradeLoss(minuteLossView.payload);
+}));
+document.addEventListener("click", (event) => {
+  if (!event.composedPath().includes($("#rt-loss-stocks-ms"))) $("#rt-loss-stocks-ms").classList.remove("open");
+});
 
 function pendingAccountMatches(params) {
   return state.account && params.source === state.source &&

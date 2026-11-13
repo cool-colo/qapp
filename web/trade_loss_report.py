@@ -126,6 +126,18 @@ def build_minute_trade_loss(
          for symbol, trade in symbols.items() if symbol in opening_prices),
         Decimal(0),
     ) if not missing_open else None
+    stock_series = {}
+    for symbol, trade in symbols.items():
+        opening = opening_prices.get(symbol)
+        amount = opening * trade["trade_qty"] if opening is not None else None
+        weight = amount / opening_notional if amount is not None and opening_notional else None
+        stock_series[symbol] = {
+            **trade,
+            "open_price": float(opening) if opening is not None else None,
+            "open_amount": float(amount) if amount is not None else None,
+            "weight": float(weight) if weight is not None else None,
+            "points": [],
+        }
     timestamps = sorted({ts for rows in bars.values() for ts in rows})
     timeline = []
     if timestamps:
@@ -144,6 +156,20 @@ def build_minute_trade_loss(
             bar = bars[symbol].get(ts)
             close = _price(bar["close"]) if bar else None
             opening = opening_prices.get(symbol)
+            priced = close is not None and opening is not None
+            signed_loss = (close - opening) * trade["trade_qty"] if priced else None
+            if signed_loss is not None and trade["side"] == "SELL":
+                signed_loss = -signed_loss
+            stock_series[symbol]["points"].append({
+                "ts": ts,
+                "close": float(close) if close is not None else None,
+                "price_change_bps": float((close / opening - 1) * 10_000) if priced else None,
+                "weighted_loss_bps": (
+                    float(signed_loss / opening_notional * 10_000)
+                    if signed_loss is not None and opening_notional else None
+                ),
+                "loss_amount": float(signed_loss) if signed_loss is not None else None,
+            })
             if close is None or opening is None:
                 continue
             loss = (close - opening) * trade["trade_qty"]
@@ -171,6 +197,7 @@ def build_minute_trade_loss(
         "missing_open_stock_codes": missing_open,
         "missing_minute_stock_codes": missing_minutes,
         "points": points,
+        "stock_series": list(stock_series.values()),
     }
 
 
