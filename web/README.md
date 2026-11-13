@@ -11,7 +11,17 @@ A local, read-only dashboard for the live trading data this repo persists:
   versus today's open, including side-aware loss amount and open/current-notional
   loss rates. It requests only those stock codes from the node's generic
   `/realtime/ticks?stock_codes=...` API, backed by the per-second strategy market
-  snapshot; it does not download the whole-market snapshot.
+  snapshot; it does not download the whole-market snapshot. Below it, a minute-level
+  **盘前计划交易损失（bp）** curve uses a fixed book: today's `before_trading`
+  `live_target_portfolio.target_qty` minus `live_position_snapshot.volume`, taking
+  the union of both stock sets. Holdings absent from the targets are full sells,
+  including stop-loss exits. Completed trades and live target changes never remove
+  stocks from this curve. Each minute's `close` from `ricequant_stock_minute_realtime`
+  is compared with the opening bar's `open`; loss bp uses the constant gross opening
+  buy-plus-sell notional. The latest whole observation is selected per minute; missing
+  prices leave gaps rather than changing the book or denominator. Missing preopen
+  snapshots are shown explicitly; an empty position book requires a zero-market-value
+  preopen asset snapshot. The curve loads independently of the live-node view.
 - **按日快照** — asset / positions / target portfolio / orders / trades for a chosen
   date + phase. Each stock row links to its **个股 K 线** view.
 - **随时间** — time series: pick one or more metrics from a checkbox list (asset
@@ -148,6 +158,7 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/realtime/trade-summary` | `source, account, trader` |
 | `GET /api/realtime/positions` | `account, trader` |
 | `GET /api/realtime/pending-trades` | `account, trader` |
+| `GET /api/realtime/trade-loss` | `source, account, trader` (today in Asia/Shanghai) |
 | `GET /api/strategy/targets` | `account, trader` |
 | `GET /api/control/state` | `account, trader` |
 | `POST /api/control/suspend` | `account, trader` |
