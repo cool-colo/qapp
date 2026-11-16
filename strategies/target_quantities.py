@@ -5144,11 +5144,11 @@ class TargetQuantityStrategy(Strategy):
     def _emit_convergence(self, event: ConvergenceEvent | None) -> None:
         if event is None:
             return
-        self.log.info(
-            "live_convergence " + json.dumps(
-                event.log_payload(str(self.id)), ensure_ascii=False, separators=(",", ":"),
-            ),
-        )
+        # self.log.info(
+        #     "live_convergence " + json.dumps(
+        #         event.log_payload(str(self.id)), ensure_ascii=False, separators=(",", ":"),
+        #     ),
+        # )
 
     def add_order_decision_listener(
         self,

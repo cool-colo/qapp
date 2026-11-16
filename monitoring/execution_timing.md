@@ -138,7 +138,7 @@ ORDER BY decision_ns;
 再用得到的 ID 搜索日志：
 
 ```bash
-rg -F '"convergence_id":"CONVERGENCE_ID"' logs/
+rg --no-ignore -F '"convergence_id":"CONVERGENCE_ID"' logs/
 ```
 
 反向关联时，在上面的 SQL 中添加：

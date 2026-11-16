@@ -19,8 +19,8 @@ def validate_auction_config(config: Any) -> None:
     prepare = auction_time(config.auction_prepare_time)
     submit = auction_time(config.auction_submit_time)
     cutoff = auction_time(config.auction_submit_cutoff)
-    if not time(9, 20) <= prepare < submit < cutoff < time(9, 25):
-        raise ValueError("Auction times must satisfy 09:20 <= prepare < submit < cutoff < 09:25")
+    if not time(9, 15) <= prepare < submit < cutoff < time(9, 25):
+        raise ValueError("Auction times must satisfy 09:15 <= prepare < submit < cutoff < 09:25")
     for name, value in (
         ("auction_reference_max_age_secs", config.auction_reference_max_age_secs),
         ("auction_buy_offset_bps", config.auction_buy_offset_bps),

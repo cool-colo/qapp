@@ -86,8 +86,8 @@ preopen_latency_fixed_advance_ms: 50
 # Auction submissions use their own window; continuous orders obey execution_windows.
 # Indicative prices require fresh equal best bid/ask levels; no cancels before 09:30.
 auction_enabled: true
-auction_prepare_time: "09:24:01"
-auction_submit_time: "09:24:50"
+auction_prepare_time: "09:16:01"
+auction_submit_time: "09:17:50"
 auction_submit_cutoff: "09:24:59"
 auction_reference_max_age_secs: 4.0
 auction_buy_offset_bps: 50.0

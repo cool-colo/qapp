@@ -2192,6 +2192,32 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(snapshot.ts_event, china_ts_ns("2026-07-02 09:30:01"))
         self.assertEqual(snapshot.ts_init, china_ts_ns("2026-07-02 09:30:01"))
 
+    def test_single_sided_bigqmt_depth_replaces_cached_book_and_timestamps(self) -> None:
+        from nautilus_trader.adapters.bigqmt.common import parse_full_tick_as_order_book_depth10
+
+        strategy = self.make_strategy()
+        payload = {"bidPrice": [9.99], "bidVol": [100],
+                   "askPrice": [10.01], "askVol": [120]}
+        for offset, (bids, asks) in enumerate([(True, True), (True, False), (False, True)]):
+            ts_event = china_ts_ns("2026-07-02 09:30:01") + offset * 3_000_000_000
+            ts_init = ts_event + 200_000_000
+            strategy.clock.now = pd.Timestamp(ts_init, unit="ns", tz="UTC")
+            strategy.clock.ts = ts_init
+            payload.update(
+                bidPrice=[9.99] if bids else [], bidVol=[100] if bids else [],
+                askPrice=[10.01] if asks else [], askVol=[120] if asks else [],
+                time=ts_event // 1_000_000,
+            )
+            depth = parse_full_tick_as_order_book_depth10(INST_A, payload, ts_init)
+            self.assertIsNotNone(depth)
+            strategy.on_order_book_depth(depth)
+            snapshot = strategy._book_snapshot(INST_A)
+            self.assertEqual(snapshot.bids, ((9.99, 100.0),) if bids else ())
+            self.assertEqual(snapshot.asks, ((10.01, 120.0),) if asks else ())
+            self.assertEqual(snapshot.ts_event, ts_event)
+            self.assertEqual(snapshot.ts_init, ts_init)
+            self.assertEqual(snapshot.observed_ns, ts_init)
+
     def test_order_book_depth_logs_all_during_open_and_close_windows(self) -> None:
         strategy = self.make_strategy()
         strategy.config = TargetQuantityStrategyConfig(
