@@ -35,6 +35,7 @@ from strategies.model_target_planners import build_model_target_planner
 from strategies.model_target_planners import normalize_stock_code
 from strategies.model_target_planners.base import ForcedExit
 from strategies.replan_triggers import ReplanTriggerTracker, price_limit_state
+from strategies.replan_triggers import PRICE_COMPARISON_TOLERANCE
 from strategies.replanning import PlanningAttempt, ReplanningBusyError, ReplanningCoordinator, planning_json
 from strategies.convergence import ConvergenceTrigger
 from strategies.opening_auction import auction_time
@@ -90,7 +91,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
     """
 
     _PROCESS_TARGETS_TIMER = "TARGET-MODEL-PROCESS-TARGETS"
-    _PRICE_COMPARISON_TOLERANCE = 1e-6
+    _PRICE_COMPARISON_TOLERANCE = PRICE_COMPARISON_TOLERANCE
 
     def __init__(self, config: TargetModelPredictionsStrategyConfig) -> None:
         super().__init__(config)

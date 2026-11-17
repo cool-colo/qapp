@@ -2797,7 +2797,9 @@ function updateLossStockPicker(payload) {
 function renderMinuteTradeLoss(payload, error = null) {
   const chart = getChart("rt-trade-loss-chart");
   const meta = $("#rt-trade-loss-meta");
-  const key = payload && state.account ? `${state.source}|${accountKey(state.account)}|${payload.trade_date}` : null;
+  const key = payload && state.account
+    ? `${state.source}|${accountKey(state.account)}|${payload.trade_date}|${(payload.target_versions || []).join(",")}`
+    : null;
   const sameBook = key === minuteLossView.key;
   if (!sameBook || !(minuteLossView.payload?.stock_series || []).length) minuteLossView.selected = new Set((payload ? payload.stock_series || [] : []).map((stock) => stock.stock_code));
   minuteLossView.key = key;
@@ -2805,9 +2807,9 @@ function renderMinuteTradeLoss(payload, error = null) {
   updateLossStockPicker(payload);
   const raw = $("#rt-loss-raw").checked, weighted = $("#rt-loss-weighted").checked;
   const statusMessages = {
-    missing_preopen_target: "暂无当天盘前目标快照",
+    missing_preopen_target: "暂无当天目标快照",
     missing_preopen_positions: "暂无当天盘前持仓快照",
-    no_trades: "盘前目标与持仓一致，无计划交易",
+    no_trades: "最新目标与盘前持仓一致，无计划交易",
   };
   const points = payload ? payload.points || [] : [];
   const stocks = payload ? payload.stock_series || [] : [];

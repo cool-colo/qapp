@@ -12,11 +12,13 @@ A local, read-only dashboard for the live trading data this repo persists:
   loss rates. It requests only those stock codes from the node's generic
   `/realtime/ticks?stock_codes=...` API, backed by the per-second strategy market
   snapshot; it does not download the whole-market snapshot. Below it, a minute-level
-  **盘前计划交易损失（bp）** curve uses a fixed book: today's `before_trading`
-  `live_target_portfolio.target_qty` minus `live_position_snapshot.volume`, taking
-  the union of both stock sets. Holdings absent from the targets are full sells,
-  including stop-loss exits. Completed trades and live target changes never remove
-  stocks from this curve. Each minute's `close` from `ricequant_stock_minute_realtime`
+  **盘前计划交易损失（bp）** curve uses today's latest target version from
+  `live_target_portfolio` (ordered by `write_time`, then `id`, without a snapshot-phase
+  filter) minus `before_trading` `live_position_snapshot.volume`, taking the union
+  of both stock sets. Repeated stocks within that version use their latest row.
+  Holdings absent from the latest targets are full sells, including stop-loss exits.
+  Completed trades remain in the estimate; a new target version updates the book
+  on refresh. Each minute's `close` from `ricequant_stock_minute_realtime`
   is compared with the opening bar's `open`; loss bp uses the constant gross opening
   buy-plus-sell notional. The latest whole observation is selected per minute; missing
   prices leave gaps rather than changing the book or denominator. Missing preopen

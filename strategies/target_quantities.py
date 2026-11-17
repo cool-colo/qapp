@@ -54,6 +54,7 @@ from strategies.convergence import ConvergenceTrigger
 from strategies.execution_reconciliation import ExecutionStateReconciler
 from strategies.execution_reconciliation import is_reconciliation_fill
 from strategies.execution_reconciliation import is_reconciliation_order
+from strategies.replan_triggers import price_limit_state
 from strategies.order_splitter import LimitOrderQuantityRules
 from strategies.order_splitter import AuctionOrderSplitter
 from strategies.order_splitter import NotionalOrderSplitter
@@ -2988,10 +2989,10 @@ class TargetQuantityStrategy(Strategy):
         if price is None or price <= 0:
             return None
         up_limit, down_limit = self._price_limits(instrument_id_text)
-        if side == OrderSide.BUY and up_limit is not None and price >= up_limit:
-            return "up_limit"
-        if side == OrderSide.SELL and down_limit is not None and price <= down_limit:
-            return "down_limit"
+        if side == OrderSide.BUY:
+            return price_limit_state(price, up_limit, None)
+        if side == OrderSide.SELL:
+            return price_limit_state(price, None, down_limit)
         return None
 
     def _target_achieved(self) -> bool:

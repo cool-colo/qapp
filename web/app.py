@@ -1557,7 +1557,7 @@ def realtime_trade_loss(
     trader: str,
     data: DataAccess = Depends(get_data),
 ) -> dict[str, Any]:
-    """Fixed preopen rebalance quantities valued at each realtime minute close."""
+    """Latest targets minus preopen holdings valued at each realtime minute close."""
     try:
         payload = trade_loss_report.query_minute_trade_loss(
             _mysql(data, source),

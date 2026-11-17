@@ -5,6 +5,9 @@ from decimal import Decimal
 import math
 
 
+PRICE_COMPARISON_TOLERANCE = 1e-6
+
+
 @dataclass(frozen=True)
 class ReplanTrigger:
     instrument_id: str
@@ -15,9 +18,11 @@ class ReplanTrigger:
 def price_limit_state(price: float | None, up: float | None, down: float | None) -> str | None:
     if price is None or not math.isfinite(price) or price <= 0:
         return None
-    if up is not None and math.isfinite(up) and up > 0 and price >= up:
+    # Float conversion can place the same quoted price just beyond its limit.
+    # This absolute CNY tolerance is well below an A-share price tick.
+    if up is not None and math.isfinite(up) and up > 0 and price >= up - PRICE_COMPARISON_TOLERANCE:
         return "up_limit"
-    if down is not None and math.isfinite(down) and down > 0 and price <= down:
+    if down is not None and math.isfinite(down) and down > 0 and price <= down + PRICE_COMPARISON_TOLERANCE:
         return "down_limit"
     return None
 

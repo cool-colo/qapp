@@ -64,6 +64,10 @@ direction restrictions.
   its existing configuration, validation, open-price comparison and report parameter.
 - Limits are evaluated at snapshot capture. An opened stock is no longer restricted
   by its earlier limit state.
+  Shared limit detection allows an absolute CNY tolerance of `1e-6`, matching the
+  existing entry-filter tolerance, so floating-point representations of the same
+  quoted price do not bypass permissions or triggers. Ordinary execution uses that
+  same detector while retaining its existing buy-up-limit/sell-down-limit rules.
 
 ## State and persistence
 

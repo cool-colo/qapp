@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+from contextlib import closing
 from datetime import datetime
 from decimal import Decimal
 from unittest.mock import patch
@@ -142,7 +144,7 @@ def test_invalid_close_produces_a_gap(close):
     assert all(point["loss_bps"] is None for point in result["points"])
 
 
-def test_query_is_scoped_to_preopen_account_snapshots_and_fixed_symbols():
+def test_query_uses_latest_targets_and_preopen_positions_with_fixed_symbols():
     mysql, clickhouse = FakeMySql(), FakeClickHouse()
     result = query_report(mysql, clickhouse)
 
@@ -150,8 +152,11 @@ def test_query_is_scoped_to_preopen_account_snapshots_and_fixed_symbols():
     assert result["target_versions"] == ["v1"]
     assert result["points"][0]["loss_bps"] == 1000.0
     assert len(mysql.calls) == 2
+    target_sql = mysql.calls[0][0]
+    assert "snapshot_type" not in target_sql
+    assert "ORDER BY write_time DESC, id DESC" in target_sql
+    assert "snapshot_type = 'before_trading'" in mysql.calls[1][0]
     for sql, params in mysql.calls:
-        assert "snapshot_type = 'before_trading'" in sql
         assert "status = 'ok'" in sql
         assert params == {"account_id": "A1", "trader_id": "T1", "trade_date": "2026-11-13"}
     assert len(clickhouse.calls) == 1
@@ -163,6 +168,56 @@ def test_query_is_scoped_to_preopen_account_snapshots_and_fixed_symbols():
     assert "'300001.XSHE'" not in sql
     assert "received_at <= now64" in sql
     assert "datetime <= now64" in sql
+
+
+@pytest.mark.parametrize("latest_phase", ["before_trading", "continuous_trading", "after_trading"])
+def test_latest_target_version_is_one_complete_book_across_snapshot_phases(latest_phase):
+    with closing(sqlite3.connect(":memory:")) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("""
+            CREATE TABLE live_target_portfolio (
+                id INTEGER, write_time TEXT, account_id TEXT, trader_id TEXT,
+                trade_date TEXT, snapshot_type TEXT, status TEXT,
+                stock_code TEXT, target_qty INTEGER, target_version TEXT
+            )
+        """)
+        rows = [
+            (1, "09:00:00", "A1", "T1", "2026-11-13", "before_trading", "ok", "000001.SZ", 100, "z-old"),
+            (2, "09:00:00", "A1", "T1", "2026-11-13", "before_trading", "ok", "300001.SZ", 100, "z-old"),
+            (3, "11:00:00", "A1", "T1", "2026-11-13", "before_trading", "ok", "000001.SZ", 100, "a-new"),
+            (4, "11:00:00", "A1", "T1", "2026-11-13", latest_phase, "ok", "600000.SH", 100, "a-new"),
+            (5, "11:00:00", "A1", "T1", "2026-11-13", latest_phase, "ok", "000001.SZ", 200, "a-new"),
+            (6, "08:00:00", "A1", "T1", "2026-11-13", "after_trading", "ok", "000001.SZ", 999, "z-old"),
+            (7, "15:00:00", "A2", "T1", "2026-11-13", latest_phase, "ok", "000001.SZ", 999, "other-account"),
+            (8, "15:00:00", "A1", "T1", "2026-11-12", latest_phase, "ok", "000001.SZ", 999, "other-day"),
+            (9, "15:00:00", "A1", "T1", "2026-11-13", latest_phase, "failed", "000001.SZ", 999, "failed"),
+            (10, "15:00:00", "A1", "T2", "2026-11-13", latest_phase, "ok", "000001.SZ", 999, "other-trader"),
+        ]
+        connection.executemany("INSERT INTO live_target_portfolio VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", reversed(rows))
+
+        class TargetTableMySql(FakeMySql):
+            def query(self, sql, params):
+                if "FROM live_target_portfolio" not in sql:
+                    return super().query(sql, params)
+                self.calls.append((sql, params))
+                for name in params:
+                    sql = sql.replace(f"%({name})s", f":{name}")
+                return [dict(row) for row in connection.execute(sql, params)]
+
+        result = query_report(TargetTableMySql(), FakeClickHouse(minutes=[]))
+
+    assert result["status"] == "ok"
+    assert result["target_versions"] == ["a-new"]
+    trades = {row["stock_code"]: row for row in result["trades"]}
+    assert trades["000001.SZ"]["side"] == "BUY"
+    assert trades["000001.SZ"]["trade_qty"] == 200
+    assert trades["600000.SH"]["side"] == "SELL"
+    assert trades["600000.SH"]["trade_qty"] == 100
+    # A stock removed from the latest target becomes an exit from preopen holdings.
+    assert trades["300001.SZ"]["target_qty"] == 0
+    assert trades["300001.SZ"]["trade_qty"] == 100
+    assert trades["300002.SZ"]["trade_qty"] == 50
+    assert result["stock_count"] == 4
 
 
 def test_minute_query_supports_beijing_symbol_and_rejects_invalid_input():

@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
 import json
+import math
 import threading
 import warnings
 from types import SimpleNamespace
@@ -14,7 +15,8 @@ from unittest.mock import MagicMock, patch
 from backtests.result_writers.live_writer import LiveSnapshotWriter
 from backtests.result_writers.live_control_writer import LiveControlWriter
 from backtests.target_model_predictions.run_backtest import BacktestTargetModelPredictionsStrategy
-from strategies.replan_triggers import ReplanTriggerTracker
+from strategies.replan_triggers import ReplanTriggerTracker, price_limit_state
+from strategies.model_target_planners.risk_manager import RiskManagerModelTargetPlanner
 from strategies.replanning import PlanningAttempt, ReplanningBusyError, planning_json
 from strategies.model_target_planners import ModelTargetPlanningContext, ModelTargetInstrumentContext
 from strategies.model_target_planners import ModelTargetPlan, TargetInfo, TargetContext
@@ -23,6 +25,8 @@ from lives.control_server import LiveControlServer
 from lives.snapshot_recorder import SnapshotRecorder, SnapshotRecorderConfig
 from market_data import DailyStockData
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.instruments import Equity
 from tests.test_opening_auction import replay_fixture, timestamp
 
 
@@ -105,6 +109,48 @@ class ReplanningTests(unittest.TestCase):
     def test_at_limit_is_locked_but_opened_stock_uses_current_state(self):
         self.assertEqual(self.strategy._planning_permissions(A, DAY, planning_context=self.context(11)), (False, False))
         self.assertEqual(self.strategy._planning_permissions(A, DAY, planning_context=self.context(10)), (True, True))
+
+    def test_roundoff_down_limit_candidate_is_locked_in_optimizer_payload(self):
+        instrument = self.engine.cache.instrument(InstrumentId.from_str(A))
+        values = Equity.to_dict(instrument)
+        values["info"]["fields"].update(UpStopPrice=12.88, DownStopPrice=10.54)
+        self.engine.cache.add_instrument(Equity.from_dict(values))
+        row_key = ("000001.SZ", DAY)
+        self.strategy._daily_stock_data[row_key] = replace(
+            self.strategy._daily_stock_data[row_key], up_limit=12.88, down_limit=10.54,
+        )
+        self.assertEqual(self.strategy._price_limits(A), (12.88, 10.54))
+        context = self.strategy.build_planning_context(DAY, stage="continuous", snapshot={
+            A: {"last_price": 10.540000000000001, "open": 10.54, "last_close": 11.71},
+            B: {"last_price": 20, "open": 20, "last_close": 20},
+        })
+        request, _ = self.strategy._target_planning_request(DAY, date(2026, 7, 7), planning_context=context)
+        candidate = next(c for c in request.candidates if c.instrument_id == A)
+        payload = RiskManagerModelTargetPlanner._candidate_payload(candidate)
+        self.assertEqual(payload["price"], 10.540000000000001)
+        self.assertFalse(payload["can_buy"])
+        self.assertFalse(payload["can_sell"])
+
+    def test_roundoff_limits_trigger_replanning_and_preserve_execution_direction_rules(self):
+        instrument = self.engine.cache.instrument(InstrumentId.from_str(A))
+        values = Equity.to_dict(instrument)
+        values["info"]["fields"].update(UpStopPrice=12.88, DownStopPrice=10.54)
+        self.engine.cache.add_instrument(Equity.from_dict(values))
+        row_key = ("000001.SZ", DAY)
+        self.strategy._daily_stock_data[row_key] = replace(
+            self.strategy._daily_stock_data[row_key], up_limit=12.88, down_limit=10.54,
+        )
+        for price, reason, side in [(10.540000000000001, "down_limit", OrderSide.SELL),
+                                    (math.nextafter(12.88, -math.inf), "up_limit", OrderSide.BUY)]:
+            with self.subTest(reason=reason):
+                self.strategy.apply_full_tick_snapshot({A: {"last_price": price}}, "test")
+                tracker = ReplanTriggerTracker()
+                triggers = tracker.observe(DAY, {A: Decimal(200)}, {A: Decimal(100)},
+                                           {A: (price, *self.strategy._price_limits(A))})
+                self.assertEqual([trigger.reason for trigger in triggers], [reason])
+                self.assertEqual(self.strategy._price_limit_reason(A, side), reason)
+                other = OrderSide.BUY if side == OrderSide.SELL else OrderSide.SELL
+                self.assertIsNone(self.strategy._price_limit_reason(A, other))
 
     def test_manual_replan_works_with_auto_disabled_and_preserves_user_pause(self):
         async def scenario():
@@ -660,6 +706,19 @@ class ReplanningTests(unittest.TestCase):
 
 
 class ReplanningArchiveTests(unittest.TestCase):
+    def test_price_limit_roundoff_does_not_mistake_a_real_opening_for_a_limit(self):
+        for price, up, down, expected in [
+            (10.540000000000001, 12.88, 10.54, "down_limit"),
+            (math.nextafter(12.88, -math.inf), 12.88, 10.54, "up_limit"),
+            (10.55, 12.88, 10.54, None),
+            (12.87, 12.88, 10.54, None),
+            (10.53, 12.88, 10.54, "down_limit"),
+            (12.89, 12.88, 10.54, "up_limit"),
+            (10.54, None, None, None),
+        ]:
+            with self.subTest(price=price, up=up, down=down):
+                self.assertEqual(price_limit_state(price, up, down), expected)
+
     def test_snapshot_serialization_preserves_enum_and_date(self):
         context = ModelTargetPlanningContext(DAY, "continuous", {A: ModelTargetInstrumentContext(price=10)})
         encoded = planning_json(context)

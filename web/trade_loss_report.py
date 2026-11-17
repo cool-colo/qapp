@@ -1,4 +1,4 @@
-"""Minute execution-loss estimates for the fixed before-trading rebalance book."""
+"""Minute execution-loss estimates for latest targets against preopen holdings."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def build_preopen_trade_book(
         for row in rows:
             code = str(row["stock_code"])
             if code in book:
-                raise ValueError(f"duplicate before-trading {field} for {code}")
+                raise ValueError(f"duplicate {field} for {code}")
             book[code] = _quantity(row[field], f"{code} {field}")
 
     trades = []
@@ -213,13 +213,26 @@ def query_minute_trade_loss(
     params = {"account_id": account, "trader_id": trader, "trade_date": day}
     identity = """
         account_id = %(account_id)s AND trader_id = %(trader_id)s
-        AND trade_date = %(trade_date)s AND snapshot_type = 'before_trading'
-        AND status = 'ok'
+        AND trade_date = %(trade_date)s AND status = 'ok'
     """
-    targets = mysql.query(
-        f"SELECT stock_code, target_qty, target_version FROM live_target_portfolio WHERE {identity}",
+    target_rows = mysql.query(
+        f"""SELECT stock_code, target_qty, target_version
+        FROM live_target_portfolio WHERE {identity}
+        ORDER BY write_time DESC, id DESC""",
         params,
     )
+    # Select one whole version, so stocks removed by replanning are not inherited
+    # from earlier targets. A version may be repeated across snapshot phases;
+    # keep its newest record per stock.
+    targets: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+    if target_rows:
+        latest_version = target_rows[0]["target_version"]
+        for row in target_rows:
+            code = str(row["stock_code"])
+            if row["target_version"] == latest_version and code not in seen_codes:
+                targets.append(row)
+                seen_codes.add(code)
     result: dict[str, Any] = {
         "trade_date": day,
         "status": "missing_preopen_target",
@@ -229,15 +242,16 @@ def query_minute_trade_loss(
     }
     if not targets:
         return result
+    preopen_identity = f"{identity} AND snapshot_type = 'before_trading'"
     positions = mysql.query(
-        f"SELECT stock_code, volume FROM live_position_snapshot WHERE {identity}",
+        f"SELECT stock_code, volume FROM live_position_snapshot WHERE {preopen_identity}",
         params,
     )
     if not positions:
         # An empty position table alone cannot distinguish a flat account from a
         # missing snapshot. Confirm the empty portfolio using its preopen asset.
         assets = mysql.query(
-            f"SELECT market_value FROM live_asset_snapshot WHERE {identity}", params,
+            f"SELECT market_value FROM live_asset_snapshot WHERE {preopen_identity}", params,
         )
         if not assets or assets[0]["market_value"] is None or Decimal(str(assets[0]["market_value"])) != 0:
             result["status"] = "missing_preopen_positions"
