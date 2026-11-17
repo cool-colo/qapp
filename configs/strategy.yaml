@@ -54,7 +54,7 @@ order_slice_notional: 300000     # CNY cap per slice; 0 disables this cap; instr
 limit_stop_mode: freeze_symbol
 auto_replan_enabled: true        # automatic price-limit replanning; manual replanning stays enabled
 leave_non_targets: false         # false => exit holdings absent from latest targets
-stop_time: "14:55"
+stop_time: "14:56"
 
 # --- Target weight planning / risk manager ---
 target_weight_planner: risk_manager            # equal_weight | risk_manager
@@ -72,15 +72,15 @@ excluded_name_prefixes:
   - "退市"
 
 # --- Exchange windows (timezone stays on CLI: --exchange-timezone) ---
-trading_windows: "09:29-11:30,13:00-14:55"
-exchange_trading_windows: "09:30-11:30,13:00-14:55"
-execution_windows: "14:30-14:55"
-exchange_execution_windows: "14:30-14:55"
+trading_windows: "09:29-11:30,13:00-14:59"
+exchange_trading_windows: "09:30-11:30,13:00-14:59"
+execution_windows: "14:30-14:56"
+exchange_execution_windows: "14:30-14:56"
 # Independent cancel windows: inclusive start, exclusive end (seconds supported).
 # Cancellation checks continue after stop_time; replacements keep execution_windows.
 # 14:56:59 can cancel; 14:57:00 cannot cancel during the closing auction.
-cancel_windows: "09:30-11:30,13:00-14:57"
-exchange_cancel_windows: "09:30-11:30,13:00-14:57"
+cancel_windows: "09:30-11:30,13:00-14:56"
+exchange_cancel_windows: "09:30-11:30,13:00-14:56"
 # Retained latency-probe settings. The 14:30 execution window is authoritative;
 # even when enabled, a pre-open trigger cannot submit outside that window.
 preopen_latency_execution_enabled: false
