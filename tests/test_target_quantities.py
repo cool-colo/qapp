@@ -531,6 +531,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         fields: dict[InstrumentId, dict] | None = None,
         target_cash_buffer_percent: float = 0.05,
         order_slice_notional: Decimal | str = "300000",
+        continuous_buy_min_notional: Decimal | str = "0",
         require_account_cash: bool = True,
         account_info: dict | None = None,
     ) -> TestableTargetQuantityStrategy:
@@ -551,6 +552,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             cancel_book_max_age_secs=120.0,
             stop_time=None,
             order_slice_notional=Decimal(str(order_slice_notional)),
+            continuous_buy_min_notional=Decimal(str(continuous_buy_min_notional)),
             require_account_cash=require_account_cash,
         )
         portfolio = FakePortfolio(
@@ -624,6 +626,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         )
         strategy._whole_market_final_success_dates = set()
         strategy._whole_market_fetch_observers = []
+        strategy._whole_market_fresh_requests = []
         book_ts = china_ts_ns("2026-07-02 14:30:00")
         strategy._depth_books = {
             str(instrument_id): depth_book_snapshot(
@@ -1342,6 +1345,67 @@ class TargetQuantityStrategyTest(unittest.TestCase):
 
         self.assertEqual(len(strategy.submitted_orders), 1)
         self.assertEqual(strategy.submitted_orders[0].quantity, Decimal("1200"))
+
+    def test_continuous_buy_minimum_is_checked_before_order_creation(self) -> None:
+        for quantity, expected_count in [(900, 0), (1000, 0), (1100, 1)]:
+            with self.subTest(quantity=quantity):
+                strategy = self.make_strategy(prices={INST_A: 10.0},
+                                              continuous_buy_min_notional="10000")
+                strategy.update_target_quantities({INST_A: quantity}, date(2026, 7, 2), "minimum")
+                self.assertEqual(len(strategy.submitted_orders), expected_count)
+                self.assertEqual(len(strategy.cache.all_orders), expected_count)
+                self.assertEqual(strategy._target_quantities[str(INST_A)], Decimal(quantity))
+                self.assertNotIn(strategy._target_version, strategy._achieved_versions)
+                if not expected_count:
+                    self.assertEqual(strategy.order_events[-1].reason,
+                                     "continuous_buy_below_min_notional")
+
+    def test_continuous_small_buy_tail_is_not_returned_by_splitter(self) -> None:
+        strategy = self.make_strategy(prices={INST_A: 10.0}, order_slice_notional="20000",
+                                      continuous_buy_min_notional="10000")
+        strategy.update_target_quantities({INST_A: 2500}, date(2026, 7, 2), "tail")
+        self.assertEqual([o.quantity for o in strategy.submitted_orders], [Decimal(2000)])
+        self.assertEqual(strategy._target_quantities[str(INST_A)], Decimal(2500))
+
+    def test_final_buy_submit_cannot_bypass_the_minimum(self) -> None:
+        strategy = self.make_strategy(prices={INST_A: 10.0}, continuous_buy_min_notional="10000")
+        intent = strategy._target_order_intent(str(INST_A), Decimal(1200))
+        submitted = strategy._submit_order_quantity(date(2026, 7, 2), intent, Decimal(500), "small")
+        self.assertFalse(submitted)
+        self.assertEqual(strategy.order_factory.count, 0)
+        self.assertEqual(strategy.cache.all_orders, [])
+
+    def test_deferred_buy_checks_its_latest_notional_before_submission(self) -> None:
+        strategy = self.make_strategy(prices={INST_A: 10.0}, free_cash="0",
+                                      continuous_buy_min_notional="10000")
+        strategy.update_target_quantities({INST_A: 1200}, date(2026, 7, 2), "cash")
+        self.assertIn(str(INST_A), strategy._deferred_buys)
+        strategy.portfolio.account_value.free_cash = Decimal(20000)
+        strategy._depth_books[str(INST_A)] = depth_book_snapshot(
+            [(8.0, 1000000)], [(8.0, 1000000)], ts_init=strategy.clock.ts,
+        )
+        strategy._converge_to_target(date(2026, 7, 2), ConvergenceTrigger.TIMER)
+        self.assertEqual(strategy.order_factory.count, 0)
+        self.assertEqual(strategy._target_quantities[str(INST_A)], Decimal(1200))
+        self.assertEqual(strategy.order_events[-1].reason, "continuous_buy_below_min_notional")
+
+    def test_continuous_minimum_does_not_apply_to_sells(self) -> None:
+        strategy = self.make_strategy(positions={INST_A: Decimal(500)}, prices={INST_A: 10.0},
+                                      continuous_buy_min_notional="10000")
+        strategy.update_target_quantities({INST_A: 0}, date(2026, 7, 2), "sell")
+        self.assertEqual(len(strategy.submitted_orders), 1)
+        self.assertEqual(strategy.submitted_orders[0].side, OrderSide.SELL)
+
+    def test_small_buy_remains_pending_and_can_become_eligible(self) -> None:
+        strategy = self.make_strategy(prices={INST_A: 10.0}, continuous_buy_min_notional="10000")
+        strategy.update_target_quantities({INST_A: 900}, date(2026, 7, 2), "small")
+        self.assertEqual(strategy.submitted_orders, [])
+        strategy._depth_books[str(INST_A)] = depth_book_snapshot(
+            [(12.0, 1000000)], [(12.0, 1000000)], ts_init=strategy.clock.ts,
+        )
+        strategy._converge_to_target(date(2026, 7, 2), ConvergenceTrigger.TIMER)
+        self.assertEqual(len(strategy.submitted_orders), 1)
+
 
     def test_order_slice_notional_splits_large_delta_by_300k(self) -> None:
         strategy = self.make_strategy(

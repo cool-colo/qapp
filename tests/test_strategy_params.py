@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
+from pathlib import Path
+import tempfile
 
 from strategies.strategy_params import StrategyParams
 
@@ -33,6 +36,38 @@ class StrategyParamsPriceTrendTest(unittest.TestCase):
                 price_trend_threshold_bps=40.0,
                 price_trend_max_bps=20.0,
             )
+
+
+class StrategyParamsBuyMinimumTest(unittest.TestCase):
+    def test_all_repository_configs_load_new_minimums(self):
+        for path in Path("configs").glob("strategy*.yaml"):
+            with self.subTest(path=path):
+                params = StrategyParams.from_yaml(str(path))
+                self.assertEqual(params.auction_min_buy_notional, Decimal(10000))
+                self.assertEqual(params.continuous_buy_min_notional, Decimal(10000))
+                self.assertEqual(params.auction_execution_time, "09:24:50")
+
+    def test_yaml_minimums_are_decimal_and_zero_disables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "strategy.yaml"
+            path.write_text('auction_min_buy_notional: "12345.67"\ncontinuous_buy_min_notional: 0\n')
+            params = StrategyParams.from_yaml(str(path))
+        self.assertEqual(params.auction_min_buy_notional, Decimal("12345.67"))
+        self.assertIsInstance(params.auction_min_buy_notional, Decimal)
+        self.assertEqual(params.continuous_buy_min_notional, Decimal(0))
+
+    def test_invalid_minimums_fail_fast(self):
+        for name in ("auction_min_buy_notional", "continuous_buy_min_notional"):
+            for value in (Decimal(-1), Decimal("NaN"), Decimal("Infinity")):
+                with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
+                    StrategyParams(**{name: value})
+
+    def test_removed_auction_threshold_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "strategy.yaml"
+            path.write_text('auction_partial_min_notional: 58000\n')
+            with self.assertRaisesRegex(ValueError, "Unknown strategy config"):
+                StrategyParams.from_yaml(str(path))
 
 if __name__ == "__main__":
     unittest.main()

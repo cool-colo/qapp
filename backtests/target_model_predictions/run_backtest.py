@@ -88,9 +88,11 @@ class DailyPlanningEvent(Data):
         ts_init: int,
         allow_planning: bool = True,
         opening_auction_snapshot: bool = False,
+        opening_auction_execution_snapshot: bool = False,
     ) -> None:
         self.allow_planning = allow_planning
         self.opening_auction_snapshot = opening_auction_snapshot
+        self.opening_auction_execution_snapshot = opening_auction_execution_snapshot
         self.trading_date = trading_date
         self.full_tick_snapshot = full_tick_snapshot
         self.previous_closes = previous_closes
@@ -179,6 +181,10 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         if data.opening_auction_snapshot and self.config.auction_enabled:
             if self.accept_opening_auction_snapshot(data.trading_date, data.full_tick_snapshot, ts_init=data.ts_init):
                 self.process_opening_auction()
+        if data.opening_auction_execution_snapshot and self.config.auction_enabled:
+            if self.accept_opening_auction_execution_snapshot(
+                    data.trading_date, data.full_tick_snapshot, ts_init=data.ts_init):
+                self.process_opening_auction_execution()
         if data.allow_planning:
             self._process_trading_day_once(data.trading_date, "planning_event")
 
@@ -547,7 +553,8 @@ def prepare_backtest_event_data(
     return planning_events, heartbeats, normalized_bars
 
 
-def prepare_tick_replay_event_data(args, rows, instruments_by_stock, *, auction_start_time="09:24:01"):
+def prepare_tick_replay_event_data(args, rows, instruments_by_stock, *, auction_start_time="09:24:01",
+                                   auction_execution_time="09:24:50"):
     from backtests.data_providers.historical_ticks import validate_final_auction_results
 
     validate_final_auction_results(rows, args.exchange_timezone)
@@ -576,24 +583,28 @@ def prepare_tick_replay_event_data(args, rows, instruments_by_stock, *, auction_
         batch["previous_closes"][str(instrument.id)] = row.previous_close
         batch["ts_event"] = max(batch["ts_event"], row.ts_event)
         batch["allow_planning"] |= row.kind != "indicative"
-    # A full-market get_full_tick is one completed batch at preparation time.
-    # Historical rows received later must never repair or replace that batch.
+    # Each auction phase captures a separate complete batch using only historical
+    # observations received by that phase's timestamp. Execution never mutates the
+    # earlier planning context or looks ahead to clearing results.
     daily_latest = {}
     for row in sorted(rows, key=lambda r: (r.ts_init, r.symbol, r.ts_event)):
         day = pd.Timestamp(row.ts_init, unit="ns", tz="UTC").tz_convert(args.exchange_timezone).date()
-        prepare_ns = exchange_timestamp_ns(day, auction_start_time, args.exchange_timezone)
-        latest = daily_latest.setdefault(day, {})
-        if row.ts_init <= prepare_ns and row.ts_event <= prepare_ns:
-            latest[str(instruments_by_stock[row.symbol].id)] = {
-                "open": row.open_price, "last_price": row.bid_price,
-                "last_close": row.previous_close,
-                "open_int": 12 if row.kind == "indicative" else 13,
-            }
-    for day, snapshot in sorted(daily_latest.items()):
-        prepare_ns = exchange_timestamp_ns(day, auction_start_time, args.exchange_timezone)
+        for phase_time in (auction_start_time, auction_execution_time):
+            capture_ns = exchange_timestamp_ns(day, phase_time, args.exchange_timezone)
+            latest = daily_latest.setdefault((day, phase_time), {})
+            if row.ts_init <= capture_ns and row.ts_event <= capture_ns:
+                latest[str(instruments_by_stock[row.symbol].id)] = {
+                    "open": row.open_price, "last_price": row.bid_price,
+                    "last_close": row.previous_close,
+                    "open_int": 12 if row.kind == "indicative" else 13,
+                }
+    for (day, phase_time), snapshot in sorted(daily_latest.items()):
+        capture_ns = exchange_timestamp_ns(day, phase_time, args.exchange_timezone)
         event = DailyPlanningEvent(
             day, snapshot, {i: fields["last_close"] for i, fields in snapshot.items()},
-            prepare_ns, prepare_ns, allow_planning=False, opening_auction_snapshot=True,
+            capture_ns, capture_ns, allow_planning=False,
+            opening_auction_snapshot=phase_time == auction_start_time,
+            opening_auction_execution_snapshot=phase_time == auction_execution_time,
         )
         events.append(CustomData(DataType(DailyPlanningEvent), event))
     for (ts_init, trading_date), batch in sorted(batches.items()):
@@ -770,6 +781,7 @@ def build_engine(
     else:
         planning_events, heartbeats = prepare_tick_replay_event_data(
             args, historical_ticks, instruments_by_stock, auction_start_time=params.auction_start_time,
+            auction_execution_time=params.auction_execution_time,
         )
         time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
         # Auction preparation events are synthetic timestamps and must obey the
@@ -834,18 +846,20 @@ def build_engine(
             risk_manager_mode=params.risk_manager_mode,
             risk_manager_timeout_secs=params.risk_manager_timeout_secs,
             order_slice_notional=params.order_slice_notional,
+            continuous_buy_min_notional=params.continuous_buy_min_notional,
             limit_stop_mode=params.limit_stop_mode,
             exit_non_targets=params.exit_non_targets,
             trading_windows=params.trading_windows,
             exchange_trading_windows=params.exchange_trading_windows,
             auction_enabled=params.auction_enabled,
             auction_start_time=params.auction_start_time,
+            auction_execution_time=params.auction_execution_time,
             auction_submit_cutoff=params.auction_submit_cutoff,
             auction_buy_offset_bps=params.auction_buy_offset_bps,
             auction_sell_offset_bps=params.auction_sell_offset_bps,
             auction_commission_rate=params.auction_commission_rate,
             auction_minimum_fee=params.auction_minimum_fee,
-            auction_partial_min_notional=params.auction_partial_min_notional,
+            auction_min_buy_notional=params.auction_min_buy_notional,
             execution_windows=params.execution_windows,
             exchange_execution_windows=params.exchange_execution_windows,
             cancel_windows=params.cancel_windows,
@@ -1064,9 +1078,14 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.exchange_execution_windows": params.exchange_execution_windows,
         "strategy.cancel_windows": params.cancel_windows,
         "strategy.exchange_cancel_windows": params.exchange_cancel_windows,
+        "strategy.auction_enabled": params.auction_enabled,
+        "strategy.auction_start_time": params.auction_start_time,
+        "strategy.auction_execution_time": params.auction_execution_time,
+        "strategy.auction_submit_cutoff": params.auction_submit_cutoff,
         "strategy.auction_commission_rate": params.auction_commission_rate,
         "strategy.auction_minimum_fee": params.auction_minimum_fee,
-        "strategy.auction_partial_min_notional": params.auction_partial_min_notional,
+        "strategy.auction_min_buy_notional": params.auction_min_buy_notional,
+        "strategy.continuous_buy_min_notional": params.continuous_buy_min_notional,
         "strategy.submission_book_max_age_secs": params.submission_book_max_age_secs,
         "strategy.cancel_book_max_age_secs": params.cancel_book_max_age_secs,
         "strategy.same_side_price_improvement_threshold": (

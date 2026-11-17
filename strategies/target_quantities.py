@@ -435,6 +435,7 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     exit_non_targets: bool = True
     limit_stop_mode: str = "freeze_symbol"
     order_slice_notional: Decimal = Decimal("300000")
+    continuous_buy_min_notional: Decimal = Decimal("10000")
     require_account_cash: bool = True
     trade_tick_log_sample_rate: float = 0.0
     order_book_depth_log_sample_rate: float = 0.0
@@ -449,12 +450,13 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     # Opening call auction; independent of continuous execution windows.
     auction_enabled: bool = True
     auction_start_time: str = "09:24:01"
+    auction_execution_time: str = "09:24:50"
     auction_submit_cutoff: str = "09:24:59"
     auction_buy_offset_bps: float = 50.0
     auction_sell_offset_bps: float = 50.0
     auction_commission_rate: float = 0.000085
     auction_minimum_fee: float = 5.0
-    auction_partial_min_notional: Decimal = Decimal("58000")
+    auction_min_buy_notional: Decimal = Decimal("10000")
 
     full_tick_refresh_secs: float = 1.0
     full_tick_prefetch_time: str | None = "09:27"
@@ -516,7 +518,6 @@ class TargetQuantityStrategy(Strategy):
         self._auction_prediction_ranks: dict[str, int] = {}
         self._auction_order_splitter = AuctionOrderSplitter(
             Decimal(str(config.auction_commission_rate)), Decimal(str(config.auction_minimum_fee)),
-            config.auction_partial_min_notional,
         )
         self._auction_budget: Decimal | None = None
         self._auction_committed_cost = Decimal("0")
@@ -658,6 +659,9 @@ class TargetQuantityStrategy(Strategy):
         self._whole_market_fetch_observers: list[
             Callable[[str, dict[str, Any]], None]
         ] = []
+        self._whole_market_fresh_requests: list[
+            tuple[str, Callable[[str, dict[str, Any]], None] | None]
+        ] = []
         self._sellable_exhausted: dict[str, date] = {}
         # ts_event (ns) of this strategy's most recent SELL cancel, per instrument.
         # Used to recognise a broker sellable-position denial that races the
@@ -699,6 +703,9 @@ class TargetQuantityStrategy(Strategy):
 
     @staticmethod
     def _validate_execution_config(config: TargetQuantityStrategyConfig) -> None:
+        minimum = Decimal(str(config.continuous_buy_min_notional))
+        if not minimum.is_finite() or minimum < 0:
+            raise ValueError("continuous_buy_min_notional must be finite and non-negative")
         non_negative = {
             "submission_book_max_age_secs": config.submission_book_max_age_secs,
             "cancel_book_max_age_secs": config.cancel_book_max_age_secs,
@@ -1022,14 +1029,20 @@ class TargetQuantityStrategy(Strategy):
         self,
         trigger: str,
         on_complete: Callable[[str, dict[str, Any]], None] | None = None,
+        *,
+        require_fresh: bool = False,
     ) -> None:
         """Request one fresh whole-market snapshot and report fetch completion."""
-        self._run_whole_market_full_tick_fetch(trigger, on_complete=on_complete)
+        self._run_whole_market_full_tick_fetch(
+            trigger, on_complete=on_complete, require_fresh=require_fresh,
+        )
 
     def _run_whole_market_full_tick_fetch(
         self,
         trigger: str,
         on_complete: Callable[[str, dict[str, Any]], None] | None = None,
+        *,
+        require_fresh: bool = False,
     ) -> None:
         """Fetch the whole-market full tick once (single batched call) and apply it.
 
@@ -1052,7 +1065,11 @@ class TargetQuantityStrategy(Strategy):
                 f"whole-market full-tick fetch skipped ({trigger}): "
                 "previous fetch is still running",
             )
-            if on_complete is not None:
+            if require_fresh:
+                # Auction phases must start their own request after an older
+                # in-flight fetch finishes, rather than reuse its earlier prices.
+                self._whole_market_fresh_requests.append((trigger, on_complete))
+            elif on_complete is not None:
                 self._whole_market_fetch_observers.append(on_complete)
             return
         started = time.monotonic()
@@ -1089,30 +1106,38 @@ class TargetQuantityStrategy(Strategy):
         self._whole_market_full_tick_task = None
         observers = list(self._whole_market_fetch_observers)
         self._whole_market_fetch_observers.clear()
+        fresh_requests = list(self._whole_market_fresh_requests)
+        self._whole_market_fresh_requests.clear()
         if requested_callback is not None:
             observers.append(requested_callback)
+
+        def start_fresh_requests() -> None:
+            for next_trigger, callback in fresh_requests:
+                self._run_whole_market_full_tick_fetch(
+                    next_trigger, on_complete=callback, require_fresh=True,
+                )
+
         try:
             result = task.result()
         except Exception as exc:
             self.log.warning(f"whole-market full-tick fetch failed ({trigger}): {exc}")
-            self._run_on_loop(
-                lambda: self._notify_whole_market_observers(
-                    observers,
-                    "failed",
-                    {"error": str(exc)},
-                ),
-            )
+            error = str(exc)
+
+            def failed() -> None:
+                self._notify_whole_market_observers(observers, "failed", {"error": error})
+                start_fresh_requests()
+
+            self._run_on_loop(failed)
             return
         # The done-callback fires on the fetch worker thread; marshal the state-
         # mutating apply and ordered completion notification back onto the node loop.
-        self._run_on_loop(
-            lambda: self._apply_whole_market_full_tick_and_notify(
-                result,
-                trigger,
-                started,
-                observers,
-            ),
-        )
+        def completed() -> None:
+            self._apply_whole_market_full_tick_and_notify(result, trigger, started, observers)
+            # Notify consumers of the old batch before starting a potentially
+            # immediately completed request which can replace the shared cache.
+            start_fresh_requests()
+
+        self._run_on_loop(completed)
 
     def _apply_whole_market_full_tick_and_notify(
         self,
@@ -2455,7 +2480,7 @@ class TargetQuantityStrategy(Strategy):
     def _within_auction_submit_time(self) -> bool:
         now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
         return (self.config.auction_enabled
-                and auction_time(self.config.auction_start_time) <= now
+                and auction_time(self.config.auction_execution_time) <= now
                 < auction_time(self.config.auction_submit_cutoff))
 
     def submit_order(self, order, position_id=None, client_id=None, params=None) -> None:
@@ -2592,6 +2617,8 @@ class TargetQuantityStrategy(Strategy):
             allocation = self._auction_order_splitter.allocate(
                 intent.instrument, quantity, Decimal(str(intent.price)), remaining,
                 allow_odd_lot=allow_odd_lot,
+                min_order_notional=(self.config.auction_min_buy_notional
+                                    if side == OrderSide.BUY else Decimal("0")),
             )
             intent.context.record(
                 auction_budget=self._auction_budget, auction_side_budget_remaining=remaining,
@@ -2600,7 +2627,9 @@ class TargetQuantityStrategy(Strategy):
                 auction_allocation_reason=allocation.reason,
                 auction_allocated_notional=allocation.notional,
                 auction_estimated_commission=allocation.commission,
-                auction_partial_min_notional=self.config.auction_partial_min_notional,
+                auction_min_buy_notional=self.config.auction_min_buy_notional,
+                auction_whole_small_target=(allocation.reason == "whole_target"
+                                            and allocation.notional <= self.config.auction_min_buy_notional),
             )
             self._record_target(current_date, instrument_id, intent.context.target_qty, reason,
                                 intent.context)
@@ -3558,7 +3587,8 @@ class TargetQuantityStrategy(Strategy):
             slices = self._order_slices(intent)
             intent.context.record(slice_count=len(slices))
             if not slices:
-                intent.context.record(cash_gate="skipped", skip_reason="no_order_slices")
+                skip_reason = intent.context.details.get("skip_reason", "no_legal_order_quantity")
+                intent.context.record(cash_gate="skipped", skip_reason=skip_reason)
                 self._deferred_buys.pop(instrument_id, None)
                 self._record_order(
                     trading_date,
@@ -3567,7 +3597,7 @@ class TargetQuantityStrategy(Strategy):
                     0,
                     target_qty,
                     "skipped",
-                    "no_legal_order_quantity",
+                    skip_reason,
                     intent_context=intent.context,
                 )
                 continue
@@ -3830,6 +3860,15 @@ class TargetQuantityStrategy(Strategy):
             price=Decimal(str(intent.price)),
             allow_odd_lot=intent.side == OrderSide.SELL and quantity == intent.context.current_qty,
         )
+        if intent.side == OrderSide.BUY and self.config.continuous_buy_min_notional > 0:
+            price = Decimal(str(intent.price))
+            minimum = self.config.continuous_buy_min_notional
+            small_slices = tuple(q for q in slices if q * price <= minimum)
+            slices = [q for q in slices if q * price > minimum]
+            intent.context.record(minimum_buy_notional=minimum, skipped_buy_slices=small_slices)
+            if small_slices and not slices:
+                intent.context.record(skip_reason="continuous_buy_below_min_notional",
+                                      order_notional=quantity * price)
         intent.context.record(
             min_order_quantity=rules.min_quantity,
             max_order_quantity=rules.max_quantity,
@@ -3922,7 +3961,7 @@ class TargetQuantityStrategy(Strategy):
                 0,
                 target_qty,
                 "skipped",
-                "no_legal_order_quantity",
+                intent.context.details.get("skip_reason", "no_legal_order_quantity"),
                 intent_context=intent.context,
             )
             return False
@@ -4003,6 +4042,23 @@ class TargetQuantityStrategy(Strategy):
                 f"Cannot submit order for {intent.instrument_id}: missing limit price "
                 f"side={intent.side.name} quantity={quantity} intent_context={intent.context.log_text()}",
             )
+            return False
+        auction_execution = self.config.auction_enabled and self._auction_execution_active
+        minimum = (self.config.auction_min_buy_notional if auction_execution
+                   else self.config.continuous_buy_min_notional)
+        notional = quantity * Decimal(str(intent.price))
+        whole_small_auction_target = auction_execution and (
+            intent.context.details.get("auction_whole_small_target", False)
+            or (quantity == intent.quantity and notional <= minimum)
+        )
+        if (intent.side == OrderSide.BUY and minimum > 0 and notional <= minimum
+                and not whole_small_auction_target):
+            phase = "auction" if auction_execution else "continuous"
+            skip_reason = f"{phase}_buy_below_min_notional"
+            intent.context.record(skip_reason=skip_reason, order_notional=notional,
+                                  minimum_buy_notional=minimum)
+            self._record_order(trading_date, str(intent.instrument_id), "buy", 0, target_qty,
+                               "skipped", skip_reason, intent_context=intent.context)
             return False
         intent.context.record(submitted_quantity=quantity, limit_price=intent.price)
         order = self.order_factory.limit(

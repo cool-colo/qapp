@@ -98,10 +98,16 @@ Transient local safety plans are archived as attempts and retain their existing
 nonpersistent execution semantics.
 
 Daily and opening-auction planning share the committed-target restore path. Restore
-empty versions before consulting projection rows or generating targets. Auction
-execution uses an accepted same-day target first, otherwise restores a committed
-target or plans a new one. Target provenance and prior daily processing do not
-block auction submission; existing execution gates and auction quotas still apply.
+empty versions before consulting projection rows or generating targets. The auction
+planning timer uses an accepted same-day target first, otherwise restores a committed
+target or plans a new one from its full-tick batch, without submitting orders. A
+separate execution timer fetches another full-tick batch and prices the fixed targets
+from its latest prices. Target provenance and prior daily processing do not block
+auction submission; existing execution gates and auction quotas still apply.
+After a restart between the two alerts, execution restores the same-day committed
+target before validating target/holding prices, including empty targets and saved
+auction ranks. An accepted same-day target takes precedence. Recovery performs no
+new planning and requires the normal pause, reconciliation and submission gates.
 
 ## Controls and runtime
 

@@ -4,6 +4,7 @@ from concurrent.futures import Future
 from dataclasses import replace
 from dataclasses import FrozenInstanceError
 from datetime import date
+from unittest.mock import MagicMock
 from unittest.mock import patch
 import unittest
 
@@ -51,7 +52,7 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
         finally:
             engine.dispose()
 
-    def test_auction_snapshot_prices_stay_fixed_after_target_subscription(self):
+    def test_auction_execution_refreshes_prices_without_changing_planning_context(self):
         def change_later_quotes(rows):
             return [replace(r, bid_price=r.bid_price * 1.01, ask_price=r.ask_price * 1.01)
                     if r.kind == "indicative" and r.ts_init > timestamp("2026-07-08 09:24:01")
@@ -64,10 +65,13 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
             subscribe.assert_called_once_with({A: 1000, B: 500})
             self.assertEqual(len(planner.requests), 1)
             self.assertEqual({str(o.instrument_id): float(o.price) for o in engine.cache.orders()},
-                             {A: 10.05, B: 20.10})
+                             {A: 10.15, B: 20.30})
             context = strategy._auction_planning_contexts[DAY]
             self.assertEqual(context.ts_init, timestamp("2026-07-08 09:24:01"))
             self.assertEqual(context.instruments[A].price, 10)
+            self.assertEqual(strategy.auction_reference(A).price, 10.1)
+            self.assertEqual(strategy.auction_reference(A).ts_init,
+                             timestamp("2026-07-08 09:24:50"))
         finally:
             engine.dispose()
 
@@ -143,20 +147,22 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
         engine, strategy, planner, _ = replay_fixture(strategy_type=lambda config:
             LiveTargetModelPredictionsStrategy(config, refresh_context=None))
         pending = Future()
+        execution_pending = Future()
         try:
             strategy.clock.set_time(timestamp("2026-07-08 09:24:00"))
             strategy.configure_whole_market_full_tick_source(lambda: {})
-            with patch.object(strategy, "_schedule_fetch", return_value=pending) as fetch, \
+            with patch.object(strategy, "_schedule_fetch", side_effect=[pending, execution_pending]) as fetch, \
                     patch.object(strategy, "_run_on_loop", side_effect=lambda callback: callback()), \
                     patch.object(strategy, "_refresh_order_book_depth_subscriptions") as subscribe, \
-                    patch.object(strategy, "execute_opening_auction",
-                                 wraps=strategy.execute_opening_auction) as execute:
+                    patch.object(strategy, "execute_opening_auction") as execute:
                 strategy._on_process_targets_timer(None)
                 strategy._on_process_targets_timer(None)
                 fetch.assert_not_called()
                 strategy._schedule_opening_auction()
                 self.assertEqual(strategy.clock.next_time_ns(strategy._OPENING_AUCTION_ALERT),
                                  timestamp("2026-07-08 09:24:01"))
+                self.assertEqual(strategy.clock.next_time_ns(strategy._OPENING_AUCTION_EXECUTION_ALERT),
+                                 timestamp("2026-07-08 09:24:50"))
                 for handler in strategy.clock.advance_time(timestamp("2026-07-08 09:24:01")):
                     handler.handle()
                 self.assertEqual(strategy.clock.next_time_ns(strategy._OPENING_AUCTION_ALERT),
@@ -172,8 +178,22 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
                 strategy._on_process_targets_timer(None)
                 self.assertEqual(fetch.call_count, 1)
                 self.assertEqual(len(planner.requests), 1)
-                execute.assert_called_once_with()
+                execute.assert_not_called()
+                self.assertEqual(engine.cache.orders(), [])
                 subscribe.assert_called_once_with({A: 1000, B: 500})
+                for handler in strategy.clock.advance_time(timestamp("2026-07-08 09:24:50")):
+                    handler.handle()
+                self.assertEqual(fetch.call_count, 2)
+                execute.assert_not_called()
+                self.assertEqual(strategy.clock.next_time_ns(strategy._OPENING_AUCTION_EXECUTION_ALERT),
+                                 timestamp("2026-07-09 09:24:50"))
+                strategy.clock.set_time(timestamp("2026-07-08 09:24:52"))
+                execution_pending.set_result({A: {"last_price": 10.1, "last_close": 10},
+                                              B: {"last_price": 20.2, "last_close": 20}})
+                self.assertEqual(len(planner.requests), 1)
+                execute.assert_called_once_with()
+                self.assertEqual(strategy.auction_reference(A).price, 10.1)
+                self.assertEqual(strategy.auction_reference(B).price, 20.2)
         finally:
             engine.dispose()
 
@@ -188,6 +208,7 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
             with patch.object(strategy, "_schedule_fetch", return_value=pending), \
                     patch.object(strategy, "_run_on_loop", side_effect=lambda callback: callback()):
                 strategy._prepare_opening_auction_snapshot(
+                    phase="planning",
                     on_ready=lambda: prepared.append(strategy._auction_planning_contexts[DAY]),
                 )
                 self.assertEqual(prepared, [])
@@ -237,11 +258,11 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
                               completed if source is whole_market_source else None) as fetch, \
                     patch.object(strategy, "_run_on_loop", side_effect=lambda callback: callback()):
                 engine.run()
-            self.assertEqual(sum(c.args == (whole_market_source,) for c in fetch.call_args_list), 1)
+            self.assertEqual(sum(c.args == (whole_market_source,) for c in fetch.call_args_list), 2)
             self.assertEqual(len(planner.requests), 1)
             self.assertEqual(len(engine.cache.orders()), 2)
             self.assertEqual({order.ts_init for order in engine.cache.orders()},
-                             {timestamp("2026-07-08 09:24:01")})
+                             {timestamp("2026-07-08 09:24:50")})
             self.assertEqual(strategy._subscribed_order_book_depth_instruments, {A, B})
         finally:
             engine.dispose()
@@ -262,5 +283,168 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
             self.assertEqual(planner.requests, [])
             self.assertEqual(engine.cache.orders(), [])
             self.assertNotIn(DAY, strategy._auction_frozen_dates)
+        finally:
+            engine.dispose()
+
+    def test_live_execution_never_reuses_an_inflight_planning_snapshot(self):
+        engine, strategy, planner, _ = replay_fixture(strategy_type=lambda config:
+            LiveTargetModelPredictionsStrategy(config, refresh_context=None))
+        planning_pending, execution_pending = Future(), Future()
+        try:
+            strategy.configure_whole_market_full_tick_source(lambda: {})
+            with patch.object(strategy, "_schedule_fetch", side_effect=[planning_pending, execution_pending]) as fetch, \
+                    patch.object(strategy, "_run_on_loop", side_effect=lambda callback: callback()), \
+                    patch.object(strategy, "execute_opening_auction") as execute:
+                strategy.clock.set_time(timestamp("2026-07-08 09:24:01"))
+                strategy._on_opening_auction_timer(None)
+                strategy.clock.set_time(timestamp("2026-07-08 09:24:50"))
+                strategy._on_opening_auction_execution_timer(None)
+                self.assertEqual(fetch.call_count, 1)
+                planning_pending.set_result({A: {"last_price": 10, "last_close": 10},
+                                             B: {"last_price": 20, "last_close": 20}})
+                self.assertEqual(fetch.call_count, 2)
+                self.assertEqual(len(planner.requests), 1)
+                self.assertEqual(engine.cache.orders(), [])
+                strategy.clock.set_time(timestamp("2026-07-08 09:24:52"))
+                execution_pending.set_result({A: {"last_price": 10.1, "last_close": 10},
+                                              B: {"last_price": 20.2, "last_close": 20}})
+                execute.assert_called_once_with()
+                self.assertEqual(strategy.auction_reference(A).price, 10.1)
+                self.assertEqual(strategy.auction_reference(B).price, 20.2)
+                self.assertEqual(strategy._auction_planning_contexts[DAY].instruments[A].price, 10)
+                strategy._on_opening_auction_execution_timer(None)
+                self.assertEqual(fetch.call_count, 2)
+                execute.assert_called_once_with()
+        finally:
+            engine.dispose()
+
+    def test_live_execution_failure_or_late_completion_keeps_plan_without_orders(self):
+        for outcome in ("failed", "empty", "missing", "late"):
+            with self.subTest(outcome=outcome):
+                engine, strategy, planner, _ = replay_fixture(strategy_type=lambda config:
+                    LiveTargetModelPredictionsStrategy(config, refresh_context=None))
+                planning_pending, execution_pending = Future(), Future()
+                try:
+                    strategy.configure_whole_market_full_tick_source(lambda: {})
+                    with patch.object(strategy, "_schedule_fetch", side_effect=[planning_pending, execution_pending]), \
+                            patch.object(strategy, "_run_on_loop", side_effect=lambda callback: callback()):
+                        strategy.clock.set_time(timestamp("2026-07-08 09:24:01"))
+                        strategy._on_opening_auction_timer(None)
+                        planning_pending.set_result({A: {"last_price": 10, "last_close": 10},
+                                                     B: {"last_price": 20, "last_close": 20}})
+                        target_version = strategy._target_version
+                        strategy.clock.set_time(timestamp("2026-07-08 09:24:50"))
+                        strategy._on_opening_auction_execution_timer(None)
+                        if outcome == "failed":
+                            execution_pending.set_exception(RuntimeError("execution snapshot unavailable"))
+                        elif outcome == "empty":
+                            execution_pending.set_result({})
+                        elif outcome == "missing":
+                            execution_pending.set_result({A: {"last_price": 10.1, "last_close": 10}})
+                        else:
+                            strategy.clock.set_time(timestamp("2026-07-08 09:24:59"))
+                            execution_pending.set_result({A: {"last_price": 10.1, "last_close": 10},
+                                                          B: {"last_price": 20.2, "last_close": 20}})
+                    self.assertEqual(len(planner.requests), 1)
+                    self.assertEqual(strategy._target_version, target_version)
+                    self.assertIn(DAY, strategy._auction_frozen_dates)
+                    self.assertIn(DAY, strategy._auction_snapshot_failed_dates)
+                    self.assertEqual(engine.cache.orders(), [])
+                    self.assertIsNone(strategy.auction_reference(A))
+                finally:
+                    engine.dispose()
+
+    def test_immediate_execution_fetch_cannot_replace_the_planning_batch(self):
+        engine, strategy, planner, _ = replay_fixture(strategy_type=lambda config:
+            LiveTargetModelPredictionsStrategy(config, refresh_context=None))
+        planning_pending, execution_ready = Future(), Future()
+        execution_ready.set_result({A: {"last_price": 10.1, "last_close": 10},
+                                    B: {"last_price": 20.2, "last_close": 20}})
+        try:
+            strategy.configure_whole_market_full_tick_source(lambda: {})
+            with patch.object(strategy, "_schedule_fetch", side_effect=[planning_pending, execution_ready]) as fetch, \
+                    patch.object(strategy, "_run_on_loop", side_effect=lambda callback: callback()), \
+                    patch.object(strategy, "execute_opening_auction") as execute:
+                strategy.clock.set_time(timestamp("2026-07-08 09:24:01"))
+                strategy._on_opening_auction_timer(None)
+                strategy.clock.set_time(timestamp("2026-07-08 09:24:50"))
+                strategy._on_opening_auction_execution_timer(None)
+                planning_pending.set_result({A: {"last_price": 10, "last_close": 10},
+                                             B: {"last_price": 20, "last_close": 20}})
+                self.assertEqual(fetch.call_count, 2)
+                self.assertEqual(len(planner.requests), 1)
+                self.assertEqual(strategy._auction_planning_contexts[DAY].instruments[A].price, 10)
+                self.assertEqual(strategy.auction_reference(A).price, 10.1)
+                execute.assert_called_once_with()
+        finally:
+            engine.dispose()
+
+    def test_execution_requires_plan_and_its_own_snapshot(self):
+        engine, strategy, planner, _ = replay_fixture()
+        snapshot = {A: {"last_price": 10, "last_close": 10},
+                    B: {"last_price": 20, "last_close": 20}}
+        try:
+            strategy.clock.set_time(timestamp("2026-07-08 09:24:50"))
+            with patch.object(strategy, "execute_opening_auction") as execute:
+                strategy.process_opening_auction_execution()
+                self.assertEqual(planner.requests, [])
+                execute.assert_not_called()
+                self.assertTrue(strategy.accept_opening_auction_snapshot(DAY, snapshot,
+                                ts_init=timestamp("2026-07-08 09:24:01")))
+                strategy.process_opening_auction()
+                strategy.process_opening_auction_execution()
+                self.assertEqual(len(planner.requests), 1)
+                execute.assert_not_called()
+                self.assertIsNone(strategy.auction_reference(A))
+                self.assertTrue(strategy.accept_opening_auction_execution_snapshot(DAY, snapshot,
+                                ts_init=timestamp("2026-07-08 09:24:50")))
+                strategy.process_opening_auction_execution()
+                execute.assert_called_once_with()
+        finally:
+            engine.dispose()
+
+    def test_execution_snapshot_requires_only_targets_and_holdings(self):
+        engine, strategy, planner, _ = replay_fixture()
+        strategy.configure_planning_archive(None, lambda day: {
+            "quantities": {A: 1000}, "reason": "saved", "version": "saved",
+            "signal_date": date(2026, 7, 7), "target_extra": {},
+        })
+        try:
+            strategy.clock.set_time(timestamp("2026-07-08 09:24:01"))
+            strategy.accept_opening_auction_snapshot(DAY, {
+                A: {"last_price": 10}, B: {"last_price": 20},
+            }, ts_init=strategy.clock.timestamp_ns())
+            strategy.process_opening_auction()
+            strategy.clock.set_time(timestamp("2026-07-08 09:24:50"))
+            self.assertTrue(strategy.accept_opening_auction_execution_snapshot(DAY, {
+                A: {"last_price": 10.1},
+            }, ts_init=strategy.clock.timestamp_ns()))
+            with patch.object(strategy, "execute_opening_auction") as execute:
+                strategy.process_opening_auction_execution()
+                execute.assert_called_once_with()
+            self.assertEqual(planner.requests, [])
+            self.assertEqual(strategy.auction_reference(A).price, 10.1)
+        finally:
+            engine.dispose()
+
+    def test_restarted_execution_restores_targets_before_checking_missing_prices(self):
+        engine, strategy, planner, _ = replay_fixture()
+        loader = MagicMock(return_value={
+            "quantities": {B: 500}, "reason": "saved", "version": "saved",
+            "signal_date": date(2026, 7, 7),
+            "target_extra": {B: {"execution_phase": "opening_auction", "prediction_rank": 1}},
+        })
+        strategy.configure_planning_archive(None, loader)
+        try:
+            strategy.clock.set_time(timestamp("2026-07-08 09:24:50"))
+            self.assertFalse(strategy.accept_opening_auction_execution_snapshot(
+                DAY, {A: {"last_price": 10}}, ts_init=strategy.clock.timestamp_ns()))
+            loader.assert_called_once_with(DAY)
+            self.assertEqual(strategy._target_quantities, {B: 500})
+            self.assertIn(DAY, strategy._auction_snapshot_failed_dates)
+            self.assertNotIn(DAY, strategy._auction_execution_snapshot_dates)
+            self.assertEqual(planner.requests, [])
+            self.assertEqual(engine.cache.orders(), [])
+            self.assertIsNone(strategy.auction_reference(B))
         finally:
             engine.dispose()

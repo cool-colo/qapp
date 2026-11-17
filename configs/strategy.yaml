@@ -51,6 +51,7 @@ price_trend_max_offset_multiplier: 3.0
 cash_buffer_percent: 0.0
 target_cash_buffer_percent: 0.01
 order_slice_notional: 300000     # CNY cap per slice; 0 disables this cap; instrument quantity limits still apply
+continuous_buy_min_notional: 10000  # Each continuous BUY must exceed this; 0 disables.
 limit_stop_mode: freeze_symbol
 auto_replan_enabled: true        # automatic price-limit replanning; manual replanning stays enabled
 leave_non_targets: false         # false => exit holdings absent from latest targets
@@ -89,17 +90,18 @@ preopen_latency_fixed_advance_ms: 50
 
 # --- Opening call auction (on by default) ---
 # Uses all available account cash, prediction-rank priority, and fixed daily targets.
-# Auction preparation fetches one complete whole-market full-tick batch and uses last_price.
+# Planning and execution each fetch a complete whole-market full-tick batch for last_price.
 # Auction submissions use their own window; continuous orders obey execution_windows.
 # Cancels obey cancel_windows, never before 09:30.
 auction_enabled: true
-auction_start_time: "09:24:01"  # One daily trigger: fetch snapshot, plan, then submit immediately.
+auction_start_time: "09:24:01"  # Planning timer: fetch latest prices, then freeze targets.
+auction_execution_time: "09:24:50"  # Execution timer: fetch latest prices again, then submit.
 auction_submit_cutoff: "09:24:59"
 auction_buy_offset_bps: 50.0
 auction_sell_offset_bps: 50.0
 auction_commission_rate: 0.000085  # 万 0.85, both buys and sells
 auction_minimum_fee: 5.0
-auction_partial_min_notional: 58000  # Partial notional > threshold; remaining target >= threshold.
+auction_min_buy_notional: 10000  # Partial auction BUY must exceed this; whole small targets allowed; 0 disables.
 
 # --- Full-tick snapshot ---
 full_tick_refresh_secs: 1.0

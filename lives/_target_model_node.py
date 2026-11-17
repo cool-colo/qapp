@@ -55,6 +55,7 @@ class VenueClients:
 
 class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
     _OPENING_AUCTION_ALERT = "TARGET-MODEL-OPENING-AUCTION"
+    _OPENING_AUCTION_EXECUTION_ALERT = "TARGET-MODEL-OPENING-AUCTION-EXECUTION"
     _REFRESH_ALERT = "TARGET-MODEL-DATA-REFRESH"
     _EARLY_REFRESH_ALERT = "TARGET-MODEL-DATA-EARLY-REFRESH"
     _EARLY_REFRESH_TIME = (7, 0)
@@ -68,7 +69,7 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         event_reporter: FixedTimeEventReporter | None = None,
     ) -> None:
         super().__init__(config)
-        self._auction_snapshot_requested_dates: set[date] = set()
+        self._auction_snapshot_requests: set[tuple[date, str]] = set()
         self._refresh_context = refresh_context
         self._refresh_interval_secs = float(refresh_interval_secs)
         self._refresh_time = self._parse_hh_mm(refresh_time)
@@ -210,8 +211,20 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
                 self.log.warning(f"Could not summarize DingTalk event {event_name}: {exc}")
 
     def _schedule_opening_auction(self) -> None:
+        self._schedule_opening_auction_alert(
+            self._OPENING_AUCTION_ALERT, self.config.auction_start_time,
+            self._on_opening_auction_timer,
+        )
+        self._schedule_opening_auction_alert(
+            self._OPENING_AUCTION_EXECUTION_ALERT, self.config.auction_execution_time,
+            self._on_opening_auction_execution_timer,
+        )
+
+    def _schedule_opening_auction_alert(
+        self, name: str, configured_time: str, callback: Callable[[Any], None],
+    ) -> None:
         now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
-        start = auction_time(self.config.auction_start_time)
+        start = auction_time(configured_time)
         alert_time = now.normalize() + pd.Timedelta(
             hours=start.hour, minutes=start.minute, seconds=start.second,
             microseconds=start.microsecond,
@@ -219,45 +232,73 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         if alert_time <= now:
             alert_time += pd.Timedelta(days=1)
         self.clock.set_time_alert(
-            name=self._OPENING_AUCTION_ALERT,
+            name=name,
             alert_time=alert_time,
-            callback=self._on_opening_auction_timer,
+            callback=callback,
             override=True,
         )
-        self.log.info(f"Next opening auction scheduled for {alert_time.isoformat()}")
+        self.log.info(f"Next opening auction alert {name} scheduled for {alert_time.isoformat()}")
 
     def _on_opening_auction_timer(self, _event: Any) -> None:
         self.log.info(
-            f"Opening auction triggered: date={self._clock_date()} "
+            f"Opening auction planning triggered: date={self._clock_date()} "
             f"start={self.config.auction_start_time}",
         )
-        self._schedule_opening_auction()
-        self._prepare_opening_auction_snapshot(on_ready=self.process_opening_auction)
+        self._schedule_opening_auction_alert(
+            self._OPENING_AUCTION_ALERT, self.config.auction_start_time,
+            self._on_opening_auction_timer,
+        )
+        self._prepare_opening_auction_snapshot(phase="planning", on_ready=self.process_opening_auction)
 
-    def _prepare_opening_auction_snapshot(self, *, on_ready: Callable[[], None]) -> None:
+    def _on_opening_auction_execution_timer(self, _event: Any) -> None:
+        self.log.info(
+            f"Opening auction execution triggered: date={self._clock_date()} "
+            f"start={self.config.auction_execution_time}",
+        )
+        self._schedule_opening_auction_alert(
+            self._OPENING_AUCTION_EXECUTION_ALERT, self.config.auction_execution_time,
+            self._on_opening_auction_execution_timer,
+        )
+        self._prepare_opening_auction_snapshot(
+            phase="execution", on_ready=self.process_opening_auction_execution,
+        )
+
+    def _prepare_opening_auction_snapshot(self, *, phase: str, on_ready: Callable[[], None]) -> None:
         """Prepare one validated snapshot, then notify the caller that it is ready."""
+        if phase not in {"planning", "execution"}:
+            raise ValueError(f"Unknown opening auction phase: {phase!r}")
         now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
         day = now.date()
+        start_time = (self.config.auction_start_time if phase == "planning"
+                      else self.config.auction_execution_time)
+        request = (day, phase)
         if (not self.config.auction_enabled or day not in self._trading_dates
-                or not auction_time(self.config.auction_start_time) <= now.time()
+                or not auction_time(start_time) <= now.time()
                 < auction_time(self.config.auction_submit_cutoff)
-                or day in self._auction_snapshot_requested_dates
+                or request in self._auction_snapshot_requests
                 or self._trading_paused or self._target_updates_paused):
             return
-        self._auction_snapshot_requested_dates.add(day)
+        self._auction_snapshot_requests.add(request)
 
         def completed(status: str, details: dict[str, Any]) -> None:
             if status != "success":
-                self.fail_opening_auction_snapshot(day, str(details.get("error")))
+                self.fail_opening_auction_snapshot(day, f"{phase} snapshot failed: {details.get('error')}")
                 return
-            if not self._within_auction_submit_time():
-                self.fail_opening_auction_snapshot(day, "snapshot completed outside auction submission window")
+            completed_at = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
+            if (completed_at.date() != day or not auction_time(start_time) <= completed_at.time()
+                    < auction_time(self.config.auction_submit_cutoff)):
+                self.fail_opening_auction_snapshot(day, f"{phase} snapshot completed outside auction window")
                 return
             snapshot = {i: asdict(tick) for i, tick in self.whole_market_snapshot().items()}
-            if self.accept_opening_auction_snapshot(day, snapshot, ts_init=int(self.clock.timestamp_ns())):
+            accept = (self.accept_opening_auction_snapshot if phase == "planning"
+                      else self.accept_opening_auction_execution_snapshot)
+            if accept(day, snapshot, ts_init=int(self.clock.timestamp_ns())):
                 on_ready()
 
-        self.request_whole_market_full_tick_refresh("auction_prepare", on_complete=completed)
+        self.request_whole_market_full_tick_refresh(
+            "auction_prepare" if phase == "planning" else "auction_execute",
+            on_complete=completed, require_fresh=True,
+        )
 
     def _on_process_targets_timer(self, _event: Any) -> None:
         if not self._within_trading_window():
@@ -557,18 +598,20 @@ def build_target_model_node(
             limit_stop_mode=params.limit_stop_mode,
             exit_non_targets=params.exit_non_targets,
             order_slice_notional=params.order_slice_notional,
+            continuous_buy_min_notional=params.continuous_buy_min_notional,
             trade_tick_log_sample_rate=params.trade_tick_log_sample_rate,
             order_book_depth_log_sample_rate=params.order_book_depth_log_sample_rate,
             trading_windows=params.trading_windows,
             exchange_trading_windows=params.exchange_trading_windows,
             auction_enabled=params.auction_enabled,
             auction_start_time=params.auction_start_time,
+            auction_execution_time=params.auction_execution_time,
             auction_submit_cutoff=params.auction_submit_cutoff,
             auction_buy_offset_bps=params.auction_buy_offset_bps,
             auction_sell_offset_bps=params.auction_sell_offset_bps,
             auction_commission_rate=params.auction_commission_rate,
             auction_minimum_fee=params.auction_minimum_fee,
-            auction_partial_min_notional=params.auction_partial_min_notional,
+            auction_min_buy_notional=params.auction_min_buy_notional,
             execution_windows=params.execution_windows,
             exchange_execution_windows=params.exchange_execution_windows,
             cancel_windows=params.cancel_windows,

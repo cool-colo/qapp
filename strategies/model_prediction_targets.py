@@ -97,6 +97,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         super().__init__(config)
         self._auction_replay_model = None
         self._auction_planning_contexts: dict[date, ModelTargetPlanningContext] = {}
+        self._auction_execution_snapshot_dates: set[date] = set()
         self._auction_snapshot_failed_dates: set[date] = set()
         self._frozen_auction_plans: dict[date, ModelTargetPlan] = {}
         self._auction_frozen_dates: set[date] = set()
@@ -632,6 +633,16 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             for signal in self._signals_by_date.get(signal_date, [])
             if signal["stock_code"] in self._instrument_by_stock
         }
+        if not self._validate_opening_auction_snapshot(context, required, snapshot):
+            return False
+        self._auction_planning_contexts[trading_date] = context
+        return True
+
+    def _validate_opening_auction_snapshot(
+        self, context: ModelTargetPlanningContext, required: set[str],
+        snapshot: dict[str, dict[str, Any]],
+    ) -> bool:
+        trading_date = context.trading_date
         suspended = self._suspended_by_date.get(trading_date, set())
         missing = []
         for i in sorted(required):
@@ -643,23 +654,68 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         if missing or not snapshot:
             self.fail_opening_auction_snapshot(trading_date, f"missing last_price: {missing}")
             return False
-        self._auction_planning_contexts[trading_date] = context
+        return True
+
+    def accept_opening_auction_execution_snapshot(
+        self, trading_date: date, snapshot: dict[str, dict[str, Any]], *, ts_init: int,
+    ) -> bool:
+        """Refresh execution references without changing the captured planning inputs."""
+        if (trading_date != self._clock_date()
+                or trading_date in self._auction_execution_snapshot_dates
+                or trading_date in self._auction_snapshot_failed_dates
+                or not self._within_auction_submit_time() or trading_date not in self._trading_dates
+                or self._trading_paused or self._target_updates_paused or self._replanning_blocked):
+            return False
+        self._roll_trading_day(trading_date)
+        if self._awaiting_pre_open_reconcile():
+            self.log.warning("Opening auction execution skipped: pre-open reconciliation is pending")
+            return False
+        if not self._restore_opening_auction_target(trading_date):
+            return False
+        context = self.build_planning_context(trading_date, stage="opening_auction",
+                                              snapshot=snapshot, ts_init=ts_init)
+        required = self._held_instrument_ids() | set(self._target_quantities)
+        if not self._validate_opening_auction_snapshot(context, required, snapshot):
+            return False
+        self.apply_full_tick_snapshot(snapshot, "auction_execute")
         self.set_opening_auction_prices(
             {i: inputs.price for i, inputs in context.instruments.items() if inputs.price is not None},
             ts_init=ts_init,
         )
+        self._auction_execution_snapshot_dates.add(trading_date)
         return True
+
+    def _restore_opening_auction_target(self, trading_date: date) -> bool:
+        """Recover a same-day target before validating execution prices, without planning."""
+        with self._trading_action_lock:
+            if self._trading_paused or self._target_updates_paused or self._replanning_blocked:
+                return False
+            has_current_target = self._target_date == trading_date and (
+                bool(self._target_version) or trading_date in self._auction_frozen_dates
+            )
+            if not has_current_target and not self._restore_saved_target(trading_date):
+                self.log.warning(f"Opening auction execution skipped: date={trading_date} no accepted or saved target")
+                return False
+            signal_date = self._resolve_signal_date(trading_date)
+            for stock_code, rank in self._prediction_ranks_by_date.get(signal_date, {}).items():
+                if stock_code in self._instrument_by_stock:
+                    self._auction_prediction_ranks.setdefault(str(self._instrument_by_stock[stock_code]), rank)
+            self._auction_frozen_dates.add(trading_date)
+            self._processed_dates.add(trading_date)
+            return True
 
     def fail_opening_auction_snapshot(self, trading_date: date, reason: str) -> None:
         self._auction_snapshot_failed_dates.add(trading_date)
         self.log.warning(f"Opening auction skipped: date={trading_date} {reason}")
 
     def process_opening_auction(self) -> None:
+        """Plan or restore the day's fixed auction targets, without submitting orders."""
         now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
         trading_date = now.date()
         if (not self.config.auction_enabled or trading_date not in self._trading_dates
                 or not auction_time(self.config.auction_start_time) <= now.time()
                 < auction_time(self.config.auction_submit_cutoff)
+                or trading_date in self._auction_snapshot_failed_dates
                 or self._trading_paused or self._target_updates_paused):
             return
         self._roll_trading_day(trading_date)
@@ -707,6 +763,21 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 f"Opening auction target ready: date={trading_date} "
                 f"target_version={self._target_version} reason={self._target_reason}",
             )
+
+    def process_opening_auction_execution(self) -> None:
+        """Submit fixed targets only after the execution phase's fresh snapshot."""
+        trading_date = self._clock_date()
+        if (not self._within_auction_submit_time() or trading_date not in self._trading_dates
+                or trading_date in self._auction_snapshot_failed_dates
+                or self._trading_paused or self._target_updates_paused):
+            return
+        if (trading_date not in self._auction_frozen_dates or self._target_date != trading_date
+                or trading_date not in self._auction_execution_snapshot_dates):
+            self.log.warning(f"Opening auction execution skipped: date={trading_date} plan or snapshot is not ready")
+            return
+        if self._awaiting_pre_open_reconcile():
+            self.log.warning("Opening auction execution skipped: pre-open reconciliation is pending")
+            return
         self.execute_opening_auction()
 
     def compute_daily_target_plan(

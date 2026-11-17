@@ -24,20 +24,17 @@ class AuctionAllocation:
 
 
 class AuctionOrderSplitter:
-    """Prefer whole targets; only allocate a large enough affordable partial order.
+    """Prefer whole targets, otherwise allocate the largest affordable legal part.
 
     The continuous-trading notional cap does not apply. Exchange quantity limits
     still apply, with minimum commission reserved for every physical order.
     """
 
-    def __init__(self, commission_rate: Decimal, minimum_fee: Decimal,
-                 partial_min_notional: Decimal) -> None:
+    def __init__(self, commission_rate: Decimal, minimum_fee: Decimal) -> None:
         self.commission_rate = Decimal(str(commission_rate))
         self.minimum_fee = Decimal(str(minimum_fee))
-        self.partial_min_notional = Decimal(str(partial_min_notional))
         for name, value in (("commission_rate", self.commission_rate),
-                            ("minimum_fee", self.minimum_fee),
-                            ("partial_min_notional", self.partial_min_notional)):
+                            ("minimum_fee", self.minimum_fee)):
             if not value.is_finite() or value < 0:
                 raise ValueError(f"Auction {name} must be finite and non-negative")
         if self.commission_rate >= 1:
@@ -70,18 +67,22 @@ class AuctionOrderSplitter:
                                  reason)
 
     def allocate(self, instrument: Any, quantity: Decimal, price: Decimal, budget: Decimal,
-                 *, allow_odd_lot: bool = False) -> AuctionAllocation:
+                 *, allow_odd_lot: bool = False,
+                 min_order_notional: Decimal = Decimal("0")) -> AuctionAllocation:
         quantity, price, budget = (Decimal(str(value)) for value in (quantity, price, budget))
         if any(not value.is_finite() for value in (quantity, price, budget)) or price <= 0:
             raise ValueError("Auction allocation requires finite values and a positive price")
+        min_order_notional = Decimal(str(min_order_notional))
+        if not min_order_notional.is_finite() or min_order_notional < 0:
+            raise ValueError("min_order_notional must be finite and non-negative")
         if quantity <= 0 or budget <= 0:
             return AuctionAllocation(reason="no_quantity_or_budget")
         full = self._allocation(instrument, quantity, price, allow_odd_lot=allow_odd_lot,
                                 reason="whole_target")
-        if sum(full.quantities, Decimal("0")) != quantity:
-            return AuctionAllocation(reason="untradeable_target_quantity")
-        if full.budget_used <= budget:
-            return full
+        if sum(full.quantities, Decimal("0")) == quantity and full.budget_used <= budget:
+            if full.notional <= min_order_notional:
+                return full
+            return self._filter_small_orders(full, price, min_order_notional)
 
         # Partial liquidation cannot use odd lots: the remainder still exists.
         # Find the maximum legal quantity including commission on every slice.
@@ -99,8 +100,15 @@ class AuctionOrderSplitter:
                 lower = middle + 1
             else:
                 upper = middle - 1
-        if best.notional <= self.partial_min_notional:
-            return AuctionAllocation(reason="partial_below_min_notional")
-        if (quantity - sum(best.quantities, Decimal("0"))) * price < self.partial_min_notional:
-            return AuctionAllocation(reason="remaining_target_below_min_notional")
-        return best
+        return self._filter_small_orders(best, price, min_order_notional)
+
+    def _filter_small_orders(self, allocation: AuctionAllocation, price: Decimal,
+                             minimum: Decimal) -> AuctionAllocation:
+        quantities = tuple(q for q in allocation.quantities if minimum == 0 or q * price > minimum)
+        if quantities == allocation.quantities:
+            return allocation
+        if not quantities:
+            return AuctionAllocation(reason="auction_buy_below_min_notional")
+        return AuctionAllocation(quantities, sum(quantities, Decimal("0")) * price,
+                                 sum((self.commission(q * price) for q in quantities), Decimal("0")),
+                                 "partial_target")

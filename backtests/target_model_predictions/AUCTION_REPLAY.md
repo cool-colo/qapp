@@ -8,10 +8,13 @@ No launcher or running account is changed automatically.
 
 ## Live configuration
 
-Set `auction_enabled: true` in the account's strategy YAML. One daily time alert at
-`auction_start_time` (default 09:24:01) requests the snapshot, then plans and submits
-orders when that batch completes. There is no periodic auction planning or second
-submission timer. Submissions stop at `auction_submit_cutoff` (default 09:24:59),
+Set `auction_enabled: true` in the account's strategy YAML. Two independent daily
+time alerts drive the auction: `auction_start_time` (default 09:24:01) fetches a
+planning snapshot and freezes targets without submitting orders;
+`auction_execution_time` (default 09:24:50) fetches another snapshot and submits
+those target quantities using the new prices and the existing BP offsets. Times
+must satisfy `09:15 <= auction_start_time < auction_execution_time < auction_submit_cutoff <= 15:00`.
+Submissions stop at `auction_submit_cutoff` (default 09:24:59),
 and no order is canceled before 09:30. Subsequent submissions and replacements obey both
 `execution_windows` and `exchange_execution_windows`. Cancellations independently
 obey `cancel_windows` and `exchange_cancel_windows`, which default to
@@ -22,12 +25,22 @@ Local and exchange timestamps must be on the same day and in the same continuous
 session; stale books still cannot trigger automatic cancellation. Resting exchange orders can
 still fill outside these windows.
 
-Preparation requests one complete whole-market full-tick batch through the existing
-live infrastructure. Planning and auction execution use its positive `last_price`;
+Each phase requests its own complete whole-market full-tick batch through the existing
+live infrastructure. An older in-flight fetch completes before the new phase's request
+starts; its result cannot substitute for the new request. Planning and execution each
+use their batch's positive `last_price`;
 for this feed, pre-open `last_price` is the indicative matching price. Snapshot
 preparation does not require depth subscriptions. No equal-book,
 exchange-timestamp or four-second age filter is applied. A failed request or a missing
-required candidate/holding price skips auction participation, without another fetch.
+required price skips auction participation, without retrying that phase or using the
+planning prices for execution. Planning validates candidate/holding prices; execution
+validates target/holding prices and requires a completed same-day target. A fetch
+completed after the cutoff cannot submit orders.
+If the process restarts between planning and execution, the execution phase restores
+the latest committed same-day target before validating its target/holding prices.
+An already accepted same-day target takes precedence; empty committed targets remain
+valid and submit no buys. This recovery does not invoke the optimizer or require the
+planning alert to run again. Without an accepted or saved target, execution is skipped.
 Suspended stocks keep the existing calendar/status handling and last-close valuation.
 The normal full-tick prefetch and other whole-market schedules retain their settings;
 the auction no longer enables a separate periodic per-universe pre-open refresh.
@@ -71,42 +84,43 @@ Both sides reserve the greater of `auction_minimum_fee` (default CNY 5) and
 for each physical order. Notional uses the submitted limit price and legal quantities.
 Targets are inspected in rank order:
 
-1. Complete target deficits that fit the remaining budget including commission are
-   submitted whole, including small targets below CNY 58,000.
+1. Complete target deficits that fit the remaining budget including commission
+   are submitted whole. Whole small buy targets may be below
+   `auction_min_buy_notional` (default CNY 10,000).
 2. Otherwise, find the largest affordable legal partial quantity, accounting for
-   every physical order's minimum fee. Submit it only when its notional is strictly
-   greater than `auction_partial_min_notional` (default CNY 58,000) **and** the
-   remaining target notional is at least that threshold. Do not reduce this quantity
-   merely to manufacture a qualifying remainder.
-3. Skip disqualified targets and continue inspecting later targets. In particular,
-   a remaining budget below CNY 58,000 can fund only complete smaller targets.
+   every physical order's minimum fee. Partial physical buy orders must strictly
+   exceed `auction_min_buy_notional`; orders at or below it are omitted during
+   allocation. A small whole target that does not fit is not partially submitted.
+3. There is no remaining-target threshold. A high-ranked target receives the
+   largest allowed partial allocation before later targets are inspected. If it
+   cannot produce an eligible order, inspect the next target, including affordable
+   whole small targets. Set the minimum to zero to disable it.
 
-For example, a CNY 100,000 target with CNY 60,000 cash is skipped because the
-affordable partial would leave a target below CNY 58,000. A CNY 200,000 target may
-qualify for that cash budget. CNY 40,000 cash cannot partially fund a CNY 100,000
-target but can fully fund a later CNY 20,000 target including its minimum fee.
-Exchange maximum order quantities can still require multiple physical orders,
-even for a complete target, with commission reserved separately for each.
+For example, a CNY 100,000 buy target with CNY 40,000 cash receives the largest
+legal partial amount after fees. CNY 10,000 cash cannot produce an eligible partial
+buy, but can still fund a later complete CNY 8,000 buy target plus commission.
+Exchange maximum quantities may force multiple physical orders; small partial buy
+tails are omitted without redistributing shares from the preceding orders.
 
 Buys are submitted first. With no submitted auction buys, no auction sells are
 submitted, even if the plan reduces holdings. The gross limit-price notional of
 actual submitted buy quantities supplies the sell budget. Sell orders and their
 commission together must fit this budget. Sell deficits are inspected from the
-worst prediction rank upward, using the same whole/partial/remainder rules.
+worst prediction rank upward, using the same largest-affordable allocation, without the buy minimum.
 Holdings absent from the full prediction ranking are sold first; the full ranking
 is retained even for stocks excluded from the buy candidate list. Auction sellable
 quantity comes from starting Nautilus holdings, less this strategy's own pending
 sells, without reading broker frozen/sellable reports.
 
-These rules can leave cash unused because of lots and thresholds. The exact
-minimum-commission crossover is `5 / 0.000085 = 58,823.53`, slightly above the default
-58,000 threshold; set the threshold higher if desired. Small whole targets still
-incur minimum commission. Partial exchange fills can create small filled or
-remaining amounts regardless of allocation thresholds. The sell cap uses submitted
-limit-price amounts, not guaranteed clearing proceeds: buys and sells may fill in
-different proportions, and clearing prices can change their actual cash amounts.
-Unfilled or unallocated target deficits remain for ordinary convergence and its
-existing splitting logic during configured continuous execution windows.
+These rules can leave cash unused because of legal lots and minimum buy sizes.
+The sell cap uses submitted limit-price amounts, not guaranteed clearing proceeds:
+buys and sells may fill in different proportions. Remaining targets stay unchanged.
+Continuous execution keeps the existing splitting policy, but each physical BUY
+must strictly exceed `continuous_buy_min_notional` (default CNY 10,000, zero disables).
+The check uses quantity times submitted limit price, excluding commission, and
+applies to initial, deferred and replacement orders. Whole small buys have no
+exception in continuous trading. SELL orders are not subject to either buy minimum.
+Small omitted tails remain outstanding; targets are not increased or marked achieved.
 
 Buy/sell limits use the preparation snapshot price plus/minus the configured offsets
 (50 bps, or 0.5%, by default),
@@ -150,9 +164,10 @@ assumed receive delay to exchange `datetime`; test this assumption together with
 submission/cancel delays. The inspected 2026-10-14 `000001.XSHE` sample had 4,821
 usable records, including a 09:25 open of 11.57 and 361,200 auction shares.
 Auction indicative observations in that sample were nine seconds apart. The replay
-uses each stock’s latest observation received by `auction_start_time`
-for a single complete batch; later observations do not replace its prices. Submission
-uses that batch immediately after planning, before `auction_submit_cutoff`.
+uses each stock’s latest observation received by `auction_start_time` for the planning
+batch and by `auction_execution_time` for a separate execution batch. Only the second
+batch prices submissions; the original planning context remains immutable. Observations
+received later and final clearing prices cannot repair either captured batch.
 
 ## Historical data contract
 

@@ -509,6 +509,7 @@ class ReplanningTests(unittest.TestCase):
             continuous=True,
             transform_config=lambda config: type(config)(**{
                 **config.dict(), "auction_start_time": "10:54:01", "auction_submit_cutoff": "10:59:59",
+                "auction_execution_time": "10:54:50",
             }),
         )
         archive = {"quantities": {A: 1000}, "reason": "saved-continuous", "version": "saved-continuous",

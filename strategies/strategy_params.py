@@ -82,6 +82,7 @@ class StrategyParams:
     cash_buffer_percent: float = 0.0
     target_cash_buffer_percent: float = 0.05
     order_slice_notional: Decimal = Decimal("300000")
+    continuous_buy_min_notional: Decimal = Decimal("10000")
     limit_stop_mode: str = "freeze_symbol"
     leave_non_targets: bool = False  # -> exit_non_targets = not leave_non_targets
     stop_time: str = "14:55"
@@ -113,12 +114,13 @@ class StrategyParams:
     # Opening call auction; independent of continuous execution windows.
     auction_enabled: bool = True
     auction_start_time: str = "09:24:01"
+    auction_execution_time: str = "09:24:50"
     auction_submit_cutoff: str = "09:24:59"
     auction_buy_offset_bps: float = 50.0
     auction_sell_offset_bps: float = 50.0
     auction_commission_rate: float = 0.000085
     auction_minimum_fee: float = 5.0
-    auction_partial_min_notional: Decimal = Decimal("58000")
+    auction_min_buy_notional: Decimal = Decimal("10000")
 
     # Full-tick snapshot
     full_tick_refresh_secs: float = 1.0
@@ -168,6 +170,9 @@ class StrategyParams:
             raise ValueError("partial_fill_notional_threshold must be non-negative")
         if self.small_leaves_notional_threshold < 0:
             raise ValueError("small_leaves_notional_threshold must be non-negative")
+        minimum = Decimal(str(self.continuous_buy_min_notional))
+        if not minimum.is_finite() or minimum < 0:
+            raise ValueError("continuous_buy_min_notional must be finite and non-negative")
         if float(self.price_trend_window_secs) <= 0:
             raise ValueError("price_trend_window_secs must be positive")
         if float(self.price_trend_threshold_bps) < 0:
@@ -270,6 +275,8 @@ class StrategyParams:
         data = dict(raw)
         for name in (
             "order_slice_notional",
+            "continuous_buy_min_notional",
+            "auction_min_buy_notional",
             "initial_cash",
             "partial_fill_notional_threshold",
             "small_leaves_notional_threshold",
