@@ -8,9 +8,11 @@ No launcher or running account is changed automatically.
 
 ## Live configuration
 
-Set `auction_enabled: true` in the account's strategy YAML. Preparation begins at
-09:24:01, orders are submitted from 09:24:50 until 09:24:59, and no order is canceled
-before 09:30. Subsequent submissions and replacements obey both
+Set `auction_enabled: true` in the account's strategy YAML. One daily time alert at
+`auction_start_time` (default 09:24:01) requests the snapshot, then plans and submits
+orders when that batch completes. There is no periodic auction planning or second
+submission timer. Submissions stop at `auction_submit_cutoff` (default 09:24:59),
+and no order is canceled before 09:30. Subsequent submissions and replacements obey both
 `execution_windows` and `exchange_execution_windows`. Cancellations independently
 obey `cancel_windows` and `exchange_cancel_windows`, which default to
 `09:30-11:30,13:00-14:57`. Cancel windows include their start and exclude their end,
@@ -20,20 +22,33 @@ Local and exchange timestamps must be on the same day and in the same continuous
 session; stale books still cannot trigger automatic cancellation. Resting exchange orders can
 still fill outside these windows.
 
-Preparation subscribes candidate and held instruments to Nautilus depth. A positive,
-equal best bid/ask during the opening auction is interpreted as the indicative
-matching price; unequal, missing, stale, future, or prior-day levels are rejected.
-Confirm this feed convention and timely delivery for each venue before enabling
-the feature. Provisioned broker reconciliation must complete before execution.
-The existing 09:27 full-tick prefetch remains available for the actual open; periodic
-full-tick refresh also runs during auction preparation.
+Preparation requests one complete whole-market full-tick batch through the existing
+live infrastructure. Planning and auction execution use its positive `last_price`;
+for this feed, pre-open `last_price` is the indicative matching price. Snapshot
+preparation does not require depth subscriptions. No equal-book,
+exchange-timestamp or four-second age filter is applied. A failed request or a missing
+required candidate/holding price skips auction participation, without another fetch.
+Suspended stocks keep the existing calendar/status handling and last-close valuation.
+The normal full-tick prefetch and other whole-market schedules retain their settings;
+the auction no longer enables a separate periodic per-universe pre-open refresh.
+Broker reconciliation must complete before execution.
+
+`ModelTargetPlanningContext` captures the trading day, stage, prices, actual opens,
+previous closes and statuses in immutable per-instrument records, indexed by a single
+`instruments` mapping and passed explicitly through planning.
+Sizing and stop-loss use the planning price. The open-gap rule uses the planning
+price before auction clearing and the fixed actual open afterwards; historical
+up-limit and trailing-take-profit rules are unchanged. Continuous execution retains
+its existing book and open-based pricing. Accepted targets immediately update the
+normal depth subscriptions, including auction targets, so cancellation checks can
+receive fresh books before the continuous submission window opens.
 
 The optimizer receives the indicative price through its existing `price` field.
-The resulting fixed daily quantities are persisted before execution, with reference
-timestamps and prediction ranks in target `extra` JSON. The 09:27 snapshot reuses
+The resulting fixed daily quantities are persisted before execution, with snapshot receipt
+time, planning stage and prediction ranks in target `extra` JSON. The 09:27 snapshot reuses
 this plan. A restart restores it and reconciles active orders before submitting.
 An existing target without auction provenance is used only for normal execution.
-Missing mandatory holding references, optimizer failure, persistence failure, or a
+Missing mandatory candidate/holding prices, optimizer failure, persistence failure, or a
 missed cutoff skips auction participation. Suspended holdings retain their existing
 previous-close valuation and cannot trade.
 
@@ -93,7 +108,7 @@ different proportions, and clearing prices can change their actual cash amounts.
 Unfilled or unallocated target deficits remain for ordinary convergence and its
 existing splitting logic during configured continuous execution windows.
 
-Buy/sell limits use the fresh indicative price plus/minus the configured offsets
+Buy/sell limits use the preparation snapshot price plus/minus the configured offsets
 (50 bps, or 0.5%, by default),
 at least one price tick, clamped to the published daily price limits. Missing limits
 skip that instrument. Indicative prices are stored separately from the actual open.
@@ -134,9 +149,10 @@ historical receive timing. `--tick-data-latency-ms` (default 0) adds an explicit
 assumed receive delay to exchange `datetime`; test this assumption together with
 submission/cancel delays. The inspected 2026-10-14 `000001.XSHE` sample had 4,821
 usable records, including a 09:25 open of 11.57 and 361,200 auction shares.
-Auction indicative observations in that sample were nine seconds apart, so fresh
-quotes do not necessarily exist at every second. Submission can occur within
-the configured 09:24:50–09:24:59 window once fresh references arrive.
+Auction indicative observations in that sample were nine seconds apart. The replay
+uses each stock’s latest observation received by `auction_start_time`
+for a single complete batch; later observations do not replace its prices. Submission
+uses that batch immediately after planning, before `auction_submit_cutoff`.
 
 ## Historical data contract
 
@@ -153,8 +169,8 @@ symbol,kind,ts_event,ts_init,bid_price,ask_price,bid_size,ask_size,previous_clos
 - `symbol` is the normalized exchange stock code, e.g. `000001.SZ`.
 - Both timestamps include a timezone. `ts_event` is exchange time; `ts_init` is
   historical receive time. Replay runs in receive-time order and rejects duplicates
-  and future event times. Samples must cover preparation, submission, and normal
-  execution windows with sufficient density for configured freshness checks.
+  and future event times. Samples must include each required stock by preparation time. Submission does not
+  require a new indicative quote; continuous execution retains its book freshness checks.
 - Prices are CNY and sizes are **shares**, not QMT hands. Convert hands explicitly
   when exporting. `previous_close` is the prior session's close.
 - `indicative` rows have equal best prices, zero `open_price`, and event time before
@@ -181,6 +197,43 @@ a suitable historical source. A date lacking final auction volume produces no
 auction fills, and reports explicitly mark the missing coverage.
 
 ## Running and interpreting a replay
+
+Tick replay accepts minute-level `--start` and `--end` datetimes:
+
+```bash
+python -m backtests.target_model_predictions.run_backtest \
+  --config /tmp/qapp_backtest.yaml \
+  --start "2026-10-14 14:30" --end "2026-10-14 14:45" \
+  --stock-codes 000001.SZ,000002.SZ \
+  --tick-table ricequant_stock_tick \
+  --report-dir output/tick_window
+```
+
+Use a backtest configuration with `risk_manager_mode: backtest`. Datetimes without
+an offset use `--exchange-timezone` (Asia/Shanghai for A-share tick replay). ISO
+datetimes with offsets are converted to that timezone. The start is inclusive and
+the datetime end is exclusive: the example includes 14:30:00 through the last
+observation before 14:45:00. Seconds/fractional seconds are also accepted. Date-only
+arguments retain the whole-date behavior, including the entire end date. A midnight
+datetime end excludes that next date. Datetime boundaries require a tick source;
+they are rejected for synthetic daily-bar matching.
+
+The interval applies to receive time (`ts_init`) for both CSV and RiceQuant data.
+RiceQuant SQL subtracts the configured data delay from these bounds and retains
+per-day partition pruning. A quote received at the end is excluded even if its
+exchange timestamp precedes the end. Synthetic auction preparation events obey
+the same interval, and the Nautilus engine's end time bounds timers and delayed
+order confirmations. The auction/continuous comparison uses identical bounds.
+
+A replay starts with configured cash and builds targets from observations received
+inside the interval; it does not replay earlier trading or inherit an earlier
+auction plan. A midday start can plan from continuous quotes carrying the actual
+open. Auction preparation inside the interval still requires complete snapshot
+coverage from the supplied observations. Signals, calendars, historical limits
+and daily valuation bars load for the included exchange dates. `daily_portfolio`
+and `daily_positions` retain their daily-close valuation basis; a partial-day run
+does not turn those reports into valuation at the requested end minute. Run
+metadata records the normalized start and exclusive end timestamps.
 
 ```bash
 python -m backtests.target_model_predictions.run_backtest \

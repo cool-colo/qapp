@@ -301,3 +301,4 @@ class LiveTradeRecord:
     qmt_raw: JsonMapping | None = None
     created_at: datetime | None = None
     schema_version: int = 1
+    strategy_id: str | None = None

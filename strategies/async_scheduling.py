@@ -27,6 +27,16 @@ class AsyncAwaitableScheduler:
         except RuntimeError:
             self._loop = None
 
+    @property
+    def has_running_loop(self) -> bool:
+        if self._loop is not None and self._loop.is_running():
+            return True
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
     def schedule(
         self,
         awaitable: Awaitable[Any],

@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS `live_control_state` (
   `trader_id`      VARCHAR(64)  NOT NULL,
   `trading_paused` TINYINT(1)   NOT NULL DEFAULT 0,
   `target_updates_paused` TINYINT(1) NOT NULL DEFAULT 0,
+  `auto_replan_enabled` TINYINT(1) NULL DEFAULT NULL,
   `updated_at`     DATETIME     NOT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_ctrl` (`account_id`,`trader_id`)
@@ -145,6 +146,12 @@ class LiveControlWriter:
         for statement in CREATE_CONTROL_TABLES_SQL:
             self._execute(statement, ())
         self._ensure_target_updates_paused_column()
+        rows = self._query("SELECT COUNT(*) FROM information_schema.COLUMNS "
+                           "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='live_control_state' "
+                           "AND COLUMN_NAME='auto_replan_enabled'", ())
+        if not rows or int(rows[0][0]) == 0:
+            self._execute("ALTER TABLE `live_control_state` ADD COLUMN `auto_replan_enabled` "
+                          "TINYINT(1) NULL DEFAULT NULL", ())
 
     def _ensure_target_updates_paused_column(self) -> None:
         """Idempotently add ``target_updates_paused`` to a pre-existing table.
@@ -170,6 +177,18 @@ class LiveControlWriter:
     # ------------------------------------------------------------------
     # State
     # ------------------------------------------------------------------
+    def load_auto_replan_enabled(self, account_id: str, trader_id: str) -> bool | None:
+        rows = self._query("SELECT `auto_replan_enabled` FROM `live_control_state` "
+                           "WHERE `account_id`=%s AND `trader_id`=%s", (account_id, trader_id))
+        return bool(rows[0][0]) if rows and rows[0][0] is not None else None
+
+    def set_auto_replan_enabled(self, account_id: str, trader_id: str, enabled: bool) -> None:
+        self._execute("INSERT INTO `live_control_state` "
+                      "(`account_id`,`trader_id`,`auto_replan_enabled`,`updated_at`) VALUES (%s,%s,%s,%s) "
+                      "ON DUPLICATE KEY UPDATE `auto_replan_enabled`=VALUES(`auto_replan_enabled`), "
+                      "`updated_at`=VALUES(`updated_at`)", (account_id, trader_id, int(enabled), datetime.now()))
+
+
     def load_trading_paused(self, account_id: str, trader_id: str) -> bool:
         rows = self._query(
             "SELECT `trading_paused` FROM `live_control_state` "

@@ -33,7 +33,6 @@ from backtests.target_model_predictions.run_backtest import (
 from market_data import DailyStockData
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig
 from strategies.model_target_planners.base import ModelTargetPlan, TargetInfo, TargetContext
-from strategies.opening_auction import AuctionReference
 from strategies.order_splitter import AuctionOrderSplitter
 from strategies.strategy_params import StrategyParams
 
@@ -163,7 +162,8 @@ def replay_fixture(*, persister=None, final_results=True, continuous=False,
     strategy._auction_replay_model = model
     if persister is not None:
         strategy.configure_live_target_plan_persister(persister)
-    events, quotes = prepare_tick_replay_event_data(SimpleNamespace(exchange_timezone="Asia/Shanghai"), rows, instruments)
+    events, quotes = prepare_tick_replay_event_data(SimpleNamespace(exchange_timezone="Asia/Shanghai"), rows, instruments,
+                                                       auction_start_time=config.auction_start_time)
     engine.add_data(prepare_tick_replay_depth_data(rows, instruments), sort=False)
     engine.add_data(quotes, sort=False)
     engine.add_data(events, client_id=PLANNING_CLIENT_ID, sort=False)
@@ -173,15 +173,13 @@ def replay_fixture(*, persister=None, final_results=True, continuous=False,
 
 
 class OpeningAuctionTest(unittest.TestCase):
-    def test_reference_freshness_and_config_validation(self):
-        now = timestamp("2026-07-08 09:24:00")
-        self.assertTrue(AuctionReference(10, now - 1, now).is_fresh(now, "Asia/Shanghai", 4))
-        for ref in [AuctionReference(10, now + 1, now + 1),
-                    AuctionReference(10, now - 5_000_000_000, now),
-                    AuctionReference(float("nan"), now, now)]:
-            self.assertFalse(ref.is_fresh(now, "Asia/Shanghai", 4))
-        for kwargs in [{"auction_submit_cutoff": "09:25"}, {"auction_buy_offset_bps": -1},
-                       {"auction_prepare_time": "09:24:50"}, {"auction_commission_rate": 1},
+    def test_auction_config_validation(self):
+        for start, cutoff in [("09:15", "09:25"), ("10:42:01", "10:50:59"), ("14:59", "15:00")]:
+            with self.subTest(start=start, cutoff=cutoff):
+                StrategyParams(auction_start_time=start, auction_submit_cutoff=cutoff)
+        for kwargs in [{"auction_submit_cutoff": "15:00:01"}, {"auction_buy_offset_bps": -1},
+                       {"auction_start_time": "09:24:59"}, {"auction_start_time": "09:14:59"},
+                       {"auction_commission_rate": 1},
                        {"auction_partial_min_notional": -1}]:
             with self.assertRaises(ValueError):
                 StrategyParams(**kwargs)
@@ -203,7 +201,7 @@ class OpeningAuctionTest(unittest.TestCase):
             quantities = {str(row.instrument_id): int(row.quantity) for _, row in orders.iterrows()}
             self.assertEqual(quantities, {"000002.SZ.QMT": 500, "000001.SZ.QMT": 200})
             self.assertEqual({o.ts_init for o in engine.cache.orders()},
-                             {timestamp("2026-07-08 09:24:50")})
+                             {timestamp("2026-07-08 09:24:01")})
             self.assertEqual({str(o.instrument_id): float(o.price) for o in engine.cache.orders()},
                              {"000001.SZ.QMT": 10.05, "000002.SZ.QMT": 20.10})
             self.assertEqual(len(planner.requests), 1)
@@ -244,7 +242,7 @@ class OpeningAuctionTest(unittest.TestCase):
 
     def test_delayed_orders_cannot_join_already_cleared_auction(self):
         engine, strategy, planner, model = replay_fixture(
-            submission_latency_ms=11000, auction_receive_delay_ms=2000)
+            submission_latency_ms=61000, auction_receive_delay_ms=2000)
         try:
             engine.run()
             self.assertFalse(engine.trader.generate_orders_report().empty)

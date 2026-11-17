@@ -54,6 +54,7 @@ class StrategyParams:
     stop_loss: float = 0.1
     trailing_take_profit: float = 0.0
     trailing_take_profit_start: float = 0.0
+    auto_replan_enabled: bool = True
     min_listed_days: int = 120
     consecutive_up_limit_days: int = 3
     max_open_gap_up: float = 0.05
@@ -111,10 +112,8 @@ class StrategyParams:
 
     # Opening call auction; independent of continuous execution windows.
     auction_enabled: bool = True
-    auction_prepare_time: str = "09:24:01"
-    auction_submit_time: str = "09:24:50"
+    auction_start_time: str = "09:24:01"
     auction_submit_cutoff: str = "09:24:59"
-    auction_reference_max_age_secs: float = 4.0
     auction_buy_offset_bps: float = 50.0
     auction_sell_offset_bps: float = 50.0
     auction_commission_rate: float = 0.000085
@@ -149,6 +148,8 @@ class StrategyParams:
 
         validate_cancel_config(self)
         validate_auction_config(self)
+        if not isinstance(self.auto_replan_enabled, bool):
+            raise ValueError("auto_replan_enabled must be a boolean")
         if int(self.consecutive_up_limit_days) < 0:
             raise ValueError("consecutive_up_limit_days must be non-negative")
         if not 0.0 <= float(self.max_open_gap_up) <= 1.0:

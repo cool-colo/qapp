@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import os
 import sys
 import tempfile
@@ -56,6 +57,12 @@ from strategies.target_quantities import TickSnapshot
 
 
 class TargetLiveConfigTest(unittest.TestCase):
+    def constructed_strategy(self):
+        from tests.test_opening_auction import replay_fixture
+        engine, strategy, _, _ = replay_fixture(auction_enabled=False)
+        self.addCleanup(engine.dispose)
+        return strategy
+
     def test_model_target_default_keeps_original_position_cap(self) -> None:
         config = TargetModelPredictionsStrategyConfig(
             instrument_ids=[],
@@ -75,7 +82,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertFalse(config.process_targets_on_timer)
 
     def test_process_trading_day_prefers_live_target_portfolio(self) -> None:
-        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        strategy = self.constructed_strategy()
         signal_date = date(2026, 7, 7)
         trading_date = date(2026, 7, 8)
         loader = MagicMock(
@@ -115,7 +122,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         strategy._live_target_plan_persister.assert_not_called()
 
     def test_process_trading_day_computes_when_live_target_portfolio_missing(self) -> None:
-        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        strategy = self.constructed_strategy()
         trading_date = date(2026, 7, 8)
         plan = ModelTargetPlan(
             trading_date=trading_date,
@@ -154,7 +161,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         strategy._live_target_plan_persister.assert_called_once_with(plan)
 
     def test_process_trading_day_persists_generated_plan_before_applying_it(self) -> None:
-        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        strategy = self.constructed_strategy()
         trading_date = date(2026, 7, 8)
         plan = ModelTargetPlan(
             trading_date=trading_date,
@@ -188,7 +195,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(events, ["persist", "apply"])
 
     def test_process_trading_day_does_not_apply_unpersisted_plan(self) -> None:
-        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        strategy = self.constructed_strategy()
         trading_date = date(2026, 7, 8)
         plan = ModelTargetPlan(
             trading_date=trading_date,
@@ -214,7 +221,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
 
     def test_process_trading_day_applies_transient_plan_without_persisting(self) -> None:
-        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        strategy = self.constructed_strategy()
         trading_date = date(2026, 7, 8)
         plan = ModelTargetPlan(
             trading_date=trading_date,
@@ -271,7 +278,7 @@ class TargetLiveConfigTest(unittest.TestCase):
 
         self.assertTrue(SnapshotRecorder.persist_strategy_target_plan(recorder, plan))
 
-        recorder._load_target.assert_called_once_with(trading_date, plan.signal_date)
+        recorder._load_target.assert_not_called()
         writer.asset_snapshot_id.assert_called_once_with(
             "ACC",
             "TRADER",
@@ -287,7 +294,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
 
     def test_process_trading_day_fails_when_live_target_rows_have_no_quantities(self) -> None:
-        strategy = TargetModelPredictionsStrategy.__new__(TargetModelPredictionsStrategy)
+        strategy = self.constructed_strategy()
         strategy._live_target_portfolio_loader = MagicMock(
             return_value=[
                 {
@@ -1159,10 +1166,13 @@ class TargetLiveConfigTest(unittest.TestCase):
             total_asset=1_000_000.0,
             investable_asset=950_000.0,
         )
-        writer = SimpleNamespace(write_target_portfolios=MagicMock())
+        writer = SimpleNamespace(write_planning_attempt=MagicMock())
         strategy = SimpleNamespace(
             compute_daily_target_plan=MagicMock(return_value=plan),
             plan_version=MagicMock(return_value="ver-1"),
+            _target_version="", _latest_planning_inputs={},
+            _trading_action_lock=threading.RLock(), _replanning_blocked=False,
+            config=SimpleNamespace(risk_manager_risk_model_id="test", alpha_model_id="test"),
         )
         recorder = SimpleNamespace()
         recorder.config = SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER")
@@ -1207,7 +1217,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             asset_id=5,
         )
 
-        record = writer.write_target_portfolios.call_args.args[0][0]
+        record = writer.write_planning_attempt.call_args.args[0][4][0]
         self.assertEqual(record.instrument_id, "000001.SZ.QMT")
         self.assertEqual(record.stock_code, "000001.SZ")
         self.assertEqual(record.target_weight, Decimal("0.12"))
@@ -1464,7 +1474,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             write_time=datetime(2026, 7, 9, 9, 32),
             account_id="ACC",
             trader_id="TRADER",
-            trade_id="T-1",
+            trade_id="T-1", strategy_id="TEST-001",
             client_order_id="O-1",
             instrument_id="000001.SZ.BIGQMT",
         )
@@ -2349,6 +2359,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder = SimpleNamespace(
             config=SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER"),
             _writer=writer,
+            cache=SimpleNamespace(order=MagicMock(return_value=None)),
             _now_naive=MagicMock(return_value=datetime(2026, 7, 9, 9, 32)),
             _event_date=MagicMock(return_value=date(2026, 7, 9)),
             _stock_code=MagicMock(return_value="000001.SZ"),
@@ -2363,12 +2374,13 @@ class TargetLiveConfigTest(unittest.TestCase):
             instrument_id="000001.SZ.BIGQMT",
             last_qty=100,
             last_px=10.5,
-            trade_id="T-1",
+            trade_id="T-1", strategy_id="TEST-001",
             client_order_id="O-1",
             venue_order_id="V-1",
             order_side=OrderSide.BUY,
             commission=Decimal("5.00"),
             info={"traded_time_ms": 1783560719000},
+            reconciliation=False,
         )
 
         SnapshotRecorder._write_trade(recorder, event)

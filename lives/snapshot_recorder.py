@@ -30,6 +30,7 @@ import time
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait
+from dataclasses import replace
 from datetime import date
 from datetime import datetime
 from decimal import Decimal
@@ -70,6 +71,9 @@ from lives.order_decision_persistence import AsyncOrderDecisionWriter
 from strategies.target_quantities import DepthBookSnapshot
 from strategies.target_quantities import OrderDecisionEvent
 from strategies.target_quantities import PreopenLatencySample
+from strategies.replanning import PlanningAttempt
+from strategies.execution_reconciliation import is_reconciliation_fill
+from uuid import uuid4
 
 
 SyncTaskCallback = Callable[[str, int, dict[str, Any]], None]
@@ -882,6 +886,13 @@ class SnapshotRecorder(Actor):
                 on_complete("skipped", 0, {"reason": "already applied in this process"})
             return
         signal_date = self._resolve_signal_date(trading_date)
+        archived = self.load_committed_plan(trading_date)
+        if archived is not None:
+            self._strategy.restore_committed_plan(trading_date, archived)
+            self._applied_target_dates.add(trading_date)
+            if on_complete is not None:
+                on_complete("skipped", 0, {"reason": "loaded committed planning version"})
+            return
         # Reuse a persisted target for the (account, trader, date, signal_date)
         # four-tuple across restarts; a before-trading target also satisfies a later
         # continuous-trading start.
@@ -920,7 +931,14 @@ class SnapshotRecorder(Actor):
             if on_complete is not None:
                 on_complete("failed", 0, {"error": str(exc)})
             return
+        if plan is None:
+            if on_complete is not None:
+                on_complete("skipped", 0, {"reason": "keeping current target after planning failure"})
+            return
         if not plan.persistable:
+            self.persist_planning_attempt(PlanningAttempt(
+                plan.request_id or uuid4().hex, trading_date, "initial", None,
+                status="safety", inputs=self._strategy._latest_planning_inputs), plan)
             version = self._strategy.plan_version(plan)
             self._apply_target(
                 trading_date,
@@ -964,8 +982,6 @@ class SnapshotRecorder(Actor):
             return False
         trading_date = plan.trading_date
         signal_date = plan.signal_date
-        if self._load_target(trading_date, signal_date):
-            return True
         try:
             asset_id = self._writer.asset_snapshot_id(
                 self.config.account_id,
@@ -984,6 +1000,19 @@ class SnapshotRecorder(Actor):
             apply_target=False,
         )
 
+    def persist_planning_attempt(self, attempt: PlanningAttempt, plan=None) -> None:
+        if plan is not None and plan.persistable:
+            if not self._persist_target_plan(plan, CONTINUOUS_TRADING, None, plan.signal_date,
+                                             apply_target=False, attempt=attempt):
+                raise RuntimeError("replanning archive transaction failed")
+            return
+        self._writer.write_planning_attempt(self.config.account_id, self.config.trader_id,
+                                            attempt.trading_date, attempt.payload(plan))
+
+    def load_committed_plan(self, trading_date: date):
+        return self._writer.load_committed_target_plan(self.config.account_id, self.config.trader_id,
+                                                      trading_date)
+
     def _persist_target_plan(
         self,
         plan: Any,
@@ -992,81 +1021,97 @@ class SnapshotRecorder(Actor):
         signal_date: date | None,
         apply_target: bool,
         on_complete: SyncTaskCallback | None = None,
+        attempt: PlanningAttempt | None = None,
     ) -> bool:
-        trading_date = plan.trading_date
-        # Raw total asset and the buffer-adjusted investable basis both come from the
-        # plan (stamped by the strategy when it built the request) so the persisted
-        # figures match exactly what was sent to the risk manager.
-        total_asset = self._plan_total_asset(plan)
-        investable_asset = self._plan_investable_asset(plan, total_asset)
-        # The risk-manager planner commits explicit share counts (固定目标股数, 0 kept).
-        # These drive execution; weights are persisted for audit only.
-        target_qty = {
-            target.instrument_id: int(target.quantity)
-            for target in plan.targets
-            if target.quantity is not None
-        }
-        version = self._strategy.plan_version(plan)
-        plan_signal_date = plan.signal_date or signal_date
-        position_id = self._position_snapshot_anchor(trading_date)
-        records: list[LiveTargetRecord] = []
-        for target in plan.targets:
-            target_context = target.target_context
-            row_version = target.target_version or version
-            extra: dict[str, Any] = {
-                "target_version": row_version,
-                "risk_model_id": self._strategy.config.risk_manager_risk_model_id,
-                "alpha_model_id": self._strategy.config.alpha_model_id,
+        with self._strategy._trading_action_lock:
+            trading_date = plan.trading_date
+            if attempt is None and (self._strategy._replanning_blocked
+                                    or plan.parent_version != (self._strategy._target_version or None)):
+                self.log.warning("initial planning result superseded; target not persisted")
+                return False
+            # Raw total asset and the buffer-adjusted investable basis both come from the
+            # plan (stamped by the strategy when it built the request) so the persisted
+            # figures match exactly what was sent to the risk manager.
+            total_asset = self._plan_total_asset(plan)
+            investable_asset = self._plan_investable_asset(plan, total_asset)
+            # The risk-manager planner commits explicit share counts (固定目标股数, 0 kept).
+            # These drive execution; weights are persisted for audit only.
+            target_qty = {
+                target.instrument_id: int(target.quantity)
+                for target in plan.targets
+                if target.quantity is not None
             }
-            if target_context.price_source == "auction_indicative":
-                extra.update(execution_phase="opening_auction",
-                             reference_price=target_context.price,
-                             reference_ts_event=target_context.price_ts_event,
-                             reference_ts_init=target_context.price_ts_init,
-                             prediction_rank=target_context.prediction_rank)
-            if target_context.recent_target_date is not None:
-                extra["recent_buy_date"] = target_context.recent_target_date.isoformat()
-            if target_context.recent_holding_days is not None:
-                extra["recent_holding_days"] = int(target_context.recent_holding_days)
-            if target_context.market_status is not None:
-                extra["market_status"] = target_context.market_status.name
-            records.append(
-                LiveTargetRecord(
-                    trade_date=trading_date,
-                    write_time=self._now_naive(),
-                    snapshot_type=snapshot_type,
-                    account_id=self.config.account_id,
-                    trader_id=self.config.trader_id,
-                    signal_date=plan_signal_date,
-                    asset_snapshot_id=asset_id,
-                    position_snapshot_id=position_id,
-                    total_asset=self._decimal_or_none(total_asset),
-                    investable_asset=self._decimal_or_none(investable_asset),
-                    request_id=plan.request_id,
-                    target_version=row_version,
-                    instrument_id=target.instrument_id,
-                    stock_code=target.stock_code,
-                    target_weight=(
-                        None
-                        if target.weight is None
-                        else Decimal(str(target.weight))
+            version = self._strategy.plan_version(plan)
+            plan_signal_date = plan.signal_date or signal_date
+            position_id = self._position_snapshot_anchor(trading_date)
+            records: list[LiveTargetRecord] = []
+            for target in plan.targets:
+                target_context = target.target_context
+                row_version = target.target_version or version
+                extra: dict[str, Any] = {
+                    "target_version": row_version,
+                    "risk_model_id": self._strategy.config.risk_manager_risk_model_id,
+                    "alpha_model_id": self._strategy.config.alpha_model_id,
+                }
+                if target_context.planning_stage is not None:
+                    extra["planning_stage"] = target_context.planning_stage
+                if target_context.price_source == "auction_indicative":
+                    extra.update(execution_phase="opening_auction",
+                                 reference_price=target_context.price,
+                                 reference_ts_event=target_context.price_ts_event,
+                                 reference_ts_init=target_context.price_ts_init,
+                                 prediction_rank=target_context.prediction_rank)
+                if target_context.recent_target_date is not None:
+                    extra["recent_buy_date"] = target_context.recent_target_date.isoformat()
+                if target_context.recent_holding_days is not None:
+                    extra["recent_holding_days"] = int(target_context.recent_holding_days)
+                if target_context.market_status is not None:
+                    extra["market_status"] = target_context.market_status.name
+                records.append(
+                    LiveTargetRecord(
+                        trade_date=trading_date,
+                        write_time=self._now_naive(),
+                        snapshot_type=snapshot_type,
+                        account_id=self.config.account_id,
+                        trader_id=self.config.trader_id,
+                        signal_date=plan_signal_date,
+                        asset_snapshot_id=asset_id,
+                        position_snapshot_id=position_id,
+                        total_asset=self._decimal_or_none(total_asset),
+                        investable_asset=self._decimal_or_none(investable_asset),
+                        request_id=plan.request_id,
+                        target_version=row_version,
+                        instrument_id=target.instrument_id,
+                        stock_code=target.stock_code,
+                        target_weight=(
+                            None
+                            if target.weight is None
+                            else Decimal(str(target.weight))
+                        ),
+                        open_price=self._decimal_or_none(target_context.price),
+                        price_source=target_context.price_source,
+                        target_qty=self._int_or_none(target.quantity),
+                        current_qty=self._int_or_none(target_context.current_qty),
+                        score=self._decimal_or_none(target_context.score),
+                        expected_return=self._decimal_or_none(target_context.expected_return),
+                        is_locked=target.is_locked,
+                        reason=plan.reason,
+                        extra=extra,
+                        created_at=self._now_naive(),
                     ),
-                    open_price=self._decimal_or_none(target_context.price),
-                    price_source=target_context.price_source,
-                    target_qty=self._int_or_none(target.quantity),
-                    current_qty=self._int_or_none(target_context.current_qty),
-                    score=self._decimal_or_none(target_context.score),
-                    expected_return=self._decimal_or_none(target_context.expected_return),
-                    is_locked=target.is_locked,
-                    reason=plan.reason,
-                    extra=extra,
-                    created_at=self._now_naive(),
-                ),
-            )
-        persisted = False
-        if records:
+                )
+            persisted = False
             try:
-                self._writer.write_target_portfolios(records)
+                if attempt is None:
+                    attempt = PlanningAttempt(plan.request_id or uuid4().hex, trading_date, "initial",
+                                              plan.parent_version, status="committed",
+                                              inputs=self._strategy._latest_planning_inputs)
+                payload = attempt.payload(plan)
+                payload.update(quantities=target_qty, version=version, reason=plan.reason,
+                               signal_date=plan_signal_date.isoformat() if plan_signal_date else None,
+                               target_extra={record.instrument_id: record.extra for record in records})
+                self._writer.write_planning_attempt(self.config.account_id, self.config.trader_id,
+                                                    trading_date, payload, records)
                 persisted = True
                 if on_complete is not None:
                     on_complete(
@@ -1086,20 +1131,16 @@ class SnapshotRecorder(Actor):
                             "error": str(exc),
                         },
                     )
-        else:
-            persisted = True
-            if on_complete is not None:
-                on_complete("success", 0, {"signal_date": plan_signal_date})
-        if apply_target:
-            self._apply_target(trading_date, target_qty, plan.reason, version, plan_signal_date)
-        if persisted:
-            self.log.info(
-                f"generated & persisted daily target: date={trading_date} signal_date={plan_signal_date} "
-                f"targets={len(plan.targets)} frozen_qty={len(target_qty)} "
-                f"total_asset={total_asset} investable_asset={investable_asset}",
-                color=LogColor.GREEN,
-            )
-        return persisted
+            if apply_target and persisted:
+                self._apply_target(trading_date, target_qty, plan.reason, version, plan_signal_date)
+            if persisted:
+                self.log.info(
+                    f"generated & persisted daily target: date={trading_date} signal_date={plan_signal_date} "
+                    f"targets={len(plan.targets)} frozen_qty={len(target_qty)} "
+                    f"total_asset={total_asset} investable_asset={investable_asset}",
+                    color=LogColor.GREEN,
+                )
+            return persisted
 
     def _plan_total_asset(self, plan: Any) -> Decimal:
         value = plan.total_asset
@@ -1184,6 +1225,12 @@ class SnapshotRecorder(Actor):
 
     def _load_target(self, trading_date: date, signal_date: date | None) -> list[dict[str, Any]]:
         try:
+            archived = self.load_committed_plan(trading_date)
+            if archived is not None:
+                return [{"instrument_id": iid, "target_qty": qty, "target_version": archived["version"],
+                         "reason": archived["reason"], "signal_date": archived["signal_date"],
+                         "extra": archived.get("target_extra", {}).get(iid, {})}
+                        for iid, qty in archived["quantities"].items()]
             return self._writer.load_target_portfolios(
                 self.config.account_id,
                 self.config.trader_id,
@@ -1272,21 +1319,22 @@ class SnapshotRecorder(Actor):
                 if isinstance(event, OrderFilled)
                 else None
             )
+            reconciliation_fill = isinstance(event, OrderFilled) and is_reconciliation_fill(
+                event, self.cache.order(event.client_order_id),
+            )
             status_time = self._local_lifecycle_time_naive(
                 event,
                 local_received_time,
             )
+            event_record = self._order_event_record(event, order_record, local_received_time, trade_record)
+            if reconciliation_fill:
+                event_record = replace(event_record, reconciliation=True)
             self._order_event_writer.submit(
                 OrderEventWrite(
-                    event_record=self._order_event_record(
-                        event,
-                        order_record,
-                        local_received_time,
-                        trade_record,
-                    ),
+                    event_record=event_record,
                     order_record=order_record,
                     status_time=status_time,
-                    trade_record=trade_record,
+                    trade_record=None if reconciliation_fill else trade_record,
                 ),
             )
         except Exception as exc:
@@ -1364,6 +1412,8 @@ class SnapshotRecorder(Actor):
 
     def _write_trade(self, event: OrderFilled) -> None:
         """Synchronous compatibility helper used by focused unit tests."""
+        if is_reconciliation_fill(event, self.cache.order(event.client_order_id)):
+            return
         self._writer.upsert_realtime_trade(
             SnapshotRecorder._trade_record_from_event(
                 self,
@@ -1389,6 +1439,7 @@ class SnapshotRecorder(Actor):
             account_id=self.config.account_id,
             trader_id=self.config.trader_id,
             trade_id=str(event.trade_id),
+            strategy_id=str(event.strategy_id),
             client_order_id=str(event.client_order_id),
             venue_order_id=self._maybe_str(getattr(event, "venue_order_id", None)),
             instrument_id=instrument_id_text,
@@ -1951,6 +2002,9 @@ class SnapshotRecorder(Actor):
             account_id=self.config.account_id,
             trader_id=self.config.trader_id,
             trade_id=trade_id,
+            # This recorder runs under the deployment's one-strategy-per-account
+            # contract, so newly backfilled broker trades are immediately in scope.
+            strategy_id=str(self._strategy.id),
             client_order_id=self._maybe_str(row.get("client_order_id")) or "",
             venue_order_id=self._maybe_str(row.get("order_id")) or self._maybe_str(row.get("order_sysid")),
             instrument_id=instrument_id_text,

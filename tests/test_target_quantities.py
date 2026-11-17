@@ -21,6 +21,7 @@ from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.objects import Quantity
 
 from strategies.async_scheduling import AsyncAwaitableScheduler
 from strategies.execution_reconciliation import ExecutionStateReconciler
@@ -174,6 +175,8 @@ class FakeFill:
     order_side: OrderSide
     last_qty: Decimal
     ts_event: int
+    client_order_id: str = "TEST-ORDER"
+    trade_id: str = "TEST-TRADE"
 
 
 class FakeOrderFactory:
@@ -331,6 +334,9 @@ class TestableTargetQuantityStrategy:
     _is_transient_sellable_denial = TargetQuantityStrategy._is_transient_sellable_denial
     _converge_to_target = TargetQuantityStrategy._converge_to_target
     _run_convergence = TargetQuantityStrategy._run_convergence
+    check_replanning_trigger = TargetQuantityStrategy.check_replanning_trigger
+    on_price_snapshot = TargetQuantityStrategy.on_price_snapshot
+    _remember_today_fill = TargetQuantityStrategy._remember_today_fill
     _schedule_convergence = TargetQuantityStrategy._schedule_convergence
     _emit_convergence = TargetQuantityStrategy._emit_convergence
     _converge_to_target_locked = TargetQuantityStrategy._converge_to_target_locked
@@ -372,6 +378,7 @@ class TestableTargetQuantityStrategy:
     _clamp_sell_quantity = TargetQuantityStrategy._clamp_sell_quantity
     venue_sellable_quantity = TargetQuantityStrategy.venue_sellable_quantity
     _today_fill_snapshot = TargetQuantityStrategy._today_fill_snapshot
+    _today_fill_events = TargetQuantityStrategy._today_fill_events
     _event_trading_date = TargetQuantityStrategy._event_trading_date
     _is_reconciliation_order = staticmethod(TargetQuantityStrategy._is_reconciliation_order)
     _open_sell_quantity = TargetQuantityStrategy._open_sell_quantity
@@ -647,6 +654,11 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._last_market_data_ts_event = book_ts
         strategy._convergence_suspended = False
         strategy._trading_paused = False
+        strategy._replanning_blocked = False
+        strategy._trading_action_lock = threading.RLock()
+        strategy._execution_activity = 0
+        strategy._live_today_fills = {}
+        strategy._restored_today_fills = {}
         strategy._target_updates_paused = False
         strategy._fetch_executor = None
         strategy._converge_lock = threading.Lock()
@@ -1848,11 +1860,9 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         # A BUY fill (no cash freed) releases only the filled instrument's backoff.
         strategy = self.make_strategy()
         strategy._insufficient_funds = {str(INST_A), str(INST_B)}
-        event = type(
-            "FillEvent",
-            (),
-            {"client_order_id": "O-1", "instrument_id": INST_A, "order_side": OrderSide.BUY},
-        )()
+        event = MagicMock(spec=OrderFilled, client_order_id="O-1", trade_id="F-1", instrument_id=INST_A,
+                          order_side=OrderSide.BUY, last_qty=Quantity.from_int(100),
+                          ts_event=strategy.clock.ts, strategy_id=strategy.id, reconciliation=False)
 
         strategy.on_order_filled(event)
 
@@ -1865,11 +1875,9 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         # rejected buys, so per-symbol discard alone would deadlock the book.
         strategy = self.make_strategy()
         strategy._insufficient_funds = {str(INST_A), str(INST_B)}
-        event = type(
-            "FillEvent",
-            (),
-            {"client_order_id": "O-1", "instrument_id": INST_A, "order_side": OrderSide.SELL},
-        )()
+        event = MagicMock(spec=OrderFilled, client_order_id="O-1", trade_id="F-1", instrument_id=INST_A,
+                          order_side=OrderSide.SELL, last_qty=Quantity.from_int(100),
+                          ts_event=strategy.clock.ts, strategy_id=strategy.id, reconciliation=False)
 
         strategy.on_order_filled(event)
 
@@ -3051,7 +3059,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         )
         fill_ts = strategy.clock.ts - 60_000_000_000
         fill_event = MagicMock(spec=OrderFilled)
-        fill_event.last_qty = FakeMoney("1000")
+        fill_event.last_qty = Quantity.from_int(1000)
         fill_event.last_px = FakeMoney("10")
         fill_event.ts_init = fill_ts
         order = FakeOrder(
@@ -3344,11 +3352,9 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             source_ts_init=2,
             source_same_side_best=Decimal("10"),
         )
-        event = type(
-            "FillEvent",
-            (),
-            {"client_order_id": "O-1", "instrument_id": INST_A, "order_side": OrderSide.BUY},
-        )()
+        event = MagicMock(spec=OrderFilled, client_order_id="O-1", trade_id="F-1", instrument_id=INST_A,
+                          order_side=OrderSide.BUY, last_qty=Quantity.from_int(100),
+                          ts_event=strategy.clock.ts, strategy_id=strategy.id, reconciliation=False)
 
         strategy.on_order_filled(event)
 

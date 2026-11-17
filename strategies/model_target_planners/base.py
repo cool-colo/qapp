@@ -3,9 +3,38 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import date
+from types import MappingProxyType
+from typing import Mapping
 from typing import Any
 
 from nautilus_trader.model.enums import MarketStatusAction
+
+
+@dataclass(frozen=True)
+class ModelTargetInstrumentContext:
+    """Inputs for one instrument within a planning snapshot."""
+
+    price: float | None = None
+    open_price: float | None = None
+    previous_close: float | None = None
+    market_status: MarketStatusAction | None = None
+    price_source: str | None = None
+    price_ts_event: int | None = None
+
+
+@dataclass(frozen=True)
+class ModelTargetPlanningContext:
+    """One immutable set of inputs for a planning attempt, independent of triggers."""
+
+    trading_date: date
+    stage: str
+    instruments: Mapping[str, ModelTargetInstrumentContext]
+    ts_init: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.stage not in {"opening_auction", "pre_open", "continuous"}:
+            raise ValueError(f"Unknown planning stage: {self.stage}")
+        object.__setattr__(self, "instruments", MappingProxyType(dict(self.instruments)))
 
 
 @dataclass(frozen=True)
@@ -21,6 +50,7 @@ class TargetContext:
     recent_target_date: date | None = None
     recent_holding_days: int | None = None
     market_status: MarketStatusAction | None = None
+    planning_stage: str | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +75,7 @@ class ModelTargetPlan:
     investable_asset: float | None = None  # total asset net of trading buffer
     persistable: bool = True
     degraded_reason: str | None = None
+    parent_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +86,14 @@ class ModelTargetCandidate:
     open_price: float | None = None  # sizing reference; provenance is recorded on the plan
     expected_return: float | None = None  # daily_model_predictions.pred_return_live
     rank: int | None = None  # original prediction rank (score-desc, 1-based)
+    can_buy: bool = True
+    can_sell: bool = True
+
+
+@dataclass(frozen=True)
+class ForcedExit:
+    reason: str
+    target_quantity: int
 
 
 @dataclass(frozen=True)

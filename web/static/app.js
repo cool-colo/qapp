@@ -2751,19 +2751,20 @@ function renderPendingTradeProjection(payload) {
   renderTable("#rt-pending-table", payload.trades, {
     columns: [
       "side", "stock_code", "name", "current_qty", "target_qty", "trade_qty",
-      "open_price", "current_price", "price_change", "open_amount",
+      "open_price", "current_price", "day_change", "price_change", "open_amount",
       "current_amount", "loss_amount",
     ],
     headers: {
       side: "方向", stock_code: "证券代码", name: "证券名称",
       current_qty: "当前数量", target_qty: "目标数量", trade_qty: "待交易数量",
-      open_price: "开盘价", current_price: "现价", price_change: "现价较开盘",
+      open_price: "开盘价", current_price: "现价", day_change: "当日涨幅",
+      price_change: "现价较开盘",
       open_amount: "开盘价执行金额", current_amount: "现价执行金额",
       loss_amount: "损失金额",
     },
     intCols: new Set(["current_qty", "target_qty", "trade_qty"]),
-    rateCols: new Set(["price_change"]),
-    signCols: new Set(["price_change", "loss_amount"]),
+    rateCols: new Set(["day_change", "price_change"]),
+    signCols: new Set(["day_change", "price_change", "loss_amount"]),
     defaultSort: { col: "side", dir: "asc" },
     linkStock: true,
     stockInfoDate: payload.trade_date,
@@ -3218,8 +3219,10 @@ $("#si-auto").addEventListener("change", (e) => {
 // ---------------------------------------------------------------------------
 const CTRL_LOG_COLS = ["ts", "action", "detail_json", "result"];
 const CTRL_LOG_HEADERS = { ts: "时间", action: "操作", detail_json: "详情", result: "结果" };
+let ctrlReplanTimer = null;
 
 async function loadControl() {
+  clearTimeout(ctrlReplanTimer);
   if (!state.account) return;
   // The 实盘 (real-money) caveat banner: shown whenever the selected data source is 实盘,
   // independent of node-api availability.
@@ -3231,6 +3234,9 @@ async function loadControl() {
     $("#ctrl-tu-state").textContent = "未配置节点";
     $("#ctrl-tu-state").className = "ctrl-value";
     $("#ctrl-tu-pause").disabled = $("#ctrl-tu-resume").disabled = true;
+    $("#ctrl-replan").disabled = true;
+    $("#ctrl-auto-replan-off").disabled = $("#ctrl-auto-replan-on").disabled = true;
+    $("#ctrl-replan-state").textContent = $("#ctrl-auto-replan-state").textContent = "未配置节点";
     setSellAllEnabled(false, "该账户未配置实盘节点 API（node_api）");
     nodeApiHint("#ctrl-log");
     return;
@@ -3250,7 +3256,15 @@ async function loadControl() {
     tb.className = "ctrl-value " + (tuPaused ? "neg" : "pos");
     $("#ctrl-tu-pause").disabled = tuPaused;
     $("#ctrl-tu-resume").disabled = !tuPaused;
-    setSellAllEnabled(state.sellEnabled);
+    const planningLabels = { committed: "已完成", safety: "使用安全目标", keep_current: "保留当前目标", failed: "失败", interrupted: "已中断" };
+    $("#ctrl-replan-state").textContent = st.replanning ? "进行中" :
+      (st.last_planning ? `${planningLabels[st.last_planning.status]}（${st.replan_counts.automatic} 次自动 / ${st.replan_counts.manual} 次手动）` : "就绪");
+    $("#ctrl-replan").disabled = st.replanning;
+    $("#ctrl-auto-replan-state").textContent = st.auto_replan_enabled ? "已启用" : "已禁止";
+    $("#ctrl-auto-replan-off").disabled = !st.auto_replan_enabled;
+    $("#ctrl-auto-replan-on").disabled = st.auto_replan_enabled;
+    setSellAllEnabled(state.sellEnabled && !st.replanning, st.replanning ? "重新规划进行中" : "");
+    if (st.replanning) ctrlReplanTimer = setTimeout(loadControl, 1000);
     renderTable("#ctrl-log", st.recent_actions || [], {
       columns: CTRL_LOG_COLS, headers: CTRL_LOG_HEADERS,
     });
@@ -3270,9 +3284,9 @@ function liveWarnHtml() {
 
 // Confirm (and, when a PIN is configured, collect a 4-digit PIN for) a 控制 write action.
 // 刷新 never routes through here. Suspend/resume/sell-all all confirm; sell-all is danger.
-async function controlPost(path, { title, bodyHtml, danger = false } = {}) {
+async function controlPost(path, { title, bodyHtml, danger = false, extraParams = {} } = {}) {
   if (!hasNodeApi()) { toast("该账户未配置实盘节点 API"); return; }
-  const params = { account: state.account.account_id, trader: state.account.trader_id };
+  const params = { account: state.account.account_id, trader: state.account.trader_id, ...extraParams };
   if (state.pinRequired) {
     const pin = await pinDialog({ title, bodyHtml, warnHtml: liveWarnHtml(), okText: "确认", danger });
     if (pin === null) return;
@@ -3297,6 +3311,12 @@ $("#ctrl-tu-resume").addEventListener("click", () =>
 $("#ctrl-sell-all").addEventListener("click", () =>
   controlPost("/api/control/sell_all", { title: "确认全部卖出", bodyHtml: "确认<b>卖出全部可卖持仓</b>？此操作不可撤销。", danger: true }));
 $("#ctrl-refresh").addEventListener("click", loadControl);
+$("#ctrl-replan").addEventListener("click", () =>
+  controlPost("/api/control/replan", { title: "确认重新规划", bodyHtml: "撤销本策略未完成订单，等待成交确认后，按最新价格重新规划。完成后保持之前的暂停状态。" }));
+$("#ctrl-auto-replan-off").addEventListener("click", () =>
+  controlPost("/api/control/auto_replan", { title: "禁止自动重规划", bodyHtml: "禁止价格触及涨跌停时自动重规划，手动操作仍可使用。", extraParams: { enabled: false } }));
+$("#ctrl-auto-replan-on").addEventListener("click", () =>
+  controlPost("/api/control/auto_replan", { title: "启用自动重规划", bodyHtml: "启用价格触及涨跌停时自动重规划。", extraParams: { enabled: true } }));
 
 // ---------------------------------------------------------------------------
 // 交易管理 → 当前目标 — the node's in-memory target book (target vs current qty).

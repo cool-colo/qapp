@@ -9,6 +9,8 @@ from typing import Iterable
 
 import pandas as pd
 
+from backtests.time_range import BacktestTimeRange
+
 
 @dataclass(frozen=True)
 class HistoricalTick:
@@ -61,6 +63,7 @@ class HistoricalTickDataProvider:
 
     def load(self, path: str, *, start: str, end: str,
              symbols: set[str], timezone: str = "Asia/Shanghai") -> list[HistoricalTick]:
+        time_range = BacktestTimeRange.parse(start, end, timezone)
         result = []
         keys = set()
         with Path(path).open(newline="", encoding="utf-8") as source:
@@ -76,7 +79,7 @@ class HistoricalTickDataProvider:
                     if event.tzinfo is None or init.tzinfo is None:
                         raise ValueError("timestamps must include timezone")
                     local = event.tz_convert(timezone)
-                    if not pd.Timestamp(start).date() <= local.date() <= pd.Timestamp(end).date():
+                    if not time_range.contains(init.value):
                         continue
                     tick = HistoricalTick(
                         symbol=raw["symbol"], kind=raw["kind"],
@@ -124,7 +127,7 @@ class HistoricalTickDataProvider:
                 except (ValueError, TypeError) as exc:
                     raise ValueError(f"Historical tick CSV row {number}: {exc}") from exc
         if not result:
-            raise ValueError("No historical ticks in requested dates/universe")
+            raise ValueError("No historical ticks in requested time range/universe")
         validate_final_auction_results(result, timezone)
         result.sort(key=lambda tick: (tick.ts_init, tick.symbol, tick.ts_event))
         return result

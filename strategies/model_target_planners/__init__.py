@@ -3,6 +3,8 @@ from strategies.model_target_planners.base import ModelTargetCandidate
 from strategies.model_target_planners.base import ModelTargetPlan
 from strategies.model_target_planners.base import ModelTargetPlanner
 from strategies.model_target_planners.base import ModelTargetPlanningRequest
+from strategies.model_target_planners.base import ModelTargetPlanningContext
+from strategies.model_target_planners.base import ModelTargetInstrumentContext
 from strategies.model_target_planners.base import TargetContext
 from strategies.model_target_planners.base import TargetInfo
 from strategies.model_target_planners.base import normalize_stock_code
@@ -15,6 +17,8 @@ __all__ = [
     "ModelTargetPlan",
     "ModelTargetPlanner",
     "ModelTargetPlanningRequest",
+    "ModelTargetPlanningContext",
+    "ModelTargetInstrumentContext",
     "RiskManagerModelTargetPlanner",
     "TargetContext",
     "TargetInfo",

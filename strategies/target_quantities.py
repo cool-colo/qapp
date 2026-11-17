@@ -52,6 +52,8 @@ from strategies.opening_auction import auction_time
 from strategies.opening_auction import validate_auction_config
 from strategies.convergence import ConvergenceTrigger
 from strategies.execution_reconciliation import ExecutionStateReconciler
+from strategies.execution_reconciliation import is_reconciliation_fill
+from strategies.execution_reconciliation import is_reconciliation_order
 from strategies.order_splitter import LimitOrderQuantityRules
 from strategies.order_splitter import AuctionOrderSplitter
 from strategies.order_splitter import NotionalOrderSplitter
@@ -445,10 +447,8 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     preopen_latency_fixed_advance_ms: int = 50
     # Opening call auction; independent of continuous execution windows.
     auction_enabled: bool = True
-    auction_prepare_time: str = "09:24:01"
-    auction_submit_time: str = "09:24:50"
+    auction_start_time: str = "09:24:01"
     auction_submit_cutoff: str = "09:24:59"
-    auction_reference_max_age_secs: float = 4.0
     auction_buy_offset_bps: float = 50.0
     auction_sell_offset_bps: float = 50.0
     auction_commission_rate: float = 0.000085
@@ -617,6 +617,12 @@ class TargetQuantityStrategy(Strategy):
         # because its typed trigger bypasses the pause without clearing it.
         # Loaded from MySQL at node startup; mutated only by set_trading_paused.
         self._trading_paused = False
+        self._replanning_blocked = False
+        self._trading_action_lock = threading.RLock()
+        self._execution_activity = 0
+        self._restored_today_fills: dict[tuple[date, str], dict[str, tuple[OrderSide, Decimal]]] = {}
+        self._live_today_fills: dict[tuple[date, str], dict[str, tuple[OrderSide, Decimal]]] = {}
+        self._today_fills_loader: Callable[[date], list[dict[str, Any]]] | None = None
         # Persistent guard, controlled via the live-node control API, that freezes
         # automatic target acceptance (daily/hourly refresh, snapshot recorder) so a
         # fresh target map cannot clobber a manual sell in the window between
@@ -927,11 +933,7 @@ class TargetQuantityStrategy(Strategy):
         self._run_full_tick_fetch(trigger="prefetch")
 
     def _on_full_tick_refresh_timer(self, _event: Any) -> None:
-        now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
-        auction_prepare = (self.config.auction_enabled
-                           and auction_time(self.config.auction_prepare_time) <= now
-                           < auction_time(self.config.auction_submit_cutoff))
-        if not auction_prepare and not self._within_trading_window():
+        if not self._within_trading_window():
             return
         self._run_full_tick_fetch(trigger="refresh")
 
@@ -1321,12 +1323,16 @@ class TargetQuantityStrategy(Strategy):
             if self._set_authoritative_open(str(instrument_id), trading_date, open_price):
                 updated += 1
         self._market_status_updated_at_ns = snapshot_ts_ns
+        self.on_price_snapshot(trading_date)
         if updated:
             self.log.info(
                 f"applied authoritative opens from full-tick ({trigger}): "
                 f"date={trading_date} count={updated}",
                 color=LogColor.BLUE,
             )
+
+    def on_price_snapshot(self, trading_date: date) -> None:
+        """Hook after a complete authoritative market snapshot is installed."""
 
     @staticmethod
     def _market_status_from_open_int(fields: Any) -> MarketStatusAction | None:
@@ -1473,6 +1479,9 @@ class TargetQuantityStrategy(Strategy):
 
     def control_target_updates_paused(self) -> bool:
         return self._target_updates_paused
+
+    def control_replanning_blocked(self) -> bool:
+        return self._replanning_blocked
 
     def control_current_targets(self) -> dict[str, Decimal]:
         return dict(self._target_quantities)
@@ -1631,6 +1640,7 @@ class TargetQuantityStrategy(Strategy):
         version: str | None = None,
         bypass_pause: bool = False,
         signal_date: date | None = None,
+        bypass_replanning: bool = False,
     ) -> None:
         """
         Accept the day's per-instrument target share counts (固定目标股数).
@@ -1646,51 +1656,56 @@ class TargetQuantityStrategy(Strategy):
         refresh, snapshot recorder) early-returns without touching the target map, so
         a fresh target cannot clobber the sell before its forced convergence runs.
         """
-        if self._target_updates_paused and not bypass_pause:
+        with self._trading_action_lock:
+            if self._replanning_blocked and not bypass_replanning:
+                self.log.info("target update skipped while replanning")
+                return
+            if self._target_updates_paused and not bypass_pause:
+                self.log.info(
+                    f"target update skipped (target_updates_paused) date={target_date} "
+                    f"count={len(quantities)} reason={reason}",
+                    color=LogColor.YELLOW,
+                )
+                return
+            self._target_signal_date = signal_date
+            normalized: dict[str, Decimal] = {}
+            for instrument_id, quantity in quantities.items():
+                instrument_id_text = str(instrument_id)
+                try:
+                    value = Decimal(str(quantity))
+                except Exception:
+                    continue
+                if value < 0:
+                    continue
+                normalized[instrument_id_text] = value
+            version_value = version or target_version(target_date, normalized, reason)
+            if (
+                version_value == self._target_version
+                and normalized == self._target_quantities
+            ):
+                self.log.info(
+                    f"target quantities unchanged for version={version_value} date={target_date} "
+                    f"count={len(normalized)} reason={reason}",
+                    color=LogColor.BLUE,
+                )
+                return
+            self._refresh_order_book_depth_subscriptions(normalized)
+            self._target_quantities = dict(sorted(normalized.items()))
+            self._target_date = target_date
+            self._target_reason = reason
+            self._target_version = version_value
+            self._frozen_instruments = {}
+            self._deferred_buys = {}
+            self._insufficient_funds = set()
+            self._pending_replacements = {}
+            self._achieved_versions.discard(version_value)
+            detail = self._target_quantities_log_detail(self._target_quantities)
             self.log.info(
-                f"target update skipped (target_updates_paused) date={target_date} "
-                f"count={len(quantities)} reason={reason}",
-                color=LogColor.YELLOW,
-            )
-            return
-        self._target_signal_date = signal_date
-        normalized: dict[str, Decimal] = {}
-        for instrument_id, quantity in quantities.items():
-            instrument_id_text = str(instrument_id)
-            try:
-                value = Decimal(str(quantity))
-            except Exception:
-                continue
-            if value < 0:
-                continue
-            normalized[instrument_id_text] = value
-        version_value = version or target_version(target_date, normalized, reason)
-        if (
-            version_value == self._target_version
-            and normalized == self._target_quantities
-        ):
-            self.log.info(
-                f"target quantities unchanged for version={version_value} date={target_date} "
-                f"count={len(normalized)} reason={reason}",
+                f"accepted target quantities version={version_value} date={target_date} "
+                f"count={len(self._target_quantities)} reason={reason} detail={detail}",
                 color=LogColor.BLUE,
             )
-            return
-        self._refresh_order_book_depth_subscriptions(normalized)
-        self._target_quantities = dict(sorted(normalized.items()))
-        self._target_date = target_date
-        self._target_reason = reason
-        self._target_version = version_value
-        self._frozen_instruments = {}
-        self._deferred_buys = {}
-        self._insufficient_funds = set()
-        self._achieved_versions.discard(version_value)
-        detail = self._target_quantities_log_detail(self._target_quantities)
-        self.log.info(
-            f"accepted target quantities version={version_value} date={target_date} "
-            f"count={len(self._target_quantities)} reason={reason} detail={detail}",
-            color=LogColor.BLUE,
-        )
-        if self._convergence_suspended:
+        if self._convergence_suspended or self._trading_paused or self._replanning_blocked:
             return
         self._converge_to_target(
             current_date=target_date,
@@ -2048,9 +2063,6 @@ class TargetQuantityStrategy(Strategy):
             observed_ns=observed.timestamp_ns,
             observed_monotonic_ns=observed.monotonic_ns,
         )
-        if self.config.auction_enabled and bids and asks and bids[0][0] == asks[0][0]:
-            self.capture_auction_reference(str(depth.instrument_id), bids[0][0],
-                                           depth_ts_event, int(depth.ts_init))
         self._log_depth_event_probe(depth, depth_ts_event)
         # On the first depth callback of each trading day, converge immediately so
         # orders are submitted as early as possible (priced against real depth)
@@ -2166,6 +2178,8 @@ class TargetQuantityStrategy(Strategy):
         return "[" + ", ".join(levels) + "]"
 
     def on_order_filled(self, event: Any) -> None:
+        self._execution_activity += 1
+        self._remember_today_fill(event)
         client_order_id = str(event.client_order_id)
         instrument_id_text = str(getattr(event, "instrument_id", ""))
         order_side = getattr(event, "order_side", None)
@@ -2218,6 +2232,7 @@ class TargetQuantityStrategy(Strategy):
             )
 
     def on_order_canceled(self, event: Any) -> None:
+        self._execution_activity += 1
         client_order_id = str(event.client_order_id)
         replacement = self._order_decision_lineages.get(client_order_id)
         self._forget_submitted_order(client_order_id)
@@ -2424,58 +2439,78 @@ class TargetQuantityStrategy(Strategy):
         except Exception as exc:
             self.log.warning(f"target convergence failed: {exc}")
 
-    def capture_auction_reference(
-        self, instrument_id: str, price: float, ts_event: int, ts_init: int,
-    ) -> None:
-        if not self.config.auction_enabled:
-            return
+    def set_opening_auction_prices(self, prices: Mapping[str, float], *, ts_init: int) -> None:
+        """Install the completed preparation batch, independent of subscribed quotes."""
         captured = self._execution_timing.point()
-        event_date = self._event_trading_date(ts_event)
-        if event_date != self._clock_date():
-            return
-        self._roll_trading_day(event_date)
-        reference = AuctionReference(float(price), int(ts_event), int(ts_init))
-        if reference.is_fresh(int(self.clock.timestamp_ns()), self.config.timezone_name,
-                              self.config.auction_reference_max_age_secs):
-            previous = self._auction_references.get(instrument_id)
-            if previous is None or reference.ts_event >= previous.ts_event:
-                self._auction_references[instrument_id] = reference
-                self._auction_reference_captured[instrument_id] = captured
+        self._auction_references = {
+            str(i): AuctionReference(float(price), None, int(ts_init))
+            for i, price in prices.items()
+        }
+        self._auction_reference_captured = {str(i): captured for i in prices}
 
     def auction_reference(self, instrument_id: str) -> AuctionReference | None:
-        reference = self._auction_references.get(instrument_id)
-        if reference is None or not reference.is_fresh(
-            int(self.clock.timestamp_ns()), self.config.timezone_name,
-            self.config.auction_reference_max_age_secs,
-        ):
-            return None
-        return reference
+        return self._auction_references.get(instrument_id)
 
     def _within_auction_submit_time(self) -> bool:
         now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
         return (self.config.auction_enabled
-                and auction_time(self.config.auction_submit_time) <= now
+                and auction_time(self.config.auction_start_time) <= now
                 < auction_time(self.config.auction_submit_cutoff))
 
+    def submit_order(self, order, position_id=None, client_id=None, params=None) -> None:
+        with self._trading_action_lock:
+            if self._replanning_blocked:
+                raise RuntimeError("order submission blocked during replanning")
+            super().submit_order(order, position_id=position_id, client_id=client_id, params=params)
+
+    def submit_order_list(self, order_list, position_id=None, client_id=None, params=None) -> None:
+        with self._trading_action_lock:
+            if self._replanning_blocked:
+                raise RuntimeError("order submission blocked during replanning")
+            super().submit_order_list(order_list, position_id=position_id, client_id=client_id, params=params)
+
+    def modify_order(self, order, quantity=None, price=None, trigger_price=None,
+                     client_id=None, params=None) -> None:
+        with self._trading_action_lock:
+            if self._replanning_blocked:
+                raise RuntimeError("order modification blocked during replanning")
+            super().modify_order(order, quantity=quantity, price=price, trigger_price=trigger_price,
+                                 client_id=client_id, params=params)
+
     def cancel_order(self, order, client_id=None, params=None) -> None:
-        if not self._within_cancel_window():
-            self.log.warning(f"Cancel suppressed outside cancellation window: {order.client_order_id}")
-            return
-        super().cancel_order(order, client_id=client_id, params=params)
+        with self._trading_action_lock:
+            if self._replanning_blocked:
+                return
+            if not self._within_cancel_window():
+                self.log.warning(f"Cancel suppressed outside cancellation window: {order.client_order_id}")
+                return
+            super().cancel_order(order, client_id=client_id, params=params)
 
     def cancel_orders(self, orders, client_id=None, params=None) -> None:
-        if not self._within_cancel_window():
-            self.log.warning("Batch cancel suppressed outside cancellation window")
-            return
-        super().cancel_orders(orders, client_id=client_id, params=params)
+        with self._trading_action_lock:
+            if self._replanning_blocked:
+                return
+            if not self._within_cancel_window():
+                self.log.warning("Batch cancel suppressed outside cancellation window")
+                return
+            super().cancel_orders(orders, client_id=client_id, params=params)
 
     def cancel_all_orders(self, instrument_id, order_side=OrderSide.NO_ORDER_SIDE,
                           client_id=None, params=None) -> None:
-        if not self._within_cancel_window():
-            self.log.warning("Cancel all suppressed outside cancellation window")
-            return
-        super().cancel_all_orders(instrument_id, order_side=order_side,
-                                  client_id=client_id, params=params)
+        with self._trading_action_lock:
+            if self._replanning_blocked:
+                return
+            if not self._within_cancel_window():
+                self.log.warning("Cancel all suppressed outside cancellation window")
+                return
+            super().cancel_all_orders(instrument_id, order_side=order_side,
+                                      client_id=client_id, params=params)
+
+    def cancel_for_replanning(self, order) -> None:
+        with self._trading_action_lock:
+            if not self._replanning_blocked or not self._within_cancel_window():
+                raise RuntimeError("replanning cancellation requires its gate and cancellation window")
+            super().cancel_order(order)
 
     def execute_opening_auction(self) -> bool:
         if not self._within_auction_submit_time():
@@ -2639,6 +2674,9 @@ class TargetQuantityStrategy(Strategy):
         replacement: OrderDecisionLineage | None = None,
     ) -> bool:
         """Run convergence after passing its window gate and acquiring its lock."""
+        if self._replanning_blocked:
+            self._execution_timing.skip("replanning")
+            return False
         if self._trading_paused and not trigger.bypasses_pause:
             self._execution_timing.skip("trading_paused")
             return False
@@ -2651,6 +2689,9 @@ class TargetQuantityStrategy(Strategy):
         if not submission_open and not cancellation_open:
             self._execution_timing.skip("outside_execution_window")
             return False
+        if submission_open and trigger != ConvergenceTrigger.OPENING_AUCTION:
+            if self.check_replanning_trigger(current_date):
+                return False
         # A manual convergence must not be silently dropped when the trading thread
         # holds the lock. Ordinary and pre-open triggers remain non-blocking.
         if trigger.waits_for_lock:
@@ -2662,6 +2703,8 @@ class TargetQuantityStrategy(Strategy):
             return False
         self._execution_timing.mark("lock_acquired")
         try:
+            if self._replanning_blocked:
+                return False
             if cancellation_open and not self._awaiting_pre_open_reconcile():
                 self._reconcile_unfilled_orders(current_date)
             self._execution_timing.mark("cancel_check_finished")
@@ -2676,6 +2719,10 @@ class TargetQuantityStrategy(Strategy):
         finally:
             self._converge_lock.release()
         return True
+
+    def check_replanning_trigger(self, trading_date: date) -> bool:
+        """Model strategies override this hook; ordinary target execution is unchanged."""
+        return False
 
     def _converge_to_target_locked(
         self,
@@ -3900,6 +3947,8 @@ class TargetQuantityStrategy(Strategy):
         slice_index: int | None = None,
         slice_count: int | None = None,
     ) -> bool:
+        if self._replanning_blocked:
+            return False
         slice_started = self._execution_timing.point()
         # Each slice owns its timing map, while sharing the immutable price inputs.
         execution_timing = dict(intent.context.details.get("execution_timing", {}))
@@ -4198,44 +4247,79 @@ class TargetQuantityStrategy(Strategy):
             )
         return clamped_qty
 
+    def configure_today_fills_loader(self, loader: Callable[[date], list[dict[str, Any]]]) -> None:
+        self._today_fills_loader = loader
+
+    def refresh_today_fills(self, trading_date: date) -> None:
+        if self._today_fills_loader is not None:
+            self.restore_today_fills(trading_date, self._today_fills_loader(trading_date))
+
+    def restore_today_fills(self, trading_date: date, rows: list[dict[str, Any]]) -> None:
+        restored: dict[tuple[date, str], dict[str, tuple[OrderSide, Decimal]]] = {}
+        for row in rows:
+            side = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}[row["side"]]
+            key = (trading_date, str(row["instrument_id"]))
+            restored.setdefault(key, {})[str(row["trade_id"])] = side, Decimal(str(row["quantity"]))
+        self._restored_today_fills = {
+            key: fills for key, fills in self._restored_today_fills.items() if key[0] != trading_date
+        } | restored
+
+    def _remember_today_fill(self, event: OrderFilled) -> None:
+        if event.strategy_id != self.id:
+            return
+        order = self.cache.order(event.client_order_id)
+        if is_reconciliation_fill(event, order):
+            return
+        day = self._event_trading_date(event.ts_event)
+        if day is None:
+            return
+        key = (day, str(event.instrument_id))
+        self._live_today_fills.setdefault(key, {})[str(event.trade_id)] = (
+            event.order_side, event.last_qty.as_decimal(),
+        )
+
+    def planning_today_fills(self, instrument_id: str, trading_date: date) -> tuple[Decimal, Decimal]:
+        fills = {str(event.trade_id): (event.order_side, event.last_qty.as_decimal())
+                 for event in self._today_fill_events(InstrumentId.from_str(instrument_id), trading_date)}
+        fills.update(self._restored_today_fills.get((trading_date, instrument_id), {}))
+        fills.update(self._live_today_fills.get((trading_date, instrument_id), {}))
+        return (sum((qty for side, qty in fills.values() if side == OrderSide.BUY), Decimal(0)),
+                sum((qty for side, qty in fills.values() if side == OrderSide.SELL), Decimal(0)))
+
+    def planning_sellable_quantity(self, instrument_id: str, trading_date: date) -> int:
+        current = self._current_quantity(InstrumentId.from_str(instrument_id))
+        venue = self.venue_sellable_quantity(instrument_id)
+        buy, _ = self.planning_today_fills(instrument_id, trading_date)
+        base = venue if venue is not None else current - buy
+        available = base - self._open_sell_quantity(InstrumentId.from_str(instrument_id))
+        return int(max(Decimal(0), min(current, available)))
+
     def _today_fill_snapshot(self, instrument_id: InstrumentId, trading_date: date) -> TodayFillSnapshot:
-        buy_qty = Decimal("0")
-        sell_qty = Decimal("0")
-        fill_count = 0
-        latest_ts_event = 0
-        try:
-            orders = self.cache.orders(instrument_id=instrument_id)
-        except Exception:
-            orders = []
+        events = {str(event.trade_id): event for event in self._today_fill_events(instrument_id, trading_date)}
+        return TodayFillSnapshot(
+            buy_qty=sum((event.last_qty.as_decimal() for event in events.values()
+                         if event.order_side == OrderSide.BUY), Decimal(0)),
+            sell_qty=sum((event.last_qty.as_decimal() for event in events.values()
+                          if event.order_side == OrderSide.SELL), Decimal(0)),
+            fill_count=len(events),
+            latest_ts_event=max((event.ts_event for event in events.values()), default=0),
+        )
+
+    def _today_fill_events(self, instrument_id: InstrumentId, trading_date: date) -> list[OrderFilled]:
+        events = []
+        orders = self.cache.orders(instrument_id=instrument_id, strategy_id=self.id)
         for order in orders:
             if self._is_reconciliation_order(order):
                 continue
-            for event in getattr(order, "events", []) or []:
-                if not isinstance(event, OrderFilled) and not (
-                    hasattr(event, "order_side") and hasattr(event, "last_qty")
-                ):
+            for event in order.events:
+                if not isinstance(event, OrderFilled) or is_reconciliation_fill(event, order):
                     continue
-                if getattr(event, "instrument_id", instrument_id) != instrument_id:
+                if event.instrument_id != instrument_id:
                     continue
-                ts_event = int(getattr(event, "ts_event", 0) or 0)
-                if self._event_trading_date(ts_event) != trading_date:
+                if self._event_trading_date(event.ts_event) != trading_date:
                     continue
-                order_side = getattr(event, "order_side", None)
-                last_qty = self._decimal_quantity(getattr(event, "last_qty", Decimal("0")))
-                if order_side == OrderSide.BUY:
-                    buy_qty += last_qty
-                elif order_side == OrderSide.SELL:
-                    sell_qty += last_qty
-                else:
-                    continue
-                fill_count += 1
-                latest_ts_event = max(latest_ts_event, ts_event)
-        return TodayFillSnapshot(
-            buy_qty=buy_qty,
-            sell_qty=sell_qty,
-            fill_count=fill_count,
-            latest_ts_event=latest_ts_event,
-        )
+                events.append(event)
+        return events
 
     def _event_trading_date(self, ts_event: int) -> date | None:
         if ts_event <= 0:
@@ -4247,8 +4331,7 @@ class TargetQuantityStrategy(Strategy):
 
     @staticmethod
     def _is_reconciliation_order(order: Any) -> bool:
-        tags = getattr(order, "tags", []) or []
-        return "RECONCILIATION" in {str(tag) for tag in tags}
+        return is_reconciliation_order(order)
 
     def _is_historical_event(self, event: Any) -> bool:
         """
@@ -4360,6 +4443,14 @@ class TargetQuantityStrategy(Strategy):
                     continue
                 orders_by_id[str(order.client_order_id)] = order
         return list(orders_by_id.values())
+
+    def replanning_orders(self) -> list[Any]:
+        """Fail closed if strategy-owned execution state cannot be inspected."""
+        orders = (self.cache.orders(strategy_id=self.id)
+                  + self.cache.orders_open(strategy_id=self.id)
+                  + self.cache.orders_inflight(strategy_id=self.id))
+        return list({str(order.client_order_id): order for order in orders
+                     if order.status not in self._TERMINAL_ORDER_STATUSES}.values())
 
     def _is_active_order(self, order: Any) -> bool:
         status = getattr(order, "status", None)
@@ -4841,9 +4932,6 @@ class TargetQuantityStrategy(Strategy):
         ts_event = int(tick.ts_event)
         if ts_event <= 0:
             raise ValueError(f"Quote tick ts_event must be positive, got {ts_event}")
-        if self.config.auction_enabled and float(tick.bid_price) == float(tick.ask_price):
-            self.capture_auction_reference(str(tick.instrument_id), float(tick.bid_price),
-                                           ts_event, int(tick.ts_init))
         self._last_quote_tick_ts_event = ts_event
         self._last_market_data_ts_event = max(self._last_market_data_ts_event, ts_event)
 

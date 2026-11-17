@@ -12,14 +12,15 @@ node, the running strategy, and the MySQL control writer. It exposes:
 - a bounded **on-demand tick** view for explicitly requested stock codes, sourced
   from the strategy's per-second in-memory full-tick snapshot; and
 - **trading control** — suspend/resume and manual sell (all-sellable or a single
-  stock) — driven through ``strategy.trading_controller``.
+  stock), manual replanning and an automatic-replanning switch.
 
 Thread model: this server runs entirely on its own daemon thread and calls the
 strategy/cache **directly**. It does NOT capture ``node.kernel.exec_engine._loop``
 and never marshals onto the Nautilus event loop. Reads are lock-free best-effort
 snapshots (GIL-safe per field; a monitor tolerates a momentary cross-field skew).
-Mutations go through the ``TradingController``, which serializes against the
-trading thread's convergence via the strategy's ``_converge_lock``.
+Manual sells go through ``TradingController`` and its convergence lock. Replanning
+requests reserve the strategy's trading gate and schedule execution on the node
+loop; the external optimizer runs in a worker thread after orders have settled.
 
 Write endpoints require a shared-token ``X-Control-Token`` header. If no token is
 configured, all writes are rejected (fail-safe). Reads are open.
@@ -43,6 +44,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 
 from strategies.trading_control import SELL_ALL_REASON
 from strategies.trading_control import SELL_REASON
+from strategies.replanning import ReplanningBusyError
 
 
 @dataclass
@@ -956,12 +958,21 @@ class LiveControlServer:
             except Exception:
                 recent = []
         return {
+            **self._strategy.replanning.state(),
             "trading_paused": bool(self._strategy.trading_controller.is_paused()),
             "target_updates_paused": bool(
                 self._strategy.trading_controller.is_target_updates_paused()
             ),
             "recent_actions": recent,
         }
+
+    def _set_auto_replan(self, enabled: bool) -> dict:
+        if self._control_writer is None:
+            raise RuntimeError("persistent control writer is unavailable")
+        self._control_writer.set_auto_replan_enabled(self._account_id, self._trader_id, enabled)
+        self._strategy.replanning.set_auto_enabled(enabled)
+        self._append_action("auto_replan", {"enabled": enabled}, "ok")
+        return {"ok": True, "auto_replan_enabled": enabled}
 
     def _persist_paused(self, paused: bool) -> None:
         if self._control_writer is None:
@@ -1090,13 +1101,24 @@ class LiveControlServer:
                         "/control/resume_target_updates",
                         "/control/sell",
                         "/control/sell_all",
+                        "/control/replan",
+                        "/control/auto_replan",
                     ):
                         self._send(404, {"error": "not found", "path": self.path})
                         return
                     if not self._require_token():
                         return
                     body = self._read_body()
-                    if path == "/control/suspend":
+                    if path == "/control/replan":
+                        request_id = server._strategy.request_replanning()
+                        server._append_action("replan", {"request_id": request_id}, "accepted")
+                        self._send(202, {"ok": True, "request_id": request_id})
+                    elif path == "/control/auto_replan":
+                        if type(body.get("enabled")) is not bool:
+                            self._send(400, {"error": "enabled must be a boolean"})
+                            return
+                        self._send(200, server._set_auto_replan(body["enabled"]))
+                    elif path == "/control/suspend":
                         self._send(200, server._set_paused(True))
                     elif path == "/control/resume":
                         self._send(200, server._set_paused(False))
@@ -1112,6 +1134,10 @@ class LiveControlServer:
                             self._send(400, {"error": "unknown stock_code / instrument_id"})
                             return
                         self._send(200, server._sell([iid], "sell", SELL_REASON))
+                except ReplanningBusyError as exc:
+                    self._send(409, {"error": str(exc)})
+                except ValueError as exc:
+                    self._send(400, {"error": str(exc)})
                 except TimeoutError as exc:
                     self._send(503, {"error": repr(exc)})
                 except Exception as exc:

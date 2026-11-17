@@ -131,6 +131,8 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
             "is_tradable": True,
             "expected_return": float(candidate.expected_return),
             "price": float(candidate.open_price),
+            "can_buy": bool(candidate.can_buy),
+            "can_sell": bool(candidate.can_sell),
         }
         if candidate.rank is not None:
             payload["rank"] = int(candidate.rank)

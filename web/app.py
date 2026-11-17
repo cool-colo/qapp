@@ -1424,6 +1424,12 @@ def build_pending_trade_projection(
         tick = ticks.get(stock_code, {})
         open_price = decimal_price(tick.get("open"))
         current_price = decimal_price(tick.get("last_price"))
+        last_close = decimal_price(tick.get("last_close"))
+        day_change = (
+            current_price / last_close - Decimal(1)
+            if current_price is not None and last_close is not None
+            else None
+        )
         priced = open_price is not None and current_price is not None
         open_amount = open_price * trade_qty if priced else None
         current_amount = current_price * trade_qty if priced else None
@@ -1448,6 +1454,7 @@ def build_pending_trade_projection(
                 "trade_qty": trade_qty,
                 "open_price": float(open_price) if open_price is not None else None,
                 "current_price": float(current_price) if current_price is not None else None,
+                "day_change": float(day_change) if day_change is not None else None,
                 "price_change": float(price_change) if price_change is not None else None,
                 "open_amount": float(open_amount) if open_amount is not None else None,
                 "current_amount": float(current_amount) if current_amount is not None else None,
@@ -1639,6 +1646,24 @@ def control_resume_target_updates(
 ) -> dict[str, Any]:
     _require_pin(pin)
     return _control_post(data, account, trader, "/control/resume_target_updates")
+
+
+@app.post("/api/control/replan")
+def control_replan(
+    account: str, trader: str, pin: str | None = None,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    _require_pin(pin)
+    return _control_post(data, account, trader, "/control/replan")
+
+
+@app.post("/api/control/auto_replan")
+def control_auto_replan(
+    account: str, trader: str, enabled: bool, pin: str | None = None,
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    _require_pin(pin)
+    return _control_post(data, account, trader, "/control/auto_replan", {"enabled": enabled})
 
 
 def _require_sell_enabled() -> None:

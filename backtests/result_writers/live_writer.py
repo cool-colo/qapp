@@ -25,6 +25,25 @@ from backtests.result_writers.live_records import LiveWholeMarketSnapshotSummary
 from backtests.result_writers.live_records import WHOLE_MARKET
 
 
+CREATE_TARGET_PLAN_SQL = """
+CREATE TABLE IF NOT EXISTS `live_target_plan` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `account_id` VARCHAR(64) NOT NULL,
+  `trader_id` VARCHAR(64) NOT NULL,
+  `trade_date` DATE NOT NULL,
+  `request_id` VARCHAR(128) NOT NULL,
+  `source` VARCHAR(24) NOT NULL,
+  `status` VARCHAR(24) NOT NULL,
+  `target_version` VARCHAR(128) NULL,
+  `payload` JSON NOT NULL,
+  `updated_at` DATETIME(6) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_plan_request` (`account_id`,`trader_id`,`request_id`),
+  KEY `idx_plan_latest` (`account_id`,`trader_id`,`trade_date`,`status`,`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, Decimal):
         return str(value)
@@ -299,6 +318,7 @@ CREATE TABLE IF NOT EXISTS `live_trade` (
   `amount`        DECIMAL(20,4) NULL,
   `commission`    DECIMAL(20,4) NULL,
   `trade_time`    DATETIME     NULL,
+  `strategy_id`   VARCHAR(128) NULL,
   `qmt_raw`       JSON         NULL,
   `created_at`    DATETIME     NOT NULL,
   `schema_version` INT         NOT NULL DEFAULT 1,
@@ -464,6 +484,7 @@ CREATE TABLE IF NOT EXISTS `live_trade_realtime` (
   `amount`        DECIMAL(20,4) NULL,
   `commission`    DECIMAL(20,4) NULL,
   `trade_time`    DATETIME     NULL,
+  `strategy_id`   VARCHAR(128) NULL,
   `qmt_raw`       JSON         NULL,
   `created_at`    DATETIME     NOT NULL,
   `schema_version` INT         NOT NULL DEFAULT 1,
@@ -608,6 +629,7 @@ class LiveSnapshotWriter:
         self._engine = None
 
     def create_tables(self) -> None:
+        self._execute(CREATE_TARGET_PLAN_SQL, ())
         for statement in CREATE_TABLES_SQL:
             if "CREATE TABLE IF NOT EXISTS `live_target_portfolio`" in statement:
                 statement = statement.replace(
@@ -624,8 +646,10 @@ class LiveSnapshotWriter:
         self._ensure_stock_tick_columns()
         self._ensure_preopen_latency_columns()
         self._ensure_target_indexes()
+        self.initialize_target_plan_archive()
 
     def create_target_table(self) -> None:
+        self._execute(CREATE_TARGET_PLAN_SQL, ())
         statement = next(
             value
             for value in CREATE_TABLES_SQL
@@ -637,6 +661,136 @@ class LiveSnapshotWriter:
         )
         self._ensure_target_columns()
         self._ensure_target_indexes()
+        self.initialize_target_plan_archive()
+
+    def initialize_target_plan_archive(self) -> None:
+        """One-time, idempotent conversion of pre-archive target projections."""
+        rows = self._query(
+            "SELECT t.`account_id`,t.`trader_id`,t.`trade_date`,t.`signal_date`,"
+            "t.`snapshot_type`,t.`target_version`,t.`reason`,t.`instrument_id`,t.`target_qty`,t.`extra` "
+            f"FROM {self._target_table_sql} t WHERE NOT EXISTS (SELECT 1 FROM `live_target_plan` p "
+            "WHERE p.`account_id`=t.`account_id` AND p.`trader_id`=t.`trader_id` "
+            "AND p.`trade_date`=t.`trade_date`) ORDER BY t.`id`", (),
+        )
+        groups: dict[tuple, list] = {}
+        for row in rows:
+            account, trader, day, signal, snapshot = row[:5]
+            groups.setdefault((account, trader, day, signal, snapshot), []).append(row)
+        chosen: dict[tuple, tuple] = {}
+        for key in groups:
+            scope = key[:3]
+            if scope not in chosen or key[4] == BEFORE_TRADING:
+                chosen[scope] = key
+        for scope, key in chosen.items():
+            batch = groups[key]
+            version = batch[-1][5] or f"migrated-{key[2]}"
+            quantities = {row[7]: int(row[8]) for row in batch if row[8] is not None}
+            extras = {}
+            for row in batch:
+                extra = row[9]
+                extras[row[7]] = json.loads(extra) if isinstance(extra, str) else extra or {}
+            payload = {"request_id": f"migration-{key[2]}", "source": "migration",
+                       "status": "committed", "trading_date": str(key[2]),
+                       "quantities": quantities, "version": version,
+                       "reason": batch[-1][6] or "loaded_target",
+                       "signal_date": str(key[3]) if key[3] else None, "target_extra": extras}
+            self.write_planning_attempt(scope[0], scope[1], key[2], payload)
+
+    def write_planning_attempt(self, account_id: str, trader_id: str, trade_date: date,
+                               payload: dict[str, Any], records: Sequence[LiveTargetRecord] = ()) -> None:
+        """Commit the archive and its current projection on the same connection."""
+        row = {"account_id": account_id, "trader_id": trader_id, "trade_date": trade_date,
+               "request_id": payload["request_id"], "source": payload["source"],
+               "status": payload["status"], "target_version": payload.get("version"),
+               "payload": _json_dumps(payload), "updated_at": datetime.now()}
+        sql, params = self._upsert_command("live_target_plan", row,
+                                           key_columns=("account_id", "trader_id", "request_id"))
+        connection = self._engine.raw_connection()
+        try:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(sql, params)
+                if payload["status"] == "committed" and payload["source"] != "migration":
+                    # Replace the entire current projection, including removed
+                    # names and an empty target. Historical versions stay archived.
+                    cursor.execute(f"DELETE FROM {self._target_table_sql} WHERE `account_id`=%s "
+                                   "AND `trader_id`=%s AND `trade_date`=%s", (account_id, trader_id, trade_date))
+                    if records:
+                        target_rows = [self._target_row(record) for record in records]
+                        target_sql, _ = self._upsert_command(
+                            self._target_portfolio_table, target_rows[0],
+                            key_columns=("account_id", "trader_id", "trade_date", "signal_date",
+                                         "snapshot_type", "instrument_id"), preserve_columns=("created_at",))
+                        cursor.executemany(target_sql, [tuple(value.values()) for value in target_rows])
+                self._commit_if_needed(connection)
+            except Exception:
+                self._rollback_if_needed(connection)
+                raise
+            finally:
+                self._close_cursor(cursor)
+        finally:
+            connection.close()
+
+    def load_committed_target_plan(self, account_id: str, trader_id: str,
+                                   trade_date: date) -> dict[str, Any] | None:
+        rows = self._query("SELECT `payload` FROM `live_target_plan` WHERE `account_id`=%s "
+                           "AND `trader_id`=%s AND `trade_date`=%s AND `status`='committed' "
+                           "ORDER BY `id` DESC LIMIT 1", (account_id, trader_id, trade_date))
+        if not rows:
+            return None
+        result = rows[0][0]
+        result = json.loads(result) if isinstance(result, str) else dict(result)
+        if result.get("signal_date"):
+            result["signal_date"] = date.fromisoformat(result["signal_date"])
+        return result
+
+    def restore_planning_state(self, account_id: str, trader_id: str, trade_date: date) -> dict[str, int]:
+        self._execute("UPDATE `live_target_plan` SET `status`='interrupted', "
+                      "`payload`=JSON_SET(`payload`,'$.status','interrupted','$.error','process restarted') "
+                      "WHERE `account_id`=%s "
+                      "AND `trader_id`=%s AND `trade_date`=%s AND `status` IN "
+                      "('pending','canceling','reconciling','planning')", (account_id, trader_id, trade_date))
+        rows = self._query("SELECT `source`,COUNT(*) FROM `live_target_plan` WHERE `account_id`=%s "
+                           "AND `trader_id`=%s AND `trade_date`=%s GROUP BY `source`",
+                           (account_id, trader_id, trade_date))
+        return {source: int(count) for source, count in rows if source in ("automatic", "manual")}
+
+    def load_latest_planning_attempt(self, account_id: str, trader_id: str, trade_date: date):
+        rows = self._query("SELECT `payload` FROM `live_target_plan` WHERE `account_id`=%s "
+                           "AND `trader_id`=%s AND `trade_date`=%s ORDER BY `id` DESC LIMIT 1",
+                           (account_id, trader_id, trade_date))
+        if not rows:
+            return None
+        return json.loads(rows[0][0]) if isinstance(rows[0][0], str) else dict(rows[0][0])
+
+    def load_strategy_today_fills(self, account_id: str, trader_id: str, trade_date: date,
+                                 strategy_id: str) -> list[dict[str, Any]]:
+        """Load actual trades by ID; reconciliation-only event rows are audit data."""
+        audit_rows = self._query(
+            "SELECT `trade_id`,`instrument_id`,MAX(`reconciliation`=FALSE) FROM `live_order_event` "
+            "WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s "
+            "AND `event_type`='OrderFilled' AND `trade_id` IS NOT NULL "
+            "GROUP BY `trade_id`,`instrument_id`", (account_id, trader_id, trade_date),
+        )
+        reconciliation_only = {(str(tid), iid) for tid, iid, actual in audit_rows if not actual}
+        trades = {}
+        for table in ("live_trade", "live_trade_realtime"):
+            rows = self._query(f"SELECT t.`trade_id`,t.`instrument_id`,t.`side`,t.`quantity` FROM `{table}` t "
+                               "WHERE t.`account_id`=%s AND t.`trader_id`=%s AND t.`trade_date`=%s "
+                               "AND t.`strategy_id`=%s AND t.`side` IN ('buy','sell') AND t.`quantity`>0",
+                               (account_id, trader_id, trade_date, strategy_id))
+            # Broker snapshots contain actual venue trades. Retain them even if
+            # their real fill was replayed only through reconciliation on restart.
+            trades.update({str(row[0]): row[1:] for row in rows
+                           if table == "live_trade" or (str(row[0]), row[1]) not in reconciliation_only})
+        return [{"trade_id": tid, "instrument_id": iid, "side": side, "quantity": quantity}
+                for tid, (iid, side, quantity) in trades.items()]
+
+    def initialize_strategy_trade_scope(self, account_id: str, trader_id: str, strategy_id: str) -> None:
+        """Assign old records under the deployment's one-strategy-per-account invariant."""
+        for table in ("live_trade", "live_trade_realtime"):
+            self._execute(f"UPDATE `{table}` SET `strategy_id`=%s WHERE `account_id`=%s "
+                          "AND `trader_id`=%s AND `strategy_id` IS NULL", (strategy_id, account_id, trader_id))
 
     @property
     def _target_table_sql(self) -> str:
@@ -798,10 +952,13 @@ class LiveSnapshotWriter:
                 pass
 
     def _ensure_trade_columns(self) -> None:
-        """
-        Add trade columns introduced after the initial live_trade deployment.
-        Best-effort only.
-        """
+        """Add strategy attribution and existing source columns idempotently."""
+        for table in ("live_trade", "live_trade_realtime"):
+            columns = self._query("SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                                  "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s "
+                                  "AND COLUMN_NAME='strategy_id'", (table,))
+            if not columns:
+                self._execute(f"ALTER TABLE `{table}` ADD COLUMN `strategy_id` VARCHAR(128) NULL", ())
         additions = {
             # See _ensure_order_columns: marks QMT-reconstructed rows.
             "source": "VARCHAR(16) NOT NULL DEFAULT 'live'",
@@ -1113,6 +1270,7 @@ class LiveSnapshotWriter:
                 self._trade_row(trade_record),
                 key_columns=("account_id", "trader_id", "trade_date", "trade_id"),
                 preserve_columns=("created_at",),
+                coalesce_columns=("strategy_id",),
             )
 
         connection = self._engine.raw_connection()
@@ -1167,6 +1325,7 @@ class LiveSnapshotWriter:
             [self._trade_row(record)],
             key_columns=("account_id", "trader_id", "trade_date", "trade_id"),
             preserve_columns=("created_at",),
+            coalesce_columns=("strategy_id",),
         )
 
     def upsert_realtime_trade(self, record: LiveTradeRecord) -> None:
@@ -1175,6 +1334,7 @@ class LiveSnapshotWriter:
             [self._trade_row(record)],
             key_columns=("account_id", "trader_id", "trade_date", "trade_id"),
             preserve_columns=("created_at",),
+            coalesce_columns=("strategy_id",),
         )
 
     # ---- reads (restart-safe loading / idempotency) --------------------------
@@ -1908,6 +2068,7 @@ class LiveSnapshotWriter:
             "qmt_raw": _json_dumps(record.qmt_raw),
             "created_at": _timestamp(record.created_at),
             "schema_version": record.schema_version,
+            "strategy_id": record.strategy_id,
         }
 
     # ---- low-level SQL (mirrors MySQLResultWriter) ---------------------------

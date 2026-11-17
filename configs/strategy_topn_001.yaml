@@ -1,0 +1,108 @@
+# Strategy-tuning parameters for the target model-prediction strategy.
+#
+# Loaded by StrategyParams.from_yaml() and shared by:
+#   - lives/live_qmt_target_model_predictions.py    (--config)
+#   - lives/live_bigqmt_target_model_predictions.py (--config)
+#   - backtests/target_model_predictions/run_backtest.py (--config)
+#
+# Point at it with --config <path> (or the STRATEGY_CONFIG_FILE env var).
+# Only STRATEGY-tuning knobs live here. Node/infra params (account id, redis,
+# clickhouse, logging, metrics, data universe) stay on CLI/env.
+#
+# Unknown keys raise an error (typos fail loudly). Any key you omit falls back to
+# the default shown below. Every value below is the current default.
+#
+# NOTE: live vs backtest differ only in `risk_manager_mode` (live -> "live",
+# backtest -> "backtest"). Keep a separate YAML per context, or edit that one key.
+# max_positions and exchange_timezone stay on CLI/env (--max-positions,
+# --exchange-timezone) because they are consumed before the strategy is built.
+
+# --- Position sizing / rotation ---
+max_position_percent: 0.03
+stop_loss: 0.1
+trailing_take_profit: 0.06
+trailing_take_profit_start: 0.15
+min_listed_days: 120
+consecutive_up_limit_days: 3  # N previous trading days; compare each close with its daily up-limit
+max_open_gap_up: 0.05          # skip entries opening >= 5% above the previous close; 0 disables
+holding_days: 10           # backtest rebalance cadence (unused by live target-timer path)
+initial_cash: 1000000
+
+# --- Order lifecycle / cash gating ---
+resubmit_check_interval_secs: 0.5  # convergence and cancel-validation cadence
+process_targets_interval_secs: 2.0 # daily target-processing trigger cadence
+submission_book_max_age_secs: 5.0
+cancel_book_max_age_secs: 4.0
+same_side_price_improvement_threshold: 20
+price_mismatch_cancel_delay_secs: 30.0
+partial_fill_cancel_grace_secs: 180.0
+partial_fill_notional_threshold: 20000
+small_leaves_notional_threshold: 20000
+price_trend_effect_enabled: false  # false: keep calculating/recording, but do not alter price or timeout
+price_trend_window_secs: 10.0
+price_trend_threshold_bps: 20.0
+price_trend_max_bps: 40.0
+price_trend_confirmation_strength: 0.5
+price_trend_book_max_age_secs: 2.0
+price_trend_min_timeout_multiplier: 0.3
+price_trend_max_offset_multiplier: 3.0
+cash_buffer_percent: 0.0
+target_cash_buffer_percent: 0.01
+order_slice_notional: 300000     # CNY notional per order slice; 0 disables splitting
+limit_stop_mode: freeze_symbol
+auto_replan_enabled: true        # automatic price-limit replanning; manual replanning stays enabled
+leave_non_targets: false         # false => exit holdings absent from latest targets
+stop_time: "14:55"
+
+# --- Target weight planning / risk manager ---
+target_weight_planner: risk_manager            # equal_weight | risk_manager
+target_weight_planner_error_policy: raise       # raise | equal_weight
+local_exit_authoritative: true                  # true => local exits override optimizer targets
+risk_manager_base_url: http://127.0.0.1:8000
+risk_manager_risk_model_id: cn_a_basic_topn_holdings_integer_lots
+alpha_model_id: subdata_noopen_newalpha292_plus_a191156_improved_pit_corrected_20260826   # experiment ID; only supported value this period
+risk_manager_mode: live                          # backtest | simulation | live
+risk_manager_timeout_secs: 60.0
+
+# --- Universe name filtering ---
+excluded_name_prefixes:
+  - "*ST"
+  - "ST"
+  - "退市"
+
+# --- Exchange windows (timezone stays on CLI: --exchange-timezone) ---
+trading_windows: "09:29-11:30,13:00-14:55"
+exchange_trading_windows: "09:30-11:30,13:00-14:55"
+execution_windows: "10:30-11:30"
+exchange_execution_windows: "10:30-11:30"
+# Cancellation is independent of submission windows; end times are exclusive.
+cancel_windows: "09:30-11:30,13:00-14:57"
+exchange_cancel_windows: "09:30-11:30,13:00-14:57"
+# Retained latency-probe settings; they cannot bypass the execution window.
+preopen_latency_execution_enabled: false
+preopen_latency_max_advance_ms: 3000
+preopen_latency_fixed_advance_ms: 50
+
+# --- Opening call auction (on by default) ---
+# Auction submissions use their own window; continuous orders obey execution_windows.
+# One whole-market full-tick batch supplies last_price; no cancels before 09:30.
+auction_enabled: true
+auction_start_time: "09:24:01"  # One daily trigger: fetch snapshot, plan, then submit immediately.
+auction_submit_cutoff: "09:24:59"
+auction_buy_offset_bps: 50.0
+auction_sell_offset_bps: 50.0
+auction_commission_rate: 0.000085  # 万 0.85, both buys and sells
+auction_minimum_fee: 5.0
+auction_partial_min_notional: 58000  # Partial notional > threshold; remaining target >= threshold.
+
+# --- Full-tick snapshot ---
+full_tick_refresh_secs: 1.0
+full_tick_prefetch_time: "09:27"
+
+# --- Order tagging (live) ---
+order_id_tag: "001"
+
+# --- Logging sample rates ---
+trade_tick_log_sample_rate: 0.0
+# Always full at 09:20-09:35 and 14:55-15:05; sampled at other times.
+order_book_depth_log_sample_rate: 0.01

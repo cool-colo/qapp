@@ -46,6 +46,9 @@ class TradingControlHost(Protocol):
     def control_target_updates_paused(self) -> bool:
         """Return whether automatic target acceptance is currently frozen."""
 
+    def control_replanning_blocked(self) -> bool:
+        """Manual trades cannot bypass the temporary replanning gate."""
+
     def control_current_targets(self) -> dict[str, Decimal]:
         """Return a copy of the current per-instrument target quantities."""
 
@@ -154,6 +157,9 @@ class TradingController:
         if not acquired:
             raise TimeoutError("manual_sell could not acquire convergence lock")
         try:
+            if self._host.control_replanning_blocked():
+                from strategies.replanning import ReplanningBusyError
+                raise ReplanningBusyError("manual trading is blocked while replanning")
             held = self._host.control_open_long_quantities()
 
             if target_only:

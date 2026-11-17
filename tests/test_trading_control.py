@@ -56,6 +56,9 @@ class FakeControlHost:
     def control_log(self, message: str) -> None:
         pass
 
+    def control_replanning_blocked(self) -> bool:
+        return False
+
 
 class SellAllTests(unittest.TestCase):
     def test_sell_all_zeros_every_target_not_just_held(self) -> None:

@@ -12,9 +12,11 @@ from market_data import DailyStockData
 from market_data import index_daily_stock_data
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from strategies.model_target_planners import CurrentHolding
+from strategies.model_target_planners.base import ForcedExit
 from strategies.model_target_planners import ModelTargetCandidate
 from strategies.model_target_planners import ModelTargetPlan
 from strategies.model_target_planners import ModelTargetPlanningRequest
+from strategies.model_target_planners import ModelTargetPlanningContext
 from strategies.model_target_planners import TargetContext
 from strategies.model_target_planners import TargetInfo
 from strategies.target_quantities import TickSnapshot
@@ -374,6 +376,7 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
             _resolve_signal_date = TargetModelPredictionsStrategy._resolve_signal_date
 
         strategy = PlanStub()
+        strategy._target_version = ""
         signal_date = date(2026, 7, 7)
         strategy.log = MagicMock()
         strategy._seed_active_positions_from_portfolio = MagicMock()
@@ -531,6 +534,8 @@ class BuildCandidatesTest(unittest.TestCase):
                 TargetModelPredictionsStrategy._PRICE_COMPARISON_TOLERANCE
             )
             _build_candidates = TargetModelPredictionsStrategy._build_candidates
+            _planning_permissions = TargetModelPredictionsStrategy._planning_permissions
+            planning_today_fills = MagicMock(return_value=(0, 0))
             _entry_skip_reason = TargetModelPredictionsStrategy._entry_skip_reason
             _has_consecutive_up_limits = TargetModelPredictionsStrategy._has_consecutive_up_limits
             _has_excessive_open_gap = TargetModelPredictionsStrategy._has_excessive_open_gap
@@ -547,6 +552,7 @@ class BuildCandidatesTest(unittest.TestCase):
             _is_suspended_status = TargetModelPredictionsStrategy._is_suspended_status
 
         strategy = CandidateStub()
+        strategy._active_positions = {}
         signal_date = date(2026, 7, 7)
         instrument_id = InstrumentId.from_str("000001.SZ.QMT")
         strategy.log = MagicMock()
@@ -842,6 +848,9 @@ class TargetPlanAuthorityTest(unittest.TestCase):
     def _make_stub(self, *, authoritative: bool):
         class PlanStub:
             _target_plan = TargetModelPredictionsStrategy._target_plan
+            capture_planning_inputs = MagicMock(return_value={})
+            finish_target_planning = TargetModelPredictionsStrategy.finish_target_planning
+            _validate_planning_permissions = staticmethod(TargetModelPredictionsStrategy._validate_planning_permissions)
 
         request = ModelTargetPlanningRequest(
             trading_date=date(2026, 7, 8),
@@ -859,9 +868,13 @@ class TargetPlanAuthorityTest(unittest.TestCase):
             reason="risk_manager_optimize",
         )
         strategy = PlanStub()
+        strategy._target_version = ""
         strategy.config = SimpleNamespace(local_exit_authoritative=authoritative)
+        strategy.build_planning_context = MagicMock(return_value=ModelTargetPlanningContext(
+            request.trading_date, "continuous", {},
+        ))
         strategy._target_planning_request = MagicMock(
-            return_value=(request, {"000001.SZ.QMT": "stop_triggered"}),
+            return_value=(request, {"000001.SZ.QMT": ForcedExit("stop_triggered", 0)}),
         )
         strategy._target_planner = SimpleNamespace(plan=MagicMock(return_value=plan))
         strategy._annotate_plan = MagicMock(return_value=plan)
@@ -914,7 +927,7 @@ class TargetPlanAuthorityTest(unittest.TestCase):
 
         plan = strategy._apply_forced_exit_overrides(
             optimizer_plan,
-            {"000001.SZ.QMT": "stop_triggered"},
+            {"000001.SZ.QMT": ForcedExit("stop_triggered", 0)},
         )
 
         self.assertEqual(plan.targets[0].quantity, 0)
@@ -949,7 +962,7 @@ class TargetPlanAuthorityTest(unittest.TestCase):
             return_value={"000001.SZ.QMT": 100, "000002.SZ.QMT": 200},
         )
         strategy._local_target_info = MagicMock(
-            side_effect=lambda instrument_id, quantity: TargetInfo(
+            side_effect=lambda instrument_id, quantity, *, planning_context=None: TargetInfo(
                 stock_code=instrument_id.split(".")[0],
                 weight=None,
                 quantity=quantity,
@@ -973,7 +986,7 @@ class TargetPlanAuthorityTest(unittest.TestCase):
 
         plan = strategy._local_safety_plan(
             request,
-            {"000001.SZ.QMT": "stop_triggered"},
+            {"000001.SZ.QMT": ForcedExit("stop_triggered", 0)},
             "missing_signal_data",
         )
 

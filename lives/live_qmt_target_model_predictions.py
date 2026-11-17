@@ -256,6 +256,17 @@ def _add_snapshot_recorder(
             is_warning=True,
         )
     strategy.configure_live_target_plan_persister(recorder.persist_strategy_target_plan)
+    strategy.configure_planning_archive(recorder.persist_planning_attempt, recorder.load_committed_plan)
+    archive_day = pd.Timestamp.now(tz=args.exchange_timezone).date()
+    writer.initialize_strategy_trade_scope(str(args.account_id), str(args.trader_id), str(strategy.id))
+    strategy.configure_today_fills_loader(lambda trading_date: writer.load_strategy_today_fills(
+        str(args.account_id), str(args.trader_id), trading_date, str(strategy.id)))
+    strategy.refresh_today_fills(archive_day)
+    strategy.replanning.day = archive_day
+    strategy.replanning.counts.update(writer.restore_planning_state(
+        str(args.account_id), str(args.trader_id), archive_day))
+    strategy.replanning.last = writer.load_latest_planning_attempt(
+        str(args.account_id), str(args.trader_id), archive_day)
     node.trader.add_actor(recorder)
     _emit_snapshot_status(
         node,

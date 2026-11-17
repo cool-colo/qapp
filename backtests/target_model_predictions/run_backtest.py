@@ -33,6 +33,7 @@ from backtests.data_providers import ClickHouseModelPredictionDataProvider  # no
 from backtests.data_providers import ModelPredictionDataRequest  # noqa: E402
 from backtests.data_providers import PredictionDataBundle  # noqa: E402
 from backtests.base import BaseBacktest  # noqa: E402
+from backtests.time_range import BacktestTimeRange  # noqa: E402
 from backtests.common import add_benchmark_args  # noqa: E402
 from backtests.common import apply_benchmark_to_reports  # noqa: E402
 from backtests.common import benchmark_config_from_args  # noqa: E402
@@ -86,8 +87,10 @@ class DailyPlanningEvent(Data):
         ts_event: int,
         ts_init: int,
         allow_planning: bool = True,
+        opening_auction_snapshot: bool = False,
     ) -> None:
         self.allow_planning = allow_planning
+        self.opening_auction_snapshot = opening_auction_snapshot
         self.trading_date = trading_date
         self.full_tick_snapshot = full_tick_snapshot
         self.previous_closes = previous_closes
@@ -173,8 +176,9 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
             subscribe_new_bars=False,
         )
         self.apply_full_tick_snapshot(data.full_tick_snapshot, "backtest_planning")
-        if self.config.auction_enabled:
-            self.process_opening_auction()
+        if data.opening_auction_snapshot and self.config.auction_enabled:
+            if self.accept_opening_auction_snapshot(data.trading_date, data.full_tick_snapshot, ts_init=data.ts_init):
+                self.process_opening_auction()
         if data.allow_planning:
             self._process_trading_day_once(data.trading_date, "planning_event")
 
@@ -224,8 +228,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the target model-prediction strategy with Nautilus and QMT venue wiring.",
     )
-    parser.add_argument("--start", default=env("BACKTEST_START_DATE", "2025-01-02"))
-    parser.add_argument("--end", default=env("BACKTEST_END_DATE", "2025-12-31"))
+    parser.add_argument("--start", default=env("BACKTEST_START_DATE", "2025-01-02"),
+                        help="Start date, or tick-replay datetime YYYY-MM-DD HH:MM (inclusive, exchange timezone).")
+    parser.add_argument("--end", default=env("BACKTEST_END_DATE", "2025-12-31"),
+                        help="End date (whole day), or tick-replay datetime YYYY-MM-DD HH:MM (exclusive).")
     parser.add_argument(
         "--config",
         default=env("STRATEGY_CONFIG_FILE"),
@@ -300,6 +306,12 @@ def parse_args() -> argparse.Namespace:
         args.minimum_commission = params.auction_minimum_fee
     if args.tick_file and args.tick_table:
         parser.error("select only one tick source: --tick-file or --tick-table")
+    try:
+        time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if time_range.has_time and not (args.tick_file or args.tick_table):
+        parser.error("datetime --start/--end require --tick-file or --tick-table")
     if params.auction_enabled and not (args.tick_file or args.tick_table):
         parser.error("auction_enabled requires --tick-file or --tick-table; daily bars cannot simulate opening auction")
     if not 0 < args.auction_participation_rate <= 1:
@@ -324,9 +336,10 @@ def build_prediction_request(
     args: argparse.Namespace,
     trading_history_days: int = 0,
 ) -> ModelPredictionDataRequest:
+    time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
     return ModelPredictionDataRequest(
-        start_date=args.start,
-        end_date=args.end,
+        start_date=time_range.start_date.isoformat(),
+        end_date=time_range.end_date.isoformat(),
         predictions_database=args.predictions_database,
         predictions_table=args.predictions_table,
         stock_codes=env_list_from_value(args.stock_codes),
@@ -366,7 +379,8 @@ def load_bars(
     bundle: PredictionDataBundle,
 ) -> tuple[dict[str, Any], dict[str, list[Any]], int]:
     provider = ClickHouseBarDataProvider(connection=connection, schema=ClickHouseBarSchema())
-    end_exclusive = (pd.Timestamp(args.end).normalize() + pd.Timedelta(days=1)).date().isoformat()
+    time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
+    end_exclusive = (pd.Timestamp(time_range.end_date) + pd.Timedelta(days=1)).date().isoformat()
     stock_codes = list(bundle.universe)
     if args.max_universe > 0:
         stock_codes = stock_codes[: args.max_universe]
@@ -379,7 +393,7 @@ def load_bars(
         prepared = provider.prepare_bars(
             symbol=data_symbol(stock_code),
             bar_type=bar_type,
-            start=args.start,
+            start=time_range.start_date.isoformat(),
             end=end_exclusive,
             timezone_name=args.exchange_timezone,
             price_precision=args.price_precision,
@@ -533,7 +547,7 @@ def prepare_backtest_event_data(
     return planning_events, heartbeats, normalized_bars
 
 
-def prepare_tick_replay_event_data(args, rows, instruments_by_stock):
+def prepare_tick_replay_event_data(args, rows, instruments_by_stock, *, auction_start_time="09:24:01"):
     from backtests.data_providers.historical_ticks import validate_final_auction_results
 
     validate_final_auction_results(rows, args.exchange_timezone)
@@ -562,6 +576,26 @@ def prepare_tick_replay_event_data(args, rows, instruments_by_stock):
         batch["previous_closes"][str(instrument.id)] = row.previous_close
         batch["ts_event"] = max(batch["ts_event"], row.ts_event)
         batch["allow_planning"] |= row.kind != "indicative"
+    # A full-market get_full_tick is one completed batch at preparation time.
+    # Historical rows received later must never repair or replace that batch.
+    daily_latest = {}
+    for row in sorted(rows, key=lambda r: (r.ts_init, r.symbol, r.ts_event)):
+        day = pd.Timestamp(row.ts_init, unit="ns", tz="UTC").tz_convert(args.exchange_timezone).date()
+        prepare_ns = exchange_timestamp_ns(day, auction_start_time, args.exchange_timezone)
+        latest = daily_latest.setdefault(day, {})
+        if row.ts_init <= prepare_ns and row.ts_event <= prepare_ns:
+            latest[str(instruments_by_stock[row.symbol].id)] = {
+                "open": row.open_price, "last_price": row.bid_price,
+                "last_close": row.previous_close,
+                "open_int": 12 if row.kind == "indicative" else 13,
+            }
+    for day, snapshot in sorted(daily_latest.items()):
+        prepare_ns = exchange_timestamp_ns(day, auction_start_time, args.exchange_timezone)
+        event = DailyPlanningEvent(
+            day, snapshot, {i: fields["last_close"] for i, fields in snapshot.items()},
+            prepare_ns, prepare_ns, allow_planning=False, opening_auction_snapshot=True,
+        )
+        events.append(CustomData(DataType(DailyPlanningEvent), event))
     for (ts_init, trading_date), batch in sorted(batches.items()):
         event = DailyPlanningEvent(
             trading_date, batch["snapshot"], batch["previous_closes"],
@@ -569,6 +603,16 @@ def prepare_tick_replay_event_data(args, rows, instruments_by_stock):
         )
         events.append(CustomData(DataType(DailyPlanningEvent), event))
     return events, quotes
+
+
+def run_engine(engine, args) -> None:
+    """Bound both replay data and engine timers by the requested datetime range."""
+    time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
+    if (args.tick_file or args.tick_table) and time_range.has_time:
+        # Nautilus includes its end timestamp; the CLI interval excludes it.
+        engine.run(start=time_range.start_ns, end=time_range.end_ns - 1)
+    else:
+        engine.run()
 
 
 def prepare_tick_replay_depth_data(rows, instruments_by_stock):
@@ -725,8 +769,12 @@ def build_engine(
         )
     else:
         planning_events, heartbeats = prepare_tick_replay_event_data(
-            args, historical_ticks, instruments_by_stock,
+            args, historical_ticks, instruments_by_stock, auction_start_time=params.auction_start_time,
         )
+        time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
+        # Auction preparation events are synthetic timestamps and must obey the
+        # interval as well. A midday replay must not execute a morning plan.
+        planning_events = [event for event in planning_events if time_range.contains(event.ts_init)]
         # Daily bars are retained solely for independent closing valuation.
         execution_bars_by_stock = bars_by_stock
     execution_bars = [
@@ -770,6 +818,7 @@ def build_engine(
             stop_loss=params.stop_loss,
             trailing_take_profit=params.trailing_take_profit,
             trailing_take_profit_start=params.trailing_take_profit_start,
+            auto_replan_enabled=params.auto_replan_enabled,
             min_listed_days=params.min_listed_days,
             initial_cash=args.starting_cash,
             timezone_name=args.exchange_timezone,
@@ -790,10 +839,8 @@ def build_engine(
             trading_windows=params.trading_windows,
             exchange_trading_windows=params.exchange_trading_windows,
             auction_enabled=params.auction_enabled,
-            auction_prepare_time=params.auction_prepare_time,
-            auction_submit_time=params.auction_submit_time,
+            auction_start_time=params.auction_start_time,
             auction_submit_cutoff=params.auction_submit_cutoff,
-            auction_reference_max_age_secs=params.auction_reference_max_age_secs,
             auction_buy_offset_bps=params.auction_buy_offset_bps,
             auction_sell_offset_bps=params.auction_sell_offset_bps,
             auction_commission_rate=params.auction_commission_rate,
@@ -924,6 +971,7 @@ def configure_target_plan_persistence(
         strategy_ref=strategy,
     )
     strategy.configure_live_target_plan_persister(recorder.persist_strategy_target_plan)
+    strategy.configure_planning_archive(recorder.persist_planning_attempt, recorder.load_committed_plan)
     engine.add_actor(recorder)
     return writer
 
@@ -934,13 +982,14 @@ def experiment_id() -> str:
 
 def create_experiment_record(args: argparse.Namespace, experiment_id_value: str, started_at: datetime) -> ExperimentRecord:
     benchmark_config = benchmark_config_from_args(args)
+    time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
     return ExperimentRecord(
         experiment_id=experiment_id_value,
         experiment_name=env("BACKTEST_EXPERIMENT_NAME", "Nautilus Target Model Predictions"),
         strategy_id=STRATEGY_ID,
         strategy_version_id=STRATEGY_VERSION_ID,
-        start_date=pd.Timestamp(args.start).date(),
-        end_date=pd.Timestamp(args.end).date(),
+        start_date=time_range.start_date,
+        end_date=time_range.end_date,
         frequency="1d",
         initial_cash=args.starting_cash,
         engine_name="nautilus_trader",
@@ -983,6 +1032,7 @@ def experiment_params(args: argparse.Namespace, experiment_id_value: str) -> lis
 
 def run_config(args: argparse.Namespace) -> dict[str, Any]:
     params = StrategyParams.from_yaml(args.config)
+    time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
     return {
         "strategy.predictions_table": args.predictions_table,
         "strategy.stock_codes": args.stock_codes,
@@ -998,6 +1048,7 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.stop_loss": params.stop_loss,
         "strategy.trailing_take_profit": params.trailing_take_profit,
         "strategy.trailing_take_profit_start": params.trailing_take_profit_start,
+        "strategy.auto_replan_enabled": params.auto_replan_enabled,
         "strategy.min_listed_days": params.min_listed_days,
         "strategy.target_cash_buffer_percent": params.target_cash_buffer_percent,
         "strategy.target_weight_planner": params.target_weight_planner,
@@ -1025,8 +1076,10 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "strategy.partial_fill_cancel_grace_secs": params.partial_fill_cancel_grace_secs,
         "strategy.partial_fill_notional_threshold": params.partial_fill_notional_threshold,
         "strategy.small_leaves_notional_threshold": params.small_leaves_notional_threshold,
-        "base.start_date": args.start,
-        "base.end_date": args.end,
+        "base.start_date": time_range.start_date.isoformat(),
+        "base.end_date": time_range.end_date.isoformat(),
+        "base.start_time": time_range.start.isoformat(),
+        "base.end_time_exclusive": time_range.end.isoformat(),
         "base.initial_cash": args.starting_cash,
         **benchmark_run_config(args),
         **REPORT_PROCESSOR.tearsheet_run_config(args),
@@ -1478,7 +1531,7 @@ def main() -> None:
     daily_stock_data = ClickHouseDailyStockDataProvider(connection).load(
         stock_codes=sorted(bars_by_stock),
         start_date=min(bundle.trading_dates),
-        end_date=args.end,
+        end_date=BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone).end_date,
     )
     if args.load_only:
         if args.tick_file or args.tick_table:
@@ -1509,7 +1562,7 @@ def main() -> None:
         experiment_id_value,
     )
     try:
-        engine.run()
+        run_engine(engine, args)
         complete_report = build_complete_report(
             args,
             engine,
@@ -1521,7 +1574,7 @@ def main() -> None:
                 args, bundle, bar_types, bars_by_stock, daily_stock_data, auction_enabled=False,
             )
             try:
-                baseline_engine.run()
+                run_engine(baseline_engine, args)
                 baseline_report = build_complete_report(args, baseline_engine, baseline_strategy, baseline_bars)
                 combined = []
                 for label, report in [("auction", complete_report), ("continuous_only", baseline_report)]:

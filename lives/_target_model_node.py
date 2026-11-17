@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from dataclasses import asdict
+from datetime import date
 from datetime import timedelta
 from typing import Any
+from typing import Callable
 
 import pandas as pd
 
@@ -30,6 +33,7 @@ from monitoring.dingtalk_alert import FixedTimeEventReporter
 from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from strategies.model_prediction_targets import TargetModelPredictionsStrategyConfig
 from strategies.strategy_params import StrategyParams
+from strategies.opening_auction import auction_time
 from nautilus_trader.common.enums import LogColor
 
 
@@ -50,6 +54,7 @@ class VenueClients:
 
 
 class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
+    _OPENING_AUCTION_ALERT = "TARGET-MODEL-OPENING-AUCTION"
     _REFRESH_ALERT = "TARGET-MODEL-DATA-REFRESH"
     _EARLY_REFRESH_ALERT = "TARGET-MODEL-DATA-EARLY-REFRESH"
     _EARLY_REFRESH_TIME = (7, 0)
@@ -63,6 +68,7 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         event_reporter: FixedTimeEventReporter | None = None,
     ) -> None:
         super().__init__(config)
+        self._auction_snapshot_requested_dates: set[date] = set()
         self._refresh_context = refresh_context
         self._refresh_interval_secs = float(refresh_interval_secs)
         self._refresh_time = self._parse_hh_mm(refresh_time)
@@ -94,6 +100,8 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
     def on_start(self) -> None:
         super().on_start()
         self._execution_reconciliation.request_after_strategy_start()
+        if self.config.auction_enabled:
+            self._schedule_opening_auction()
         self._schedule_early_refresh()
         if self._refresh_time is not None:
             self._schedule_daily_refresh()
@@ -201,9 +209,57 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
             except Exception as exc:
                 self.log.warning(f"Could not summarize DingTalk event {event_name}: {exc}")
 
+    def _schedule_opening_auction(self) -> None:
+        now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
+        start = auction_time(self.config.auction_start_time)
+        alert_time = now.normalize() + pd.Timedelta(
+            hours=start.hour, minutes=start.minute, seconds=start.second,
+            microseconds=start.microsecond,
+        )
+        if alert_time <= now:
+            alert_time += pd.Timedelta(days=1)
+        self.clock.set_time_alert(
+            name=self._OPENING_AUCTION_ALERT,
+            alert_time=alert_time,
+            callback=self._on_opening_auction_timer,
+            override=True,
+        )
+        self.log.info(f"Next opening auction scheduled for {alert_time.isoformat()}")
+
+    def _on_opening_auction_timer(self, _event: Any) -> None:
+        self.log.info(
+            f"Opening auction triggered: date={self._clock_date()} "
+            f"start={self.config.auction_start_time}",
+        )
+        self._schedule_opening_auction()
+        self._prepare_opening_auction_snapshot(on_ready=self.process_opening_auction)
+
+    def _prepare_opening_auction_snapshot(self, *, on_ready: Callable[[], None]) -> None:
+        """Prepare one validated snapshot, then notify the caller that it is ready."""
+        now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
+        day = now.date()
+        if (not self.config.auction_enabled or day not in self._trading_dates
+                or not auction_time(self.config.auction_start_time) <= now.time()
+                < auction_time(self.config.auction_submit_cutoff)
+                or day in self._auction_snapshot_requested_dates
+                or self._trading_paused or self._target_updates_paused):
+            return
+        self._auction_snapshot_requested_dates.add(day)
+
+        def completed(status: str, details: dict[str, Any]) -> None:
+            if status != "success":
+                self.fail_opening_auction_snapshot(day, str(details.get("error")))
+                return
+            if not self._within_auction_submit_time():
+                self.fail_opening_auction_snapshot(day, "snapshot completed outside auction submission window")
+                return
+            snapshot = {i: asdict(tick) for i, tick in self.whole_market_snapshot().items()}
+            if self.accept_opening_auction_snapshot(day, snapshot, ts_init=int(self.clock.timestamp_ns())):
+                on_ready()
+
+        self.request_whole_market_full_tick_refresh("auction_prepare", on_complete=completed)
+
     def _on_process_targets_timer(self, _event: Any) -> None:
-        if self.config.auction_enabled:
-            self.process_opening_auction()
         if not self._within_trading_window():
             return
         trading_date = self._clock_date()
@@ -461,6 +517,7 @@ def build_target_model_node(
             stop_loss=params.stop_loss,
             trailing_take_profit=params.trailing_take_profit,
             trailing_take_profit_start=params.trailing_take_profit_start,
+            auto_replan_enabled=params.auto_replan_enabled,
             min_listed_days=params.min_listed_days,
             initial_cash=params.initial_cash,
             timezone_name=args.exchange_timezone,
@@ -505,10 +562,8 @@ def build_target_model_node(
             trading_windows=params.trading_windows,
             exchange_trading_windows=params.exchange_trading_windows,
             auction_enabled=params.auction_enabled,
-            auction_prepare_time=params.auction_prepare_time,
-            auction_submit_time=params.auction_submit_time,
+            auction_start_time=params.auction_start_time,
             auction_submit_cutoff=params.auction_submit_cutoff,
-            auction_reference_max_age_secs=params.auction_reference_max_age_secs,
             auction_buy_offset_bps=params.auction_buy_offset_bps,
             auction_sell_offset_bps=params.auction_sell_offset_bps,
             auction_commission_rate=params.auction_commission_rate,
@@ -730,6 +785,9 @@ def build_target_model_node(
             str(args.account_id), str(args.trader_id)
         )
         strategy.trading_controller.set_target_updates_paused(bool(target_updates_paused))
+        auto_replan = control_writer.load_auto_replan_enabled(str(args.account_id), str(args.trader_id))
+        if auto_replan is not None:
+            strategy.replanning.auto_enabled = auto_replan
         node.get_logger().info(
             f"Loaded trading_paused={paused} "
             f"target_updates_paused={target_updates_paused} from live_control_state",

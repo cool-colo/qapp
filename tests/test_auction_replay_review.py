@@ -162,7 +162,7 @@ class AuctionReplayReviewTest(unittest.TestCase):
             engine.dispose()
 
     def test_fractional_final_timestamp_does_not_extend_opening_submission_cutoff(self):
-        engine, strategy, _, _ = replay_fixture(submission_latency_ms=10025, transform_rows=lambda rows: [
+        engine, strategy, _, _ = replay_fixture(submission_latency_ms=59025, transform_rows=lambda rows: [
             replace(row, ts_event=row.ts_event + 50_000_000, ts_init=row.ts_init + 50_000_000)
             if row.kind == "auction" else row for row in rows])
         try:

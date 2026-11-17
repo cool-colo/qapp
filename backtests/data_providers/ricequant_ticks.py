@@ -13,6 +13,7 @@ from backtests.data_providers.clickhouse import quote_literal
 from backtests.data_providers.historical_ticks import HistoricalTick
 from backtests.data_providers.historical_ticks import continuous_session_index
 from backtests.data_providers.historical_ticks import validate_final_auction_results
+from backtests.time_range import BacktestTimeRange
 
 
 def ricequant_symbol(stock_code: str) -> str:
@@ -40,6 +41,7 @@ class ClickHouseRicequantTickDataProvider:
         self.client = ClickHouseBarDataProvider(connection, ClickHouseBarSchema())
 
     def load(self, *, start: str, end: str, symbols: set[str]) -> list[HistoricalTick]:
+        time_range = BacktestTimeRange.parse(start, end)
         if not symbols:
             raise ValueError("RiceQuant tick replay requires a nonempty universe")
         # The inspected RiceQuant source covers SH/SZ only. Do not invent a BJ
@@ -48,9 +50,22 @@ class ClickHouseRicequantTickDataProvider:
         # Restrict to selected strategy candidates and daily partitions. Neither
         # the final-per-day DWD table nor an unbounded whole-market scan is used.
         result = []
-        day = pd.Timestamp(start).date()
-        last_day = pd.Timestamp(end).date()
+        # Replay runs on receipt time. Push its interval into exchange-time SQL
+        # after subtracting the explicit receive delay, retaining daily pruning.
+        delay = pd.Timedelta(nanoseconds=self.delay_ns)
+        exchange_start, exchange_end = time_range.start - delay, time_range.end - delay
+        day = exchange_start.date()
+        last_day = (exchange_end - pd.Timedelta(nanoseconds=1)).date()
+
+        def sql_time(value: pd.Timestamp) -> str:
+            return value.strftime("%Y-%m-%d %H:%M:%S") + f".{value.microsecond * 1000 + value.nanosecond:09d}"
+
         while day <= last_day:
+            session_start = pd.Timestamp(f"{day.isoformat()} 09:15", tz="Asia/Shanghai")
+            session_end = pd.Timestamp(f"{day.isoformat()} 15:00", tz="Asia/Shanghai")
+            if exchange_start > session_end or exchange_end <= session_start:
+                day += timedelta(days=1)
+                continue
             for offset in range(0, len(mapping), 100):
                 chunk = sorted(mapping)[offset:offset + 100]
                 sql = f"""
@@ -61,13 +76,16 @@ PREWHERE trading_date = toDate({quote_literal(day.isoformat())})
      AND order_book_id IN ({','.join(quote_literal(code) for code in chunk)})
 WHERE datetime >= toDateTime64({quote_literal(day.isoformat() + ' 09:15:00')},9,'Asia/Shanghai')
   AND datetime <= toDateTime64({quote_literal(day.isoformat() + ' 15:00:00')},9,'Asia/Shanghai')
+  AND datetime >= toDateTime64({quote_literal(sql_time(exchange_start))},9,'Asia/Shanghai')
+  AND datetime < toDateTime64({quote_literal(sql_time(exchange_end))},9,'Asia/Shanghai')
 ORDER BY datetime, order_book_id, tick_sequence
 FORMAT JSONEachRow
 """
-                result.extend(self.build_ticks(self.client.fetch_json_each_row(sql), mapping))
+                result.extend(row for row in self.build_ticks(self.client.fetch_json_each_row(sql), mapping)
+                              if time_range.contains(row.ts_init))
             day += timedelta(days=1)
         if not result:
-            raise ValueError("No usable ricequant_stock_tick data in requested dates/universe")
+            raise ValueError("No usable ricequant_stock_tick data in requested time range/universe")
         validate_final_auction_results(result)
         result.sort(key=lambda tick: (tick.ts_init, tick.symbol, tick.ts_event))
         return result

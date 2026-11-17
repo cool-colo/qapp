@@ -11,8 +11,24 @@ from typing import Callable
 import pandas as pd
 
 from nautilus_trader.common.enums import LogColor
+from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.orders import Order
 
 from strategies.async_scheduling import AsyncAwaitableScheduler
+
+
+def is_reconciliation_order(order: Order) -> bool:
+    return order.tags is not None and "RECONCILIATION" in order.tags
+
+
+def is_reconciliation_fill(event: OrderFilled, order: Order | None) -> bool:
+    """Exclude synthetic/replayed fills from actual strategy trade history.
+
+    Claimed position-alignment orders can lack the RECONCILIATION tag. Their
+    events still carry Nautilus' reconciliation flag. Real historical trades
+    are restored separately from persistence using their venue trade IDs.
+    """
+    return event.reconciliation or (order is not None and is_reconciliation_order(order))
 
 
 class ExecutionStateReconciler:
@@ -65,6 +81,34 @@ class ExecutionStateReconciler:
     @property
     def is_configured(self) -> bool:
         return self._reconcile is not None and self._reconcile_time is not None
+
+    @property
+    def timeout_secs(self) -> float:
+        return self._timeout_secs
+
+    async def reconcile_once(self) -> None:
+        """Wait for reconciliation, including one requested after a running pass."""
+        if not self.is_configured:
+            return  # Backtests have no venue execution service.
+        task = self._task
+        if task is not None and not task.done():
+            if isinstance(task, ConcurrentFuture):
+                await asyncio.wrap_future(task)
+            else:
+                await task
+        async def reconcile():
+            result = self._reconcile(timeout_secs=self._timeout_secs)
+            if inspect.isawaitable(result):
+                result = await asyncio.wait_for(result, timeout=self._timeout_secs)
+            if not result:
+                raise RuntimeError("execution-state reconciliation failed")
+        task = asyncio.create_task(reconcile())
+        self._task = task
+        try:
+            await task
+        finally:
+            if self._task is task:
+                self._task = None
 
     def schedule_daily(self) -> None:
         clock = self._runtime_clock()
@@ -193,7 +237,8 @@ class ExecutionStateReconciler:
         report_scheduled_event: bool = False,
         started: float | None = None,
     ) -> None:
-        self._task = None
+        if self._task is task:
+            self._task = None
         try:
             result = task.result()
         except Exception as exc:

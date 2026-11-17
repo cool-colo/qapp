@@ -148,8 +148,8 @@ class ModelTargetPlannerTest(unittest.TestCase):
         self.assertEqual(
             captured["payload"]["candidates"],
             [
-                {"stock_code": "000001.SZ", "score": 0.12, "is_tradable": True, "expected_return": 0.031, "price": 10.0, "rank": 1},
-                {"stock_code": "000002.SZ", "score": 0.08, "is_tradable": True, "expected_return": 0.017, "price": 20.0, "rank": 2},
+                {"stock_code": "000001.SZ", "score": 0.12, "is_tradable": True, "expected_return": 0.031, "price": 10.0, "rank": 1, "can_buy": True, "can_sell": True},
+                {"stock_code": "000002.SZ", "score": 0.08, "is_tradable": True, "expected_return": 0.017, "price": 20.0, "rank": 2, "can_buy": True, "can_sell": True},
             ],
         )
         # current_weights come from holdings only, with the new item schema. The internal
