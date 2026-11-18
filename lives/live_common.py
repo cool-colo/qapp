@@ -560,7 +560,7 @@ class LivePredictionDataLoader:
             },
         )
 
-    def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float]]:
+    def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float | int]]:
         """
         Authoritative full-tick snapshot per instrument id from the broker gateway.
 

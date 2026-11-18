@@ -160,6 +160,8 @@ def replay_fixture(*, persister=None, final_results=True, continuous=False,
     if transform_config is not None:
         config = transform_config(config)
     strategy = strategy_type(config)
+    # Replay subscriptions have no network warm-up to wait for.
+    strategy._sleep = lambda _seconds: None
     planner = FixedPlanner(second_day_exit=second_day_exit, second_day_rotate=second_day_rotate)
     strategy._target_planner = planner
     strategy._auction_replay_model = model
@@ -259,8 +261,10 @@ class OpeningAuctionTest(unittest.TestCase):
         strategy.configure_planning_archive(None, loader)
         source = lambda: {}
         ready = Future()
-        ready.set_result({"000001.SZ.QMT": {"last_price": 10.1, "last_close": 10},
-                          "000002.SZ.QMT": {"last_price": 20.2, "last_close": 20}})
+        ready.set_result({"000001.SZ.QMT": {"last_price": 10.1, "last_close": 10,
+                                           "ts_event": timestamp("2026-07-08 09:24:49")},
+                          "000002.SZ.QMT": {"last_price": 20.2, "last_close": 20,
+                                           "ts_event": timestamp("2026-07-08 09:24:49")}})
         strategy.configure_whole_market_full_tick_source(source)
         try:
             with patch.object(strategy, "_schedule_fetch", side_effect=lambda requested:
@@ -696,6 +700,9 @@ class OpeningAuctionTest(unittest.TestCase):
                 engine.run()
                 self.assertEqual(len(engine.cache.orders()), 1)
                 self.assertEqual(strategy.config.auction_execution_time, "09:24:40")
+                self.assertTrue(strategy.config.subscribe_order_book_depth)
+                self.assertTrue(strategy._subscribed_order_book_depth_instruments)
+                self.assertTrue(strategy._depth_books)
                 self.assertEqual({o.ts_init for o in engine.cache.orders()},
                                  {timestamp("2026-07-08 09:24:40")})
                 self.assertEqual(engine.trader.generate_fills_report().last_qty.astype(int).sum(), 100)

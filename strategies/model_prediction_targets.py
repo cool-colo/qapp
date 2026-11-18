@@ -586,6 +586,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     previous_close=self._last_close.get(i),
                     market_status=None if tick is None else tick.market_status,
                     price_source=source,
+                    price_ts_event=None if tick is None else tick.ts_event,
                 )
         else:
             instruments = {i: ModelTargetInstrumentContext(previous_close=close)
@@ -607,6 +608,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                     market_status=tick.market_status,
                     price_source=("auction_indicative" if stage == "opening_auction" else "full_tick_last")
                                  if price is not None else None,
+                    price_ts_event=tick.ts_event,
                 )
         return ModelTargetPlanningContext(
             trading_date=trading_date, stage=stage, instruments=instruments,
@@ -656,10 +658,10 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             return False
         return True
 
-    def accept_opening_auction_execution_snapshot(
-        self, trading_date: date, snapshot: dict[str, dict[str, Any]], *, ts_init: int,
+    def accept_opening_auction_execution_update(
+        self, trading_date: date, *, ts_init: int,
     ) -> bool:
-        """Refresh execution references without changing the captured planning inputs."""
+        """Validate updated caches without freezing the execution reference prices."""
         if (trading_date != self._clock_date()
                 or trading_date in self._auction_execution_snapshot_dates
                 or trading_date in self._auction_snapshot_failed_dates
@@ -672,16 +674,26 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             return False
         if not self._restore_opening_auction_target(trading_date):
             return False
-        context = self.build_planning_context(trading_date, stage="opening_auction",
-                                              snapshot=snapshot, ts_init=ts_init)
-        required = self._held_instrument_ids() | set(self._target_quantities)
-        if not self._validate_opening_auction_snapshot(context, required, snapshot):
+        if ts_init is None or ts_init <= 0:
+            self.fail_opening_auction_snapshot(trading_date, "execution full-market update is not ready")
             return False
+        updated_at = pd.Timestamp(ts_init, unit="ns", tz="UTC").tz_convert(self.config.timezone_name)
+        if (self._whole_market_status_updated_at_ns != ts_init or not self._whole_market_status
+                or updated_at.date() != trading_date
+                or updated_at.time() < auction_time(self.config.auction_execution_time)):
+            self.fail_opening_auction_snapshot(trading_date, "execution full-market update is not ready")
+            return False
+        snapshot = {i: dataclasses.asdict(tick) for i, tick in self._whole_market_status.items()}
         self.apply_full_tick_snapshot(snapshot, "auction_execute")
-        self.set_opening_auction_prices(
-            {i: inputs.price for i, inputs in context.instruments.items() if inputs.price is not None},
-            ts_init=ts_init,
-        )
+        required = self._held_instrument_ids() | set(self._target_quantities)
+        suspended = self._suspended_by_date.get(trading_date, set())
+        missing = [i for i in sorted(required)
+                   if self._stock_code_for_instrument(i) not in suspended
+                   and not self._is_suspended_status(i)
+                   and self._select_opening_auction_reference(i)[0] is None]
+        if missing:
+            self.fail_opening_auction_snapshot(trading_date, f"missing auction reference: {missing}")
+            return False
         self._auction_execution_snapshot_dates.add(trading_date)
         return True
 

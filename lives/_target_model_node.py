@@ -289,10 +289,16 @@ class LiveTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
                     < auction_time(self.config.auction_submit_cutoff)):
                 self.fail_opening_auction_snapshot(day, f"{phase} snapshot completed outside auction window")
                 return
-            snapshot = {i: asdict(tick) for i, tick in self.whole_market_snapshot().items()}
-            accept = (self.accept_opening_auction_snapshot if phase == "planning"
-                      else self.accept_opening_auction_execution_snapshot)
-            if accept(day, snapshot, ts_init=int(self.clock.timestamp_ns())):
+            if phase == "planning":
+                snapshot = {i: asdict(tick) for i, tick in self.whole_market_snapshot().items()}
+                accepted = self.accept_opening_auction_snapshot(
+                    day, snapshot, ts_init=int(self.clock.timestamp_ns()),
+                )
+            else:
+                accepted = self.accept_opening_auction_execution_update(
+                    day, ts_init=self._whole_market_status_updated_at_ns,
+                )
+            if accepted:
                 on_ready()
 
         self.request_whole_market_full_tick_refresh(
@@ -654,7 +660,7 @@ def build_target_model_node(
         event_reporter=event_reporter.report,
     )
 
-    def _fetch_full_tick() -> dict[str, dict[str, float]]:
+    def _fetch_full_tick() -> dict[str, dict[str, float | int]]:
         # Today's authoritative full-tick snapshot per instrument from the broker.
         # Covers the full configured universe (not just held positions) so new buy
         # targets are priced from the real open, plus active positions that dropped
@@ -692,7 +698,7 @@ def build_target_model_node(
             return {}
         return loader.full_tick_snapshot(codes)
 
-    def _fetch_whole_market_full_tick() -> dict[str, dict[str, float]]:
+    def _fetch_whole_market_full_tick() -> dict[str, dict[str, float | int]]:
         # Whole-market (京沪深A) full-tick snapshot. The universe is whatever the
         # instrument provider loaded into the Nautilus cache at startup — with the
         # default QMT_LOAD_ALL_INSTRUMENTS=True this is the entire A-share sector

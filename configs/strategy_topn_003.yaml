@@ -88,8 +88,8 @@ preopen_latency_fixed_advance_ms: 50
 # Auction submissions use their own window; continuous orders obey execution_windows.
 # Planning and execution each fetch a whole-market full-tick batch; no cancels before 09:30.
 auction_enabled: true
-auction_start_time: "09:16:01"  # Planning timer: fetch latest prices, then freeze targets.
-auction_execution_time: "09:24:50"  # Execution timer: fetch latest prices again, then submit.
+auction_start_time: "09:20:01"  # Planning timer: fetch latest prices, then freeze targets.
+auction_execution_time: "09:20:50"  # Execution timer: fetch latest prices again, then submit.
 auction_submit_cutoff: "09:24:59"
 auction_buy_offset_bps: 50.0
 auction_sell_offset_bps: 50.0

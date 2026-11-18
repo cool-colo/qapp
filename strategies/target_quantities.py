@@ -43,7 +43,6 @@ from strategies.async_scheduling import AsyncAwaitableScheduler
 from strategies.execution_timing import ConvergenceEvent
 from strategies.execution_timing import ConvergenceTiming
 from strategies.execution_timing import ExecutionTiming
-from strategies.execution_timing import TimingPoint
 from strategies.cancellation import A_SHARE_CANCEL_WINDOWS
 from strategies.cancellation import cancel_window_index
 from strategies.cancellation import validate_cancel_config
@@ -347,6 +346,7 @@ class TickSnapshot:
     pvolume: int | None = None
     open_int: int | None = None
     last_settlement_price: float | None = None
+    ts_event: int | None = None
 
     @classmethod
     def from_fields(cls, fields: Any) -> "TickSnapshot":
@@ -370,6 +370,7 @@ class TickSnapshot:
             pvolume=cls._int_or_none(fields.get("pvolume")),
             open_int=open_int,
             last_settlement_price=cls._float_or_none(fields.get("last_settlement_price")),
+            ts_event=cls._int_or_none(fields.get("ts_event")),
         )
 
     @staticmethod
@@ -512,7 +513,6 @@ class TargetQuantityStrategy(Strategy):
         validate_cancel_config(config)
         validate_auction_config(config)
         self._auction_references: dict[str, AuctionReference] = {}
-        self._auction_reference_captured: dict[str, TimingPoint] = {}
         self._auction_attempted: set[str] = set()
         self._auction_execution_active = False
         self._auction_prediction_ranks: dict[str, int] = {}
@@ -582,9 +582,10 @@ class TargetQuantityStrategy(Strategy):
         self._market_status_updated_at_ns: int | None = None
         # Latest whole-market (京沪深A) full tick per instrument id — same shape as
         # ``_market_status`` but covers the entire A-share universe, not just the
-        # strategy's traded instruments. Intraday, latest-wins; reset daily. Not used
-        # for trading decisions; the recorder persists it once after market close.
+        # strategy's traded instruments. Auction execution compares these prices
+        # with subscribed depth; the recorder persists the final snapshot.
         self._whole_market_status: dict[str, TickSnapshot] = {}
+        self._whole_market_status_updated_at_ns: int | None = None
         # True once the first depth-driven convergence of the current trading day
         # has fired (reset per day in _roll_trading_day). Lets the earliest
         # order-book depth callback submit orders as early as possible.
@@ -792,8 +793,9 @@ class TargetQuantityStrategy(Strategy):
         ``{instrument_id_text: {"open": ..., ...}}`` covering the entire A-share
         universe. Called once at startup, at ``whole_market_full_tick_time`` daily,
         then every ``whole_market_full_tick_interval_secs`` during the trading window.
-        The result is stored in ``_whole_market_status`` (latest-wins, in memory);
-        it is not used for trading and is persisted only by the recorder after close.
+        The result is stored in ``_whole_market_status`` (latest-wins, in memory),
+        compared with subscribed depth during auction execution, and persisted by
+        the recorder after close.
         """
         self._whole_market_full_tick_source = fetch_whole_market_full_tick
 
@@ -1177,6 +1179,10 @@ class TargetQuantityStrategy(Strategy):
         except Exception as exc:
             self.log.warning(f"whole-market completion callback failed: {exc}")
 
+    def apply_whole_market_full_tick_snapshot(self, snapshot: Any, trigger: str) -> None:
+        """Install a full-market batch through the shared live/replay cache path."""
+        self._apply_whole_market_full_tick(snapshot, trigger, time.monotonic())
+
     def _apply_whole_market_full_tick(
         self,
         snapshot: Any,
@@ -1185,9 +1191,8 @@ class TargetQuantityStrategy(Strategy):
     ) -> None:
         """Store the whole-market snapshot (latest-wins) and log fetch timing.
 
-        Unlike ``_apply_full_tick`` this does NOT anchor opens, seed ``_last_close``,
-        or touch trading state — it only refreshes the in-memory ``_whole_market_status``
-        map for after-close persistence and status inspection.
+        Unlike ``_apply_full_tick`` this does not anchor opens or seed ``_last_close``.
+        Auction execution reads this cache after the completed update.
         """
         elapsed_ms = (time.monotonic() - started) * 1000.0
         if not isinstance(snapshot, dict) or not snapshot:
@@ -1204,6 +1209,7 @@ class TargetQuantityStrategy(Strategy):
         # Latest-wins: replace the map wholesale so a concurrent reader never sees a
         # half-updated dict (timer callbacks may run on a separate thread).
         self._whole_market_status = status
+        self._whole_market_status_updated_at_ns = int(self.clock.timestamp_ns())
         if self._whole_market_final_refresh_time is not None:
             try:
                 now = pd.Timestamp(self.clock.utc_now()).tz_convert(
@@ -1782,7 +1788,10 @@ class TargetQuantityStrategy(Strategy):
                 f"active_count={len(subscribed_ids)}",
                 color=LogColor.BLUE,
             )
-            self._sleep(10.0)
+            self._wait_for_order_book_depth_subscriptions()
+
+    def _wait_for_order_book_depth_subscriptions(self) -> None:
+        self._sleep(10.0)
 
     @staticmethod
     def _target_quantities_log_detail(quantities: dict[str, Decimal]) -> str:
@@ -1841,7 +1850,6 @@ class TargetQuantityStrategy(Strategy):
         self._trading_day = trading_date
         if self.config.auction_enabled:
             self._auction_references = {}
-            self._auction_reference_captured = {}
             self._auction_attempted = set()
             self._auction_budget = None
             self._auction_committed_cost = Decimal("0")
@@ -1853,6 +1861,7 @@ class TargetQuantityStrategy(Strategy):
         self._market_status = {}
         self._market_status_updated_at_ns = None
         self._whole_market_status = {}
+        self._whole_market_status_updated_at_ns = None
         self._depth_books = {}
         self._order_quote_states = {}
         self._execution_intent_ids = {}
@@ -2064,6 +2073,13 @@ class TargetQuantityStrategy(Strategy):
         depth_ts_event = int(depth.ts_event)
         if depth_ts_event <= 0:
             raise ValueError(f"Order-book depth ts_event must be positive, got {depth_ts_event}")
+        event_date = self._event_trading_date(depth_ts_event)
+        if event_date is None or (self._trading_day is not None and event_date < self._trading_day):
+            return
+        self._roll_trading_day(event_date)
+        previous = self._depth_books.get(str(depth.instrument_id))
+        if previous is not None and depth_ts_event < previous.ts_event:
+            return
         self._last_market_data_ts_event = max(
             self._last_market_data_ts_event,
             depth_ts_event,
@@ -2074,13 +2090,10 @@ class TargetQuantityStrategy(Strategy):
             ts_event_ns=depth_ts_event,
             ts_init_ns=int(depth.ts_init),
         )
-        trading_date = self._event_trading_date(depth_ts_event) or self._clock_date()
-        # The depth book is captured for aggressive walk-book pricing only. Its
-        # mid/best price is NOT a dependable reference for today's open or last
-        # price (pre-open auction levels are provisional, snapshots are sparse), so
-        # it must never feed _today_open / _last_close. Today's open comes from
-        # real bars or the QMT full-tick snapshot.
-        self._roll_trading_day(trading_date)
+        trading_date = event_date
+        # Continuous execution uses the ladder and auction execution can select
+        # its midpoint. Neither should feed _today_open / _last_close: today's
+        # open still comes from real bars or the QMT full-tick snapshot.
         self._depth_books[str(depth.instrument_id)] = DepthBookSnapshot(
             bids=tuple(bids),
             asks=tuple(asks),
@@ -2465,17 +2478,42 @@ class TargetQuantityStrategy(Strategy):
         except Exception as exc:
             self.log.warning(f"target convergence failed: {exc}")
 
-    def set_opening_auction_prices(self, prices: Mapping[str, float], *, ts_init: int) -> None:
-        """Install the completed preparation batch, independent of subscribed quotes."""
-        captured = self._execution_timing.point()
-        self._auction_references = {
-            str(i): AuctionReference(float(price), None, int(ts_init))
-            for i, price in prices.items()
-        }
-        self._auction_reference_captured = {str(i): captured for i in prices}
-
     def auction_reference(self, instrument_id: str) -> AuctionReference | None:
+        """Return the last reference actually used to submit an auction order."""
         return self._auction_references.get(instrument_id)
+
+    def _select_opening_auction_reference(
+        self, instrument_id: str,
+    ) -> tuple[AuctionReference | None, dict[str, Any]]:
+        """Compare exchange timestamps of cached full tick and subscribed depth."""
+        tick = self._whole_market_status.get(instrument_id)
+        book = self._depth_books.get(instrument_id)
+        whole_price = None if tick is None else tick.last_price
+        whole_ts = None if tick is None else tick.ts_event
+        depth_prices = [] if book is None else [
+            price for price in (book.best_bid, book.best_ask)
+            if price is not None and math.isfinite(price) and price > 0
+        ]
+        depth_price = sum(price / len(depth_prices) for price in depth_prices) if depth_prices else None
+        depth_ts = None if book is None else book.ts_event
+
+        def valid(price: float | None, ts_event: int | None) -> bool:
+            return (price is not None and math.isfinite(price) and price > 0
+                    and ts_event is not None and ts_event > 0
+                    and self._event_trading_date(ts_event) == self._clock_date())
+
+        whole_valid = valid(whole_price, whole_ts)
+        depth_valid = valid(depth_price, depth_ts)
+        details = dict(whole_market_price=whole_price, whole_market_ts_event=whole_ts,
+                       depth_price=depth_price, depth_ts_event=depth_ts,
+                       whole_market_reference_valid=whole_valid, depth_reference_valid=depth_valid)
+        if whole_valid and (not depth_valid or whole_ts >= depth_ts):
+            return AuctionReference(whole_price, whole_ts, self._whole_market_status_updated_at_ns,
+                                    source="whole_market_full_tick"), details
+        if depth_valid:
+            return AuctionReference(depth_price, depth_ts, book.ts_init,
+                                    source="order_book_depth"), details
+        return None, details
 
     def _within_auction_submit_time(self) -> bool:
         now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
@@ -2595,76 +2633,94 @@ class TargetQuantityStrategy(Strategy):
                 break
             if instrument_id in self._auction_attempted:
                 continue
-            intent = intents[instrument_id]
-            committed = (self._auction_committed_cost if side == OrderSide.BUY
-                         else self._auction_sell_committed_cost)
-            side_budget = (self._auction_budget if side == OrderSide.BUY
-                           else self._auction_buy_committed_notional)
-            remaining = max(Decimal("0"), side_budget - committed)
-            if side == OrderSide.BUY:
-                free_cash = self._nautilus_free_cash()
-                if free_cash is None:
-                    return
-                remaining = min(remaining, max(Decimal("0"), free_cash))
-            quantity = intent.quantity
-            allow_odd_lot = False
-            if side == OrderSide.SELL:
-                quantity = self._clamp_sell_quantity(current_date, intent.instrument_id,
-                                                     quantity, reason, intent.context)
-                if quantity is None or quantity <= 0:
-                    continue
-                allow_odd_lot = quantity == intent.context.details["sellable_qty"]
-            allocation = self._auction_order_splitter.allocate(
-                intent.instrument, quantity, Decimal(str(intent.price)), remaining,
-                allow_odd_lot=allow_odd_lot,
-                min_order_notional=(self.config.auction_min_buy_notional
-                                    if side == OrderSide.BUY else Decimal("0")),
-            )
-            intent.context.record(
-                auction_budget=self._auction_budget, auction_side_budget_remaining=remaining,
-                auction_side_budget=side_budget,
-                prediction_rank=ranks[instrument_id], splitter="AuctionOrderSplitter",
-                auction_allocation_reason=allocation.reason,
-                auction_allocated_notional=allocation.notional,
-                auction_estimated_commission=allocation.commission,
-                auction_min_buy_notional=self.config.auction_min_buy_notional,
-                auction_whole_small_target=(allocation.reason == "whole_target"
-                                            and allocation.notional <= self.config.auction_min_buy_notional),
-            )
-            self._record_target(current_date, instrument_id, intent.context.target_qty, reason,
-                                intent.context)
-            if not allocation.quantities:
-                self._record_order(current_date, instrument_id, side.name.lower(), 0,
-                                   intent.context.target_qty, "skipped", allocation.reason,
-                                   intent.context)
-                if side == OrderSide.BUY:
-                    self._deferred_buys[instrument_id] = intent.context.target_qty
-                continue
+            original = intents[instrument_id]
+            quantity_left = original.quantity
             submitted_quantity = Decimal("0")
-            for index, requested in enumerate(allocation.quantities, 1):
-                if not self._within_auction_submit_time():
+            index = 0
+            recorded_target = False
+            while quantity_left > 0 and self._within_auction_submit_time():
+                # Re-read both caches for every physical order, including slices.
+                # Allocation and commitments must use this same selected price.
+                intent = self._target_order_intent(instrument_id, original.context.target_qty)
+                if intent is None or intent.side != side:
                     break
+                intent.context.record(
+                    convergence_trigger=original.context.details.get("convergence_trigger"),
+                    trading_date=current_date,
+                )
+                committed = (self._auction_committed_cost if side == OrderSide.BUY
+                             else self._auction_sell_committed_cost)
+                side_budget = (self._auction_budget if side == OrderSide.BUY
+                               else self._auction_buy_committed_notional)
+                remaining = max(Decimal("0"), side_budget - committed)
+                if side == OrderSide.BUY:
+                    free_cash = self._nautilus_free_cash()
+                    if free_cash is None:
+                        return
+                    remaining = min(remaining, max(Decimal("0"), free_cash))
+                quantity = min(quantity_left, intent.quantity)
+                allow_odd_lot = False
+                if side == OrderSide.SELL:
+                    quantity = self._clamp_sell_quantity(current_date, intent.instrument_id,
+                                                         quantity, reason, intent.context)
+                    if quantity is None or quantity <= 0:
+                        break
+                    allow_odd_lot = quantity == intent.context.details["sellable_qty"]
+                allocation = self._auction_order_splitter.allocate(
+                    intent.instrument, quantity, Decimal(str(intent.price)), remaining,
+                    allow_odd_lot=allow_odd_lot,
+                    min_order_notional=(self.config.auction_min_buy_notional
+                                        if side == OrderSide.BUY else Decimal("0")),
+                )
+                intent.context.record(
+                    auction_budget=self._auction_budget, auction_side_budget_remaining=remaining,
+                    auction_side_budget=side_budget,
+                    prediction_rank=ranks[instrument_id], splitter="AuctionOrderSplitter",
+                    auction_allocation_reason=allocation.reason,
+                    auction_allocated_notional=allocation.notional,
+                    auction_estimated_commission=allocation.commission,
+                    auction_min_buy_notional=self.config.auction_min_buy_notional,
+                    auction_whole_small_target=(submitted_quantity == 0
+                                                and quantity == original.quantity
+                                                and allocation.reason == "whole_target"
+                                                and allocation.notional <= self.config.auction_min_buy_notional),
+                )
+                if not recorded_target:
+                    self._record_target(current_date, instrument_id, intent.context.target_qty,
+                                        reason, intent.context)
+                    recorded_target = True
+                if not allocation.quantities:
+                    self._record_order(current_date, instrument_id, side.name.lower(), 0,
+                                       intent.context.target_qty, "skipped", allocation.reason,
+                                       intent.context)
+                    break
+                requested = allocation.quantities[0]
                 price = Decimal(str(intent.price))
                 expected_cost = requested * price + self._auction_order_splitter.commission(requested * price)
                 if side == OrderSide.BUY:
                     free_cash = self._nautilus_free_cash()
                     if free_cash is None or free_cash < expected_cost:
                         break
+                index += 1
                 if not self._submit_order_quantity(current_date, intent, requested, reason,
-                                                   slice_index=index, slice_count=len(allocation.quantities)):
+                                                   slice_index=index,
+                                                   slice_count=index - 1 + len(allocation.quantities)):
                     break
                 quantity = Decimal(str(intent.context.details["submitted_quantity"]))
                 notional = quantity * price
                 cost = notional + self._auction_order_splitter.commission(notional)
                 submitted_quantity += quantity
+                # A partial allocation must not expand back to the full target on
+                # the next iteration; only its unsubmitted slices remain eligible.
+                quantity_left = sum(allocation.quantities, Decimal("0")) - quantity
                 if side == OrderSide.BUY:
                     self._auction_committed_cost += cost
                     self._auction_buy_committed_notional += notional
                 else:
                     self._auction_sell_committed_cost += cost
                 self._auction_attempted.add(instrument_id)
-            if side == OrderSide.BUY and submitted_quantity < intent.quantity:
-                self._deferred_buys[instrument_id] = intent.context.target_qty
+            if side == OrderSide.BUY and submitted_quantity < original.quantity:
+                self._deferred_buys[instrument_id] = original.context.target_qty
             elif side == OrderSide.BUY:
                 self._deferred_buys.pop(instrument_id, None)
 
@@ -3687,8 +3743,14 @@ class TargetQuantityStrategy(Strategy):
             return None
 
         if self.config.auction_enabled and self._auction_execution_active:
-            reference = self.auction_reference(instrument_id_text)
-            if reference is None or self._is_suspended_status(instrument_id_text):
+            reference, reference_details = self._select_opening_auction_reference(instrument_id_text)
+            if reference is None:
+                self.log.warning(
+                    f"Auction skipped: no valid reference for {instrument_id_text} "
+                    f"candidates={IntentContext._format_value(reference_details)}",
+                )
+                return None
+            if self._is_suspended_status(instrument_id_text):
                 return None
             offset_bps = (self.config.auction_buy_offset_bps if side == OrderSide.BUY
                           else self.config.auction_sell_offset_bps)
@@ -3705,12 +3767,9 @@ class TargetQuantityStrategy(Strategy):
                 return None
             context = IntentContext(instrument_id_text, target_qty, current_qty, delta_qty,
                                     None, "AuctionOffset", self._execution_intent_id(instrument_id_text))
-            captured = self._auction_reference_captured.get(instrument_id_text)
-            if captured is not None:
-                execution_timing.update(
-                    reference_captured_ns=captured.timestamp_ns,
-                    reference_to_intent_ns=intent_started.monotonic_ns - captured.monotonic_ns,
-                )
+            captured = self._execution_timing.point()
+            execution_timing.update(reference_captured_ns=captured.timestamp_ns)
+            context.details.update(reference_details)
             context.record(execution_phase="opening_auction", reference_price=reference.price,
                            reference_ts_event=reference.ts_event, reference_ts_init=reference.ts_init,
                            price_source=reference.source, target_version=self._target_version,
@@ -4061,6 +4120,11 @@ class TargetQuantityStrategy(Strategy):
                                "skipped", skip_reason, intent_context=intent.context)
             return False
         intent.context.record(submitted_quantity=quantity, limit_price=intent.price)
+        if auction_execution:
+            self._auction_references[str(intent.instrument_id)] = AuctionReference(
+                intent.context.details["reference_price"], intent.context.details["reference_ts_event"],
+                intent.context.details["reference_ts_init"], intent.context.details["price_source"],
+            )
         order = self.order_factory.limit(
             instrument_id=intent.instrument_id,
             order_side=intent.side,

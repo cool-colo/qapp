@@ -321,6 +321,7 @@ class TestableTargetQuantityStrategy:
     _subscribe_market_data = TargetQuantityStrategy._subscribe_market_data
     _unsubscribe_market_data = TargetQuantityStrategy._unsubscribe_market_data
     _refresh_order_book_depth_subscriptions = TargetQuantityStrategy._refresh_order_book_depth_subscriptions
+    _wait_for_order_book_depth_subscriptions = TargetQuantityStrategy._wait_for_order_book_depth_subscriptions
     update_target_quantities = TargetQuantityStrategy.update_target_quantities
     _target_quantities_log_detail = staticmethod(TargetQuantityStrategy._target_quantities_log_detail)
     on_order_book_depth = TargetQuantityStrategy.on_order_book_depth

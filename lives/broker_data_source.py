@@ -52,15 +52,24 @@ def build_instrument_id(stock_code: str, venue: str) -> str:
 # --------------------------------------------------------------------------------------
 
 
-def coerce_tick_fields(tick: Any) -> dict[str, float]:
+def coerce_tick_fields(tick: Any) -> dict[str, float | int]:
     if not isinstance(tick, dict):
         return {}
-    coerced: dict[str, float] = {}
+    coerced: dict[str, float | int] = {}
     for key, value in tick.items():
         try:
-            coerced[str(key)] = float(value)
+            # Keep source milliseconds and Nautilus nanoseconds as integers.
+            # Converting epoch nanoseconds through float loses precision.
+            if key in ("time_ms", "ts_event"):
+                timestamp = int(value)
+                if timestamp > 0:
+                    coerced[str(key)] = timestamp
+            else:
+                coerced[str(key)] = float(value)
         except (TypeError, ValueError):
             continue
+    if "time_ms" in coerced:
+        coerced["ts_event"] = int(coerced["time_ms"]) * 1_000_000
     return coerced
 
 
@@ -208,7 +217,7 @@ def normalize_broker_positions(
 class BrokerDataSource(Protocol):
     venue: str
 
-    def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float]]: ...
+    def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float | int]]: ...
 
     def divid_events(
         self,
@@ -234,7 +243,7 @@ class QmtBrokerDataSource:
     def __init__(self, args: Any) -> None:
         self.args = args
 
-    def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float]]:
+    def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float | int]]:
         """
         Authoritative full-tick snapshot per instrument id from the QMT proxy
         ``get_full_tick`` endpoint (``POST /api/v1/data/full-tick``).
@@ -248,7 +257,7 @@ class QmtBrokerDataSource:
             return {}
         api_key = getattr(self.args, "api_key", None)
         symbol_to_stock = {code.strip().upper(): code for code in stock_codes}
-        by_stock: dict[str, dict[str, float]] = {}
+        by_stock: dict[str, dict[str, float | int]] = {}
         for chunk in chunks(sorted(symbol_to_stock), 500):
             payload = self._post_full_tick(base_url, api_key, chunk)
             for item in payload:
@@ -377,6 +386,7 @@ class QmtBrokerDataSource:
 # ``openInt`` is QMT's real-time market-status code (1=停牌); the strategy reads it
 # via ``open_int`` to freeze suspended holdings, so it must be carried through.
 _BIG_QMT_TICK_FIELD_MAP = {
+    "time": "time_ms",
     "open": "open",
     "lastPrice": "last_price",
     "high": "high",
@@ -422,7 +432,7 @@ class BigQmtBrokerDataSource:
         self._xtdata = BigQmtXtData(self._trader.client)
         self._account = StockAccount(account_id)
 
-    def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float]]:
+    def full_tick_snapshot(self, stock_codes: list[str]) -> dict[str, dict[str, float | int]]:
         if not stock_codes:
             _LOGGER.error("full-tick snapshot requested with empty stock_codes")
             return {}
@@ -432,7 +442,7 @@ class BigQmtBrokerDataSource:
             return {}
         self._ensure_client()
         symbol_to_stock = {code.strip().upper(): code for code in stock_codes}
-        by_stock: dict[str, dict[str, float]] = {}
+        by_stock: dict[str, dict[str, float | int]] = {}
         for chunk in chunks(sorted(symbol_to_stock), 500):
             data = self._xtdata.get_full_tick(chunk) or {}
             for symbol, raw_tick in data.items():
@@ -455,7 +465,7 @@ class BigQmtBrokerDataSource:
         }
 
     @staticmethod
-    def _normalize_tick(raw_tick: Any) -> dict[str, float]:
+    def _normalize_tick(raw_tick: Any) -> dict[str, float | int]:
         if not isinstance(raw_tick, dict):
             return {}
         renamed: dict[str, Any] = {}

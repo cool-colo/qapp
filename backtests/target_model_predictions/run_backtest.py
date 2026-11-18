@@ -164,7 +164,13 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         self,
         quantities: dict[str, Decimal],
     ) -> None:
-        # Daily bars are the venue's execution data; no L2 stream exists in this backtest.
+        if self._auction_replay_model is None:
+            # Daily-bar execution has no historical depth stream.
+            return
+        super()._refresh_order_book_depth_subscriptions(quantities)
+
+    def _wait_for_order_book_depth_subscriptions(self) -> None:
+        # Historical depth is dispatched synchronously by the replay engine.
         return
 
     def on_data(self, data: Data) -> None:
@@ -182,8 +188,9 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
             if self.accept_opening_auction_snapshot(data.trading_date, data.full_tick_snapshot, ts_init=data.ts_init):
                 self.process_opening_auction()
         if data.opening_auction_execution_snapshot and self.config.auction_enabled:
-            if self.accept_opening_auction_execution_snapshot(
-                    data.trading_date, data.full_tick_snapshot, ts_init=data.ts_init):
+            self.apply_whole_market_full_tick_snapshot(data.full_tick_snapshot, "backtest_auction_execute")
+            if self.accept_opening_auction_execution_update(
+                    data.trading_date, ts_init=self._whole_market_status_updated_at_ns):
                 self.process_opening_auction_execution()
         if data.allow_planning:
             self._process_trading_day_once(data.trading_date, "planning_event")
@@ -579,6 +586,7 @@ def prepare_tick_replay_event_data(args, rows, instruments_by_stock, *, auction_
             "open": row.open_price, "last_price": row.bid_price,
             "last_close": row.previous_close,
             "open_int": 12 if row.kind == "indicative" else 13,
+            "ts_event": row.ts_event,
         }
         batch["previous_closes"][str(instrument.id)] = row.previous_close
         batch["ts_event"] = max(batch["ts_event"], row.ts_event)
@@ -597,6 +605,7 @@ def prepare_tick_replay_event_data(args, rows, instruments_by_stock, *, auction_
                     "open": row.open_price, "last_price": row.bid_price,
                     "last_close": row.previous_close,
                     "open_int": 12 if row.kind == "indicative" else 13,
+                    "ts_event": row.ts_event,
                 }
     for (day, phase_time), snapshot in sorted(daily_latest.items()):
         capture_ns = exchange_timestamp_ns(day, phase_time, args.exchange_timezone)
@@ -886,7 +895,7 @@ def build_engine(
             subscribe_bars=False,
             subscribe_quote_ticks=True,
             subscribe_trade_ticks=False,
-            subscribe_order_book_depth=False,
+            subscribe_order_book_depth=historical_ticks is not None,
         ),
     )
     strategy._auction_replay_model = replay_model
