@@ -36,6 +36,9 @@ from strategies.model_target_planners import normalize_stock_code
 from strategies.model_target_planners.base import ForcedExit
 from strategies.replan_triggers import ReplanTriggerTracker, price_limit_state
 from strategies.replan_triggers import PRICE_COMPARISON_TOLERANCE
+from strategies.replan_triggers import (
+    PriceLimitReplanTriggerPolicy, ScheduledReplanTriggerPolicy, ReplanValidity,
+)
 from strategies.replanning import PlanningAttempt, ReplanningBusyError, ReplanningCoordinator, planning_json
 from strategies.convergence import ConvergenceTrigger
 from strategies.opening_auction import auction_time
@@ -79,6 +82,7 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     process_targets_on_timer: bool = False
     process_targets_interval_secs: float = 2.0
     auto_replan_enabled: bool = True
+    scheduled_replan_times: tuple[str, ...] = ()
 
 
 class TargetModelPredictionsStrategy(TargetQuantityStrategy):
@@ -144,6 +148,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self.signal_events: list[ModelPredictionSignalEvent] = []
         self.replanning = ReplanningCoordinator(self)
         self._replan_triggers = ReplanTriggerTracker()
+        self._price_limit_replan_triggers = PriceLimitReplanTriggerPolicy(self._replan_triggers)
+        self._scheduled_replan_triggers = ScheduledReplanTriggerPolicy(self, config.scheduled_replan_times)
         self._planning_attempt_persister = None
         self._committed_plan_loader = None
         self._latest_planning_inputs: dict[str, Any] = {}
@@ -184,23 +190,30 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         coordinator = self.replanning
         with self._trading_action_lock:
             if (coordinator.initial_in_progress or not self.automatic_replanning_allowed()
-                    or not self._target_version or not self._within_cancel_window()):
+                    or not self._target_version):
                 return False
-            desired = self._desired_quantities()
-            quantities = {iid: self._current_quantity(InstrumentId.from_str(iid)) for iid in desired}
-            limits = {iid: (None if self._market_status.get(iid) is None else self._market_status[iid].last_price,
-                            *self._price_limits(iid)) for iid in desired.keys() | self._market_status.keys()}
-            triggers = self._replan_triggers.observe(trading_date, desired, quantities, limits)
+            triggers = self._price_limit_replan_triggers.collect(self, trading_date)
             if triggers:
-                try:
-                    coordinator.request("automatic", triggers)
-                except ReplanningBusyError:
-                    pass
+                self.submit_automatic_replanning(triggers, self._price_limit_replan_triggers.validity)
                 return True
             return coordinator.busy
 
+    def submit_automatic_replanning(self, triggers, validity: ReplanValidity) -> str | None:
+        """All automatic trigger policies enter the same order/planning coordinator."""
+        try:
+            return self.replanning.request("automatic", triggers, validity=validity)
+        except ReplanningBusyError:
+            return None
+
+    def run_pending_replanning(self) -> None:
+        self._scheduled_replan_triggers.drain()
+
+    def replanning_trigger_state(self) -> dict:
+        return self._scheduled_replan_triggers.state()
+
     def on_stop(self) -> None:
         self.replanning.stopped = True
+        self._scheduled_replan_triggers.stop()
         if "MODEL-REPLAN-STEP" in self.clock.timer_names:
             self.clock.cancel_timer("MODEL-REPLAN-STEP")
         task = self.replanning.task
@@ -375,6 +388,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self.replanning.stopped = False
         super().on_start()
         self._start_process_targets_timer()
+        self._scheduled_replan_triggers.start()
 
     def _start_process_targets_timer(self) -> None:
         interval_secs = float(self.config.process_targets_interval_secs)
@@ -819,6 +833,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         finally:
             with self.replanning._lock:
                 self.replanning.initial_in_progress = False
+            self._scheduled_replan_triggers.wake_pending()
 
     def _compute_daily_target_plan(
         self, trading_date: date, *, planning_context: ModelTargetPlanningContext | None = None,

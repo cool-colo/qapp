@@ -13,6 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from strategies.model_target_planners.base import ModelTargetPlan
+from strategies.replan_triggers import ExecutionWindowReplanValidity, ReplanValidity
 
 
 class ReplanningBusyError(RuntimeError):
@@ -47,6 +48,7 @@ class PlanningAttempt:
     follow_up_triggers: list[Any] = dataclasses.field(default_factory=list)
     inputs: dict[str, Any] = dataclasses.field(default_factory=dict)
     error: str | None = None
+    validity: ReplanValidity = dataclasses.field(default_factory=ExecutionWindowReplanValidity)
 
     def payload(self, plan: ModelTargetPlan | None = None) -> dict[str, Any]:
         return {**planning_json(self), "plan": planning_json(plan)}
@@ -80,31 +82,32 @@ class ReplanningCoordinator:
             self.host._replan_triggers.reset()
         self.auto_enabled = enabled
 
-    def request(self, source: str, triggers=()) -> str:
+    def request(self, source: str, triggers=(), *, validity: ReplanValidity | None = None) -> str:
         host = self.host
+        validity = ExecutionWindowReplanValidity() if validity is None else validity
         if source not in ("manual", "automatic"):
             raise ValueError(f"unknown replanning source: {source}")
         if self.stopped:
             raise ValueError("strategy is stopped")
         if not host._async_scheduler.has_running_loop and host._execution_state_reconciler.is_configured:
             raise RuntimeError("live replanning requires the running node event loop")
-        if not host._within_execution_window() or not host._within_cancel_window():
-            raise ValueError("replanning requires an execution and cancellation window")
         with host._trading_action_lock, self._lock:
+            day = host._clock_date()
+            if not validity.allows(host, day, starting=True):
+                raise ValueError("replanning requires its permitted planning window (execution and cancellation window for ordinary requests)")
             if source == "automatic" and not host.automatic_replanning_allowed():
                 raise ValueError("automatic replanning is disabled for the current target or paused")
             if self.busy:
-                if source == "automatic" and self.current is not None:
+                if source == "automatic" and validity.coalesce_while_busy and self.current is not None:
                     destination = (self.current.triggers
                                    if self.current.status in ("pending", "canceling", "reconciling")
                                    else self.current.follow_up_triggers)
                     destination.extend(trigger for trigger in triggers if trigger not in destination)
                 raise ReplanningBusyError("replanning is already in progress")
-            day = host._clock_date()
             if self.day != day:
                 self.day, self.counts = day, {"automatic": 0, "manual": 0}
             attempt = PlanningAttempt(uuid4().hex, day, source, host._target_version or None,
-                                      triggers=list(triggers))
+                                      triggers=list(triggers), validity=validity)
             self.current = attempt
             self._coroutine_started = False
             host._replanning_blocked = True
@@ -146,10 +149,10 @@ class ReplanningCoordinator:
         try:
             if host.clock.timestamp_ns() >= self._deadline:
                 raise TimeoutError("replanning timed out waiting for terminal orders")
-            if not host._within_execution_window() or not host._within_cancel_window():
-                raise RuntimeError("execution window closed during replanning")
+            self._validate_window(attempt, canceling=True)
             orders = host.replanning_orders()
             if orders:
+                self._require_cancellation_window()
                 attempt.status = "canceling"
                 self._ready_at = 0
                 for order in orders:
@@ -199,6 +202,9 @@ class ReplanningCoordinator:
         host = self.host
         with host._trading_action_lock:
             self._ensure_active(attempt)
+            self._validate_window(attempt)
+            if host._execution_activity != self._captured_activity or host.replanning_orders():
+                raise RuntimeError("execution state changed while the planner was running")
             if plan is None:
                 attempt.status = "keep_current"
                 attempt.error = host._last_planning_error
@@ -218,6 +224,14 @@ class ReplanningCoordinator:
         if self.stopped or self.current is not attempt:
             raise asyncio.CancelledError
 
+    def _validate_window(self, attempt: PlanningAttempt, *, canceling: bool = False) -> None:
+        if not attempt.validity.allows(self.host, attempt.trading_date, canceling=canceling):
+            raise RuntimeError("permitted planning window closed during replanning or trading date changed")
+
+    def _require_cancellation_window(self) -> None:
+        if not self.host._within_cancel_window():
+            raise RuntimeError("cancellation window closed during replanning with active orders")
+
     def _capture_inputs(self, attempt: PlanningAttempt):
         host = self.host
         with self._lock:
@@ -225,6 +239,8 @@ class ReplanningCoordinator:
             # Capture is the cutoff: later triggers cannot modify these inputs.
             # Queue them for rechecking after this attempt, in both runtimes.
             attempt.status = "planning"
+        self._validate_window(attempt)
+        self._captured_activity = host._execution_activity
         context = host.build_planning_context(attempt.trading_date, stage="continuous")
         request, forced_exits, degraded = host.prepare_target_planning(attempt.trading_date, context)
         attempt.inputs = host.capture_planning_inputs(request, forced_exits, context)
@@ -265,6 +281,9 @@ class ReplanningCoordinator:
             self.current = None
             self._coroutine_started = False
             host._replanning_blocked = False
+        host.run_pending_replanning()
+        if host._replanning_blocked:
+            return
         if not self.stopped and host._within_execution_window() and not host._trading_paused:
             host._schedule_convergence(current_date=host._clock_date(), trigger=host.replan_resume_trigger())
 
@@ -282,13 +301,14 @@ class ReplanningCoordinator:
             canceled = set()
             while True:
                 self._ensure_active(attempt)
-                if not host._within_cancel_window():
-                    raise RuntimeError("cancellation window closed during replanning")
+                self._validate_window(attempt, canceling=True)
                 # No lock is held across an await or an external request.
                 acquired = host._converge_lock.acquire(blocking=False)
                 if acquired:
                     try:
                         orders = host.replanning_orders()
+                        if orders:
+                            self._require_cancellation_window()
                         for order in orders:
                             key = str(order.client_order_id)
                             if key not in canceled and not order.is_pending_cancel:
@@ -306,15 +326,18 @@ class ReplanningCoordinator:
             await asyncio.sleep(float(host.config.cancel_reconverge_delay_secs))
             while True:
                 self._ensure_active(attempt)
+                self._validate_window(attempt)
                 activity = host._execution_activity
                 await host._execution_state_reconciler.reconcile_once()
                 await asyncio.sleep(float(host.config.cancel_reconverge_delay_secs))
-                if not host.replanning_orders() and activity == host._execution_activity:
+                orders = host.replanning_orders()
+                if orders:
+                    self._require_cancellation_window()
+                if not orders and activity == host._execution_activity:
                     break
                 if time.monotonic() >= deadline:
                     raise TimeoutError("execution state did not settle for replanning")
-            if not host._within_execution_window():
-                raise RuntimeError("execution window closed during replanning")
+            self._validate_window(attempt)
             context, request, forced_exits, degraded_reason = self._capture_inputs(attempt)
             host.archive_planning_attempt(attempt)
             candidate = None
@@ -332,8 +355,6 @@ class ReplanningCoordinator:
             else:
                 if host._execution_activity != activity or host.replanning_orders():
                     raise RuntimeError("execution state changed while the planner was running")
-                if host._clock_date() != attempt.trading_date or not host._within_execution_window():
-                    raise RuntimeError("planning result arrived outside its execution window")
                 plan = self._apply_result(attempt, plan)
         except asyncio.CancelledError:
             self.interrupt(attempt)
@@ -352,4 +373,5 @@ class ReplanningCoordinator:
         return {"auto_replan_enabled": self.auto_enabled, "replanning": self.busy,
                 "planning": self.current.payload() if self.current else None,
                 "last_planning": self.last, "replan_date": str(self.day) if self.day else None,
-                "replan_counts": dict(self.counts)}
+                "replan_counts": dict(self.counts),
+                **self.host.replanning_trigger_state()}

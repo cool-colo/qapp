@@ -51,7 +51,9 @@ target_cash_buffer_percent: 0.01
 order_slice_notional: 300000     # CNY notional per order slice; 0 disables splitting
 continuous_buy_min_notional: 10000  # Each continuous BUY must exceed this; 0 disables.
 limit_stop_mode: freeze_symbol
-auto_replan_enabled: true        # automatic price-limit replanning; manual replanning stays enabled
+auto_replan_enabled: true        # shared switch for price-limit and scheduled replanning
+scheduled_replan_times: ["13:50:00"]  # Daily replan in strategy timezone; continuous sessions only.
+# Scheduled replanning updates today's accepted targets; execution_windows still gate orders.
 leave_non_targets: false         # false => exit holdings absent from latest targets
 stop_time: "14:55"
 

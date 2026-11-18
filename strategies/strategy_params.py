@@ -55,6 +55,7 @@ class StrategyParams:
     trailing_take_profit: float = 0.0
     trailing_take_profit_start: float = 0.0
     auto_replan_enabled: bool = True
+    scheduled_replan_times: tuple[str, ...] = ()
     min_listed_days: int = 120
     consecutive_up_limit_days: int = 3
     max_open_gap_up: float = 0.05
@@ -147,9 +148,12 @@ class StrategyParams:
     def __post_init__(self) -> None:
         from strategies.cancellation import validate_cancel_config
         from strategies.opening_auction import validate_auction_config
+        from strategies.replan_triggers import normalize_scheduled_replan_times
 
         validate_cancel_config(self)
         validate_auction_config(self)
+        object.__setattr__(self, "scheduled_replan_times",
+                           normalize_scheduled_replan_times(self.scheduled_replan_times))
         if not isinstance(self.auto_replan_enabled, bool):
             raise ValueError("auto_replan_enabled must be a boolean")
         if int(self.consecutive_up_limit_days) < 0:

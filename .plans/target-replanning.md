@@ -14,7 +14,8 @@
 - Automatic replanning respects trading/target-update pauses and
   `auto_replan_enabled`. Manual replanning ignores the automatic switch and may run
   while the user has paused trading or target updates. Both require execution and
-  cancellation windows. They preserve the independent pause settings.
+  cancellation windows for ordinary price-limit/manual requests. Scheduled requests
+  use the continuous-session validity described below. All preserve independent pause settings.
 - Manual sell/sell-all target versions suppress automatic replanning until the next
   ordinary model target refresh replaces them. An explicit manual replan may still
   replace those targets; no additional pause or resume control is required.
@@ -119,6 +120,39 @@ new planning and requires the normal pause, reconciliation and submission gates.
 
 ## Controls and runtime
 
+### Scheduled trigger policy
+
+`scheduled_replan_times` is an optional YAML list (default `[]`), shared by live and
+backtest. For example, `["10:00", "14:00:00"]` replans the accepted same-day target
+at those times in the strategy timezone. Configuration normalizes, sorts and
+deduplicates HH:MM/HH:MM:SS strings; times outside [09:30,11:30) or [13:00,15:00)
+are rejected. Nontrading days and missing same-day targets skip the event. Empty
+accepted targets are eligible. Initial planning keeps its existing entry points.
+
+Price-limit and scheduled trigger policies submit to the same coordinator. Each
+attempt carries its validity policy: ordinary requests keep the execution/cancel
+window requirements, while scheduled requests expire at the end of the originating
+continuous session. Active/inflight orders always require a legal cancellation
+window, regardless of trigger. Without active orders, scheduled planning can proceed
+outside the cancellation and execution windows; it still reconciles and waits for
+stable execution state. Both runtimes reject results after expiry/date change or
+execution activity changes. Successful target acceptance never widens order windows.
+Scheduled planning uses the existing full-tick cache and shared input construction.
+
+Scheduled events received during planning are queued separately from price-limit
+latches, even before snapshot capture. On completion, valid queued events coalesce
+into one new attempt with fresh inputs and all contributing times. Pauses, the
+automatic switch and manual-liquidation protection are rechecked before starting.
+An initial-planning completion wakes pending events after returning to its caller;
+the next attempt does not overlap initial planning. Stop clears alerts and pending
+events. Restart schedules future times without backfilling missed events or restoring
+the in-memory queue.
+
+Archives retain `source="automatic"` for both automatic policies and add trigger
+`kind` and request `validity` to the existing JSON payload. No table migration is
+needed. Control state adds `scheduled_replan_next_times` and
+`scheduled_replan_pending`. Skipped/expired events log their reason.
+
 The dashboard's 交易管理 tab exposes manual replanning and the automatic switch using
 the existing token/PIN protection:
 
@@ -167,3 +201,12 @@ strategy attribution and scoped SQL loading. The final full suite has 569 passes
 and the same 36 existing failures as the pre-change tick-replay run (557 passes).
 Python compilation and whitespace checks pass. SQL behavior is verified against
 an in-memory database; no live database or venue was accessed for this change.
+
+Scheduled replanning verified on 2026-11-18: 20 new tests cover configuration,
+window isolation, automatic guards, busy-event coalescing, initial-planning races,
+fresh follow-up inputs, cancellation and late activity, expiry/date changes,
+archive/reconciliation failures, shutdown and restart scheduling. A real TestClock
+tick replay commits a new target at 10:00 without orders, then executes only that
+target after 14:30. The related suite has 106 passes; the full suite has 637 passes
+and the same 39 failing test IDs as the recorded baseline (617 passes / 39 failures).
+Python compilation and whitespace checks pass. No live database or venue was accessed.
