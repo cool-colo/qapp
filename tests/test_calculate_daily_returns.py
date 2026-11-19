@@ -1,5 +1,5 @@
 from argparse import Namespace
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 import unittest
 from unittest.mock import MagicMock
@@ -9,9 +9,18 @@ from scripts.calculate_daily_returns import calculate_records
 from scripts.calculate_daily_returns import calculate_records_by_account
 from scripts.calculate_daily_returns import fetch_mysql_inputs
 from scripts.calculate_daily_returns import main
+from scripts.calculate_daily_returns import reconstruct_opening_quantity
 
 
 class DailyReturnCalculationTests(unittest.TestCase):
+    def _position_snapshot(self, volume: int, stock_code: str = "001210.SZ") -> dict:
+        return {
+            "account_id": "8886569186", "trader_id": "BIGQMT-PROD-001",
+            "instrument_id": stock_code + ".BIGQMT", "stock_code": stock_code,
+            "volume": volume, "avg_price": "10", "trade_date": "2026-11-19",
+            "write_time": datetime(2026, 11, 19, 9, 27),
+        }
+
     def _asset(self, market_value: str, cash: str, frozen_cash: str) -> dict:
         return {
             "account_id": "account", "trader_id": "trader",
@@ -33,6 +42,7 @@ class DailyReturnCalculationTests(unittest.TestCase):
                     "price": "10",
                     "quantity": 100,
                     "amount": "1000",
+                    "trade_time": "2026-07-27 10:00:00",
                 },
                 {
                     "account_id": "account",
@@ -43,12 +53,14 @@ class DailyReturnCalculationTests(unittest.TestCase):
                     "price": "11",
                     "quantity": 200,
                     "amount": "2200",
+                    "trade_time": "2026-07-27 10:00:00",
                 },
             ],
             before_positions=[
                 {
                     "account_id": "account", "trader_id": "trader", "instrument_id": "600000.SSE",
                     "stock_code": "600000.SH", "volume": 500, "avg_price": "9",
+                    "trade_date": "2026-07-27", "write_time": "2026-07-27 09:27:00",
                 },
             ],
             after_positions=[
@@ -74,10 +86,110 @@ class DailyReturnCalculationTests(unittest.TestCase):
         self.assertEqual(summary["calculation_type"], "all")
         self.assertEqual(summary["return_amount"], Decimal("389.8900"))
 
+    def test_reconstructs_opening_positions_and_counts_all_day_fills_once(self) -> None:
+        for label, snapshot_qty, fills, after_qty, expected_opening, expected_hold, expected_pnl in (
+            ("new auction buy", 1100, [("buy", 1100, "09:25:00")], 1100, 0, 0, "1095"),
+            ("auction and later buys", 1500, [("buy", 500, "09:25:00"), ("buy", 200, "10:00:00")], 1700, 1000, 1000, "1695"),
+            ("auction and later sells", 600, [("sell", 400, "09:25:00"), ("sell", 200, "10:00:00")], 400, 1000, 400, "994.67"),
+            ("fully sold at auction", 0, [("sell", 1000, "09:25:00")], 0, 1000, 0, "994.45"),
+            ("credited bonus shares", 1500, [("buy", 100, "10:00:00")], 1600, 1500, 1500, "1595"),
+            ("fill exactly at snapshot", 1100, [("buy", 100, "09:27:00")], 1100, 1000, 1000, "1095"),
+        ):
+            with self.subTest(label=label):
+                snapshot = self._position_snapshot(snapshot_qty)
+                trades = [
+                    {
+                        "account_id": snapshot["account_id"], "trader_id": snapshot["trader_id"],
+                        "instrument_id": snapshot["instrument_id"], "stock_code": snapshot["stock_code"],
+                        "side": side, "quantity": quantity, "price": "10" if side == "buy" else "11",
+                        "trade_time": "2026-11-19 " + fill_time,
+                    }
+                    for side, quantity, fill_time in fills
+                ]
+                self.assertEqual(reconstruct_opening_quantity("2026-11-19", snapshot, trades), expected_opening)
+                rows = calculate_records(
+                    "2026-11-19", trades, [snapshot], [{**snapshot, "volume": after_qty}] if after_qty else [],
+                    [{"stock_code": snapshot["stock_code"], "last_price": "11", "last_close": "10"}],
+                )
+                self.assertEqual(sum(row["quantity"] for row in rows if row["calculation_type"] == "hold"), expected_hold)
+                self.assertEqual(rows[-1]["return_amount"], Decimal(expected_pnl))
+                self.assertEqual(snapshot["volume"], snapshot_qty)
+
+    def test_reconstruction_uses_shanghai_time_for_aware_timestamps(self) -> None:
+        snapshot = self._position_snapshot(1100)
+        snapshot["write_time"] = "2026-11-19T09:27:00+08:00"
+        trades = [{"quantity": 1100, "side": "BUY", "trade_time": "2026-11-19T01:25:00+00:00"}]
+        self.assertEqual(reconstruct_opening_quantity("2026-11-19", snapshot, trades), 0)
+
+    def test_invalid_reconstructed_positions_fail_only_the_affected_account(self) -> None:
+        for label, volume, trade_time, expected_error in (
+            ("missing fill time", 100, None, "missing trade_time"),
+            ("wrong fill day", 100, "2026-11-18 09:25:00", "trade_time is not on"),
+            ("negative opening volume", 50, "2026-11-19 09:25:00", "negative reconstructed opening quantity"),
+        ):
+            with self.subTest(label=label):
+                corrupt = self._position_snapshot(volume)
+                good = {**self._position_snapshot(100), "account_id": "good"}
+                records, failures = calculate_records_by_account(
+                    "2026-11-19",
+                    [{**corrupt, "side": "buy", "quantity": 100, "price": "10", "trade_time": trade_time}],
+                    [good, corrupt], [good, corrupt],
+                    [{"stock_code": corrupt["stock_code"], "last_price": "11", "last_close": "10"}],
+                )
+                self.assertEqual(set(records), {("good", "BIGQMT-PROD-001")})
+                self.assertEqual(set(failures), {("8886569186", "BIGQMT-PROD-001")})
+                self.assertIn(expected_error, str(next(iter(failures.values()))))
+
+    def test_fetch_reconstructs_missing_fully_sold_stock_and_preserves_bonus_shares(self) -> None:
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = {"pretrade_date": date(2026, 11, 18)}
+        bonus = self._position_snapshot(1500, "002734.SZ")
+        sold = self._position_snapshot(0)
+        previous = [
+            {**row, "volume": quantity, "trade_date": date(2026, 11, 18), "write_time": "2026-11-18 15:03:00"}
+            for row, quantity in ((bonus, 1000), (sold, 100))
+        ]
+        # The sold stock also received bonus shares and was fully sold before
+        # 09:27, so yesterday's 100 shares must not override today's zero row.
+        trades = [{**sold, "quantity": 200, "side": "sell", "price": "11", "trade_time": "2026-11-19 09:25:00"}]
+        ticks = [{"stock_code": row["stock_code"], "last_price": "11", "last_close": "10"} for row in (bonus, sold)]
+        header = {key: sold[key] for key in ("account_id", "trader_id", "trade_date", "write_time")}
+        cursor.fetchall.side_effect = [[bonus], previous, [bonus], trades, ticks, [], [], [header]]
+        inputs = fetch_mysql_inputs(
+            connection, Namespace(account_id=sold["account_id"], trader_id=sold["trader_id"]), "2026-11-19",
+        )
+        before = {row["instrument_id"]: row for row in inputs[1]}
+        self.assertEqual(before[sold["instrument_id"]]["volume"], 0)
+        self.assertEqual(reconstruct_opening_quantity("2026-11-19", before[sold["instrument_id"]], trades), 200)
+        self.assertEqual(before[bonus["instrument_id"]]["volume"], 1500)
+        rows = calculate_records("2026-11-19", *inputs[:4])
+        self.assertEqual(rows[-1]["return_amount"], Decimal("1694.89"))
+        trade_query = next(call.args[0] for call in cursor.execute.call_args_list if "FROM `live_trade`" in call.args[0])
+        self.assertIn("`trade_time`", trade_query)
+
+    def test_fetch_preserves_previous_day_baseline_when_account_has_no_current_snapshot(self) -> None:
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = {"pretrade_date": date(2026, 11, 18)}
+        previous = {**self._position_snapshot(100), "trade_date": "2026-11-18", "write_time": "2026-11-18 15:03:00"}
+        current = self._position_snapshot(200)
+        trades = [{**current, "side": "buy", "quantity": 100, "price": "10", "trade_time": "2026-11-19 09:25:00"}]
+        ticks = [{"stock_code": current["stock_code"], "last_price": "11", "last_close": "10"}]
+        cursor.fetchall.side_effect = [[], [previous], [current], trades, ticks, [], [], []]
+        inputs = fetch_mysql_inputs(
+            connection, Namespace(account_id=current["account_id"], trader_id=current["trader_id"]), "2026-11-19",
+        )
+        self.assertEqual(inputs[1], [previous])
+        self.assertEqual(reconstruct_opening_quantity("2026-11-19", previous, trades), 100)
+        rows = calculate_records("2026-11-19", *inputs[:4])
+        self.assertEqual(rows[-1]["return_amount"], Decimal("195"))
+
     def test_summary_uses_net_value_change_and_previous_net_value_as_reference(self) -> None:
         position = {
             "account_id": "account", "trader_id": "trader", "instrument_id": "600000.SH",
             "stock_code": "600000.SH", "volume": 100,
+            "trade_date": "2026-07-27", "write_time": "2026-07-27 09:27:00",
         }
         rows = calculate_records(
             "2026-07-27", trades=[], before_positions=[position], after_positions=[position],
@@ -98,6 +210,7 @@ class DailyReturnCalculationTests(unittest.TestCase):
         position = {
             "account_id": "account", "trader_id": "trader", "instrument_id": "600000.SH",
             "stock_code": "600000.SH", "volume": 100,
+            "trade_date": "2026-07-27", "write_time": "2026-07-27 09:27:00",
         }
         rows = calculate_records(
             "2026-07-27", trades=[], before_positions=[position], after_positions=[position],
@@ -141,6 +254,7 @@ class DailyReturnCalculationTests(unittest.TestCase):
         position = {
             "account_id": "account", "trader_id": "trader", "instrument_id": "600000.SH",
             "stock_code": "600000.SH", "volume": 100,
+            "trade_date": "2026-07-27", "write_time": "2026-07-27 09:27:00",
         }
         asset = self._asset("1000", "9000", "0")
         for current, previous in ((asset, None), (None, asset), (None, None)):
@@ -193,6 +307,7 @@ class DailyReturnCalculationTests(unittest.TestCase):
             {
                 "account_id": account_id, "trader_id": "trader", "instrument_id": "600000.SH",
                 "stock_code": "600000.SH", "volume": 100,
+                "trade_date": "2026-07-27", "write_time": "2026-07-27 09:27:00",
             }
             for account_id in ("account", "fallback")
         ]
@@ -217,7 +332,7 @@ class DailyReturnCalculationTests(unittest.TestCase):
         cursor.fetchone.return_value = {"pretrade_date": previous_trade_date}
         current_assets = [self._asset("1100", "9000", "0")]
         previous_assets = [self._asset("1000", "9000", "0")]
-        cursor.fetchall.side_effect = [[], [], [], [], [], current_assets, previous_assets]
+        cursor.fetchall.side_effect = [[], [], [], [], [], current_assets, previous_assets, []]
 
         inputs = fetch_mysql_inputs(
             connection, Namespace(account_id="account", trader_id="trader"), "2026-07-27",
@@ -228,14 +343,16 @@ class DailyReturnCalculationTests(unittest.TestCase):
         self.assertEqual(len(calendar_queries), 1)
         self.assertEqual(calendar_queries[0].args[1], ("2026-07-27",))
         asset_queries = [call for call in cursor.execute.call_args_list if "`live_asset_snapshot`" in call.args[0]]
-        self.assertEqual(len(asset_queries), 2)
-        for query, day in zip(asset_queries, ("2026-07-27", previous_trade_date)):
+        self.assertEqual(len(asset_queries), 3)
+        for query, day in zip(asset_queries[:2], ("2026-07-27", previous_trade_date)):
             sql, params = query.args
             self.assertIn("`market_value`, `cash`, `frozen_cash`", sql)
             self.assertIn("`snapshot_type` = 'after_trading'", sql)
             self.assertIn("`trade_date` = %s", sql)
             self.assertIn("`account_id` = %s AND `trader_id` = %s", sql)
             self.assertEqual(params, [day, "account", "trader"])
+        self.assertIn("`snapshot_type` = 'before_trading'", asset_queries[-1].args[0])
+        self.assertIn("`write_time`", asset_queries[-1].args[0])
 
     def test_rejects_unreconciled_opening_and_closing_positions(self) -> None:
         with self.assertRaisesRegex(ValueError, "position reconciliation failed"):
@@ -243,7 +360,8 @@ class DailyReturnCalculationTests(unittest.TestCase):
                 "2026-07-27",
                 trades=[],
                 before_positions=[
-                    {"account_id": "a", "trader_id": "t", "instrument_id": "000001.SZ", "stock_code": "000001.SZ", "volume": 100},
+                    {"account_id": "a", "trader_id": "t", "instrument_id": "000001.SZ", "stock_code": "000001.SZ", "volume": 100,
+                     "trade_date": "2026-07-27", "write_time": "2026-07-27 09:27:00"},
                 ],
                 after_positions=[
                     {"account_id": "a", "trader_id": "t", "instrument_id": "000001.SZ", "stock_code": "000001.SZ", "volume": 200},
@@ -259,12 +377,14 @@ class DailyReturnCalculationTests(unittest.TestCase):
                     "account_id": "a", "trader_id": "t", "instrument_id": "000001.SZ",
                     "stock_code": "000001.SZ", "side": "SELL", "price": "10",
                     "quantity": 100, "amount": "1000",
+                    "trade_time": "2026-07-27 10:00:00",
                 },
             ],
             before_positions=[
                 {
                     "account_id": "a", "trader_id": "t", "instrument_id": "000001.SZ",
                     "stock_code": "000001.SZ", "volume": 100,
+                    "trade_date": "2026-07-27", "write_time": "2026-07-27 09:27:00",
                 },
             ],
             after_positions=[],
@@ -284,6 +404,7 @@ class DailyReturnCalculationTests(unittest.TestCase):
                     {
                         "account_id": "a", "trader_id": "t", "instrument_id": "000720.SZ.QMT",
                         "stock_code": "000720.SZ", "volume": 0,
+                        "trade_date": "2026-07-27", "write_time": "2026-07-27 09:27:00",
                     },
                 ],
                 after_positions=[],
@@ -300,6 +421,7 @@ class DailyReturnCalculationTests(unittest.TestCase):
                 "instrument_id": "000001.SZ",
                 "stock_code": "000001.SZ",
                 "volume": volume,
+                "trade_date": "2026-07-27", "write_time": "2026-07-27 09:27:00",
             }
             for account_id, volume in (("good", 100), ("corrupt", 200))
         ]
@@ -343,6 +465,7 @@ class DailyReturnCalculationTests(unittest.TestCase):
                 "instrument_id": "000001.SZ",
                 "stock_code": "000001.SZ",
                 "volume": volume,
+                "trade_date": "2026-07-27", "write_time": "2026-07-27 09:27:00",
             }
             for account_id, volume in (("good", 100), ("corrupt", 200))
         ]

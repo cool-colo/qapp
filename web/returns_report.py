@@ -10,7 +10,8 @@ changes are:
   * the final SELECT emits raw NUMERIC columns with english names instead of the
     Chinese percent-string presentation columns, so the values can be charted;
   * strategy returns use the previous trading day's after-trading net value
-    (``market_value + cash + frozen_cash``) as the denominator;
+    (``market_value + cash + frozen_cash``, less recorded cash deposits) as the
+    denominator;
   * the ``combined`` CTE has a WHERE that requires an after-trading asset snapshot,
     its previous net value, and a daily return. This is a web-only divergence from
     the .sql: the filter runs before the windowed cumulatives so the displayed
@@ -113,7 +114,10 @@ asset_nav_history AS (
     SELECT
         trade_date,
         market_value,
-        market_value + cash + frozen_cash AS net_value
+        -- Keep cash deposits in sync with scripts/calculate_daily_returns.py.
+        market_value + cash + frozen_cash
+            - CASE WHEN account_id = '8886569186' AND trade_date >= '2026-11-19'
+                   THEN 150000 ELSE 0 END AS net_value
     FROM live_asset_snapshot
     WHERE snapshot_type = 'after_trading'
         AND account_id = %(account_id)s

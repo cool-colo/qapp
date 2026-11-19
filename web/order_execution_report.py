@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from web.db import ClickHouseClient
 from web.db import MySqlSource
+from web.db import actual_local_fill_filter
 from web.db import jsonable_rows
 from web.db import quote_identifier
 from web.db import quote_literal
@@ -178,6 +179,7 @@ def query_order_execution(
         SELECT trade_date, trade_id, client_order_id, venue_order_id, stock_code, side,
                price, quantity, amount, commission, trade_time, write_time
         FROM live_trade_realtime WHERE {identity}
+          AND {actual_local_fill_filter("live_trade_realtime")}
         ORDER BY trade_time, write_time, trade_id
         """,
         params,

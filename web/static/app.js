@@ -162,7 +162,7 @@ function dqcSeverityClass(s) {
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-const state = { source: null, accounts: [], account: null, sellEnabled: false, pinRequired: false };
+const state = { source: null, accounts: [], account: null, sellEnabled: false, pinRequired: false, includeAuctionSlippage: true };
 const SIGNAL_RELATION_LABELS = {
   explicit: "订单记录",
   target: "目标组合",
@@ -2615,6 +2615,19 @@ function renderRealtimeAsset(asset, emptyText = "无资产数据") {
 
 // 交易 sub-panel — today's local fill turnover from MySQL. Rates use the same
 // account's before_trading total_asset as their denominator.
+function realtimeOrderStatusLabel(order) {
+  if (order.status === "canceled") {
+    return order.filled_qty > 0 ? "部撤" : "已撤";
+  }
+  const labels = {
+    initialized: "待提交", submitted: "已报", accepted: "已报",
+    partially_filled: "部成", filled: "已成", rejected: "废单",
+    denied: "拒单", expired: "已过期", pending_cancel: "待撤",
+    pending_update: "待改", canceled: "已撤",
+  };
+  return labels[order.status] || order.status;
+}
+
 function renderRealtimeTradeSummary(summary) {
   const el = $("#rt-trades");
   if (!summary) { el.innerHTML = '<div class="empty">无交易数据</div>'; return; }
@@ -2637,49 +2650,94 @@ function renderRealtimeTradeSummary(summary) {
     : `盘前总资产 ${fmt(summary.total_asset)}`;
   const slippage = summary.slippage || {};
   const slippageGroups = [
-    ["total", "总滑点", slippage.total],
     ["buy", "总买入滑点", slippage.buy],
     ["sell", "总卖出滑点", slippage.sell],
+    ["total", "总滑点", slippage.total],
   ];
   const slippageCards = slippageGroups.map(([kind, label, item]) =>
     `<div class="trade-summary-card ${kind}">
        <div class="trade-summary-title">${label}</div>
        <div class="trade-summary-metrics">
-         <div><span>滑点金额</span><b>${fmt(item && item.amount)}</b></div>
+         <div><span>滑点金额</span><b>${item && item.amount !== null ? fmt(item.amount) : "暂不可用"}</b></div>
          <div><span>滑点</span><b>${item && item.bps !== null && item.bps !== undefined ? fmt(item.bps) + " bp" : "—"}</b></div>
        </div>
      </div>`
   ).join("");
+  const unpricedCount = slippage.total.unpriced_stock_count;
+  const pricingNote = unpricedCount
+    ? `<div class="trade-summary-meta">${unpricedCount} 只股票缺少有效开盘价，成交数量和金额已计入；相关滑点暂不可用。</div>`
+    : "";
   el.innerHTML =
     `<div class="trade-summary-meta">${escapeHtml(summary.trade_date)} · ${assetText}</div>` +
     `<div class="trade-summary-grid">${cards}</div>` +
-    `<div class="trade-slippage-title">滑点（正值表示成交价相对开盘价更差）</div>` +
+    `<div class="trade-slippage-title">成交汇总与滑点（正值表示成交价相对开盘价更差）</div>` +
+    `<label class="inline"><input type="checkbox" id="rt-include-auction" ${slippage.include_auction ? "checked" : ""} /> 包含集合竞价成交</label>` +
+    `<div class="trade-summary-meta">集合竞价成交价作为开盘价，滑点为 0；总滑点按纳入的成交金额加权。</div>` +
+    pricingNote +
     `<div class="trade-summary-grid">${slippageCards}</div>` +
-    `<div id="rt-slippage-table" class="table-wrap trade-slippage-table"></div>`;
+    `<div id="rt-slippage-table" class="table-wrap trade-slippage-table"></div>` +
+    `<div class="trade-slippage-title">当日委托</div>` +
+    `<div id="rt-order-table" class="table-wrap trade-slippage-table"></div>`;
   renderTable("#rt-slippage-table", slippage.stocks || [], {
     columns: [
-      "stock_code", "side", "order_count", "trade_count", "traded_qty",
+      "stock_code", "stock_name", "side", "order_count", "trade_count", "traded_qty",
       "traded_amount", "avg_open_price", "avg_trade_price",
       "slippage_amount", "slippage_bps",
     ],
     headers: {
-      stock_code: "证券代码", side: "方向", order_count: "委托数",
+      stock_code: "证券代码", stock_name: "证券名称", side: "方向", order_count: "委托数",
       trade_count: "成交笔数", traded_qty: "成交数量", traded_amount: "成交金额",
       avg_open_price: "加权开盘价", avg_trade_price: "加权成交价",
       slippage_amount: "滑点金额", slippage_bps: "滑点(bp)",
     },
     intCols: new Set(["order_count", "trade_count", "traded_qty"]),
+    defaultSort: { col: "side", dir: "asc" },
+    linkStock: true,
+    stockInfoDate: summary.trade_date,
+    cellFn: (col, value) => {
+      if (col === "side") {
+        return `<td class="text ${String(value).toLowerCase() === "buy" ? "pos" : "neg"}">${String(value).toUpperCase() === "BUY" ? "买入" : "卖出"}</td>`;
+      }
+      if (value === null) return '<td>—</td>';
+      return undefined;
+    },
+  });
+  const orders = summary.orders.map((order) => ({
+    ...order,
+    status_text: realtimeOrderStatusLabel(order),
+    unfilled_qty: order.quantity - order.filled_qty,
+  }));
+  renderTable("#rt-order-table", orders, {
+    columns: [
+      "stock_code", "stock_name", "side", "status_text", "quantity", "filled_qty", "unfilled_qty",
+      "limit_price", "avg_fill_price", "venue_order_id",
+    ],
+    headers: {
+      stock_code: "证券代码", stock_name: "证券名称", side: "方向", status_text: "状态",
+      quantity: "委托数量", filled_qty: "成交数量", unfilled_qty: "未成交数量",
+      limit_price: "委托价", avg_fill_price: "成交均价", venue_order_id: "委托编号",
+    },
+    intCols: new Set(["quantity", "filled_qty", "unfilled_qty"]),
+    defaultSort: { col: "side", dir: "asc" },
     linkStock: true,
     stockInfoDate: summary.trade_date,
     cellFn: (col, value) => col === "side"
-      ? `<td class="text ${String(value).toLowerCase() === "buy" ? "pos" : "neg"}">${String(value).toUpperCase() === "BUY" ? "买入" : "卖出"}</td>`
+      ? `<td class="text ${value === "BUY" ? "pos" : "neg"}">${value === "BUY" ? "买入" : "卖出"}</td>`
       : undefined,
+  });
+  $("#rt-include-auction").addEventListener("change", (event) => {
+    state.includeAuctionSlippage = event.target.checked;
+    loadRealtimeTradeSummary();
   });
 }
 
 async function loadRealtimeTradeSummary() {
   try {
-    const summary = await api("/api/realtime/trade-summary", accountParams());
+    const includeAuction = state.includeAuctionSlippage;
+    const summary = await api("/api/realtime/trade-summary", {
+      ...accountParams(), include_auction: includeAuction,
+    });
+    if (includeAuction !== state.includeAuctionSlippage) return;
     renderRealtimeTradeSummary(summary);
   } catch (e) {
     $("#rt-trades").innerHTML = '<div class="empty">获取失败</div>';

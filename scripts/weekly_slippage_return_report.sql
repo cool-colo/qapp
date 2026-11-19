@@ -66,7 +66,10 @@ asset_nav_history AS (
     SELECT
         trade_date,
         market_value,
-        market_value + cash + frozen_cash AS net_value
+        -- Keep cash deposits in sync with scripts/calculate_daily_returns.py.
+        market_value + cash + frozen_cash
+            - CASE WHEN account_id = '8886569186' AND trade_date >= '2026-11-19'
+                   THEN 150000 ELSE 0 END AS net_value
     FROM live_asset_snapshot
     WHERE snapshot_type = 'after_trading'
         AND account_id = @account_id

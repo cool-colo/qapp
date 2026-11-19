@@ -16,9 +16,12 @@ For each account/trader/stock/day the generated rows are:
 * ``all``: the sum of the above rows
 
 ``unchanged_qty`` is the portion of the closing position that was not bought
-today (``after_trading volume - today's buy volume``).  It is reconciled with
-``before_trading volume - today's sell volume``; a discrepancy fails loudly so
-that a partial/missing snapshot is not silently reported as P&L.
+today (``after_trading volume - today's buy volume``).  The opening quantity is
+reconstructed from today's snapshot: ``snapshot volume - buys at/before snapshot
+time + sells at/before snapshot time``. This retains credited bonus shares while
+removing opening-auction fills already included in a 09:27 snapshot. It is
+reconciled with ``opening volume - today's sell volume``; a discrepancy fails
+loudly so that a partial/missing snapshot is not silently reported as P&L.
 
 By default, the portfolio ``summary`` uses the change in after-trading net value
 from the previous trading day: ``net value = market_value + cash + frozen_cash``
@@ -162,6 +165,46 @@ def _asset_net_value(row: dict[str, Any]) -> Decimal:
     return sum((_decimal(row[column]) for column in ("market_value", "cash", "frozen_cash")), ZERO)
 
 
+def _local_datetime(value: Any, *, field: str) -> datetime:
+    if value is None or value == "":
+        raise ValueError(f"missing {field}")
+    result = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    if result.tzinfo is not None:
+        result = result.astimezone(SHANGHAI_TZ).replace(tzinfo=None)
+    return result
+
+
+def reconstruct_opening_quantity(
+    trade_date: date | str,
+    snapshot: dict[str, Any],
+    trades: list[dict[str, Any]],
+) -> int:
+    """Undo same-day fills included in the position snapshot, without mutating it."""
+    requested_date = date.fromisoformat(str(trade_date))
+    snapshot_date = date.fromisoformat(str(snapshot["trade_date"]))
+    quantity = int(snapshot["volume"] or 0)
+    # Preserve the existing previous-trading-day baseline for accounts with no
+    # current-day snapshot. Today's fills are not part of yesterday's snapshot.
+    if snapshot_date < requested_date:
+        return quantity
+    if snapshot_date != requested_date:
+        raise ValueError(f"position snapshot date {snapshot_date} is after {requested_date}")
+    key = "/".join(_row_key(snapshot))
+    snapshot_time = _local_datetime(snapshot["write_time"], field=f"snapshot write_time for {key}")
+    if snapshot_time.date() != requested_date:
+        raise ValueError(f"snapshot write_time is not on {requested_date} for {key}")
+    for trade in trades:
+        trade_time = _local_datetime(trade["trade_time"], field=f"trade_time for {key}")
+        if trade_time.date() != requested_date:
+            raise ValueError(f"trade_time is not on {requested_date} for {key}")
+        if trade_time <= snapshot_time:
+            trade_quantity = int(trade["quantity"])
+            quantity += -trade_quantity if _normalise_side(trade["side"]) == "buy" else trade_quantity
+    if quantity < 0:
+        raise ValueError(f"negative reconstructed opening quantity for {key} on {requested_date}: {quantity}")
+    return quantity
+
+
 def calculate_records(
     trade_date: date | str,
     trades: list[dict[str, Any]],
@@ -177,6 +220,9 @@ def calculate_records(
 
     This public, pure function is also the calculation boundary for tests and
     makes the financial convention explicit independently of the SQL readers.
+    Before-position snapshots include ``trade_date``
+    and ``write_time``; trades include ``trade_time`` to reconstruct day-start
+    quantities without counting opening-auction fills twice.
     """
     if account_return_method not in ACCOUNT_RETURN_METHODS:
         raise ValueError(
@@ -209,7 +255,7 @@ def calculate_records(
         sells = [row for row in instrument_trades if _normalise_side(row.get("side")) == "sell"]
         buy_qty, buy_price, buy_amount = _weighted_price(buys)
         sell_qty, sell_price, sell_amount = _weighted_price(sells)
-        before_qty = int((before or {}).get("volume") or 0)
+        before_qty = reconstruct_opening_quantity(trade_date, before, instrument_trades) if before is not None else 0
         after_qty = int((after or {}).get("volume") or 0)
         # Some broker snapshots retain zero-volume rows after a position is
         # closed.  They are neither a holding nor a trade and must not require a
@@ -433,7 +479,7 @@ def _filters(args: argparse.Namespace, prefix: str = "") -> tuple[str, list[Any]
 
 def fetch_mysql_inputs(connection, args: argparse.Namespace, trade_date: str) -> tuple[list[dict[str, Any]], ...]:
     scope, scope_params = _filters(args)
-    columns = "`account_id`, `trader_id`, `instrument_id`, `stock_code`, `volume`, `avg_price`"
+    columns = "`account_id`, `trader_id`, `instrument_id`, `stock_code`, `volume`, `avg_price`, `trade_date`, `write_time`"
     with connection.cursor() as cursor:
         cursor.execute(
             f"SELECT {columns} FROM `live_position_snapshot` WHERE `trade_date` = %s "
@@ -463,11 +509,6 @@ def fetch_mysql_inputs(connection, args: argparse.Namespace, trade_date: str) ->
             [previous_trade_date, *scope_params],
         )
         fallback = list(cursor.fetchall())
-        seen = {_row_key(row) for row in before}
-        for row in fallback:
-            if _row_key(row) not in seen:
-                before.append(row)
-                seen.add(_row_key(row))
         cursor.execute(
             f"SELECT {columns} FROM `live_position_snapshot` WHERE `trade_date` = %s "
             "AND `snapshot_type` = 'after_trading'" + scope,
@@ -475,7 +516,7 @@ def fetch_mysql_inputs(connection, args: argparse.Namespace, trade_date: str) ->
         )
         after = list(cursor.fetchall())
         cursor.execute(
-            "SELECT `account_id`, `trader_id`, `instrument_id`, `stock_code`, `side`, `price`, `quantity`, `amount` "
+            "SELECT `account_id`, `trader_id`, `instrument_id`, `stock_code`, `side`, `price`, `quantity`, `amount`, `trade_time` "
             "FROM `live_trade` WHERE `trade_date` = %s" + scope,
             [trade_date, *scope_params],
         )
@@ -500,6 +541,34 @@ def fetch_mysql_inputs(connection, args: argparse.Namespace, trade_date: str) ->
             [previous_trade_date, *scope_params],
         )
         previous_assets = list(cursor.fetchall())
+        # The asset snapshot supplies a timestamp even when the account has no
+        # positions left after the opening auction. Missing position rows in a
+        # recorded snapshot represent zero volume, not yesterday's holdings.
+        cursor.execute(
+            "SELECT `account_id`, `trader_id`, `trade_date`, `write_time` FROM `live_asset_snapshot` "
+            "WHERE `trade_date` = %s AND `snapshot_type` = 'before_trading'" + scope,
+            [trade_date, *scope_params],
+        )
+        before_assets = {
+            (str(row["account_id"]), str(row["trader_id"])): row for row in cursor.fetchall()
+        }
+    seen = {_row_key(row) for row in before}
+    for rows, use_previous in ((fallback, True), (after, False), (trades, False)):
+        for row in rows:
+            key = _row_key(row)
+            if key in seen:
+                continue
+            asset = before_assets.get(key[:2])
+            if asset is not None:
+                before.append({
+                    **asset, "instrument_id": row["instrument_id"], "stock_code": row["stock_code"],
+                    "volume": 0, "avg_price": None,
+                })
+            elif use_previous:
+                before.append(row)
+            else:
+                continue
+            seen.add(key)
     return trades, before, after, ticks, current_assets, previous_assets
 
 

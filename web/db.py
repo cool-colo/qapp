@@ -41,6 +41,27 @@ def jsonable_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{k: jsonable(v) for k, v in row.items()} for row in rows]
 
 
+def actual_local_fill_filter(table_ref: str) -> str:
+    """Require an actual fill event for a locally persisted trade.
+
+    Synthetic reconciliation trades are excluded even if left in an old summary.
+    An actual trade stays valid when its ID also has reconciliation replay events.
+    """
+    if not IDENTIFIER_RE.fullmatch(table_ref):
+        raise ValueError(f"unsafe trade table reference: {table_ref!r}")
+    return f"""EXISTS (
+        SELECT 1
+        FROM live_order_event e
+        WHERE e.account_id = {table_ref}.account_id
+          AND e.trader_id = {table_ref}.trader_id
+          AND e.trade_date = {table_ref}.trade_date
+          AND e.client_order_id = {table_ref}.client_order_id
+          AND e.trade_id = {table_ref}.trade_id
+          AND e.event_type = 'OrderFilled'
+          AND e.reconciliation = FALSE
+    )"""
+
+
 class MySqlSource:
     """A per-source MySQL reader. Opens a short-lived connection per query.
 

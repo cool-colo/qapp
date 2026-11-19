@@ -24,6 +24,7 @@ from web import order_execution_report
 from web import trade_loss_report
 from web.realtime_minute_report import query_realtime_minutes
 from web.config import AppConfig, load_config
+from web.db import actual_local_fill_filter
 from web.db import DataAccess, MySqlSource, NodeApiClient, jsonable, jsonable_rows, quote_literal
 from web.returns_report import (
     RETURN_COLUMNS,
@@ -1134,10 +1135,11 @@ def realtime_trade_summary(
     account: str,
     trader: str,
     data: DataAccess = Depends(get_data),
+    include_auction: bool = True,
 ) -> dict[str, Any]:
     """Today's observed live fills, turnover and open-price slippage."""
     mysql = _mysql(data, source)
-    trading_date = date.today().isoformat()
+    trading_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
     params = {
         "account_id": account,
         "trader_id": trader,
@@ -1168,79 +1170,116 @@ def realtime_trade_summary(
         FROM live_trade_realtime
         WHERE {_ACCOUNT_KEYS}
           AND trade_date = %(trade_date)s
-          AND EXISTS (
-              SELECT 1
-              FROM live_order_event e
-              WHERE e.account_id = live_trade_realtime.account_id
-                AND e.trader_id = live_trade_realtime.trader_id
-                AND e.trade_date = live_trade_realtime.trade_date
-                AND e.client_order_id = live_trade_realtime.client_order_id
-                AND e.trade_id = live_trade_realtime.trade_id
-                AND e.event_type = 'OrderFilled'
-                AND e.reconciliation = FALSE
-          )
+          AND {actual_local_fill_filter("live_trade_realtime")}
         """,
         params,
     )
+    auction_filter = "" if include_auction else "WHERE is_opening_auction = 0"
     slippage_rows = mysql.query(
         f"""
+        WITH actual_trades AS (
+            SELECT t.*,
+                   CASE WHEN TIME(t.trade_time) >= '09:25:00'
+                              AND TIME(t.trade_time) < '09:30:00'
+                        THEN 1 ELSE 0 END AS is_opening_auction
+            FROM live_trade_realtime t
+            WHERE t.account_id = %(account_id)s
+              AND t.trader_id = %(trader_id)s
+              AND t.trade_date = %(trade_date)s
+              AND t.price IS NOT NULL
+              AND t.quantity IS NOT NULL
+              AND t.quantity > 0
+              AND UPPER(t.side) IN ('BUY', 'SELL')
+              AND {actual_local_fill_filter("t")}
+        ), auction_prices AS (
+            SELECT stock_code, MIN(price) AS auction_open_price,
+                   MAX(price) AS auction_max_price
+            FROM actual_trades
+            WHERE is_opening_auction = 1 AND price > 0
+            GROUP BY stock_code
+        ), priced_trades AS (
+            SELECT t.*, COALESCE(t.stock_code, o.stock_code) AS display_stock_code,
+                   a.auction_open_price, a.auction_max_price,
+                   CASE WHEN a.auction_open_price > 0 THEN a.auction_open_price
+                        WHEN o.open_price > 0 THEN o.open_price
+                        ELSE NULL END AS reference_open_price
+            FROM actual_trades t
+            LEFT JOIN live_order_realtime o
+              ON o.account_id = t.account_id
+             AND o.trader_id = t.trader_id
+             AND o.trade_date = t.trade_date
+             AND o.client_order_id = t.client_order_id
+            LEFT JOIN auction_prices a ON a.stock_code = t.stock_code
+        )
         SELECT
-            COALESCE(t.stock_code, o.stock_code) AS stock_code,
-            UPPER(t.side) AS side,
-            COUNT(DISTINCT t.client_order_id) AS order_count,
+            display_stock_code AS stock_code,
+            UPPER(side) AS side,
+            COUNT(DISTINCT client_order_id) AS order_count,
             COUNT(*) AS trade_count,
-            SUM(t.quantity) AS traded_qty,
-            SUM(t.price * t.quantity) AS traded_amount,
-            SUM(o.open_price * t.quantity) / NULLIF(SUM(t.quantity), 0)
+            MAX(auction_open_price) AS auction_open_price,
+            MAX(auction_max_price) AS auction_max_price,
+            SUM(CASE WHEN reference_open_price > 0 THEN 0 ELSE 1 END)
+                AS unpriced_trade_count,
+            SUM(quantity) AS traded_qty,
+            SUM(price * quantity) AS traded_amount,
+            SUM(reference_open_price * quantity) / NULLIF(SUM(quantity), 0)
                 AS avg_open_price,
-            SUM(t.price * t.quantity) / NULLIF(SUM(t.quantity), 0)
+            SUM(price * quantity) / NULLIF(SUM(quantity), 0)
                 AS avg_trade_price,
             SUM(
                 CASE
-                    WHEN UPPER(t.side) = 'BUY'
-                        THEN (t.price - o.open_price) * t.quantity
-                    WHEN UPPER(t.side) = 'SELL'
-                        THEN (o.open_price - t.price) * t.quantity
+                    WHEN UPPER(side) = 'BUY'
+                        THEN (price - reference_open_price) * quantity
+                    WHEN UPPER(side) = 'SELL'
+                        THEN (reference_open_price - price) * quantity
                     ELSE 0
                 END
             ) AS slippage_amount,
             SUM(
                 CASE
-                    WHEN UPPER(t.side) = 'BUY'
-                        THEN (t.price - o.open_price) * t.quantity
-                    WHEN UPPER(t.side) = 'SELL'
-                        THEN (o.open_price - t.price) * t.quantity
+                    WHEN UPPER(side) = 'BUY'
+                        THEN (price - reference_open_price) * quantity
+                    WHEN UPPER(side) = 'SELL'
+                        THEN (reference_open_price - price) * quantity
                     ELSE 0
                 END
-            ) / NULLIF(SUM(t.price * t.quantity), 0) * 10000 AS slippage_bps
-        FROM live_trade_realtime t
-        JOIN live_order_realtime o
-          ON o.account_id = t.account_id
-         AND o.trader_id = t.trader_id
-         AND o.trade_date = t.trade_date
-         AND o.client_order_id = t.client_order_id
-        WHERE t.account_id = %(account_id)s
-          AND t.trader_id = %(trader_id)s
-          AND t.trade_date = %(trade_date)s
-          AND o.open_price IS NOT NULL
-          AND o.open_price > 0
-          AND t.price IS NOT NULL
-          AND t.quantity IS NOT NULL
-          AND t.quantity > 0
-          AND UPPER(t.side) IN ('BUY', 'SELL')
+            ) / NULLIF(SUM(price * quantity), 0) * 10000 AS slippage_bps
+        FROM priced_trades
+        {auction_filter}
+        GROUP BY display_stock_code, UPPER(side)
+        ORDER BY display_stock_code, UPPER(side)
+        """,
+        params,
+    )
+    # The opening auction establishes the day's open, including for later fills.
+    # Conflicting auction prices are ambiguous market data, never a blended open.
+    for row in slippage_rows:
+        auction_open = row.pop("auction_open_price")
+        auction_max = row.pop("auction_max_price")
+        if auction_open != auction_max:
+            raise ValueError(f"conflicting opening-auction prices for {row['stock_code']}")
+        if row["unpriced_trade_count"]:
+            for column in ("avg_open_price", "slippage_amount", "slippage_bps"):
+                row[column] = None
+    order_rows = mysql.query(
+        """
+        SELECT o.stock_code, o.client_order_id, o.venue_order_id, UPPER(o.side) AS side,
+               o.status, o.quantity, o.filled_qty, o.avg_fill_price,
+               o.limit_price, o.order_time, o.created_at
+        FROM live_order_realtime o
+        WHERE o.account_id = %(account_id)s
+          AND o.trader_id = %(trader_id)s
+          AND o.trade_date = %(trade_date)s
           AND EXISTS (
               SELECT 1
               FROM live_order_event e
-              WHERE e.account_id = t.account_id
-                AND e.trader_id = t.trader_id
-                AND e.trade_date = t.trade_date
-                AND e.client_order_id = t.client_order_id
-                AND e.trade_id = t.trade_id
-                AND e.event_type = 'OrderFilled'
+              WHERE e.account_id = o.account_id
+                AND e.trader_id = o.trader_id
+                AND e.trade_date = o.trade_date
+                AND e.client_order_id = o.client_order_id
                 AND e.reconciliation = FALSE
           )
-        GROUP BY COALESCE(t.stock_code, o.stock_code), UPPER(t.side)
-        ORDER BY COALESCE(t.stock_code, o.stock_code), UPPER(t.side)
+        ORDER BY o.created_at, o.client_order_id
         """,
         params,
     )
@@ -1256,13 +1295,17 @@ def realtime_trade_summary(
     total_amount = buy_amount + sell_amount
     usable_asset = total_asset is not None and total_asset > 0
 
-    def slippage_summary(side: str | None = None) -> dict[str, Decimal | None]:
+    def slippage_summary(side: str | None = None) -> dict[str, Decimal | int | None]:
         rows = [row for row in slippage_rows if side is None or str(row.get("side", "")).upper() == side]
+        unpriced_stock_count = sum(bool(row["unpriced_trade_count"]) for row in rows)
+        if unpriced_stock_count:
+            return {"amount": None, "bps": None, "unpriced_stock_count": unpriced_stock_count}
         amount = sum((as_decimal(row.get("slippage_amount")) for row in rows), Decimal(0))
         traded_amount = sum((as_decimal(row.get("traded_amount")) for row in rows), Decimal(0))
         return {
             "amount": amount,
             "bps": amount / traded_amount * Decimal(10000) if traded_amount else None,
+            "unpriced_stock_count": 0,
         }
 
     summary = {
@@ -1274,7 +1317,9 @@ def realtime_trade_summary(
         "sell_rate": sell_amount / total_asset if usable_asset else None,
         "total_amount": total_amount,
         "total_rate": total_amount / total_asset if usable_asset else None,
+        "orders": data.attach_names(jsonable_rows(order_rows)),
         "slippage": {
+            "include_auction": include_auction,
             "total": {key: jsonable(value) for key, value in slippage_summary().items()},
             "buy": {
                 key: jsonable(value) for key, value in slippage_summary("BUY").items()
@@ -1282,7 +1327,7 @@ def realtime_trade_summary(
             "sell": {
                 key: jsonable(value) for key, value in slippage_summary("SELL").items()
             },
-            "stocks": jsonable_rows(slippage_rows),
+            "stocks": data.attach_names(jsonable_rows(slippage_rows)),
         },
     }
     return {key: jsonable(value) for key, value in summary.items()}

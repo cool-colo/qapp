@@ -42,6 +42,7 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 
+from strategies.execution_reconciliation import is_reconciliation_fill
 from strategies.trading_control import SELL_ALL_REASON
 from strategies.trading_control import SELL_REASON
 from strategies.replanning import ReplanningBusyError
@@ -288,13 +289,11 @@ class LiveControlServer:
     def _today_sells(self, instrument_id_text: str) -> dict[str, float]:
         """Aggregate today's SELL fills for an instrument from the Nautilus cache.
 
-        Returns today's sold quantity and notional (Σ qty×price). Only the SELL side
-        is trustworthy: reconciliation reseeds each open long as a single synthetic
-        BUY @ cost (so today's buys can't be read from fills — see ``_open_row``),
-        but it never fabricates a SELL, so any SELL fill here is a genuine intraday
-        sell. Used for the realized leg of 当日盈亏 on a partially-sold position.
-        Intra-session this is exact; after a restart reconciliation drops the sell
-        fills entirely, so this returns 0 and the realized leg simply vanishes.
+        Returns sold quantity and notional (Σ qty×price) from actual fill events.
+        Reconciliation can generate synthetic BUY and SELL fills to align positions;
+        these are excluded using the shared actual-fill predicate. Used for the
+        realized leg of 当日盈亏 on a partially-sold position. A restart can remove
+        actual cached fills, leaving no realized leg until those fills are restored.
         """
         sell_qty = sell_notional = 0.0
         try:
@@ -311,7 +310,7 @@ class LiveControlServer:
             except Exception:
                 continue
             for event in events:
-                if not isinstance(event, OrderFilled):
+                if not isinstance(event, OrderFilled) or is_reconciliation_fill(event, order):
                     continue
                 if event.order_side != OrderSide.SELL:
                     continue
@@ -501,9 +500,8 @@ class LiveControlServer:
             # held legs above), so add their realized result. Today's sells can only be
             # of carried shares (today's buys are T+1-locked, unsellable same day), so
             # the reference is always 昨收: (卖出金额 − 昨收 × 今卖量). Sell fills are
-            # genuine and reliable intra-session; after a restart reconciliation drops
-            # them (it reseeds open longs as a single net-BUY, keeping no SELL fill), so
-            # sell_qty degrades to 0 and this leg vanishes — the held legs stay correct.
+            # filtered to exclude synthetic reconciliation events. A restart can drop
+            # actual cached sells, so this leg requires their history to be restored.
             sells = self._today_sells(iid_text)
             if sells["sell_qty"] > 0:
                 day_pnl += sells["sell_notional"] - prev_close * sells["sell_qty"]

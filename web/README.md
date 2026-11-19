@@ -6,7 +6,28 @@ A local, read-only dashboard for the live trading data this repo persists:
   key/value card next to a **资产构成** pie of 持仓市值 / 可用资金 / 冻结资金. The
   交易 sub-page reads today's `live_trade_realtime` fills from MySQL and shows buy,
   sell, and total turnover amounts and their rates against today's
-  `before_trading` `live_asset_snapshot.total_asset`. The **待交易估算** sub-page lists
+  `before_trading` `live_asset_snapshot.total_asset`. Its per-stock fill table keeps
+  opening-auction fills even when the matching order has no opening price. Actual
+  opening-auction prices, identified by broker trade times from 09:25 up to 09:30,
+  establish the day's open for that stock: auction slippage is zero, and later fills
+  use that same opening price. Conflicting auction prices raise rather than creating
+  an average opening price. **包含集合竞价成交** is checked by default. Unchecking
+  it removes auction fills from the slippage rows and their amount-weighted bp
+  denominator while retaining their opening prices for later fills. Turnover cards
+  always cover the whole day. Missing opening prices for continuous fills still make
+  the affected slippage unavailable. A separate same-day order table
+  shows local order statuses, including filled, canceled, and partially filled then
+  canceled (部撤), with submitted, filled, and unfilled quantities. Both tables show
+  security codes and names, with names resolved from ClickHouse. They exclude
+  records having only reconciliation events, so synthetic position adjustments do
+  not appear as today's trading. The order-execution view applies the same filter
+  to its local fill table and chart markers, including old summary rows. Actual
+  trades remain included when their IDs also have reconciliation replay events.
+  For a partially sold carried position, 当日盈亏
+  is `(last price - previous close) × remaining shares + actual sell proceeds -
+  previous close × sold shares`, before fees. Synthetic reconciliation fills are
+  excluded from the sold leg. 持仓盈亏 instead compares the remaining shares with
+  their cost price. The **待交易估算** sub-page lists
   only unfinished target quantities and compares executing them at the latest price
   versus today's open, including side-aware loss amount and open/current-notional
   loss rates. It requests only those stock codes from the node's generic
@@ -118,9 +139,12 @@ not list accounts in the config.
 columns) differ. **If you change the report logic, update both files in lockstep.**
 
 Strategy daily return is `return_amount / previous after-trading net value`, where
-net value is `market_value + cash + frozen_cash`. Weekly cumulative P&L/return and the
-report footer also use after-trading net-value endpoints. `/api/returns` returns the
-footer as `summary`; the frontend renders it without recomputing totals.
+net value is `market_value + cash + frozen_cash`, less recorded cash deposits effective
+on or before each snapshot date. Account `8886569186` has CNY 150,000 deducted from
+2026-11-19 onward, including the return-rate base. Weekly cumulative P&L/return and the
+report footer also use these adjusted after-trading net-value endpoints.
+`/api/returns` returns the footer as `summary`; the frontend renders it without
+recomputing totals.
 
 ## Setup
 
@@ -166,7 +190,7 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `POST /api/change_records` | body: `{title, details}` |
 | `PUT /api/change_records/{id}` | body: `{title, details}` |
 | `DELETE /api/change_records/{id}` | body: `{pin}` (required) |
-| `GET /api/realtime/trade-summary` | `source, account, trader` |
+| `GET /api/realtime/trade-summary` | `source, account, trader, include_auction?` (default true) |
 | `GET /api/realtime/positions` | `account, trader` |
 | `GET /api/realtime/pending-trades` | `account, trader` |
 | `GET /api/realtime/trade-loss` | `source, account, trader` (today in Asia/Shanghai; aggregate and per-stock bp/weights) |
