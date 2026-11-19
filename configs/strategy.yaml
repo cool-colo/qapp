@@ -49,7 +49,7 @@ price_trend_book_max_age_secs: 2.0
 price_trend_min_timeout_multiplier: 0.3
 price_trend_max_offset_multiplier: 3.0
 cash_buffer_percent: 0.0
-target_cash_buffer_percent: 0.01
+target_cash_buffer_percent: 0.12
 order_slice_notional: 300000     # CNY cap per slice; 0 disables this cap; instrument quantity limits still apply
 continuous_buy_min_notional: 10000  # Each continuous BUY must exceed this; 0 disables.
 limit_stop_mode: freeze_symbol
@@ -96,8 +96,8 @@ preopen_latency_fixed_advance_ms: 50
 # Auction submissions use their own window; continuous orders obey execution_windows.
 # Cancels obey cancel_windows, never before 09:30.
 auction_enabled: true
-auction_start_time: "09:24:01"  # Planning timer: fetch latest prices, then freeze targets.
-auction_execution_time: "09:24:50"  # Execution timer: fetch latest prices again, then submit.
+auction_start_time: "09:24:25"  # Planning timer: fetch latest prices, then freeze targets.
+auction_execution_time: "09:24:55"  # Execution timer: fetch latest prices again, then submit.
 auction_submit_cutoff: "09:24:59"
 auction_buy_offset_bps: 50.0
 auction_sell_offset_bps: 50.0
