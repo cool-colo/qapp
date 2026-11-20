@@ -124,8 +124,8 @@ const NUMERIC_RE = /_rate|_bps|price|value|asset|cash|pnl|amount|qty|volume|weig
 function isNumericCol(col) { return NUMERIC_RE.test(col); }
 
 const RATE_COLS = new Set([
-  "strat_daily_rate", "csi1000_daily_rate", "excess_daily_rate",
-  "week_cum_strat_rate", "week_cum_csi1000_rate", "week_cum_excess_rate", "target_weight",
+  "strat_daily_rate", "csi2000_daily_rate", "excess_daily_rate",
+  "week_cum_strat_rate", "week_cum_csi2000_rate", "week_cum_excess_rate", "target_weight",
   "daily_volatility", "annual_volatility",
   // Signal-quality label returns / excess / decile spread are all rates (right % axis).
   "ls10", "top20_label_return", "top50_label_return",
@@ -817,7 +817,7 @@ const REPORT_HEADERS = {
   after_market_value: "盘后市值",
   return_amount: "当日盈亏",
   strat_daily_rate: "策略日收益",
-  csi1000_daily_rate: "中证1000日收益",
+  csi2000_daily_rate: "中证2000日收益",
   excess_daily_rate: "日超额",
   daily_volatility: "日波动率",
   annual_volatility: "年化波动率",
@@ -826,7 +826,7 @@ const REPORT_HEADERS = {
   week_label: "周",
   week_cum_return_amount: "本周累计盈亏",
   week_cum_strat_rate: "本周策略累计",
-  week_cum_csi1000_rate: "本周中证1000累计",
+  week_cum_csi2000_rate: "本周中证2000累计",
   week_cum_excess_rate: "本周累计超额",
   buy_slippage_bps: "买入滑点(bp)",
   sell_slippage_bps: "卖出滑点(bp)",
@@ -834,9 +834,9 @@ const REPORT_HEADERS = {
 };
 // Columns to sign-color (rates, excess, pnl-like amounts, slippage).
 const REPORT_SIGN_COLS = new Set([
-  "return_amount", "strat_daily_rate", "csi1000_daily_rate", "excess_daily_rate",
+  "return_amount", "strat_daily_rate", "csi2000_daily_rate", "excess_daily_rate",
   "daily_sharpe", "annual_sharpe",
-  "week_cum_return_amount", "week_cum_strat_rate", "week_cum_csi1000_rate",
+  "week_cum_return_amount", "week_cum_strat_rate", "week_cum_csi2000_rate",
   "week_cum_excess_rate", "buy_slippage_bps", "sell_slippage_bps", "total_slippage_bps",
 ]);
 // Footer amount columns formatted with exactly two decimal places.
@@ -1404,8 +1404,8 @@ const ASSET_METRICS = [
   "nt_equity", "nt_unrealized_pnl", "nt_realized_pnl",
 ];
 const RETURN_METRICS = [
-  "strat_daily_rate", "csi1000_daily_rate", "excess_daily_rate",
-  "week_cum_strat_rate", "week_cum_csi1000_rate", "week_cum_excess_rate",
+  "strat_daily_rate", "csi2000_daily_rate", "excess_daily_rate",
+  "week_cum_strat_rate", "week_cum_csi2000_rate", "week_cum_excess_rate",
   "daily_volatility", "annual_volatility", "daily_sharpe", "annual_sharpe",
   "return_amount", "week_cum_return_amount", "before_market_value", "after_market_value",
   "buy_slippage_bps", "sell_slippage_bps", "total_slippage_bps",

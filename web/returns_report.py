@@ -1,8 +1,8 @@
 """Parameterized daily return & slippage report.
 
 Derived from ``scripts/weekly_slippage_return_report.sql`` — the CTE logic is kept
-byte-for-byte identical so this stays faithful to the canonical report. The only
-changes are:
+aligned with the standalone MySQL report for strategy NAV and slippage.
+The web-specific changes are:
 
   * the leading ``SET @var`` session statements are removed; the five parameters
     (@start_date, @end_date, @trader_id, @instrument_suffix, @account_id) become
@@ -16,18 +16,23 @@ changes are:
     its previous net value, and a daily return. This is a web-only divergence from
     the .sql: the filter runs before the windowed cumulatives so the displayed
     week_cum_* values stay consistent with the rows actually shown;
+  * the benchmark is CSI 2000 from ClickHouse RiceQuant daily/index realtime
+    data, passed into MySQL as bound CTE values; the standalone MySQL report
+    retains its snapshot-based CSI 1000 benchmark;
   * the API also returns a period summary computed from the first and last
     after-trading net values in the requested date range.
 
 IF YOU CHANGE THE REPORT LOGIC, UPDATE BOTH THIS FILE AND THE .sql IN LOCKSTEP
-(except the ``combined`` WHERE filter noted above, which is web-only).
+(except the web-specific filtering, benchmark source and presentation above).
 """
 
 from __future__ import annotations
 
+from datetime import date
+from decimal import Decimal
 from typing import Any
 
-from web.db import MySqlSource
+from web.db import ClickHouseClient, MySqlSource, quote_literal
 
 # Risk-adjusted metric conventions (also hard-coded as literals in RETURNS_SQL and
 # the canonical .sql — keep all three in sync). Sharpe uses a 2% annual risk-free
@@ -42,7 +47,7 @@ RETURN_COLUMNS = [
     "after_market_value",
     "return_amount",
     "strat_daily_rate",
-    "csi1000_daily_rate",
+    "csi2000_daily_rate",
     "excess_daily_rate",
     "daily_volatility",
     "annual_volatility",
@@ -51,12 +56,17 @@ RETURN_COLUMNS = [
     "week_label",
     "week_cum_return_amount",
     "week_cum_strat_rate",
-    "week_cum_csi1000_rate",
+    "week_cum_csi2000_rate",
     "week_cum_excess_rate",
     "buy_slippage_bps",
     "sell_slippage_bps",
     "total_slippage_bps",
 ]
+
+_EMPTY_BENCHMARK_SQL = (
+    "SELECT CAST(NULL AS DATE) AS trade_date, NULL AS close_price, "
+    "NULL AS pre_close, NULL AS daily_rate WHERE FALSE"
+)
 
 RETURNS_SQL = """
 WITH
@@ -168,27 +178,8 @@ daily_return AS (
         AND trade_date BETWEEN %(start_date)s AND %(end_date)s
         AND account_id = %(account_id)s
 ),
-csi_all AS (
-    SELECT
-        trade_date,
-        close     AS close_price,
-        pre_close AS pre_close,
-        pct_chg / 100 AS daily_rate
-    FROM index_eod_price
-    WHERE ts_code = '000985.CSI'
-        AND trade_date BETWEEN %(start_date)s AND %(end_date)s
-),
-csi1000 AS (
-    SELECT
-        trade_date,
-        MAX(last_price) AS close_price,
-        MAX(last_close) AS pre_close,
-        (MAX(last_price) - MAX(last_close)) / NULLIF(MAX(last_close), 0) AS daily_rate
-    FROM live_stock_tick_snapshot
-    WHERE stock_code = '399852.SZ'
-        AND snapshot_type = 'after_trading'
-        AND trade_date BETWEEN %(start_date)s AND %(end_date)s
-    GROUP BY trade_date
+csi2000 AS (
+    {benchmark_sql}
 ),
 all_dates AS (
     SELECT trade_date FROM daily_slippage
@@ -196,8 +187,7 @@ all_dates AS (
     UNION SELECT trade_date FROM after_market
     UNION SELECT trade_date FROM asset_nav
     UNION SELECT trade_date FROM daily_return
-    UNION SELECT trade_date FROM csi_all
-    UNION SELECT trade_date FROM csi1000
+    UNION SELECT trade_date FROM csi2000
 ),
 combined AS (
     SELECT
@@ -215,20 +205,16 @@ combined AS (
         s.sell_trade_amount,
         s.total_slippage_amount,
         s.total_trade_amount,
-        ca.daily_rate  AS csi_all_daily_rate,
-        ca.close_price AS csi_all_close,
-        ca.pre_close   AS csi_all_preclose,
-        ck.daily_rate  AS csi1000_daily_rate,
-        ck.close_price AS csi1000_close,
-        ck.pre_close   AS csi1000_preclose
+        ck.daily_rate  AS csi2000_daily_rate,
+        ck.close_price AS csi2000_close,
+        ck.pre_close   AS csi2000_preclose
     FROM all_dates d
     LEFT JOIN before_market bm ON d.trade_date = bm.trade_date
     LEFT JOIN after_market  am ON d.trade_date = am.trade_date
     LEFT JOIN asset_nav     an ON d.trade_date = an.trade_date
     LEFT JOIN daily_return  r  ON d.trade_date = r.trade_date
     LEFT JOIN daily_slippage s ON d.trade_date = s.trade_date
-    LEFT JOIN csi_all       ca ON d.trade_date = ca.trade_date
-    LEFT JOIN csi1000       ck ON d.trade_date = ck.trade_date
+    LEFT JOIN csi2000       ck ON d.trade_date = ck.trade_date
     -- Require a complete after-to-after net-value pair plus a daily return so the
     -- windowed values stay consistent with the rows actually returned.
     WHERE an.net_value IS NOT NULL
@@ -241,10 +227,8 @@ windowed AS (
         net_value - FIRST_VALUE(previous_net_value) OVER w AS week_cum_return_amount,
         net_value / NULLIF(FIRST_VALUE(previous_net_value) OVER w, 0) - 1
             AS week_cum_strat_rate,
-        (csi_all_close - FIRST_VALUE(csi_all_preclose) OVER w)
-            / NULLIF(FIRST_VALUE(csi_all_preclose) OVER w, 0) AS week_cum_csi_all_rate,
-        (csi1000_close - FIRST_VALUE(csi1000_preclose) OVER w)
-            / NULLIF(FIRST_VALUE(csi1000_preclose) OVER w, 0) AS week_cum_csi1000_rate,
+        (csi2000_close - FIRST_VALUE(csi2000_preclose) OVER w)
+            / NULLIF(FIRST_VALUE(csi2000_preclose) OVER w, 0) AS week_cum_csi2000_rate,
         -- Expanding (cumulative) risk metrics over the full period up to this row
         -- (ordered by trade_date, NOT partitioned by week). Sample std (n-1);
         -- Sharpe uses a 2%% annual risk-free rate converted to daily (0.02/252).
@@ -271,10 +255,10 @@ SELECT
     w.net_value                                           AS net_value,
     w.previous_net_value                                  AS previous_net_value,
     w.strat_daily_rate                                    AS strat_daily_rate,
-    w.csi1000_daily_rate                                  AS csi1000_daily_rate,
-    w.csi1000_close                                       AS csi1000_close,
-    w.csi1000_preclose                                    AS csi1000_preclose,
-    (w.strat_daily_rate - w.csi1000_daily_rate)           AS excess_daily_rate,
+    w.csi2000_daily_rate                                  AS csi2000_daily_rate,
+    w.csi2000_close                                       AS csi2000_close,
+    w.csi2000_preclose                                    AS csi2000_preclose,
+    (w.strat_daily_rate - w.csi2000_daily_rate)           AS excess_daily_rate,
     w.daily_volatility                                    AS daily_volatility,
     (w.daily_volatility * SQRT(252))                      AS annual_volatility,
     w.daily_sharpe                                        AS daily_sharpe,
@@ -282,14 +266,14 @@ SELECT
     CONCAT('W', w.week_num)                               AS week_label,
     w.week_cum_return_amount                              AS week_cum_return_amount,
     w.week_cum_strat_rate                                 AS week_cum_strat_rate,
-    w.week_cum_csi1000_rate                               AS week_cum_csi1000_rate,
-    (w.week_cum_strat_rate - w.week_cum_csi1000_rate)     AS week_cum_excess_rate,
+    w.week_cum_csi2000_rate                               AS week_cum_csi2000_rate,
+    (w.week_cum_strat_rate - w.week_cum_csi2000_rate)     AS week_cum_excess_rate,
     (w.buy_slippage_amount  / NULLIF(w.buy_trade_amount,  0) * 10000) AS buy_slippage_bps,
     (w.sell_slippage_amount / NULLIF(w.sell_trade_amount, 0) * 10000) AS sell_slippage_bps,
     (w.total_slippage_amount / NULLIF(w.total_trade_amount, 0) * 10000) AS total_slippage_bps
 FROM windowed w
 ORDER BY w.trade_date
-"""
+""".replace("{benchmark_sql}", _EMPTY_BENCHMARK_SQL)
 
 # Fallback used when an account has no positions to derive the suffix from.
 _DEFAULT_SUFFIX = ".QMT"
@@ -326,6 +310,7 @@ def derive_instrument_suffix(mysql: MySqlSource, account_id: str, trader_id: str
 
 def query_returns(
     mysql: MySqlSource,
+    clickhouse: ClickHouseClient,
     *,
     account_id: str,
     trader_id: str,
@@ -333,17 +318,93 @@ def query_returns(
     end_date: str,
     instrument_suffix: str | None = None,
 ) -> list[dict[str, Any]]:
+    start_date = date.fromisoformat(start_date).isoformat()
+    end_date = date.fromisoformat(end_date).isoformat()
+    if start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
     suffix = instrument_suffix or derive_instrument_suffix(mysql, account_id, trader_id)
-    return mysql.query(
-        RETURNS_SQL,
-        {
-            "account_id": account_id,
-            "trader_id": trader_id,
-            "start_date": start_date,
-            "end_date": end_date,
-            "instrument_suffix": suffix,
-        },
+    params: dict[str, Any] = {
+        "account_id": account_id,
+        "trader_id": trader_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "instrument_suffix": suffix,
+    }
+    benchmark = clickhouse.query(csi2000_query(start_date, end_date))
+    selects = []
+    for i, row in enumerate(benchmark):
+        params[f"benchmark_date_{i}"] = row["trade_date"]
+        # MySQL NAV values are Decimal. Bind market numbers as decimal literals
+        # too, so period summaries can subtract the two return rates directly.
+        for parameter, column in (
+            ("close", "close_price"), ("preclose", "pre_close"), ("rate", "daily_rate"),
+        ):
+            value = row[column]
+            params[f"benchmark_{parameter}_{i}"] = Decimal(str(value)) if value is not None else None
+        selects.append(
+            f"SELECT CAST(%(benchmark_date_{i})s AS DATE) AS trade_date, "
+            f"%(benchmark_close_{i})s AS close_price, "
+            f"%(benchmark_preclose_{i})s AS pre_close, "
+            f"%(benchmark_rate_{i})s AS daily_rate",
+        )
+    benchmark_sql = "\n    UNION ALL\n    ".join(selects) if selects else _EMPTY_BENCHMARK_SQL
+    return mysql.query(RETURNS_SQL.replace(_EMPTY_BENCHMARK_SQL, benchmark_sql), params)
+
+
+def csi2000_query(start_date: str, end_date: str) -> str:
+    """Daily history plus today's latest index minute when EOD is not loaded.
+
+    Keep the preceding daily close even when it lies outside the report range.
+    Repeated observations use a whole-row tuple so nullable fields cannot pick
+    values from an older observation independently.
+    """
+    start = quote_literal(date.fromisoformat(start_date).isoformat())
+    end = quote_literal(date.fromisoformat(end_date).isoformat())
+    return f"""
+    WITH daily AS (
+        SELECT trading_date AS trade_date,
+               argMax(tuple(close, prev_close),
+                      tuple(_ingest_time, _batch_id, _record_hash)) AS prices
+        FROM ricequant_index_daily
+        WHERE order_book_id = '932000.INDX'
+          AND trading_date <= toDate({end})
+        GROUP BY trading_date
+    ), benchmark AS (
+        SELECT trade_date, tupleElement(prices, 1) AS close_price,
+               tupleElement(prices, 2) AS pre_close
+        FROM daily
+        WHERE trade_date BETWEEN toDate({start}) AND toDate({end})
+        UNION ALL
+        SELECT trade_date, tupleElement(prices, 1) AS close_price,
+               (SELECT tupleElement(prices, 1) FROM daily
+                WHERE trade_date < toDate(now('Asia/Shanghai'))
+                ORDER BY trade_date DESC LIMIT 1) AS pre_close
+        FROM (
+            SELECT trade_date,
+                   argMax(tuple(close), tuple(datetime, received_at, event_id)) AS prices
+            FROM ricequant_index_minute_realtime
+            WHERE order_book_id = '932000.INDX'
+              AND trade_date = toDate(now('Asia/Shanghai'))
+              AND trade_date BETWEEN toDate({start}) AND toDate({end})
+              AND trade_date NOT IN (SELECT trade_date FROM daily)
+              AND (
+                  formatDateTime(datetime, '%H:%i:%S', 'Asia/Shanghai') BETWEEN '09:30:00' AND '11:30:00'
+                  OR formatDateTime(datetime, '%H:%i:%S', 'Asia/Shanghai') BETWEEN '13:00:00' AND '15:00:00'
+              )
+              AND datetime <= now64(3, 'Asia/Shanghai')
+              AND received_at <= now64(6, 'Asia/Shanghai')
+            GROUP BY trade_date
+        )
     )
+    SELECT toString(trade_date) AS trade_date,
+           if(isFinite(close_price) AND close_price > 0, close_price, NULL) AS close_price,
+           if(isFinite(pre_close) AND pre_close > 0, pre_close, NULL) AS pre_close,
+           if(isFinite(close_price) AND close_price > 0
+              AND isFinite(pre_close) AND pre_close > 0,
+              close_price / pre_close - 1, NULL) AS daily_rate
+    FROM benchmark
+    ORDER BY trade_date
+    """
 
 
 def build_return_summary(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -369,16 +430,11 @@ def build_return_summary(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         else None
     )
 
-    benchmark_rows = [
-        row for row in rows
-        if row.get("csi1000_close") is not None and row.get("csi1000_preclose") is not None
-    ]
     benchmark_rate = None
-    if benchmark_rows:
-        benchmark_initial = benchmark_rows[0]["csi1000_preclose"]
-        benchmark_final = benchmark_rows[-1]["csi1000_close"]
-        if benchmark_initial is not None and benchmark_initial != 0:
-            benchmark_rate = benchmark_final / benchmark_initial - 1
+    benchmark_initial = first.get("csi2000_preclose")
+    benchmark_final = last.get("csi2000_close")
+    if benchmark_initial is not None and benchmark_initial != 0 and benchmark_final is not None:
+        benchmark_rate = benchmark_final / benchmark_initial - 1
     excess_rate = (
         period_rate - benchmark_rate
         if period_rate is not None and benchmark_rate is not None
@@ -389,10 +445,10 @@ def build_return_summary(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "trade_date": "合计",
         "return_amount": period_pnl,
         "strat_daily_rate": period_rate,
-        "csi1000_daily_rate": benchmark_rate,
+        "csi2000_daily_rate": benchmark_rate,
         "excess_daily_rate": excess_rate,
         "week_cum_return_amount": period_pnl,
         "week_cum_strat_rate": period_rate,
-        "week_cum_csi1000_rate": benchmark_rate,
+        "week_cum_csi2000_rate": benchmark_rate,
         "week_cum_excess_rate": excess_rate,
     }

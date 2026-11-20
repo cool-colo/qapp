@@ -52,6 +52,12 @@ A local, read-only dashboard for the live trading data this repo persists:
 - **按日快照** — asset / positions / target portfolio / orders / trades for a chosen
   date + phase. Hovering or clicking a stock code opens a menu for **个股 K 线**
   and **实时分钟线**; keyboard focus supports the same menu.
+- **收益报表** — strategy returns and excess returns against CSI 2000
+  (`932000.INDX`). Benchmark history comes from ClickHouse `ricequant_index_daily`
+  using `close / prev_close - 1`. If today's daily row is not loaded, the latest
+  `ricequant_index_minute_realtime.close` is compared with the previous trading
+  day's daily close. Daily, weekly, period totals and return charts share this
+  benchmark; unavailable prices leave benchmark/excess values blank.
 - **随时间** — time series: pick one or more metrics from a checkbox list (asset
   columns or return-report columns) and a date range; x = date, one line per selected
   column. Rate columns move to a right-hand % axis when mixed with magnitude columns,
@@ -59,7 +65,7 @@ A local, read-only dashboard for the live trading data this repo persists:
   metric, switching 数据类型, or changing either date redraws immediately; **绘制** stays
   as an explicit re-fetch of the same parameters.
 - **对比** — overlay multiple series on one chart, each = (source, account, metric).
-  A preset plots 策略周累计收益率 vs 中证1000周累计收益率 for the current account.
+  A preset plots 策略周累计收益率 vs 中证2000周累计收益率 for the current account.
 - **个股 K 线** — daily candlestick from ClickHouse `dws_stock_factor_wide`, with this
   account's **buy (red ↑) / sell (green ↓)** fills overlaid as markers. Changing a date
   or the 显示买卖点 option redraws right away (as it does in **对比**, where a date change
