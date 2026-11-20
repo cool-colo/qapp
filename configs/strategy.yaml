@@ -19,7 +19,7 @@
 
 # --- Position sizing / rotation ---
 max_position_percent: 0.03
-stop_loss: 0.1
+stop_loss: 0.2
 trailing_take_profit: 0.06
 trailing_take_profit_start: 0.15
 min_listed_days: 120
