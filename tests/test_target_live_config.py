@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -37,6 +38,7 @@ from backtests.result_writers.live_writer import REALTIME_ORDER_STATUS_COLUMNS
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.identifiers import InstrumentId
 
 from lives.live_qmt_target_model_predictions import _emit_snapshot_status
 from lives.live_qmt_target_model_predictions import LiveTargetModelPredictionsStrategy
@@ -54,6 +56,7 @@ from strategies.model_target_planners import TargetInfo
 from strategies.target_quantities import DepthBookSnapshot
 from strategies.target_quantities import TargetQuantityStrategy
 from strategies.target_quantities import TickSnapshot
+from strategies.strategy_params import StrategyParams
 
 
 class TargetLiveConfigTest(unittest.TestCase):
@@ -62,6 +65,20 @@ class TargetLiveConfigTest(unittest.TestCase):
         engine, strategy, _, _ = replay_fixture(auction_enabled=False)
         self.addCleanup(engine.dispose)
         return strategy
+
+    def constructed_recorder(self, writer):
+        from tests.test_opening_auction import replay_fixture
+
+        engine, strategy, _, _ = replay_fixture(auction_enabled=False)
+        self.addCleanup(engine.dispose)
+        recorder = SnapshotRecorder(
+            config=SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER"),
+            writer=writer,
+            strategy_ref=strategy,
+        )
+        engine.add_actor(recorder)
+        self.addCleanup(recorder.on_stop)
+        return recorder, strategy
 
     def test_model_target_default_keeps_original_position_cap(self) -> None:
         config = TargetModelPredictionsStrategyConfig(
@@ -331,19 +348,24 @@ class TargetLiveConfigTest(unittest.TestCase):
         with patch.dict(
             os.environ,
             {"QMT_ACCOUNT_ID": "TEST"},
-            clear=False,
+            clear=True,
         ):
-            with patch.object(sys, "argv", ["test"]):
+            with patch("lives.live_qmt_target_model_predictions.load_env"), patch.object(
+                sys, "argv", ["test", "--config", "configs/strategy.yaml"],
+            ):
                 args = parse_args()
         self.assertFalse(hasattr(args, "pre_open_reconcile_time"))
 
     def test_parse_args_loads_explicit_env_file_before_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             env_file = Path(tmp_dir) / "live.env"
+            config_file = Path(tmp_dir) / "strategy.yaml"
+            config_file.write_text("{}\n", encoding="utf-8")
             env_file.write_text(
                 "QMT_ACCOUNT_ID=ENV-ACCOUNT\n"
                 "QAPP_ENV=production\n"
-                "DINGTALK_TIMEOUT_SECS=7.5\n",
+                "DINGTALK_TIMEOUT_SECS=7.5\n"
+                f"STRATEGY_CONFIG_FILE={config_file}\n",
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {}, clear=True):
@@ -354,6 +376,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(args.environment, "production")
         self.assertEqual(args.dingtalk_timeout_secs, 7.5)
         self.assertEqual(args.env_file, str(env_file))
+        self.assertEqual(args.config, str(config_file))
 
     def test_fixed_time_reporter_includes_environment_and_identity(self) -> None:
         alerter = SimpleNamespace(configured=True, send_text=MagicMock(return_value=True))
@@ -377,23 +400,34 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertIn("account: ACC", content)
         self.assertIn("rows: 3", content)
 
-    def test_full_tick_args_default(self) -> None:
-        with patch.dict(os.environ, {"QMT_ACCOUNT_ID": "TEST"}, clear=False):
-            with patch.object(sys, "argv", ["test"]):
+    def test_full_tick_yaml_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_file = Path(tmp_dir) / "strategy.yaml"
+            config_file.write_text("{}\n", encoding="utf-8")
+            with patch.dict(os.environ, {"QMT_ACCOUNT_ID": "TEST"}, clear=True), patch(
+                "lives.live_qmt_target_model_predictions.load_env",
+            ), patch.object(sys, "argv", ["test", "--config", str(config_file)]):
                 args = parse_args()
-        self.assertEqual(args.full_tick_refresh_secs, 1.0)
-        self.assertEqual(args.full_tick_prefetch_time, "09:27")
+            params = StrategyParams.from_yaml(args.config)
+        self.assertEqual(params.full_tick_refresh_secs, 1.0)
+        self.assertEqual(params.full_tick_prefetch_time, "09:27")
+        self.assertFalse(hasattr(args, "full_tick_refresh_secs"))
+        self.assertFalse(hasattr(args, "full_tick_prefetch_time"))
 
-    def test_full_tick_prefetch_can_be_disabled(self) -> None:
-        with patch.dict(os.environ, {"QMT_ACCOUNT_ID": "TEST"}, clear=False):
-            with patch.object(
-                sys,
-                "argv",
-                ["test", "--full-tick-prefetch-time", "", "--full-tick-refresh-secs", "0"],
-            ):
+    def test_full_tick_prefetch_can_be_disabled_in_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_file = Path(tmp_dir) / "strategy.yaml"
+            config_file.write_text(
+                'full_tick_prefetch_time: ""\nfull_tick_refresh_secs: 0\n',
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"QMT_ACCOUNT_ID": "TEST"}, clear=True), patch(
+                "lives.live_qmt_target_model_predictions.load_env",
+            ), patch.object(sys, "argv", ["test", "--config", str(config_file)]):
                 args = parse_args()
-        self.assertEqual(args.full_tick_prefetch_time, "")
-        self.assertEqual(args.full_tick_refresh_secs, 0.0)
+            params = StrategyParams.from_yaml(args.config)
+        self.assertEqual(params.full_tick_prefetch_time, "")
+        self.assertEqual(params.full_tick_refresh_secs, 0.0)
 
     def test_full_tick_config_fields_default(self) -> None:
         config = TargetModelPredictionsStrategyConfig(
@@ -691,6 +725,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             date(2026, 7, 8),
             allow_fallback=False,
             report_tasks=True,
+            retry_whole_market=True,
         )
 
     def test_snapshot_fixed_timers_skip_non_trading_days(self) -> None:
@@ -853,22 +888,44 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
 
     def test_writer_load_recent_target_dates_allows_unlocked_or_increased_locked_targets(self) -> None:
-        writer = object.__new__(LiveSnapshotWriter)
-        writer._query = MagicMock(return_value=[("000001.SZ", date(2026, 7, 7))])
-
-        result = writer.load_recent_target_dates(
-            "ACC",
-            "TRADER",
-            date(2026, 7, 8),
-            date(2026, 6, 1),
-            ["000001.SZ"],
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE live_target_portfolio (account_id TEXT, trader_id TEXT, "
+            "stock_code TEXT, trade_date TEXT, target_qty INTEGER, current_qty INTEGER, "
+            "is_locked BOOLEAN)",
         )
+        cases = [
+            ("000001.SZ", "2026-07-07", 100, 100, None),
+            ("000001.SZ", "2026-07-06", 100, 100, False),
+            ("000002.SZ", "2026-07-07", 100, 100, False),
+            ("000003.SZ", "2026-07-07", 200, 100, True),
+            ("000004.SZ", "2026-07-07", 100, 100, True),
+            ("000005.SZ", "2026-07-07", 100, 200, True),
+            ("000006.SZ", "2026-07-07", 0, 100, False),
+            ("000007.SZ", "2026-07-07", None, 100, False),
+            ("000008.SZ", "2026-07-08", 100, 100, False),
+            ("000009.SZ", "2026-05-31", 100, 100, False),
+        ]
+        connection.executemany(
+            "INSERT INTO live_target_portfolio VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [("ACC", "TRADER", *row) for row in cases],
+        )
+        writer = LiveSnapshotWriter.for_testing(connection=connection)
 
-        self.assertEqual(result, {"000001.SZ": date(2026, 7, 7)})
-        sql = writer._query.call_args.args[0]
-        self.assertIn(
-            "(`is_locked` != TRUE OR (`is_locked` = TRUE AND `target_qty` > `current_qty`))",
-            sql,
+        def query(sql, params):
+            values = tuple(value.isoformat() if isinstance(value, date) else value for value in params)
+            return connection.execute(sql.replace("%s", "?"), values).fetchall()
+
+        with patch.object(writer, "_query", side_effect=query):
+            result = writer.load_recent_target_dates(
+                "ACC", "TRADER", date(2026, 7, 8), date(2026, 6, 1),
+                [row[0] for row in cases],
+            )
+
+        self.assertEqual(
+            result,
+            {code: date(2026, 7, 7) for code in ("000001.SZ", "000002.SZ", "000003.SZ")},
         )
 
     def test_writer_load_before_trading_stock_codes(self) -> None:
@@ -1166,58 +1223,37 @@ class TargetLiveConfigTest(unittest.TestCase):
             total_asset=1_000_000.0,
             investable_asset=950_000.0,
         )
-        writer = SimpleNamespace(write_planning_attempt=MagicMock())
-        strategy = SimpleNamespace(
-            compute_daily_target_plan=MagicMock(return_value=plan),
-            plan_version=MagicMock(return_value="ver-1"),
-            _target_version="", _latest_planning_inputs={},
-            _trading_action_lock=threading.RLock(), _replanning_blocked=False,
-            config=SimpleNamespace(risk_manager_risk_model_id="test", alpha_model_id="test"),
+        writer = MagicMock(spec=LiveSnapshotWriter)
+        writer.latest_position_snapshot_id.return_value = 7
+        recorder, strategy = self.constructed_recorder(writer)
+        strategy.compute_daily_target_plan = MagicMock(return_value=plan)
+        strategy.plan_version = MagicMock(return_value="ver-1")
+        strategy.update_target_quantities = MagicMock()
+        writer.write_planning_attempt.side_effect = (
+            lambda *args: strategy.update_target_quantities.assert_not_called()
         )
-        recorder = SimpleNamespace()
-        recorder.config = SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER")
-        recorder.log = MagicMock()
-        recorder._writer = writer
-        recorder._strategy = strategy
         recorder._now_naive = MagicMock(return_value=datetime(2026, 7, 10, 9, 27))
-        recorder._position_snapshot_anchor = MagicMock(return_value=7)
-        recorder._apply_target = MagicMock()
-        recorder._decimal_or_none = SnapshotRecorder._decimal_or_none
-        recorder._int_or_none = SnapshotRecorder._int_or_none
-        recorder._frozen_total_asset = MagicMock()
-        recorder._plan_total_asset = lambda target_plan: SnapshotRecorder._plan_total_asset(
-            recorder,
-            target_plan,
-        )
-        recorder._plan_investable_asset = (
-            lambda target_plan, total_asset: SnapshotRecorder._plan_investable_asset(
-                recorder,
-                target_plan,
-                total_asset,
-            )
-        )
-        recorder._persist_target_plan = (
-            lambda target_plan, snapshot_type, asset_id, resolved_signal_date, apply_target,
-            on_complete=None: SnapshotRecorder._persist_target_plan(
-                recorder,
-                target_plan,
-                snapshot_type,
-                asset_id,
-                resolved_signal_date,
-                apply_target,
-                on_complete,
-            )
-        )
 
-        SnapshotRecorder._generate_and_persist_target(
-            recorder,
+        recorder._generate_and_persist_target(
             trading_date,
             BEFORE_TRADING,
             signal_date,
             asset_id=5,
         )
 
-        record = writer.write_planning_attempt.call_args.args[0][4][0]
+        writer.write_planning_attempt.assert_called_once()
+        account_id, trader_id, recorded_date, payload, records = writer.write_planning_attempt.call_args.args
+        self.assertEqual((account_id, trader_id, recorded_date), ("ACC", "TRADER", trading_date))
+        self.assertEqual(payload["status"], "committed")
+        self.assertEqual(payload["request_id"], "req-1")
+        self.assertEqual(payload["quantities"], {"000001.SZ.QMT": 10000})
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.snapshot_type, BEFORE_TRADING)
+        self.assertEqual(record.asset_snapshot_id, 5)
+        self.assertEqual(record.position_snapshot_id, 7)
+        self.assertEqual(record.total_asset, Decimal("1000000.0"))
+        self.assertEqual(record.investable_asset, Decimal("950000.0"))
         self.assertEqual(record.instrument_id, "000001.SZ.QMT")
         self.assertEqual(record.stock_code, "000001.SZ")
         self.assertEqual(record.target_weight, Decimal("0.12"))
@@ -1232,19 +1268,22 @@ class TargetLiveConfigTest(unittest.TestCase):
             record.extra,
             {
                 "target_version": "ver-1",
+                "risk_model_id": strategy.config.risk_manager_risk_model_id,
+                "alpha_model_id": strategy.config.alpha_model_id,
                 "recent_buy_date": "2026-07-01",
                 "recent_holding_days": 6,
                 "market_status": "SUSPEND",
             },
         )
-        recorder._apply_target.assert_called_once_with(
-            trading_date,
-            {"000001.SZ.QMT": 10000},
-            "risk_manager_optimize",
-            "ver-1",
+        strategy.update_target_quantities.assert_called_once_with(
+            quantities={"000001.SZ.QMT": 10000},
+            target_date=trading_date,
+            reason="risk_manager_optimize",
+            version="ver-1",
+            signal_date=signal_date,
         )
 
-    def test_snapshot_recorder_applies_transient_plan_without_writing_rows(self) -> None:
+    def test_snapshot_recorder_archives_transient_plan_without_target_rows(self) -> None:
         trading_date = date(2026, 7, 10)
         plan = ModelTargetPlan(
             trading_date=trading_date,
@@ -1265,18 +1304,13 @@ class TargetLiveConfigTest(unittest.TestCase):
             degraded_reason="risk_manager_failure",
         )
         callback = MagicMock()
-        recorder = SimpleNamespace(
-            _strategy=SimpleNamespace(
-                compute_daily_target_plan=MagicMock(return_value=plan),
-                plan_version=MagicMock(return_value="transient-ver"),
-            ),
-            _apply_target=MagicMock(),
-            _persist_target_plan=MagicMock(),
-            log=MagicMock(),
-        )
+        writer = MagicMock(spec=LiveSnapshotWriter)
+        recorder, strategy = self.constructed_recorder(writer)
+        strategy.compute_daily_target_plan = MagicMock(return_value=plan)
+        strategy.plan_version = MagicMock(return_value="transient-ver")
+        strategy.update_target_quantities = MagicMock()
 
-        SnapshotRecorder._generate_and_persist_target(
-            recorder,
+        recorder._generate_and_persist_target(
             trading_date,
             BEFORE_TRADING,
             plan.signal_date,
@@ -1284,12 +1318,18 @@ class TargetLiveConfigTest(unittest.TestCase):
             on_complete=callback,
         )
 
-        recorder._persist_target_plan.assert_not_called()
-        recorder._apply_target.assert_called_once_with(
-            trading_date,
-            {"000001.SZ.QMT": 0},
-            plan.reason,
-            "transient-ver",
+        writer.write_planning_attempt.assert_called_once()
+        account_id, trader_id, recorded_date, payload = writer.write_planning_attempt.call_args.args
+        self.assertEqual((account_id, trader_id, recorded_date), ("ACC", "TRADER", trading_date))
+        self.assertEqual(payload["status"], "safety")
+        self.assertFalse(payload["plan"]["persistable"])
+        writer.write_target_portfolios.assert_not_called()
+        strategy.update_target_quantities.assert_called_once_with(
+            quantities={"000001.SZ.QMT": 0},
+            target_date=trading_date,
+            reason=plan.reason,
+            version="transient-ver",
+            signal_date=plan.signal_date,
         )
         callback.assert_called_once_with(
             "failed",
@@ -2020,42 +2060,31 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
 
     def test_record_stock_ticks_writes_all_snapshot_instruments(self) -> None:
-        writer = SimpleNamespace(write_stock_tick_snapshots=MagicMock())
-        strategy = SimpleNamespace(
-            tick_snapshot_for=MagicMock(
-                return_value=TickSnapshot(
-                    market_status=MarketStatusAction.CLOSE,
-                    last_price=10.77,
-                    open=10.85,
-                    high=10.93,
-                    low=10.72,
-                    last_close=10.84,
-                    amount=864435900.0,
-                    volume=800766,
-                    pvolume=80076623,
-                    open_int=15,
-                    last_settlement_price=10.84,
-                ),
+        writer = MagicMock(spec=LiveSnapshotWriter)
+        recorder, strategy = self.constructed_recorder(writer)
+        strategy.tick_snapshot_for = MagicMock(
+            return_value=TickSnapshot(
+                market_status=MarketStatusAction.CLOSE,
+                last_price=10.77,
+                open=10.85,
+                high=10.93,
+                low=10.72,
+                last_close=10.84,
+                amount=864435900.0,
+                volume=800766,
+                pvolume=80076623,
+                open_int=15,
+                last_settlement_price=10.84,
             ),
         )
-        recorder = SimpleNamespace(
-            _writer=writer,
-            _strategy=strategy,
-            _stock_code=MagicMock(
-                side_effect=lambda instrument_id: instrument_id.removesuffix(".QMT"),
-            ),
-            _now_naive=MagicMock(return_value=datetime(2026, 7, 8, 15, 5)),
-            _decimal_or_none=SnapshotRecorder._decimal_or_none,
-            log=MagicMock(),
-        )
+        recorder._now_naive = MagicMock(return_value=datetime(2026, 7, 8, 15, 5))
         snapshot = {
             "000001.SZ.QMT": {"open": 10.85},
             "000002.SZ.QMT": {"open": 20.00},
         }
 
         completed = MagicMock()
-        SnapshotRecorder._record_stock_ticks(
-            recorder,
+        recorder._record_stock_ticks(
             date(2026, 7, 8),
             snapshot,
             on_complete=completed,
@@ -2069,6 +2098,11 @@ class TargetLiveConfigTest(unittest.TestCase):
         )
         record = records[0]
         self.assertEqual(record.instrument_id, "000001.SZ.QMT")
+        self.assertEqual(record.stock_code, "000001.SZ")
+        self.assertEqual(
+            record.name,
+            strategy.cache.instrument(InstrumentId.from_str(record.instrument_id)).info["name"],
+        )
         self.assertEqual(record.market_status, "CLOSE")
         self.assertEqual(record.amount, Decimal("864435900.0"))
         self.assertEqual(record.volume, 800766)

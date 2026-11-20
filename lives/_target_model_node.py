@@ -459,7 +459,7 @@ def build_target_model_node(
     from nautilus_trader.config import LiveExecEngineConfig
     from nautilus_trader.config import LoggingConfig
     from nautilus_trader.config import TradingNodeConfig
-    from nautilus_trader.live.node import TradingNode
+    from lives.trading_node import LiveTradingNode
     from nautilus_trader.model.identifiers import TraderId
 
     params = StrategyParams.from_yaml(args.config)
@@ -529,7 +529,7 @@ def build_target_model_node(
         timeout_disconnection=10.0,
         timeout_post_stop=5.0,
     )
-    node = TradingNode(config=config_node)
+    node = LiveTradingNode(config=config_node)
     params.log(node.get_logger(), source=args.config)
     event_reporter = FixedTimeEventReporter(
         DingTalkAlerter.from_env(timeout=args.dingtalk_timeout_secs),
