@@ -73,7 +73,8 @@ class ExposureSnapshotProvider:
                 None if buy is None else buy.as_decimal(),
                 None if sell is None else sell.as_decimal(),
                 "trading_permissions" if not (can_buy and can_sell) else "",
-                Decimal(str(host.config.continuous_buy_min_notional)))
+                Decimal(str(host.config.continuous_buy_min_notional)),
+                allow_odd_lot_sell=rules.allow_odd_lot_sell)
         venue = host._instrument_ids[0].venue if host._instrument_ids else None
         account = host.portfolio.account(venue=venue) if venue is not None else None
         balance = account.balance_total() if account is not None else None

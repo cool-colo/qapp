@@ -49,6 +49,7 @@ class InstrumentSnapshot:
     sell_price: Decimal | None = None
     block_reason: str = ""
     minimum_buy_notional: Decimal = Decimal(0)
+    allow_odd_lot_sell: bool = False
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,8 @@
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal
 from trading_orchestration.components.assessors.exposure_assessor import ExposureAssessor
+from trading_orchestration.components.allocations.exposure_quantity import (
+    corrective_quantity, liquidation_quantity,
+)
 
 
 class ExposureOrderAdmission:
@@ -33,16 +36,11 @@ class ExposureOrderAdmission:
         room = max(Decimal(0), assessment.maximum_notional - pending_value)
         target = context.target.quantities.get(instrument_id, Decimal(0))
         remaining = (target - item.quantity if direction == "buy" else item.quantity - target) - pending_quantity
-        required_qty = (needed / item.price / item.increment).to_integral_value(
-            rounding=ROUND_CEILING) * item.increment
-        room_qty = (room / item.price / item.increment).to_integral_value(
-            rounding=ROUND_FLOOR) * item.increment
-        allowed = min(requested, remaining, room_qty, max(item.minimum, required_qty))
+        cap = min(requested, remaining)
+        liquidation = Decimal(0)
         if direction == "sell":
-            allowed = min(allowed, item.sellable)
-        allowed = (allowed / item.increment).to_integral_value(rounding=ROUND_FLOOR) * item.increment
-        if direction == "buy" and (item.buy_price is None or
-                                    allowed * item.buy_price <= item.minimum_buy_notional):
-            return Decimal(0)
-        return allowed if allowed >= item.minimum else Decimal(0)
+            cap = min(cap, item.sellable)
+            liquidation = liquidation_quantity(item, target, pending_quantity)
+        return corrective_quantity(item, direction, needed=needed, room=room, cap=cap,
+                                   liquidation=liquidation)
 

@@ -83,5 +83,6 @@ class TaskRun:
     process: Any = None
     reason: str = ""
     started: bool = False
-    final_state: RunState | None = None
+    final_decision: Decision | None = None
+    cleanup_decision: Decision | None = None
 

@@ -235,6 +235,36 @@ class AuctionReplayReviewTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Multiple final"):
             provider.build_ticks(rows, {"000001.XSHE": "000001.SZ"})
 
+    def test_ricequant_opening_result_window_preserves_event_and_receive_times(self):
+        provider = ClickHouseRicequantTickDataProvider(
+            ClickHouseConnectionConfig(), data_latency_ms=100)
+        for clock, expected in [("09:25:00", 1), ("09:25:01.863", 1),
+                                ("09:25:04.999999999", 1), ("09:25:05", 1),
+                                ("09:25:05.000000001", 0), ("09:25:06", 0)]:
+            with self.subTest(clock=clock):
+                raw = dict(order_book_id="000001.XSHE", datetime=f"2026-07-08 {clock}",
+                           open=10, volume=1000, prev_close=10, a1=10, b1=10,
+                           a1_v=1000, b1_v=1000)
+                ticks = provider.build_ticks([raw], {"000001.XSHE": "000001.SZ"})
+                self.assertEqual(len(ticks), expected)
+                if ticks:
+                    self.assertEqual(ticks[0].kind, "auction")
+                    self.assertEqual(ticks[0].ts_event, timestamp(raw["datetime"]))
+                    self.assertEqual(ticks[0].ts_init, ticks[0].ts_event + 100_000_000)
+                    self.assertEqual((ticks[0].bid_size, ticks[0].ask_size), (1000, 1000))
+
+    def test_ricequant_expanded_window_rejects_duplicate_daily_liquidity(self):
+        provider = ClickHouseRicequantTickDataProvider(ClickHouseConnectionConfig())
+        first = dict(order_book_id="000001.XSHE", datetime="2026-07-08 09:25:00.050",
+                     open=10, volume=1000, prev_close=10, a1=10, b1=10,
+                     a1_v=1000, b1_v=1000)
+        with self.assertRaisesRegex(ValueError, "Multiple final"):
+            provider.build_ticks([first, dict(first, datetime="2026-07-08 09:25:02")],
+                                 {"000001.XSHE": "000001.SZ"})
+        ticks = provider.build_ticks([first, dict(first, datetime="2026-07-09 09:25:02")],
+                                     {"000001.XSHE": "000001.SZ"})
+        self.assertEqual(len(ticks), 2)
+
     def test_ricequant_closing_ticks_remain_indicative_even_at_15_00(self):
         provider = ClickHouseRicequantTickDataProvider(ClickHouseConnectionConfig())
         rows = [dict(order_book_id="000001.XSHE", datetime=f"2026-07-08 {clock_time}",

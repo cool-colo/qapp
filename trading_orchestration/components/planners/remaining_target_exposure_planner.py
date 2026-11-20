@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal
 
 from trading_orchestration.components.assessors.exposure_assessor import ExposureAssessor
 from trading_orchestration.configuration.exposure_config import ExposureConfig
 from trading_orchestration.contexts.exposure_context import ExposureContext, ExposurePlan
+from trading_orchestration.components.allocations.exposure_quantity import (
+    corrective_quantity, liquidation_quantity, round_down,
+)
 
 
 class RemainingTargetExposurePlanner:
@@ -50,43 +53,39 @@ class RemainingTargetExposurePlanner:
             if item.increment <= 0 or item.minimum <= 0:
                 return ExposurePlan("unknown", "invalid_quantity_rules", **base)
             cap = remaining if side == "buy" else min(remaining, item.sellable)
-            cap = (cap / item.increment).to_integral_value(rounding=ROUND_FLOOR) * item.increment
-            if cap < item.minimum:
+            liquidation = liquidation_quantity(item, desired) if side == "sell" else Decimal(0)
+            cap = max(round_down(cap, item.increment), liquidation)
+            if cap <= 0 or (cap < item.minimum and not liquidation):
                 excluded[iid] = "no_legal_remaining_quantity"
                 continue
             rank = target.ranks.get(iid)
             ordering = ((rank is None, rank or 0, iid) if side == "buy"
                         else (rank is not None, -(rank or 0), iid))
-            candidates.append((ordering, iid, item, cap, price))
+            candidates.append((ordering, iid, item, cap, price, liquidation))
         candidates.sort(key=lambda x: x[0])
-        capacity = sum((cap * item.price for _, _, item, cap, _ in candidates), Decimal(0))
+        capacity = sum((cap * item.price for _, _, item, cap, _, _ in candidates), Decimal(0))
         details = dict(required_notional=required, available_notional=capacity, excluded=excluded)
         if capacity < required:
             return ExposurePlan("replan", "remaining_target_capacity_insufficient", **base, **details)
 
         quantities = {iid: item.quantity for iid, item in context.instruments.items()}
         achieved, cash = Decimal(0), context.free_cash
-        for _, iid, item, cap, order_price in candidates:
+        for _, iid, item, cap, order_price, liquidation in candidates:
             need = max(Decimal(0), required - achieved)
             if need == 0:
                 break
-            quantity = (need / item.price / item.increment).to_integral_value(
-                rounding=ROUND_CEILING) * item.increment
-            quantity = min(cap, max(item.minimum, quantity))
-            room = ((maximum - achieved) / item.price / item.increment).to_integral_value(
-                rounding=ROUND_FLOOR) * item.increment
-            quantity = min(quantity, room)
             if side == "buy":
                 affordable = max(Decimal(0), min(
                     cash / (order_price * (1 + self.config.commission_rate)),
                     (cash - self.config.minimum_fee) / order_price))
-                quantity = min(quantity, (affordable / item.increment).to_integral_value(
-                    rounding=ROUND_FLOOR) * item.increment)
-                if quantity * order_price <= item.minimum_buy_notional:
-                    excluded[iid] = "minimum_buy_notional"
-                    continue
-            if quantity < item.minimum:
-                excluded[iid] = "budget_or_tolerance_prevents_legal_order"
+                cap = min(cap, affordable)
+            quantity = corrective_quantity(item, side, needed=need, room=maximum - achieved,
+                                           cap=cap, liquidation=liquidation)
+            if quantity == 0:
+                available = round_down(min(cap, (maximum - achieved) / item.price), item.increment)
+                excluded[iid] = ("minimum_buy_notional" if side == "buy" and
+                                 available * order_price <= item.minimum_buy_notional
+                                 else "budget_or_tolerance_prevents_legal_order")
                 continue
             quantities[iid] = item.quantity + quantity if side == "buy" else item.quantity - quantity
             achieved += quantity * item.price

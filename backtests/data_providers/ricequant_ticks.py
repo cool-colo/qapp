@@ -29,7 +29,9 @@ class ClickHouseRicequantTickDataProvider:
 
     ``datetime`` is exchange time. Database ``_ingest_time`` is NOT historical
     receive time, so an explicit simulated data delay supplies ``ts_init``.
-    The 09:25 cumulative volume is the opening auction's final成交量.
+    The first seconds after 09:25 carry the opening auction's final成交量.
+    Recognize final results through 09:25:05 inclusive, without changing their
+    exchange/receipt timestamps or allowing multiple final results per day.
     """
 
     def __init__(self, connection: ClickHouseConnectionConfig,
@@ -114,7 +116,8 @@ FORMAT JSONEachRow
                     continue
                 result.append(HistoricalTick(symbol, "indicative", event.value,
                     event.value + self.delay_ns, price, price, 1, 1, float(close), 0))
-            elif clock_time == "09:25:00":
+            elif (9, 25, 0, 0, 0) <= (event.hour, event.minute, event.second,
+                                     event.microsecond, event.nanosecond) <= (9, 25, 5, 0, 0):
                 price, volume = raw["open"], raw["volume"]
                 if (price is None or volume is None or price <= 0 or volume <= 0
                         or not math.isfinite(price) or not math.isfinite(volume)):

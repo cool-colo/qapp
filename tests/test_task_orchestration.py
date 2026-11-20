@@ -1,4 +1,5 @@
 from dataclasses import replace
+from copy import deepcopy
 from decimal import Decimal as D
 import unittest
 
@@ -23,6 +24,26 @@ class Process:
         return Decision(RunState.SUCCEEDED if self.done else RunState.RUNNING, "work")
     def quiesce(self, ctx):
         return Decision(RunState.SUCCEEDED if self.clean else RunState.WAITING, "cleanup")
+
+
+class OutcomeProcess(Process):
+    def __init__(self, outcome, *, clean=False):
+        super().__init__()
+        self.outcome = outcome
+        self.clean = clean
+        self.cleanup_evidence = {"orders": ["order-1"]}
+        self.cleanup_error = None
+
+    def advance(self, ctx):
+        self.visits.append(ctx)
+        return self.outcome
+
+    def quiesce(self, ctx):
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
+        return Decision(RunState.SUCCEEDED if self.clean else RunState.WAITING,
+                        "execution_stable" if self.clean else "awaiting_terminal_orders",
+                        self.cleanup_evidence)
 
 
 class OrchestratorTest(unittest.TestCase):
@@ -77,6 +98,115 @@ class OrchestratorTest(unittest.TestCase):
         engine.tick(2)
         self.assertIsNone(engine.owner_task())
 
+    def test_business_outcome_survives_immediate_and_delayed_cleanup(self):
+        for state in (RunState.SUCCEEDED, RunState.FAILED, RunState.UNACHIEVABLE):
+            for clean in (True, False):
+                with self.subTest(state=state, immediate_cleanup=clean):
+                    engine = self.engine()
+                    evidence = {"target_version": "v1", "assessment": {"deviation": "0.01"}}
+                    expected = deepcopy(evidence)
+                    process = OutcomeProcess(Decision(state, "business_result", evidence), clean=clean)
+                    engine.register(TaskSpec("a", 1), lambda: process)
+                    run_id = engine.submit("a", Proposal("a"))
+                    engine.tick(1)
+                    if not clean:
+                        pending = engine.snapshot()["runs"][-1]
+                        self.assertEqual(pending["state"], "stopping")
+                        self.assertEqual(pending["final_result"], {
+                            "state": state.value, "reason": "business_result", "evidence": expected})
+                        self.assertEqual(engine.owner_task(), "a")
+                        self.assertFalse([r for r in engine.records
+                                          if r.run_id == run_id and r.action == "TERMINATED"])
+                        # A component and a caller must not mutate retained context.
+                        evidence["assessment"]["deviation"] = "99"
+                        pending["final_result"]["evidence"]["assessment"]["deviation"] = "88"
+                        process.cleanup_evidence["orders"].clear()
+                        process.clean = True
+                        engine.tick(2)
+                    terminal = [r for r in engine.records
+                                if r.run_id == run_id and r.action == "TERMINATED"]
+                    self.assertEqual(len(terminal), 1)
+                    self.assertEqual(terminal[0].reason, "business_result")
+                    self.assertEqual(terminal[0].evidence, {**expected, "state": state.value})
+                    result = engine.snapshot()["runs"][-1]
+                    self.assertEqual(result["reason"], "business_result")
+                    self.assertEqual(result["final_result"]["evidence"], expected)
+                    self.assertEqual(result["cleanup_result"]["reason"], "execution_stable")
+                    self.assertIsNone(engine.owner_task())
+                    if not clean:
+                        waiting = [r for r in engine.actions() if r["run_id"] == run_id
+                                   and r["action"] == "WAITING_CLEANUP"]
+                        self.assertEqual(waiting[0]["evidence"]["orders"], ["order-1"])
+                        waiting[0]["evidence"]["orders"].clear()
+                        self.assertEqual(next(r for r in engine.actions()
+                                             if r["run_id"] == run_id and r["action"] == "WAITING_CLEANUP")
+                                         ["evidence"]["orders"], ["order-1"])
+
+    def test_cleanup_error_does_not_replace_outcome_or_release_owner(self):
+        engine = self.engine()
+        process = OutcomeProcess(Decision(RunState.SUCCEEDED, "target_achieved", {"remaining": 0}))
+        process.cleanup_error = RuntimeError("reconciliation unavailable")
+        engine.register(TaskSpec("a", 1), lambda: process)
+        engine.register(TaskSpec("next", 2), Process)
+        run_id = engine.submit("a", Proposal("a"))
+        engine.tick(1)
+        engine.submit("next", Proposal("next"))
+        engine.tick(2)
+        self.assertEqual(engine.owner_task(), "a")
+        process.cleanup_error = None
+        process.clean = True
+        engine.tick(3)
+        self.assertEqual(engine.owner_task(), "next")
+        terminal = next(r for r in engine.records if r.run_id == run_id and r.action == "TERMINATED")
+        self.assertEqual((terminal.reason, terminal.evidence),
+                         ("target_achieved", {"state": "succeeded", "remaining": 0}))
+
+    def test_control_termination_retains_its_cause_through_cleanup(self):
+        for cause, state, reason in (("expiry", "expired", "proposal_expired"),
+                                     ("cancel", "cancelled", "cancelled"),
+                                     ("stop", "cancelled", "shutdown")):
+            with self.subTest(cause=cause):
+                engine = self.engine()
+                process = Process()
+                process.clean = False
+                engine.register(TaskSpec("a", 1), lambda: process)
+                run_id = engine.submit("a", Proposal("a", expires_ns=2 if cause == "expiry" else None))
+                engine.tick(1)
+                if cause == "cancel":
+                    engine.cancel(run_id)
+                elif cause == "stop":
+                    engine.stop()
+                engine.tick(2)
+                self.assertEqual(engine.owner_task(), "a")
+                process.clean = True
+                engine.tick(3)
+                terminal = next(r for r in engine.records
+                                if r.run_id == run_id and r.action == "TERMINATED")
+                self.assertEqual((terminal.reason, terminal.evidence["state"]), (reason, state))
+
+    def test_late_expiry_cancel_or_shutdown_does_not_rewrite_business_result(self):
+        for cause in ("expiry", "cancel", "stop"):
+            with self.subTest(cause=cause):
+                engine = self.engine()
+                process = OutcomeProcess(Decision(RunState.UNACHIEVABLE, "capacity_insufficient",
+                                                  {"required": "1000", "capacity": "100"}))
+                engine.register(TaskSpec("a", 1), lambda: process)
+                run_id = engine.submit("a", Proposal("a", expires_ns=2))
+                engine.tick(1)
+                if cause == "cancel":
+                    engine.cancel(run_id)
+                elif cause == "stop":
+                    engine.stop()
+                engine.tick(2)
+                self.assertEqual(engine.owner_task(), "a")
+                process.clean = True
+                engine.tick(3)
+                terminal = next(r for r in engine.records
+                                if r.run_id == run_id and r.action == "TERMINATED")
+                self.assertEqual(terminal.reason, "capacity_insufficient")
+                self.assertEqual(terminal.evidence, {
+                    "state": "unachievable", "required": "1000", "capacity": "100"})
+
     def test_restart_is_empty_not_checkpoint_recovery(self):
         engine = self.engine()
         engine.register(TaskSpec("a", 1), Process)
@@ -98,6 +228,51 @@ class OrchestratorTest(unittest.TestCase):
         engine.tick(2)
         engine.tick(3)
         self.assertEqual(engine.owner_task(), "ordinary")
+
+    def test_bootstrap_delayed_cleanup_preserves_shutdown_and_success_result(self):
+        for stop_requested in (True, False):
+            with self.subTest(stop_requested=stop_requested):
+                engine = TaskOrchestrator()
+                evidence = {"target_version": "v1", "restored": {"positions": 3}}
+                boot = OutcomeProcess(Decision(RunState.SUCCEEDED,
+                                               "initialized_from_business_facts", evidence))
+                ordinary = Process()
+                engine.register(TaskSpec("boot", 0, preemptible=False), lambda: boot, bootstrap=True)
+                engine.register(TaskSpec("ordinary", 1000), lambda: ordinary)
+                engine.start(0)
+                engine.submit("ordinary", Proposal("queued_during_bootstrap"))
+                self.assertEqual(engine.lifecycle, "initializing")
+
+                if stop_requested:
+                    engine.stop()
+                    self.assertIsNone(engine.submit("ordinary", Proposal("during_shutdown")))
+                engine.tick(1)
+                self.assertEqual(engine.lifecycle, "stopping" if stop_requested else "initializing")
+                self.assertEqual(engine.owner_task(), "boot")
+                self.assertFalse(ordinary.visits)
+
+                boot.clean = True
+                engine.tick(2)
+                self.assertEqual(engine.lifecycle, "stopped" if stop_requested else "ready")
+                self.assertIsNone(engine.owner_task())
+                result = engine.snapshot()["runs"][0]
+                self.assertEqual(result["state"], "succeeded")
+                self.assertEqual(result["final_result"], {
+                    "state": "succeeded", "reason": "initialized_from_business_facts",
+                    "evidence": evidence})
+                terminal = [r for r in engine.records if r.task_id == "boot" and r.action == "TERMINATED"]
+                self.assertEqual(len(terminal), 1)
+                self.assertEqual(terminal[0].reason, "initialized_from_business_facts")
+                self.assertEqual(terminal[0].evidence, {**evidence, "state": "succeeded"})
+
+                engine.tick(3)
+                if stop_requested:
+                    self.assertEqual(engine.lifecycle, "stopped")
+                    self.assertFalse(ordinary.visits)
+                    self.assertIsNone(engine.submit("ordinary", Proposal("after_shutdown")))
+                else:
+                    self.assertEqual(engine.owner_task(), "ordinary")
+                    self.assertTrue(ordinary.visits)
 
     def test_repeated_runs_are_deterministic(self):
         def run():

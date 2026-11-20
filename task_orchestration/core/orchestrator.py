@@ -87,7 +87,7 @@ class TaskOrchestrator:
     def _record(self, run: TaskRun, action: str, reason: str, evidence=None) -> None:
         self._sequence += 1
         record = ActionRecord(self._sequence, self._now, action, run.task_id, run.run_id,
-                              reason, dict(evidence or {}))
+                              reason, deepcopy(dict(evidence or {})))
         self.records.append(record)
         self.statistics[action] += 1
         if self._audit is not None:
@@ -140,10 +140,12 @@ class TaskOrchestrator:
             if run.state in TERMINAL:
                 continue
             if run.proposal.expires_ns is not None and self._now >= run.proposal.expires_ns:
+                expired = Decision(RunState.EXPIRED, "proposal_expired",
+                                   {"expires_ns": run.proposal.expires_ns})
                 if self._owners.get(self._bindings[run.task_id].spec.scope) == run.run_id:
-                    run.final_state = RunState.EXPIRED
+                    self._request_finish(run, expired)
                 else:
-                    self._finish(run, RunState.EXPIRED, "proposal_expired")
+                    self._finish(run, expired)
 
         scopes = sorted({binding.spec.scope for binding in self._bindings.values()})
         for scope in scopes:
@@ -160,16 +162,15 @@ class TaskOrchestrator:
                 preempt = (candidate is not None and spec.preemptible
                            and self._bindings[candidate.task_id].spec.can_preempt
                            and self._bindings[candidate.task_id].spec.priority > spec.priority)
-                if owner.final_state is not None or preempt or self.paused or self.lifecycle == "stopping":
+                if owner.final_decision is not None or preempt or self.paused or self.lifecycle == "stopping":
                     if owner.state not in {RunState.SUSPENDING, RunState.STOPPING}:
-                        owner.state = RunState.STOPPING if owner.final_state else RunState.SUSPENDING
-                        self._record(owner, "QUIESCE_REQUESTED", "stop" if owner.final_state else "preempt_or_pause")
-                    result = self._call(owner, cleanup=True)
-                    owner.reason = result.reason
+                        owner.state = RunState.STOPPING if owner.final_decision else RunState.SUSPENDING
+                        self._record(owner, "QUIESCE_REQUESTED", "stop" if owner.final_decision else "preempt_or_pause")
+                    result = self._cleanup(owner)
                     if result.state == RunState.SUCCEEDED:
                         self._owners.pop(scope, None)
-                        if owner.final_state or self.lifecycle == "stopping":
-                            self._finish(owner, owner.final_state or RunState.CANCELLED, result.reason)
+                        if owner.final_decision is not None:
+                            self._finish(owner, owner.final_decision)
                         else:
                             owner.state = RunState.SUSPENDED
                             # A new process must reassess current state after resumption.
@@ -184,26 +185,25 @@ class TaskOrchestrator:
                 try:
                     owner.process = self._bindings[owner.task_id].factory()
                 except Exception as exc:
-                    self._finish(owner, RunState.FAILED, f"component_creation_failed: {exc}")
+                    self._finish(owner, Decision(RunState.FAILED, f"component_creation_failed: {exc}"))
                     continue
                 self._epoch += 1
                 owner.owner_epoch = self._epoch
                 owner.state = RunState.RUNNING
+                owner.cleanup_decision = None
                 self._owners[scope] = owner.run_id
                 self._record(owner, "ADMITTED", "priority_and_scope", {"epoch": owner.owner_epoch})
             if owner is not None and not self.paused:
                 result = self._call(owner)
                 if result.state in TERMINAL:
                     # Completion also requires cleanup before releasing responsibility.
-                    owner.final_state = result.state
-                    owner.reason = result.reason
-                    cleaned = self._call(owner, cleanup=True)
+                    final = self._request_finish(owner, result)
+                    cleaned = self._cleanup(owner)
                     if cleaned.state == RunState.SUCCEEDED:
                         self._owners.pop(scope, None)
-                        self._finish(owner, result.state, result.reason, result.evidence)
+                        self._finish(owner, final)
                     else:
                         owner.state = RunState.STOPPING
-                        self._record(owner, "WAITING_CLEANUP", cleaned.reason)
                 else:
                     if owner.state != result.state or owner.reason != result.reason:
                         self._record(owner, "PROGRESS", result.reason, result.evidence)
@@ -221,10 +221,32 @@ class TaskOrchestrator:
             return Decision(RunState.WAITING if cleanup else RunState.FAILED,
                             f"{type(exc).__name__}: {exc}")
 
-    def _finish(self, run: TaskRun, state: RunState, reason: str, evidence=None) -> None:
-        run.state, run.reason = state, reason
-        self._record(run, "TERMINATED", reason, {"state": state.value, **(evidence or {})})
-        if run.task_id == self._bootstrap_id and state == RunState.SUCCEEDED:
+    def _request_finish(self, run: TaskRun, result: Decision) -> Decision:
+        # Latch the complete outcome before cleanup can mutate component state.
+        # A later deadline/control request cannot rewrite an already decided result.
+        if run.final_decision is None:
+            if result.state not in TERMINAL:
+                raise ValueError("final decision must have a terminal state")
+            run.final_decision = Decision(result.state, result.reason, deepcopy(dict(result.evidence)))
+            self._record(run, "OUTCOME_DECIDED", result.reason,
+                         {**run.final_decision.evidence, "state": result.state.value})
+        return run.final_decision
+
+    def _cleanup(self, run: TaskRun) -> Decision:
+        result = self._call(run, cleanup=True)
+        if run.cleanup_decision != result:
+            run.cleanup_decision = Decision(result.state, result.reason, deepcopy(dict(result.evidence)))
+            action = "CLEANUP_COMPLETED" if result.state == RunState.SUCCEEDED else "WAITING_CLEANUP"
+            self._record(run, action, result.reason, {**result.evidence, "state": result.state.value})
+        run.reason = result.reason
+        return result
+
+    def _finish(self, run: TaskRun, result: Decision) -> None:
+        final = self._request_finish(run, result)
+        run.state, run.reason = final.state, final.reason
+        self._record(run, "TERMINATED", final.reason, {**final.evidence, "state": final.state.value})
+        if (run.task_id == self._bootstrap_id and final.state == RunState.SUCCEEDED
+                and self.lifecycle == "initializing"):
             self.lifecycle = "ready"
 
     def set_enabled(self, task_id: str, enabled: bool) -> None:
@@ -240,7 +262,7 @@ class TaskOrchestrator:
             if not enabled:
                 for run in self._runs.values():
                     if run.task_id == task_id and run.state in {RunState.QUEUED, RunState.SUSPENDED}:
-                        self._finish(run, RunState.CANCELLED, "definition_disabled")
+                        self._finish(run, Decision(RunState.CANCELLED, "definition_disabled"))
 
     def reevaluate(self) -> None:
         with self._lock:
@@ -253,9 +275,9 @@ class TaskOrchestrator:
             if run.state in TERMINAL:
                 return
             if run.run_id in self._owners.values():
-                run.final_state = RunState.CANCELLED
+                self._request_finish(run, Decision(RunState.CANCELLED, "cancelled"))
             else:
-                self._finish(run, RunState.CANCELLED, "cancelled")
+                self._finish(run, Decision(RunState.CANCELLED, "cancelled"))
 
     def stop(self) -> None:
         with self._lock:
@@ -263,9 +285,9 @@ class TaskOrchestrator:
             for run in self._runs.values():
                 if run.state not in TERMINAL:
                     if run.run_id in self._owners.values():
-                        run.final_state = RunState.CANCELLED
+                        self._request_finish(run, Decision(RunState.CANCELLED, "shutdown"))
                     else:
-                        self._finish(run, RunState.CANCELLED, "shutdown")
+                        self._finish(run, Decision(RunState.CANCELLED, "shutdown"))
 
     def owns(self, context: TaskContext, scope: str = "default") -> bool:
         with self._lock:
@@ -284,8 +306,18 @@ class TaskOrchestrator:
                     "tasks": {k: {"enabled": b.spec.enabled, "priority": b.spec.priority,
                                   "next_evaluation_ns": b.next_ns} for k, b in self._bindings.items()},
                     "runs": [{"run_id": r.run_id, "task_id": r.task_id, "state": r.state.value,
-                              "reason": r.reason, "epoch": r.owner_epoch} for r in self._runs.values()],
+                              "reason": r.reason, "epoch": r.owner_epoch,
+                              "final_result": self._decision_snapshot(r.final_decision),
+                              "cleanup_result": self._decision_snapshot(r.cleanup_decision)}
+                             for r in self._runs.values()],
                     "statistics": dict(self.statistics)}
+
+    @staticmethod
+    def _decision_snapshot(result: Decision | None) -> dict | None:
+        if result is None:
+            return None
+        return {"state": result.state.value, "reason": result.reason,
+                "evidence": deepcopy(dict(result.evidence))}
 
     def actions(self, *, after_sequence: int = 0, limit: int = 100) -> list[dict]:
         if after_sequence < 0 or not 1 <= limit <= 1000:
