@@ -1504,9 +1504,20 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             | {holding.instrument_id for holding in current_holdings},
         )
         total_asset = float(self._portfolio_value())
-        holdings_value = sum(
-            holding.quantity * holding.price for holding in current_holdings
-        )
+        # The sizing basis includes every actual holding, before local exclusions
+        # or sellable-quantity reductions applied to current_holdings.
+        holdings_value = 0.0
+        for instrument_id, quantity in self._held_quantities().items():
+            price = open_prices.get(instrument_id)
+            if price is None:
+                price, _ = self._open_price_with_source(
+                    instrument_id, planning_context=planning_context,
+                )
+            if price is None or not math.isfinite(price) or price <= 0:
+                raise ValueError(
+                    f"Planning requires a valid price to value holding {instrument_id}",
+                )
+            holdings_value += quantity * price
         if self._account_id_equals(86904088000):
             investable_asset = float(holdings_value * 1.01)
         else:

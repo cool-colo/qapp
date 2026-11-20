@@ -235,7 +235,7 @@ def main() -> None:
         node.dispose()
         return
     try:
-        node.run()
+        node.run(raise_exception=True)
     finally:
         if control_server is not None:
             control_server.stop()
