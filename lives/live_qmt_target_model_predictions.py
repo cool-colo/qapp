@@ -262,11 +262,12 @@ def _add_snapshot_recorder(
     strategy.configure_today_fills_loader(lambda trading_date: writer.load_strategy_today_fills(
         str(args.account_id), str(args.trader_id), trading_date, str(strategy.id)))
     strategy.refresh_today_fills(archive_day)
-    strategy.replanning.day = archive_day
-    strategy.replanning.counts.update(writer.restore_planning_state(
-        str(args.account_id), str(args.trader_id), archive_day))
-    strategy.replanning.last = writer.load_latest_planning_attempt(
-        str(args.account_id), str(args.trader_id), archive_day)
+    if strategy.orchestration is None:
+        strategy.replanning.day = archive_day
+        strategy.replanning.counts.update(writer.restore_planning_state(
+            str(args.account_id), str(args.trader_id), archive_day))
+        strategy.replanning.last = writer.load_latest_planning_attempt(
+            str(args.account_id), str(args.trader_id), archive_day)
     node.trader.add_actor(recorder)
     _emit_snapshot_status(
         node,

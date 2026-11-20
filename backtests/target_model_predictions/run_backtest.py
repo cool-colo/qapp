@@ -841,6 +841,7 @@ def build_engine(
             trailing_take_profit_start=params.trailing_take_profit_start,
             auto_replan_enabled=params.auto_replan_enabled,
             scheduled_replan_times=params.scheduled_replan_times,
+            task_orchestration_config=params.task_orchestration_config,
             min_listed_days=params.min_listed_days,
             initial_cash=args.starting_cash,
             timezone_name=args.exchange_timezone,

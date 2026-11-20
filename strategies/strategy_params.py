@@ -56,6 +56,7 @@ class StrategyParams:
     trailing_take_profit_start: float = 0.0
     auto_replan_enabled: bool = True
     scheduled_replan_times: tuple[str, ...] = ()
+    task_orchestration_config: str = ""
     min_listed_days: int = 120
     consecutive_up_limit_days: int = 3
     max_open_gap_up: float = 0.05

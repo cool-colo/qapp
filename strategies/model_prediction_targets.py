@@ -47,6 +47,7 @@ from strategies.target_quantities import TargetQuantityStrategy
 from strategies.target_quantities import TargetQuantityStrategyConfig
 from strategies.target_quantities import TickSnapshot
 from strategies.target_quantities import bar_date
+from trading_orchestration.adapters.orchestrated_strategy_mixin import OrchestratedStrategyMixin
 
 
 class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only=True, frozen=True):
@@ -83,9 +84,10 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     process_targets_interval_secs: float = 2.0
     auto_replan_enabled: bool = True
     scheduled_replan_times: tuple[str, ...] = ()
+    task_orchestration_config: str = ""
 
 
-class TargetModelPredictionsStrategy(TargetQuantityStrategy):
+class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantityStrategy):
     """
     Model-prediction target provider using the reusable target-quantity executor.
 
@@ -98,6 +100,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
     _PRICE_COMPARISON_TOLERANCE = PRICE_COMPARISON_TOLERANCE
 
     def __init__(self, config: TargetModelPredictionsStrategyConfig) -> None:
+        self.orchestration = None
         super().__init__(config)
         self._auction_replay_model = None
         self._auction_planning_contexts: dict[date, ModelTargetPlanningContext] = {}
@@ -154,6 +157,10 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self._committed_plan_loader = None
         self._latest_planning_inputs: dict[str, Any] = {}
         self.planning_attempts: dict[str, dict[str, Any]] = {}
+        if config.task_orchestration_config:
+            from trading_orchestration.configuration.orchestration_config import OrchestrationConfig
+            from trading_orchestration.adapters.strategy_bridge import StrategyBridge
+            self.orchestration = StrategyBridge(self, OrchestrationConfig.load(config.task_orchestration_config))
 
     def configure_planning_archive(self, persister, loader=None) -> None:
         self._planning_attempt_persister = persister
@@ -168,6 +175,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         self.planning_attempts[attempt.request_id] = attempt.payload(plan)
 
     def accept_model_target_plan(self, plan: ModelTargetPlan, *, bypass_pause: bool = False) -> None:
+        self.trading_state.planned_models[self._plan_version(plan)] = plan
         self.update_target_quantities(self._target_quantities_from_plan(plan),
                                       target_date=plan.trading_date, reason=plan.reason,
                                       version=self._plan_version(plan), signal_date=plan.signal_date,
@@ -177,6 +185,13 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         return ConvergenceTrigger.TIMER
 
     def request_replanning(self) -> str:
+        if self.orchestration is not None:
+            from strategies.replan_triggers import ExecutionWindowReplanValidity
+            validity = ExecutionWindowReplanValidity()
+            if not validity.allows(self, self._clock_date(), starting=True):
+                raise ValueError("manual replanning requires execution and cancellation windows")
+            return self.orchestration.request("manual_replan", validity,
+                                              expires_ns=self.orchestration.deadline())
         return self.replanning.request("manual")
 
     def automatic_replanning_allowed(self) -> bool:
@@ -187,6 +202,10 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 and self._target_reason not in (SELL_REASON, SELL_ALL_REASON))
 
     def check_replanning_trigger(self, trading_date: date) -> bool:
+        if self.orchestration is not None:
+            if not self.orchestration.driving:
+                self.orchestration.wake()
+            return False
         coordinator = self.replanning
         with self._trading_action_lock:
             if (coordinator.initial_in_progress or not self.automatic_replanning_allowed()
@@ -200,6 +219,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
 
     def submit_automatic_replanning(self, triggers, validity: ReplanValidity) -> str | None:
         """All automatic trigger policies enter the same order/planning coordinator."""
+        if self.orchestration is not None:
+            return self.orchestration.request("scheduled_replan", validity, key=repr(triggers),
+                                              expires_ns=self.orchestration.deadline())
         try:
             return self.replanning.request("automatic", triggers, validity=validity)
         except ReplanningBusyError:
@@ -212,6 +234,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         return self._scheduled_replan_triggers.state()
 
     def on_stop(self) -> None:
+        if self.orchestration is not None:
+            self.orchestration.stop()
         self.replanning.stopped = True
         self._scheduled_replan_triggers.stop()
         if "MODEL-REPLAN-STEP" in self.clock.timer_names:
@@ -389,6 +413,8 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         super().on_start()
         self._start_process_targets_timer()
         self._scheduled_replan_triggers.start()
+        if self.orchestration is not None:
+            self.orchestration.start()
 
     def _start_process_targets_timer(self) -> None:
         interval_secs = float(self.config.process_targets_interval_secs)
@@ -409,6 +435,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         if self._replanning_blocked or self._target_updates_paused:
             return False
         if trading_date in self._processed_dates:
+            return False
+        if self.orchestration is not None and not self.orchestration.driving:
+            self.orchestration.request("daily_planning", expires_ns=self.orchestration.deadline())
             return False
         if self._process_trading_day(trading_date) is False:
             return False
@@ -463,6 +492,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         An empty committed plan has no projection rows but is still a saved target.
         Daily and auction planning must make the same distinction.
         """
+        if self.orchestration is not None:
+            # Bootstrap is the only archive-loading owner in orchestration mode.
+            return self._target_date == trading_date and bool(self._target_version)
         if self._committed_plan_loader is not None:
             archived = self._committed_plan_loader(trading_date)
             if archived is not None:
@@ -482,6 +514,11 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
         return False
 
     def restore_committed_plan(self, trading_date: date, archived: dict[str, Any]) -> None:
+        if self.orchestration is not None:
+            from trading_orchestration.adapters.plan_archive_adapter import plan_from_archive
+            model = plan_from_archive(archived)
+            if model is not None:
+                self.trading_state.planned_models[archived["version"]] = model
         self._roll_trading_day(trading_date)
         for iid, extra in archived.get("target_extra", {}).items():
             if extra.get("execution_phase") == "opening_auction":
@@ -744,6 +781,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
                 or trading_date in self._auction_snapshot_failed_dates
                 or self._trading_paused or self._target_updates_paused):
             return
+        if self.orchestration is not None and not self.orchestration.driving:
+            self.orchestration.request("auction_planning", expires_ns=self.orchestration.deadline(auction=True))
+            return
         self._roll_trading_day(trading_date)
         if self._awaiting_pre_open_reconcile():
             self.log.warning("Opening auction skipped: pre-open reconciliation is pending")
@@ -792,6 +832,9 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
 
     def process_opening_auction_execution(self) -> None:
         """Submit fixed targets only after the execution phase's fresh snapshot."""
+        if self.orchestration is not None and not self.orchestration.driving:
+            self.orchestration.request("auction_execution", expires_ns=self.orchestration.deadline(auction=True))
+            return
         trading_date = self._clock_date()
         if (not self._within_auction_submit_time() or trading_date not in self._trading_dates
                 or trading_date in self._auction_snapshot_failed_dates
@@ -824,6 +867,7 @@ class TargetModelPredictionsStrategy(TargetQuantityStrategy):
             plan = self._compute_daily_target_plan(trading_date, planning_context=planning_context)
             if plan is not None:
                 plan = dataclasses.replace(plan, parent_version=parent_version)
+                self.trading_state.planned_models[self._plan_version(plan)] = plan
             if plan is None:
                 self.archive_planning_attempt(PlanningAttempt(
                     uuid4().hex, trading_date, "initial", self._target_version,

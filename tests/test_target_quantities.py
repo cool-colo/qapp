@@ -397,6 +397,7 @@ class TestableTargetQuantityStrategy:
     _pricer_for_side = TargetQuantityStrategy._pricer_for_side
     _limit_price = TargetQuantityStrategy._limit_price
     _execution_book_validation = TargetQuantityStrategy._execution_book_validation
+    execution_book_windows = TargetQuantityStrategy.execution_book_windows
     _build_price_context = TargetQuantityStrategy._build_price_context
     _quote_snapshot = TargetQuantityStrategy._quote_snapshot
     _book_snapshot = TargetQuantityStrategy._book_snapshot

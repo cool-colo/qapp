@@ -881,6 +881,13 @@ class SnapshotRecorder(Actor):
         asset_id: int | None,
         on_complete: SyncTaskCallback | None = None,
     ) -> None:
+        if self._strategy.orchestration is not None:
+            # Bootstrap owns archive loading; all new planning uses the same gate.
+            run_id = self._strategy.orchestration.request(
+                "daily_planning", expires_ns=self._strategy.orchestration.deadline())
+            if on_complete is not None:
+                on_complete("skipped", 0, {"reason": "delegated to task orchestration", "run_id": run_id})
+            return
         if trading_date in self._applied_target_dates:
             if on_complete is not None:
                 on_complete("skipped", 0, {"reason": "already applied in this process"})

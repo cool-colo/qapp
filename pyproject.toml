@@ -43,5 +43,5 @@ all = ["pymysql", "sqlalchemy", "prometheus_client", "fastapi", "uvicorn[standar
 # (e.g. `python -m backtests.model_predictions.run_backtest`), so the trading
 # packages and their subpackages must be importable as top-level packages. There
 # is no src/ layout. logs/, output/, and monitoring/ are not import packages.
-include = ["backtests*", "lives*", "strategies*", "web*"]
+include = ["backtests*", "lives*", "strategies*", "web*", "task_orchestration*", "trading_orchestration*"]
 exclude = ["logs*", "output*", "monitoring*"]

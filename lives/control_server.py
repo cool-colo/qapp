@@ -1057,6 +1057,19 @@ class LiveControlServer:
                         )
                     elif path == "/control/state":
                         self._send(200, server._control_state())
+                    elif path == "/scheduler/state":
+                        bridge = server._strategy.orchestration
+                        self._send(200, {"enabled": False} if bridge is None else bridge.state())
+                    elif path == "/scheduler/commands":
+                        bridge = server._strategy.orchestration
+                        self._send(200, {} if bridge is None else bridge.control_results())
+                    elif path == "/scheduler/actions":
+                        bridge = server._strategy.orchestration
+                        query = parse_qs(parsed.query)
+                        records = [] if bridge is None else bridge.engine.actions(
+                            after_sequence=int(query.get("after_sequence", ["0"])[0]),
+                            limit=int(query.get("limit", ["100"])[0]))
+                        self._send(200, {"actions": records})
                     elif path == "/strategy/info":
                         self._send(200, server._strategy_info_payload())
                     elif path == "/strategy/signals":
@@ -1101,13 +1114,20 @@ class LiveControlServer:
                         "/control/sell_all",
                         "/control/replan",
                         "/control/auto_replan",
+                        "/scheduler/control",
                     ):
                         self._send(404, {"error": "not found", "path": self.path})
                         return
                     if not self._require_token():
                         return
                     body = self._read_body()
-                    if path == "/control/replan":
+                    if path == "/scheduler/control":
+                        bridge = server._strategy.orchestration
+                        if bridge is None:
+                            raise ValueError("task orchestration is not configured")
+                        command_id = bridge.submit_control(body.get("action"), body.get("arguments", {}))
+                        self._send(202, {"command_id": command_id, "status": "accepted"})
+                    elif path == "/control/replan":
                         request_id = server._strategy.request_replanning()
                         server._append_action("replan", {"request_id": request_id}, "accepted")
                         self._send(202, {"ok": True, "request_id": request_id})

@@ -1,0 +1,35 @@
+# Opt in by setting task_orchestration_config: configs/task_orchestration.yaml
+# in the existing strategy YAML. All values below are process-local configuration.
+schema_version: 1
+poll_interval_secs: 0.5
+
+exposure_components:
+  assessor: position_ratio
+  planner: remaining_target
+  executor: nautilus_exposure
+  stabilizer: cancel_reconcile
+  risk_planner: risk_manager
+  validator: formal_remainder
+  outcome: capacity_replan
+
+exposure:
+  enabled: true
+  tolerance: "0.05"  # percentage points, inclusive completion boundary
+  windows: "09:30-11:30,13:00-14:56"
+  interval_secs: 1.0
+  priority: 300
+  commission_rate: "0.000085"
+  minimum_fee: "5"
+  quote_max_age_secs: 4.0
+
+tasks:
+  daily_planning: {priority: 100}
+  auction_planning: {priority: 100}
+  auction_execution: {priority: 100}
+  normal_execution: {priority: 100}
+  scheduled_replan: {priority: 200}
+  price_limit_replan: {priority: 200}
+  exposure_correction: {priority: 300}
+  manual_replan: {priority: 500}
+  manual_execution: {priority: 500}
+

@@ -61,6 +61,8 @@ from strategies.pricing import PriceContext
 from strategies.pricing import SameSideBestBuyPriceStrategy
 from strategies.pricing import SameSideBestSellPriceStrategy
 from strategies.trading_control import TradingController
+from trading_orchestration.contexts.trading_state import TradingState
+from trading_orchestration.contexts.target_state_owner import TargetStateOwner
 
 # QMT repurposes the full-tick ``open_int`` field as a real-time market-status code
 # (the ISO-10383-style trading-phase state machine). Map each known code to a
@@ -474,7 +476,7 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     whole_market_final_refresh_time: str | None = "15:01"
 
 
-class TargetQuantityStrategy(Strategy):
+class TargetQuantityStrategy(TargetStateOwner, Strategy):
     """
     Nautilus-first target-quantity executor.
 
@@ -509,6 +511,7 @@ class TargetQuantityStrategy(Strategy):
     }
 
     def __init__(self, config: TargetQuantityStrategyConfig) -> None:
+        self.trading_state = TradingState()
         super().__init__(config)
         validate_cancel_config(config)
         validate_auction_config(config)
@@ -4613,6 +4616,10 @@ class TargetQuantityStrategy(Strategy):
             raw = max(raw, down_limit)
         return instrument.make_price(raw)
 
+    def execution_book_windows(self) -> str:
+        """Submission quote window of the active execution profile."""
+        return self.config.exchange_execution_windows
+
     def _execution_book_validation(
         self,
         ctx: PriceContext,
@@ -4639,7 +4646,7 @@ class TargetQuantityStrategy(Strategy):
         if for_cancel:
             if not self._within_cancel_window(ts_event):
                 return (False, "outside_cancel_window", None)
-        elif self._time_window_index(event_time.time(), self.config.exchange_execution_windows) is None:
+        elif self._time_window_index(event_time.time(), self.execution_book_windows()) is None:
             return (False, "outside_execution_window", None)
 
         now_ns = int(self.clock.timestamp_ns())
