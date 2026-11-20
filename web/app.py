@@ -494,6 +494,7 @@ def get_returns(
     try:
         rows = query_returns(
             mysql,
+            data.clickhouse,
             account_id=account,
             trader_id=trader,
             start_date=start,
