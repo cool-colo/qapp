@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import PropertyMock
 from unittest.mock import call
+from unittest.mock import create_autospec
 from unittest.mock import patch
 
 import pandas as pd
@@ -59,6 +60,7 @@ from strategies.target_quantities import TargetQuantityStrategy
 from strategies.target_quantities import TickSnapshot
 from strategies.strategy_params import StrategyParams
 from strategies.replanning import PlanningAttempt
+from trading_orchestration.services.whole_market_snapshot import WholeMarketSnapshotService
 
 
 class TargetLiveConfigTest(unittest.TestCase):
@@ -1591,10 +1593,11 @@ class TargetLiveConfigTest(unittest.TestCase):
 
     def test_whole_market_after_close_uses_final_success_without_refetch(self) -> None:
         trading_date = date(2026, 7, 8)
+        snapshots = create_autospec(WholeMarketSnapshotService, instance=True, spec_set=True)
+        snapshots.final_refresh_succeeded.return_value = True
         strategy = SimpleNamespace(
             config=SimpleNamespace(whole_market_full_tick_enabled=True),
-            market_snapshots=SimpleNamespace(final_refresh_succeeded=MagicMock(return_value=True),
-            refresh=MagicMock()),
+            market_snapshots=snapshots,
         )
         recorder = SimpleNamespace(
             _strategy=strategy,
@@ -1615,15 +1618,15 @@ class TargetLiveConfigTest(unittest.TestCase):
 
     def test_whole_market_after_close_refetches_before_export(self) -> None:
         trading_date = date(2026, 7, 8)
+        snapshots = create_autospec(WholeMarketSnapshotService, instance=True, spec_set=True)
+        snapshots.final_refresh_succeeded.return_value = False
+        snapshots.refresh.side_effect = lambda reason, on_complete: on_complete(
+            "success",
+            {"instruments": 2, "error": None},
+        )
         strategy = SimpleNamespace(
             config=SimpleNamespace(whole_market_full_tick_enabled=True),
-            market_snapshots=SimpleNamespace(final_refresh_succeeded=MagicMock(return_value=False),
-            refresh=MagicMock(
-                side_effect=lambda trigger, on_complete: on_complete(
-                    "success",
-                    {"instruments": 2, "error": None},
-                ),
-            )),
+            market_snapshots=snapshots,
         )
         recorder = SimpleNamespace(
             _strategy=strategy,
@@ -1636,7 +1639,10 @@ class TargetLiveConfigTest(unittest.TestCase):
             trading_date,
         )
 
-        strategy.market_snapshots.refresh.assert_called_once()
+        strategy.market_snapshots.refresh.assert_called_once_with(
+            reason="after_trading_final",
+            on_complete=unittest.mock.ANY,
+        )
         recorder._record_whole_market_ticks.assert_called_once_with(
             trading_date,
             on_complete=None,
@@ -1644,15 +1650,15 @@ class TargetLiveConfigTest(unittest.TestCase):
 
     def test_whole_market_after_close_skips_export_when_final_refetch_fails(self) -> None:
         trading_date = date(2026, 7, 8)
+        snapshots = create_autospec(WholeMarketSnapshotService, instance=True, spec_set=True)
+        snapshots.final_refresh_succeeded.return_value = False
+        snapshots.refresh.side_effect = lambda reason, on_complete: on_complete(
+            "failed",
+            {"instruments": 0, "error": "rpc timeout"},
+        )
         strategy = SimpleNamespace(
             config=SimpleNamespace(whole_market_full_tick_enabled=True),
-            market_snapshots=SimpleNamespace(final_refresh_succeeded=MagicMock(return_value=False),
-            refresh=MagicMock(
-                side_effect=lambda trigger, on_complete: on_complete(
-                    "failed",
-                    {"instruments": 0, "error": "rpc timeout"},
-                ),
-            )),
+            market_snapshots=snapshots,
         )
         recorder = SimpleNamespace(
             _strategy=strategy,
@@ -1667,6 +1673,10 @@ class TargetLiveConfigTest(unittest.TestCase):
             on_complete=completed,
         )
 
+        snapshots.refresh.assert_called_once_with(
+            reason="after_trading_final",
+            on_complete=unittest.mock.ANY,
+        )
         recorder._record_whole_market_ticks.assert_not_called()
         completed.assert_called_once_with("failed", 0, {"error": "rpc timeout"})
 

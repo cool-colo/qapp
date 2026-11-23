@@ -596,7 +596,7 @@ class SnapshotRecorder(Actor):
 
         try:
             self._strategy.market_snapshots.refresh(
-                trigger="after_trading_final",
+                reason="after_trading_final",
                 on_complete=_on_refresh_complete,
             )
         except Exception as exc:

@@ -48,6 +48,12 @@ class HoldingExclusionTest(unittest.TestCase):
             _log_missing_exit_open_price = TargetModelPredictionsStrategy._log_missing_exit_open_price
             _update_trailing_state = TargetModelPredictionsStrategy._update_trailing_state
             _record_signal = TargetModelPredictionsStrategy._record_signal
+            _prev_trading_close = TargetModelPredictionsStrategy._prev_trading_close
+            _adjusted_close = TargetModelPredictionsStrategy._adjusted_close
+            _adjusted_entry_cost = TargetModelPredictionsStrategy._adjusted_entry_cost
+            _adj_factor = TargetModelPredictionsStrategy._adj_factor
+            _stop_cost_ratio = TargetModelPredictionsStrategy._stop_cost_ratio
+            _log_stop_loss_shadow = TargetModelPredictionsStrategy._log_stop_loss_shadow
 
         strategy = HoldingStub()
         strategy.config = SimpleNamespace(
@@ -63,6 +69,13 @@ class HoldingExclusionTest(unittest.TestCase):
         strategy._instrument_by_stock = {"000001.SZ": InstrumentId.from_str("000001.SZ.QMT")}
         strategy._st_by_date = st_by_date or {}
         strategy._suspended_by_date = suspended_by_date or {}
+        strategy._trading_dates = [date(2026, 7, 1), date(2026, 7, 7), date(2026, 7, 8)]
+        strategy._daily_stock_data = index_daily_stock_data([
+            DailyStockData("000001.SZ", day, close=last_close.get("000001.SZ.QMT"), adj_factor=1.0)
+            for day in strategy._trading_dates
+        ])
+        strategy._divid_events_loader = None
+        strategy._entry_cost_adjust_warnings = set()
         strategy.signal_events = []
         return strategy
 
@@ -86,6 +99,7 @@ class HoldingExclusionTest(unittest.TestCase):
             signal_date=date(2026, 7, 7),
             instrument_id=instrument_id,
             exit_rank=1,
+            span_start_date=date(2026, 7, 1),
         )
 
         self.assertEqual(reason, "stop_triggered")
@@ -114,6 +128,7 @@ class HoldingExclusionTest(unittest.TestCase):
             signal_date=date(2026, 7, 7),
             instrument_id=instrument_id,
             exit_rank=1,
+            span_start_date=date(2026, 7, 1),
         )
 
         self.assertEqual(reason, "stop_triggered")
@@ -145,6 +160,7 @@ class HoldingExclusionTest(unittest.TestCase):
             signal_date=date(2026, 7, 7),
             instrument_id=instrument_id,
             exit_rank=1,
+            span_start_date=date(2026, 7, 1),
         )
 
         self.assertIsNone(reason)
@@ -171,6 +187,7 @@ class HoldingExclusionTest(unittest.TestCase):
             signal_date=date(2026, 7, 7),
             instrument_id=instrument_id,
             exit_rank=1,
+            span_start_date=date(2026, 7, 1),
         )
 
         self.assertEqual(reason, "suspended")
@@ -188,6 +205,10 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
             _today_open_price = TargetModelPredictionsStrategy._today_open_price
             _open_price_with_source = TargetModelPredictionsStrategy._open_price_with_source
             _is_suspended_status = TargetModelPredictionsStrategy._is_suspended_status
+            _position_span_start_dates = TargetModelPredictionsStrategy._position_span_start_dates
+            _raise_high_price_to_span_peak = TargetModelPredictionsStrategy._raise_high_price_to_span_peak
+            _highest_close_over_span = TargetModelPredictionsStrategy._highest_close_over_span
+            _planning_permissions = TargetModelPredictionsStrategy._planning_permissions
 
         strategy = HoldingStub()
         strategy.log = MagicMock()
@@ -196,6 +217,8 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         strategy._signals_by_date = {}
         strategy._prediction_ranks_by_date = {}
         strategy._recent_target_loader = None
+        strategy._position_span_start_loader = None
+        strategy.config = SimpleNamespace(trailing_take_profit_start=0.15)
         strategy._market_status = {}
         strategy._last_close = {}
         strategy._suspended_by_date = {}
@@ -207,6 +230,9 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         strategy._held_instrument_ids = MagicMock(return_value={"000157.SZ.QMT"})
         strategy._current_quantity = MagicMock(return_value=100)
         strategy._holding_exclusion = MagicMock(return_value=None)
+        strategy.planning_today_fills = MagicMock(return_value=(0, 0))
+        strategy.planning_sellable_quantity = MagicMock(return_value=100)
+        strategy._price_limits = MagicMock(return_value=(None, None))
         strategy._log_missing_new_entry_open_price = MagicMock()
         return strategy
 
@@ -344,7 +370,7 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
     def test_triggered_holding_is_removed_and_collected_for_authority_decision(self) -> None:
         strategy = self._make_stub()
         strategy._holding_exclusion = MagicMock(return_value="stop_triggered")
-        forced_exits: dict[str, str] = {}
+        forced_exits: dict[str, ForcedExit] = {}
 
         holdings = strategy._build_current_holdings(
             date(2026, 7, 23),
@@ -354,7 +380,7 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
         )
 
         self.assertEqual(holdings, [])
-        self.assertEqual(forced_exits, {"000157.SZ.QMT": "stop_triggered"})
+        self.assertEqual(forced_exits, {"000157.SZ.QMT": ForcedExit("stop_triggered", 0)})
 
     def test_recent_target_cutoff_window_defaults_to_90(self) -> None:
         strategy = self._make_stub()
@@ -451,6 +477,7 @@ class AnnotatePlanTest(unittest.TestCase):
             _annotate_plan = TargetModelPredictionsStrategy._annotate_plan
             _open_price_with_source = TargetModelPredictionsStrategy._open_price_with_source
             _market_status_for = TargetModelPredictionsStrategy._market_status_for
+            _today_open_price = TargetModelPredictionsStrategy._today_open_price
 
         strategy = AnnotateStub()
         strategy._today_open = {"000001.SZ.QMT": 10.1}

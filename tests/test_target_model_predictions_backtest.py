@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -246,6 +248,22 @@ class BacktestPlanningEventTest(unittest.TestCase):
     def test_next_planning_event_receives_position_filled_by_prior_execution_bar(
         self,
     ) -> None:
+        directory = self.enterContext(TemporaryDirectory())
+        config = Path(directory) / "strategy.yaml"
+        # Exercise daily inventory carry with one-lot targets. Repository tuning
+        # enables intraday replanning and a CNY 10,000 minimum buy, which are
+        # separate behaviors from this event-ordering regression.
+        config.write_text(
+            "auction_enabled: false\n"
+            "scheduled_replan_times: []\n"
+            "continuous_buy_min_notional: 0\n"
+            "min_listed_days: 0\n"
+            "risk_manager_mode: backtest\n"
+            "risk_manager_base_url: http://127.0.0.1:1\n"
+            "risk_manager_risk_model_id: test\n"
+            "alpha_model_id: test\n",
+            encoding="utf-8",
+        )
         signal_date = date(2026, 7, 7)
         first_trade_date = date(2026, 7, 8)
         second_trade_date = date(2026, 7, 9)
@@ -256,7 +274,7 @@ class BacktestPlanningEventTest(unittest.TestCase):
             ],
         }
         args = SimpleNamespace(
-            config="configs/strategy.yaml",
+            config=str(config),
             tick_file=None,
             tick_table=None,
             start=first_trade_date.isoformat(),
@@ -295,17 +313,9 @@ class BacktestPlanningEventTest(unittest.TestCase):
             selected_rows=2,
         )
         bar_types = {"000001.SZ": build_bar_type("000001.SZ")}
-        with patch.dict(
-            "os.environ",
-            {
-                "TARGET_MODEL_WEIGHT_PLANNER": "risk_manager",
-                "RISK_MANAGER_BASE_URL": "http://127.0.0.1:1",
-                "RISK_MANAGER_RISK_MODEL_ID": "test",
-            },
-        ):
-            engine, strategy, _ = build_engine(
-                args, bundle, bar_types, bars_by_stock, (), auction_enabled=False,
-            )
+        engine, strategy, _ = build_engine(
+            args, bundle, bar_types, bars_by_stock, (), auction_enabled=False,
+        )
 
         class CapturingPlanner:
             def __init__(self) -> None:
@@ -341,6 +351,8 @@ class BacktestPlanningEventTest(unittest.TestCase):
             self.assertEqual(planner.requests[1].current_holdings[0].quantity, 100)
             self.assertFalse(strategy.config.subscribe_bars)
             self.assertFalse(strategy.config.process_targets_on_timer)
+            self.assertEqual(strategy.config.scheduled_replan_times, ())
+            self.assertEqual(strategy.config.continuous_buy_min_notional, Decimal(0))
             self.assertEqual(strategy.config.execution_windows, "14:30-14:55")
         finally:
             engine.dispose()

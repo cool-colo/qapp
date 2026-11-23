@@ -26,15 +26,11 @@ def _event():
     return tracker.finish(timing)
 
 
-def test_convergence_is_one_json_log_line_with_id_and_all_timing_fields():
-    strategy = fixtures.TargetQuantityStrategyTest().make_strategy()
+def test_convergence_payload_serializes_id_and_all_timing_fields():
     event = _event()
-    TargetQuantityStrategy._emit_convergence(strategy, event)
-    messages = [args[0] for args, kwargs in strategy.log.infos if args[0].startswith("live_convergence ")]
-    assert len(messages) == 1
-    assert "\n" not in messages[0]
-    payload = json.loads(messages[0].removeprefix("live_convergence "))
-    assert payload == event.log_payload(str(strategy.id))
+    payload = json.loads(json.dumps(event.log_payload("TEST-STRATEGY")))
+    assert payload == event.log_payload("TEST-STRATEGY")
+    assert payload["strategy_id"] == "TEST-STRATEGY"
     assert payload["trading_date"] == "2026-11-13"
     assert payload["convergence_id"] == event.convergence_id
     assert payload["status"] == "skipped"
@@ -42,16 +38,15 @@ def test_convergence_is_one_json_log_line_with_id_and_all_timing_fields():
     assert all("CREATE TABLE IF NOT EXISTS `live_convergence`" not in sql for sql in CREATE_TABLES_SQL)
 
 
-def test_duplicate_completion_does_not_emit_another_log_line():
-    strategy = fixtures.TargetQuantityStrategyTest().make_strategy()
+def test_duplicate_completion_does_not_create_another_event():
     tracker = ExecutionTiming(lambda: 1_000_000_000)
     timing = tracker.request(date(2026, 11, 13), "timer")
-    TargetQuantityStrategy._emit_convergence(strategy, tracker.finish(timing))
-    TargetQuantityStrategy._emit_convergence(strategy, tracker.finish(timing))
-    assert len(strategy.log.infos) == 1
+    event = tracker.finish(timing)
+    assert event is not None
+    assert tracker.finish(timing) is None
 
 
-def test_log_id_matches_persisted_decision_and_cycle_logging_does_not_enqueue_db_record():
+def test_convergence_id_matches_persisted_decision_and_emission_does_not_enqueue_db_record():
     strategy = fixtures.TargetQuantityStrategyTest().make_strategy()
     strategy._target_quantities = {str(fixtures.INST_A): Decimal(100)}
     strategy._target_version = "V-1"
@@ -74,8 +69,7 @@ def test_log_id_matches_persisted_decision_and_cycle_logging_does_not_enqueue_db
         assert isinstance(record, LiveOrderDecisionRecord)
         TargetQuantityStrategy._emit_convergence(strategy, event)
         decisions.submit.assert_called_once()  # Logging never enters the MySQL queue.
-        message = next(args[0] for args, kwargs in strategy.log.infos if args[0].startswith("live_convergence "))
-        payload = json.loads(message.removeprefix("live_convergence "))
+        payload = event.log_payload(str(strategy.id))
         assert record.context["execution_timing"]["convergence_id"] == payload["convergence_id"]
         submission = payload["context"]["submissions"][0]
         assert submission["decision_id"] == record.decision_id

@@ -281,8 +281,8 @@ class FakeClock:
     def set_time_alert(self, **kwargs) -> None:
         self.time_alerts.append(kwargs)
 
-    def set_timer(self, **kwargs) -> None:
-        self.timers.append(kwargs)
+    def set_timer(self, name, interval, **kwargs) -> None:
+        self.timers.append({"name": name, "interval": interval, **kwargs})
 
 
 class FakeLog:
@@ -1662,14 +1662,19 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(order_context["sellable_source"], "broker_can_use_volume")
         self.assertEqual(order_context["sell_clamp_status"], "clamped")
 
-    def test_live_sizing_prefers_broker_total_asset_over_cash_only_equity(self) -> None:
+    def test_live_sizing_uses_account_components_over_reported_total_and_cash_only_equity(self) -> None:
         strategy = self.make_strategy(
             positions={INST_A: Decimal("143100")},
             equity="3352261.79",
             free_cash="3352261.79",
             prices={INST_A: 3.35},
             open_prices={INST_A: 3.40},
-            account_info={"total_asset": "10007406.36", "available_cash": "3352261.79"},
+            account_info={
+                "total_asset": "11007406.36",
+                "market_value": "6555144.57",
+                "available_cash": "3352261.79",
+                "frozen_cash": "100000.00",
+            },
             order_slice_notional="1000000",
         )
 
@@ -1686,10 +1691,11 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             if "Account sizing snapshot" in args[0]
         ]
         self.assertEqual(len(sizing_logs), 1)
-        self.assertIn("value_source=account_state_info.total_asset", sizing_logs[0])
+        self.assertIn("value_source=market_value+cash+frozen_cash", sizing_logs[0])
         self.assertIn("selected_portfolio_value=10007406.36", sizing_logs[0])
         self.assertIn("nautilus_portfolio_equity=3352261.79", sizing_logs[0])
-        self.assertIn("broker_total_asset=10007406.36", sizing_logs[0])
+        self.assertIn("broker_total_asset_reported=11007406.36", sizing_logs[0])
+        self.assertIn("broker_total_asset_computed=10007406.36", sizing_logs[0])
 
     def test_broker_total_asset_allows_underweight_buy_when_portfolio_equity_is_cash_only(self) -> None:
         strategy = self.make_strategy(
@@ -2638,9 +2644,14 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_whole_market_refresh_continues_after_trading_stop(self) -> None:
         strategy = self.make_strategy()
         strategy.clock.now = pd.Timestamp("2026-07-02 06:56:00", tz="UTC")
+        strategy.market_snapshots.configure_source(lambda: {})
         strategy.market_snapshots.refresh = MagicMock()
+        strategy.market_snapshots.start()
+        timer = next(timer for timer in strategy.clock.timers
+                     if timer["name"] == "WHOLE-MARKET-REFRESH")
+        strategy.market_snapshots.refresh.reset_mock()
 
-        strategy.market_snapshots._periodic()
+        timer["callback"](None)
 
         strategy.market_snapshots.refresh.assert_called_once_with(
             "refresh",
@@ -2723,7 +2734,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         self.assertEqual(strategy._today_open[str(INST_A)], 10.0)
         self.assertEqual(strategy.submitted_orders, [])
 
-    def test_apply_full_tick_logs_complete_first_sorted_record(self) -> None:
+    def test_apply_full_tick_logs_open_count_and_retains_complete_ticks(self) -> None:
         strategy = self.make_strategy(open_prices={})
         strategy._trading_day = date(2026, 7, 2)
         first_fields = {"open": 10.0, "last_price": 10.1, "open_int": 13}
@@ -2737,14 +2748,19 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             "refresh",
         )
 
-        first_record_logs = [
+        open_logs = [
             args[0]
             for args, _kwargs in strategy.log.infos
-            if "first full-tick snapshot record" in args[0]
+            if "applied authoritative opens from full-tick" in args[0]
         ]
-        self.assertEqual(first_record_logs, [
-            f"first full-tick snapshot record (refresh): {(str(INST_A), first_fields)!r}",
+        self.assertEqual(open_logs, [
+            "applied authoritative opens from full-tick (refresh): date=2026-07-02 count=2",
         ])
+        for instrument_id, fields in ((INST_A, first_fields), (INST_B, last_fields)):
+            tick = strategy.tick_snapshot_for(str(instrument_id))
+            self.assertEqual(tick.open, fields["open"])
+            self.assertEqual(tick.last_price, fields["last_price"])
+            self.assertEqual(tick.open_int, fields["open_int"])
 
     def test_full_tick_async_source_runs_without_running_loop(self) -> None:
         strategy = self.make_strategy()

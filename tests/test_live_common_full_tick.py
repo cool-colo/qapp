@@ -7,20 +7,25 @@ import unittest
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 
+from backtests.data_providers.clickhouse import ClickHouseConnectionConfig
+from lives.broker_data_source import QmtBrokerDataSource
 from lives.live_common import LivePredictionDataLoader
 
 
 def _loader() -> LivePredictionDataLoader:
-    # Build without touching ClickHouse: only the full-tick HTTP path is exercised.
-    loader = LivePredictionDataLoader.__new__(LivePredictionDataLoader)
-    loader.args = argparse.Namespace(
+    # Provider construction does not query ClickHouse; broker I/O is mocked below.
+    args = argparse.Namespace(
         base_url_http="http://proxy.local",
         api_key="key",
         account_id="ACC",
         account_type="STOCK",
         clickhouse_timeout_secs=5.0,
     )
-    return loader
+    return LivePredictionDataLoader(
+        args,
+        ClickHouseConnectionConfig(),
+        broker_source=QmtBrokerDataSource(args),
+    )
 
 
 class _Response:
@@ -46,31 +51,31 @@ class FullTickSnapshotTest(unittest.TestCase):
             {"symbol": "999999.SZ", "tick": {"open": 1.0}},  # not requested -> dropped
         ]
         with (
-            patch.object(loader, "_post_full_tick", return_value=payload) as mock_post,
-            self.assertLogs("lives.live_common", level="WARNING") as logs,
+            patch.object(loader._broker_source, "_post_full_tick", return_value=payload) as mock_post,
+            self.assertLogs("lives.broker_data_source", level="WARNING") as logs,
         ):
             snapshot = loader.full_tick_snapshot(["000001.SZ", "000002.SZ"])
 
-        mock_post.assert_called_once()
+        mock_post.assert_called_once_with("http://proxy.local", "key", ["000001.SZ", "000002.SZ"])
         self.assertEqual(snapshot["000001.SZ.QMT"]["open"], 53.09)
         self.assertEqual(snapshot["000001.SZ.QMT"]["last_price"], 54.0)
         self.assertEqual(snapshot["000002.SZ.QMT"]["open"], 20.0)
         self.assertNotIn("999999.SZ.QMT", snapshot)
         self.assertEqual(
             logs.output,
-            ["WARNING:lives.live_common:full-tick snapshot returned unrequested symbol: 999999.SZ"],
+            ["WARNING:lives.broker_data_source:full-tick snapshot returned unrequested symbol: 999999.SZ"],
         )
 
     def test_full_tick_snapshot_empty_inputs(self) -> None:
         loader = _loader()
-        with self.assertLogs("lives.live_common", level="ERROR") as logs:
+        with self.assertLogs("lives.broker_data_source", level="ERROR") as logs:
             self.assertEqual(loader.full_tick_snapshot([]), {})
         self.assertIn("empty stock_codes", logs.output[0])
 
     def test_full_tick_snapshot_requires_base_url(self) -> None:
         loader = _loader()
         loader.args.base_url_http = ""
-        with self.assertLogs("lives.live_common", level="ERROR") as logs:
+        with self.assertLogs("lives.broker_data_source", level="ERROR") as logs:
             self.assertEqual(loader.full_tick_snapshot(["000001.SZ"]), {})
         self.assertIn("base_url_http", logs.output[0])
 
@@ -82,14 +87,14 @@ class FullTickSnapshotTest(unittest.TestCase):
         ]
 
         with (
-            patch.object(loader, "_post_full_tick", return_value=payload),
-            self.assertLogs("lives.live_common", level="WARNING") as logs,
+            patch.object(loader._broker_source, "_post_full_tick", return_value=payload),
+            self.assertLogs("lives.broker_data_source", level="WARNING") as logs,
         ):
             self.assertEqual(loader.full_tick_snapshot(["000001.SZ"]), {})
 
-        self.assertIn("WARNING:lives.live_common:full-tick snapshot returned unrequested symbol: 999999.SZ", logs.output)
+        self.assertIn("WARNING:lives.broker_data_source:full-tick snapshot returned unrequested symbol: 999999.SZ", logs.output)
         self.assertIn(
-            "ERROR:lives.live_common:full-tick snapshot returned unusable tick for 000001.SZ: {'open': None}",
+            "ERROR:lives.broker_data_source:full-tick snapshot returned unusable tick for 000001.SZ: {'open': None}",
             logs.output,
         )
 
@@ -106,11 +111,11 @@ class FullTickSnapshotTest(unittest.TestCase):
             )
 
         with (
-            patch("lives.live_common.urllib.request.urlopen", side_effect=fake_urlopen),
-            patch("lives.live_common.time.sleep") as sleep,
-            self.assertLogs("lives.live_common", level="WARNING") as logs,
+            patch("lives.broker_data_source.urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("lives.broker_data_source.time.sleep") as sleep,
+            self.assertLogs("lives.broker_data_source", level="WARNING") as logs,
         ):
-            rows = loader._post_full_tick("http://proxy.local", "key", ["000001.SZ"])
+            rows = loader._broker_source._post_full_tick("http://proxy.local", "key", ["000001.SZ"])
 
         self.assertEqual(rows, [{"symbol": "000001.SZ", "tick": {"open": 1}}])
         self.assertEqual(len(attempts), 3)
@@ -123,14 +128,14 @@ class FullTickSnapshotTest(unittest.TestCase):
 
         with (
             patch(
-                "lives.live_common.urllib.request.urlopen",
+                "lives.broker_data_source.urllib.request.urlopen",
                 side_effect=urllib.error.URLError("proxy unavailable"),
             ) as urlopen,
-            patch("lives.live_common.time.sleep") as sleep,
-            self.assertLogs("lives.live_common", level="WARNING") as logs,
+            patch("lives.broker_data_source.time.sleep") as sleep,
+            self.assertLogs("lives.broker_data_source", level="WARNING") as logs,
         ):
             with self.assertRaisesRegex(RuntimeError, "after 5 attempts"):
-                loader._post_full_tick("http://proxy.local", "key", ["000001.SZ"])
+                loader._broker_source._post_full_tick("http://proxy.local", "key", ["000001.SZ"])
 
         self.assertEqual(urlopen.call_count, 5)
         self.assertEqual(sleep.call_count, 4)
@@ -148,7 +153,7 @@ class FullTickSnapshotTest(unittest.TestCase):
                 "market_value": "466506.00",
             },
         ]
-        with patch.object(loader, "_fetch_broker_positions", new=AsyncMock(return_value=rows)):
+        with patch.object(loader._broker_source, "_with_broker_session", new=AsyncMock(return_value=rows)):
             snapshot = asyncio.run(loader.broker_position_snapshot())
 
         position = snapshot["000720.SZ.QMT"]
