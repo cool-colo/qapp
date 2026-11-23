@@ -45,7 +45,9 @@ class StrategyParamsBuyMinimumTest(unittest.TestCase):
                 params = StrategyParams.from_yaml(str(path))
                 self.assertEqual(params.auction_min_buy_notional, Decimal(10000))
                 self.assertEqual(params.continuous_buy_min_notional, Decimal(10000))
-                self.assertEqual(params.auction_execution_time, "09:24:50")
+                self.assertEqual(params.auction_execution_time, "09:24:57")
+                self.assertEqual(params.auction_buy_offset_bps, 80.0)
+                self.assertEqual(params.auction_sell_offset_bps, 50.0)
 
     def test_yaml_minimums_are_decimal_and_zero_disables(self):
         with tempfile.TemporaryDirectory() as directory:
