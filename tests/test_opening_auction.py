@@ -145,6 +145,9 @@ def replay_fixture(*, persister=None, final_results=True, continuous=False,
                                for day in ([8, 9] if two_days else [8])
                                for code, price in prices),
         auction_enabled=auction_enabled, subscribe_bars=False, subscribe_quote_ticks=True,
+        # Historical replay scenarios use their original submission time and offsets.
+        auction_execution_time="09:24:50",
+        auction_buy_offset_bps=50.0, auction_sell_offset_bps=50.0,
         auction_min_buy_notional=Decimal(str(auction_min_buy_notional)),
         continuous_buy_min_notional=Decimal(str(continuous_buy_min_notional)),
         price_mismatch_cancel_delay_secs=1 if closing_cancel_time else 30,
