@@ -23,6 +23,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from backtests.result_writers.live_records import AFTER_TRADING
+from backtests.result_writers.live_records import BEFORE_AUCTION
 from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import LiveTargetRecord
@@ -545,6 +546,49 @@ class TargetLiveConfigTest(unittest.TestCase):
             retry_whole_market=False,
         )
 
+    def test_before_auction_timer_is_registered_at_0924(self) -> None:
+        recorder, _ = self.constructed_recorder(MagicMock())
+        with (
+            patch.object(SnapshotRecorder, "_subscribe_order_events"),
+            patch.object(SnapshotRecorder, "_catch_up_on_start"),
+            patch.object(SnapshotRecorder, "_schedule_daily") as schedule,
+        ):
+            recorder.on_start()
+        schedule.assert_any_call(
+            recorder._BEFORE_AUCTION_ALERT, (9, 24), recorder._on_before_auction_timer,
+        )
+
+    def test_before_auction_records_assets_and_positions_only(self) -> None:
+        recorder, strategy = self.constructed_recorder(MagicMock())
+        trading_date = date(2026, 11, 23)
+        strategy._trading_dates = {trading_date}
+        with (
+            patch.object(SnapshotRecorder, "_now", return_value=pd.Timestamp("2026-11-23 09:24", tz="Asia/Shanghai")),
+            patch.object(SnapshotRecorder, "_schedule_daily") as schedule,
+            patch.object(SnapshotRecorder, "_record_asset") as assets,
+            patch.object(SnapshotRecorder, "_record_positions") as positions,
+            patch.object(SnapshotRecorder, "_ensure_daily_target") as targets,
+        ):
+            recorder._on_before_auction_timer(None)
+        schedule.assert_called_once_with(
+            recorder._BEFORE_AUCTION_ALERT, (9, 24), recorder._on_before_auction_timer,
+        )
+        for record in (assets, positions):
+            self.assertEqual(record.call_args.args, (trading_date, BEFORE_AUCTION, "live"))
+            self.assertTrue(callable(record.call_args.kwargs["on_complete"]))
+        targets.assert_not_called()
+
+    def test_before_auction_skips_non_trading_days(self) -> None:
+        recorder, strategy = self.constructed_recorder(MagicMock())
+        strategy._trading_dates = {date(2026, 11, 23)}
+        with (
+            patch.object(SnapshotRecorder, "_now", return_value=pd.Timestamp("2026-11-22 09:24", tz="Asia/Shanghai")),
+            patch.object(SnapshotRecorder, "_schedule_daily"),
+            patch.object(SnapshotRecorder, "_run_before_auction") as record,
+        ):
+            recorder._on_before_auction_timer(None)
+        record.assert_not_called()
+
     def test_snapshot_fixed_timers_enable_per_task_reporting(self) -> None:
         recorder = self._make_snapshot_recorder_stub("2026-07-08 09:27:00")
         recorder._before_time = (9, 27)
@@ -735,8 +779,8 @@ class TargetLiveConfigTest(unittest.TestCase):
             {code: date(2026, 7, 7) for code in ("000001.SZ", "000002.SZ", "000003.SZ")},
         )
 
-    def test_writer_load_before_trading_stock_codes(self) -> None:
-        writer = object.__new__(LiveSnapshotWriter)
+    def test_writer_load_before_auction_stock_codes(self) -> None:
+        writer = LiveSnapshotWriter.for_testing(connection=MagicMock())
         writer._query = MagicMock(
             return_value=[
                 ("000729.SZ",),
@@ -745,7 +789,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             ],
         )
 
-        result = writer.load_before_trading_stock_codes(
+        result = writer.load_before_auction_stock_codes(
             "ACC",
             "TRADER",
             date(2026, 8, 4),
@@ -754,7 +798,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         self.assertEqual(result, ["000001.SZ", "000729.SZ"])
         sql, params = writer._query.call_args.args
         self.assertIn("`live_position_snapshot`", sql)
-        self.assertIn("`snapshot_type`='before_trading'", sql)
+        self.assertIn("`snapshot_type`='before_auction'", sql)
         self.assertEqual(params, ("ACC", "TRADER", date(2026, 8, 4)))
 
     def test_writer_execute_commits_through_pooled_connection(self) -> None:
@@ -1402,7 +1446,7 @@ class TargetLiveConfigTest(unittest.TestCase):
         recorder = SimpleNamespace(
             config=SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER"),
             _writer=SimpleNamespace(
-                load_before_trading_stock_codes=MagicMock(
+                load_before_auction_stock_codes=MagicMock(
                     return_value=["000729.SZ"],
                 ),
             ),
@@ -1418,6 +1462,9 @@ class TargetLiveConfigTest(unittest.TestCase):
 
         SnapshotRecorder._run_after_trading(recorder, trading_date, allow_fallback=False)
 
+        recorder._writer.load_before_auction_stock_codes.assert_called_once_with(
+            "ACC", "TRADER", trading_date,
+        )
         recorder._run_full_tick_fetch.assert_called_once()
         kwargs = recorder._run_full_tick_fetch.call_args.kwargs
         self.assertEqual(kwargs["trigger"], AFTER_TRADING)
@@ -1464,7 +1511,7 @@ class TargetLiveConfigTest(unittest.TestCase):
             ),
         )
         recorder._writer = SimpleNamespace(
-            load_before_trading_stock_codes=MagicMock(
+            load_before_auction_stock_codes=MagicMock(
                 return_value=["000001.SZ"],
             ),
         )

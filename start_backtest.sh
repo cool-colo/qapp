@@ -2,12 +2,13 @@
 
 set -euo pipefail
 
-cd /data/flc/code/quant/qapp
+QAPP_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd -- "${QAPP_ROOT}"
 
 source /home/fanglicheng/miniconda3/etc/profile.d/conda.sh
 conda activate quant
 
-export QMT_LOG_DIRECTORY=/data/flc/code/quant/qapp/logs
+export QMT_LOG_DIRECTORY="${QAPP_ROOT}/logs"
 export QMT_USE_REDIS=1
 export QMT_REDIS_HOST=r-2zekv1mdld2oijmaj5.redis.rds.aliyuncs.com
 export QMT_REDIS_PASSWORD=CUZus#3MdtmNDe@8wm
@@ -33,4 +34,4 @@ exec python backtests/target_model_predictions/run_backtest.py \
 	--report-dir /tmp/qapp_model_report_check \
 	--benchmark-code 399300.SZ \
 	 --predictions-table daily_model_predictions_training_strict_all_gain_stable_top1200_20260802 \
-        --config /data/flc/code/quant/qapp/configs/strategy_86008933.yaml
+        --config "${QAPP_ROOT}/configs/strategy_86008933.yaml"

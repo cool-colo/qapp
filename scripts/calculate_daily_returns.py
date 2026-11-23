@@ -25,11 +25,17 @@ loudly so that a partial/missing snapshot is not silently reported as P&L.
 
 By default, the portfolio ``summary`` uses the change in after-trading net value
 from the previous trading day: ``net value = market_value + cash + frozen_cash``
-from ``live_asset_snapshot``. Its return rate is the change divided by the
-previous net value. If either day's asset snapshot is missing, the summary falls
+from ``live_asset_snapshot``, less recorded cash deposits effective on or before
+each snapshot date. Account 8886569186 deposited CNY 150,000 on 2026-11-19;
+this amount is excluded from that date onward, including the return-rate base.
+Its return rate is the change divided by the previous adjusted net value.
+If either day's asset snapshot is missing, the summary falls
 back to the sum of the per-stock returns above. Pass
 ``--account-return-method positions-and-trades`` to always calculate the summary
 from positions and trades instead.
+
+Prices prefer the day's ``after_trading`` tick snapshot. Stocks absent from that
+snapshot use the same day's ``whole_market`` snapshot, including auction exits.
 
 Usage::
 
@@ -69,6 +75,11 @@ TRADE_CALENDAR_TABLE = "trade_calendar"
 ASSET_SNAPSHOT_METHOD = "asset-snapshot"
 POSITIONS_AND_TRADES_METHOD = "positions-and-trades"
 ACCOUNT_RETURN_METHODS = (ASSET_SNAPSHOT_METHOD, POSITIONS_AND_TRADES_METHOD)
+# Keep deposit adjustments in sync with web/returns_report.py and
+# scripts/weekly_slippage_return_report.sql. Positive amounts are cash inflows.
+ACCOUNT_CASH_DEPOSITS = {
+    "8886569186": ((date(2026, 11, 19), Decimal("150000")),),
+}
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -157,12 +168,20 @@ def _weighted_price(trades: list[dict[str, Any]]) -> tuple[int, Decimal, Decimal
 
 
 def _asset_net_value(row: dict[str, Any]) -> Decimal:
+    """Exclude cash deposits according to the asset snapshot's own date."""
     for column in ("market_value", "cash", "frozen_cash"):
         if row[column] is None:
             raise ValueError(
                 f"missing {column} in after-trading asset snapshot for {row['account_id']}/{row['trader_id']}",
             )
-    return sum((_decimal(row[column]) for column in ("market_value", "cash", "frozen_cash")), ZERO)
+    snapshot_date = date.fromisoformat(str(row["trade_date"]))
+    deposits = sum(
+        (amount for effective_date, amount in ACCOUNT_CASH_DEPOSITS.get(str(row["account_id"]), ())
+         if effective_date <= snapshot_date),
+        ZERO,
+    )
+    net_value = sum((_decimal(row[column]) for column in ("market_value", "cash", "frozen_cash")), ZERO)
+    return net_value - deposits
 
 
 def _local_datetime(value: Any, *, field: str) -> datetime:
@@ -220,7 +239,8 @@ def calculate_records(
 
     This public, pure function is also the calculation boundary for tests and
     makes the financial convention explicit independently of the SQL readers.
-    Before-position snapshots include ``trade_date``
+    Asset snapshots include ``trade_date`` so each endpoint's cash deposits can
+    be excluded independently. Before-position snapshots include ``trade_date``
     and ``write_time``; trades include ``trade_time`` to reconstruct day-start
     quantities without counting opening-auction fills twice.
     """
@@ -521,14 +541,23 @@ def fetch_mysql_inputs(connection, args: argparse.Namespace, trade_date: str) ->
             [trade_date, *scope_params],
         )
         trades = list(cursor.fetchall())
+        # Prefer one complete after-trading row per instrument. Auction exits may
+        # only exist in the same day's whole-market snapshot.
         cursor.execute(
             "SELECT `instrument_id`, `stock_code`, `last_price`, `open`, `last_close` "
             "FROM `live_stock_tick_snapshot` "
-            "WHERE `trade_date` = %s AND `snapshot_type` = 'after_trading'",
-            (trade_date,),
+            "WHERE `trade_date` = %s AND `snapshot_type` = 'after_trading' "
+            "UNION ALL "
+            "SELECT w.`instrument_id`, w.`stock_code`, w.`last_price`, w.`open`, w.`last_close` "
+            "FROM `live_stock_tick_snapshot` w "
+            "WHERE w.`trade_date` = %s AND w.`snapshot_type` = 'whole_market' "
+            "AND NOT EXISTS (SELECT 1 FROM `live_stock_tick_snapshot` a "
+            "WHERE a.`trade_date` = w.`trade_date` AND a.`instrument_id` = w.`instrument_id` "
+            "AND a.`snapshot_type` = 'after_trading')",
+            (trade_date, trade_date),
         )
         ticks = list(cursor.fetchall())
-        asset_columns = "`account_id`, `trader_id`, `market_value`, `cash`, `frozen_cash`"
+        asset_columns = "`account_id`, `trader_id`, `trade_date`, `market_value`, `cash`, `frozen_cash`"
         cursor.execute(
             f"SELECT {asset_columns} FROM `live_asset_snapshot` WHERE `trade_date` = %s "
             "AND `snapshot_type` = 'after_trading'" + scope,

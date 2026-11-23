@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-source /data/flc/code/prod_quant/qapp/start_calculate_daily_returns_prod.sh
+QAPP_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${QAPP_ROOT}/start_calculate_daily_returns_prod.sh"
 
 if [[ $# -ne 2 ]]; then
   echo "Usage: $0 START_DATE END_DATE" >&2

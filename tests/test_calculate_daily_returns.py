@@ -2,6 +2,7 @@ from argparse import Namespace
 from datetime import date, datetime
 from decimal import Decimal
 import unittest
+import sqlite3
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -21,9 +22,12 @@ class DailyReturnCalculationTests(unittest.TestCase):
             "write_time": datetime(2026, 11, 19, 9, 27),
         }
 
-    def _asset(self, market_value: str, cash: str, frozen_cash: str) -> dict:
+    def _asset(
+        self, market_value: str, cash: str, frozen_cash: str,
+        *, account_id: str = "account", trade_date: date | str = "2026-07-27",
+    ) -> dict:
         return {
-            "account_id": "account", "trader_id": "trader",
+            "account_id": account_id, "trader_id": "trader", "trade_date": trade_date,
             "market_value": market_value, "cash": cash, "frozen_cash": frozen_cash,
             # The summary must use the requested components, not total_asset.
             "total_asset": "999999",
@@ -206,6 +210,67 @@ class DailyReturnCalculationTests(unittest.TestCase):
         self.assertEqual(summary["reference_amount"], Decimal("10000.0000"))
         self.assertEqual(summary["return_rate"], Decimal("0.01500000"))
 
+    def test_cash_deposit_is_excluded_from_net_value_on_and_after_effective_date(self) -> None:
+        for previous_day, current_day, previous_cash, current_cash, expected_pnl, expected_base, expected_rate in (
+            ("2026-11-17", "2026-11-18", "990000", "1000000", "10000", "990000", "0.01010101"),
+            ("2026-11-18", "2026-11-19", "1000000", "1160000", "10000", "1000000", "0.01000000"),
+            ("2026-11-18", "2026-11-19", "1000000", "1150000", "0", "1000000", "0.00000000"),
+            ("2026-11-19", "2026-11-20", "1160000", "1155000", "-5000", "1010000", "-0.00495050"),
+            ("2026-11-19", "2026-11-20", "1150000", "1150000", "0", "1000000", "0.00000000"),
+            ("2026-11-20", "2026-11-23", "1155000", "1160000", "5000", "1005000", "0.00497512"),
+        ):
+            with self.subTest(day=current_day, current_cash=current_cash):
+                current = self._asset("0", current_cash, "0", account_id="8886569186", trade_date=current_day)
+                previous = self._asset("0", previous_cash, "0", account_id="8886569186", trade_date=date.fromisoformat(previous_day))
+                records, failures = calculate_records_by_account(
+                    current_day, [], [], [], [], current_assets=[current], previous_assets=[previous],
+                )
+                self.assertEqual(failures, {})
+                summary = records[("8886569186", "trader")][-1]
+                self.assertEqual(summary["return_amount"], Decimal(expected_pnl))
+                self.assertEqual(summary["reference_amount"], Decimal(expected_base))
+                self.assertEqual(summary["return_rate"], Decimal(expected_rate))
+                # Reporting adjustments must not mutate the broker snapshots.
+                self.assertEqual(current["cash"], current_cash)
+                self.assertEqual(previous["cash"], previous_cash)
+
+    def test_cash_deposit_does_not_adjust_other_accounts(self) -> None:
+        records, failures = calculate_records_by_account(
+            "2026-11-19", [], [], [], [],
+            current_assets=[
+                self._asset("0", "1160000", "0", account_id=account_id, trade_date="2026-11-19")
+                for account_id in ("8886569186", "other")
+            ],
+            previous_assets=[
+                self._asset("0", "1000000", "0", account_id=account_id, trade_date="2026-11-18")
+                for account_id in ("8886569186", "other")
+            ],
+        )
+        self.assertEqual(failures, {})
+        self.assertEqual(records[("8886569186", "trader")][-1]["return_amount"], Decimal("10000"))
+        self.assertEqual(records[("other", "trader")][-1]["return_amount"], Decimal("160000"))
+
+    def test_cash_deposit_does_not_change_stock_pnl_or_positions_and_trades_summary(self) -> None:
+        position = {
+            "account_id": "8886569186", "trader_id": "trader", "instrument_id": "600000.SH",
+            "stock_code": "600000.SH", "volume": 100,
+            "trade_date": "2026-11-19", "write_time": "2026-11-19 09:27:00",
+        }
+        for method, expected_reference in (("asset-snapshot", "1000000"), ("positions-and-trades", "1000")):
+            with self.subTest(method=method):
+                rows = calculate_records(
+                    "2026-11-19", [], [position], [position],
+                    [{"stock_code": "600000.SH", "last_price": "11", "last_close": "10"}],
+                    current_asset=self._asset("1100", "1149000", "0", account_id="8886569186", trade_date="2026-11-19"),
+                    previous_asset=self._asset("1000", "999000", "0", account_id="8886569186", trade_date="2026-11-18"),
+                    account_return_method=method,
+                )
+                self.assertEqual(rows[-1]["return_amount"], Decimal("100"))
+                self.assertEqual(rows[-1]["reference_amount"], Decimal(expected_reference))
+                stock_total = next(row for row in rows if row["stock_code"] != "summary" and row["calculation_type"] == "all")
+                self.assertEqual(stock_total["return_amount"], Decimal("100"))
+                self.assertEqual(stock_total["reference_amount"], Decimal("1000"))
+
     def test_summary_can_be_forced_to_use_positions_and_trades(self) -> None:
         position = {
             "account_id": "account", "trader_id": "trader", "instrument_id": "600000.SH",
@@ -325,13 +390,71 @@ class DailyReturnCalculationTests(unittest.TestCase):
         self.assertEqual(records[("fallback", "trader")][-1]["return_amount"], Decimal("100.0000"))
         self.assertEqual(records[("fallback", "trader")][-1]["reference_amount"], Decimal("1000.0000"))
 
+    def test_tick_query_falls_back_to_same_day_whole_market_for_auction_exit(self) -> None:
+        # Execute the production price query against real rows so precedence and
+        # date/instrument matching are checked independently of mocked SQL text.
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.execute(
+            "CREATE TABLE live_stock_tick_snapshot (trade_date TEXT, snapshot_type TEXT, "
+            "instrument_id TEXT, stock_code TEXT, last_price TEXT, open TEXT, last_close TEXT)",
+        )
+        db.executemany(
+            "INSERT INTO live_stock_tick_snapshot VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("2026-11-23", "whole_market", "000779.SZ.BIGQMT", "000779.SZ", "6.85", "6.64", "6.77"),
+                ("2026-11-20", "after_trading", "000779.SZ.BIGQMT", "000779.SZ", "6.77", "6.94", "7.08"),
+                ("2026-11-23", "after_trading", "000001.SZ.BIGQMT", "000001.SZ", "12", "11", "10"),
+                ("2026-11-23", "whole_market", "000001.SZ.BIGQMT", "000001.SZ", "99", "99", "99"),
+                ("2026-11-20", "whole_market", "000002.SZ.BIGQMT", "000002.SZ", "9", "9", "9"),
+            ],
+        )
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = {"pretrade_date": date(2026, 11, 20)}
+        trade = {
+            "account_id": "8886569186", "trader_id": "BIGQMT-PROD-001",
+            "instrument_id": "000779.SZ.BIGQMT", "stock_code": "000779.SZ",
+            "side": "sell", "quantity": 1300, "price": "6.64",
+            "trade_time": "2026-11-23 09:25:00",
+        }
+
+        def fetchall():
+            sql, params = cursor.execute.call_args.args
+            if "FROM `live_stock_tick_snapshot`" in sql:
+                return [dict(row) for row in db.execute(sql.replace("%s", "?"), params)]
+            if "FROM `live_trade`" in sql:
+                return [trade]
+            return []
+
+        cursor.fetchall.side_effect = fetchall
+        trades, before, after, ticks, _, _ = fetch_mysql_inputs(
+            connection, Namespace(account_id="8886569186", trader_id="BIGQMT-PROD-001"), "2026-11-23",
+        )
+        self.assertEqual(len(ticks), 2)
+        prices = {row["stock_code"]: row for row in ticks}
+        self.assertEqual(prices["000001.SZ"]["last_price"], "12")
+        self.assertEqual(prices["000779.SZ"]["last_close"], "6.77")
+        rows = calculate_records("2026-11-23", trades, before, after, ticks)
+        sold = next(row for row in rows if row["calculation_type"] == "sell")
+        self.assertEqual(sold["return_amount"], Decimal("-174.4316"))
+
+        # Yesterday's snapshot must not hide a missing price today.
+        db.execute("DELETE FROM live_stock_tick_snapshot WHERE trade_date='2026-11-23' AND stock_code='000779.SZ'")
+        trades, before, after, ticks, _, _ = fetch_mysql_inputs(
+            connection, Namespace(account_id="8886569186", trader_id="BIGQMT-PROD-001"), "2026-11-23",
+        )
+        with self.assertRaisesRegex(ValueError, "missing last_close"):
+            calculate_records("2026-11-23", trades, before, after, ticks)
+
     def test_fetches_after_trading_assets_for_current_and_exact_previous_trading_day(self) -> None:
         connection = MagicMock()
         cursor = connection.cursor.return_value.__enter__.return_value
         previous_trade_date = date(2026, 7, 24)  # Friday before the requested Monday.
         cursor.fetchone.return_value = {"pretrade_date": previous_trade_date}
-        current_assets = [self._asset("1100", "9000", "0")]
-        previous_assets = [self._asset("1000", "9000", "0")]
+        current_assets = [self._asset("1100", "9000", "0", trade_date="2026-07-27")]
+        previous_assets = [self._asset("1000", "9000", "0", trade_date=previous_trade_date)]
         cursor.fetchall.side_effect = [[], [], [], [], [], current_assets, previous_assets, []]
 
         inputs = fetch_mysql_inputs(
@@ -347,6 +470,7 @@ class DailyReturnCalculationTests(unittest.TestCase):
         for query, day in zip(asset_queries[:2], ("2026-07-27", previous_trade_date)):
             sql, params = query.args
             self.assertIn("`market_value`, `cash`, `frozen_cash`", sql)
+            self.assertIn("`trader_id`, `trade_date`, `market_value`", sql)
             self.assertIn("`snapshot_type` = 'after_trading'", sql)
             self.assertIn("`trade_date` = %s", sql)
             self.assertIn("`account_id` = %s AND `trader_id` = %s", sql)

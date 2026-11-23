@@ -12,6 +12,7 @@ from typing import Mapping
 JsonMapping = Mapping[str, Any]
 
 # Snapshot type values shared across the live_* tables.
+BEFORE_AUCTION = "before_auction"
 BEFORE_TRADING = "before_trading"
 CONTINUOUS_TRADING = "continuous_trading"
 AFTER_TRADING = "after_trading"
