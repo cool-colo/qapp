@@ -19,11 +19,16 @@ class Process:
         self.done = done
         self.clean = True
         self.visits = []
+        self.cleanup_error = None
+        self.cleanup_evidence = {}
+        self.cleanup_reason = "cleanup"
     def advance(self, ctx):
         self.visits.append(ctx)
         return Decision(RunState.SUCCEEDED if self.done else RunState.RUNNING, "work")
-    def quiesce(self, ctx):
-        return Decision(RunState.SUCCEEDED if self.clean else RunState.WAITING, "cleanup")
+    def interrupt(self, ctx):
+        pass
+    def after_stable(self, ctx):
+        pass
 
 
 class OutcomeProcess(Process):
@@ -38,20 +43,54 @@ class OutcomeProcess(Process):
         self.visits.append(ctx)
         return self.outcome
 
-    def quiesce(self, ctx):
-        if self.cleanup_error is not None:
-            raise self.cleanup_error
-        return Decision(RunState.SUCCEEDED if self.clean else RunState.WAITING,
-                        "execution_stable" if self.clean else "awaiting_terminal_orders",
-                        self.cleanup_evidence)
+
+
+class ControlledStabilizer:
+    """Fake external state, independent of task lifecycle methods."""
+    def __init__(self, engine):
+        self.engine = engine
+
+    def stabilize(self, ctx):
+        process = self.engine._runs[ctx.run_id].process
+        if process is None:
+            return Decision(RunState.SUCCEEDED, "entry_clean")
+        if process.cleanup_error is not None:
+            raise process.cleanup_error
+        reason = ("execution_stable" if process.clean else "awaiting_terminal_orders"
+                  ) if isinstance(process, OutcomeProcess) else process.cleanup_reason
+        return Decision(RunState.SUCCEEDED if process.clean else RunState.WAITING,
+                        reason, process.cleanup_evidence)
+
+
+def test_engine():
+    engine = TaskOrchestrator(stabilizer_factory=lambda _scope: ControlledStabilizer(engine))
+    return engine
+
+
+test_engine.__test__ = False
 
 
 class OrchestratorTest(unittest.TestCase):
     def engine(self):
-        engine = TaskOrchestrator()
+        engine = test_engine()
         engine.register(TaskSpec("boot", 0), lambda: Process(done=True), bootstrap=True)
         engine.start(0)
         return engine
+
+    def test_event_wake_advances_tasks_without_evaluating_condition_triggers(self):
+        from unittest.mock import Mock
+        engine = self.engine()
+        trigger = Mock()
+        trigger.evaluate.return_value = None
+        process = Process()
+        engine.register(TaskSpec("timed", 1), lambda: process)
+        engine.register(TaskSpec("condition", 2), Process, trigger)
+        engine.submit("timed", Proposal("timer"))
+        engine.tick(1, evaluate_triggers=False)
+        self.assertTrue(process.visits)
+        trigger.evaluate.assert_not_called()
+        engine.tick(2)
+        trigger.evaluate.assert_called_once_with(2)
 
     def test_high_priority_waits_for_confirmed_cleanup_and_revokes_old_epoch(self):
         engine = self.engine()
@@ -216,7 +255,7 @@ class OrchestratorTest(unittest.TestCase):
         self.assertEqual(fresh.snapshot()["lifecycle"], "ready")
 
     def test_bootstrap_prevents_higher_priority_normal_task(self):
-        engine = TaskOrchestrator()
+        engine = test_engine()
         boot = Process()
         engine.register(TaskSpec("boot", 0, preemptible=False), lambda: boot, bootstrap=True)
         engine.register(TaskSpec("ordinary", 1000), Process)
@@ -232,7 +271,7 @@ class OrchestratorTest(unittest.TestCase):
     def test_bootstrap_delayed_cleanup_preserves_shutdown_and_success_result(self):
         for stop_requested in (True, False):
             with self.subTest(stop_requested=stop_requested):
-                engine = TaskOrchestrator()
+                engine = test_engine()
                 evidence = {"target_version": "v1", "restored": {"positions": 3}}
                 boot = OutcomeProcess(Decision(RunState.SUCCEEDED,
                                                "initialized_from_business_facts", evidence))
@@ -254,7 +293,7 @@ class OrchestratorTest(unittest.TestCase):
                 boot.clean = True
                 engine.tick(2)
                 self.assertEqual(engine.lifecycle, "stopped" if stop_requested else "ready")
-                self.assertIsNone(engine.owner_task())
+                self.assertEqual(engine.owner_task(), None if stop_requested else "ordinary")
                 result = engine.snapshot()["runs"][0]
                 self.assertEqual(result["state"], "succeeded")
                 self.assertEqual(result["final_result"], {

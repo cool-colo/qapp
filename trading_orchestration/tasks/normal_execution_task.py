@@ -1,11 +1,10 @@
 from task_orchestration.models import Decision, RunState
-from trading_orchestration.components.stabilizers.nautilus_state_stabilizer import NautilusStateStabilizer
+from task_orchestration.components.processes.task_process import BusinessTask
 
 
-class NormalExecutionTask:
+class NormalExecutionTask(BusinessTask):
     def __init__(self, bridge):
         self.bridge = bridge
-        self.stabilizer = NautilusStateStabilizer(bridge)
 
     def advance(self, context):
         host = self.bridge.host
@@ -17,7 +16,3 @@ class NormalExecutionTask:
         if self.bridge.target_satisfied():
             return Decision(RunState.SUCCEEDED, "target_achieved")
         return Decision(RunState.RUNNING, "target_remaining")
-
-    def quiesce(self, context):
-        return self.stabilizer.stabilize(context)
-

@@ -73,7 +73,6 @@ from strategies.target_quantities import OrderDecisionEvent
 from strategies.target_quantities import PreopenLatencySample
 from strategies.replanning import PlanningAttempt
 from strategies.execution_reconciliation import is_reconciliation_fill
-from uuid import uuid4
 
 
 SyncTaskCallback = Callable[[str, int, dict[str, Any]], None]
@@ -170,7 +169,6 @@ class SnapshotRecorder(Actor):
         self._after_time = self._parse_hh_mm(config.after_time)
         # Guards so each phase applies the frozen target to the strategy at most once
         # per process-day even if the timer and the on-start catch-up both fire.
-        self._applied_target_dates: set[date] = set()
 
     # ---- lifecycle -----------------------------------------------------------
 
@@ -412,7 +410,7 @@ class SnapshotRecorder(Actor):
             if report_tasks
             else None
         )
-        asset_id = self._record_asset(
+        self._record_asset(
             trading_date,
             BEFORE_TRADING,
             source,
@@ -426,18 +424,15 @@ class SnapshotRecorder(Actor):
         )
         self._ensure_daily_target(
             trading_date,
-            BEFORE_TRADING,
-            asset_id,
             on_complete=callback("live_target_portfolio"),
         )
 
     def _run_continuous_trading(self, trading_date: date, allow_fallback: bool = False) -> None:
         source = SOURCE_FALLBACK if allow_fallback and not self._within_trading_window() else SOURCE_LIVE
-        asset_id = self._record_asset(trading_date, CONTINUOUS_TRADING, source)
+        self._record_asset(trading_date, CONTINUOUS_TRADING, source)
         self._record_positions(trading_date, CONTINUOUS_TRADING, source)
-        # A before-trading target takes precedence; only mint a continuous_trading
-        # target if before-trading never ran (e.g. started mid-session same day).
-        self._ensure_daily_target(trading_date, CONTINUOUS_TRADING, asset_id)
+        # The planning task reuses any accepted same-day target after bootstrap.
+        self._ensure_daily_target(trading_date)
 
     def _run_after_trading(
         self,
@@ -536,7 +531,7 @@ class SnapshotRecorder(Actor):
                     {"reason": "whole-market full-tick disabled"},
                 )
             return
-        if self._strategy.whole_market_final_refresh_succeeded(trading_date):
+        if self._strategy.market_snapshots.final_refresh_succeeded(trading_date):
             self._record_whole_market_ticks(trading_date, on_complete=on_complete)
             return
 
@@ -553,7 +548,7 @@ class SnapshotRecorder(Actor):
             self._record_whole_market_ticks(trading_date, on_complete=on_complete)
 
         try:
-            self._strategy.request_whole_market_full_tick_refresh(
+            self._strategy.market_snapshots.refresh(
                 trigger="after_trading_final",
                 on_complete=_on_refresh_complete,
             )
@@ -570,7 +565,7 @@ class SnapshotRecorder(Actor):
         trading_date: date,
         on_complete: SyncTaskCallback | None = None,
     ) -> None:
-        snapshot = self._strategy.whole_market_snapshot()
+        snapshot = self._strategy.market_snapshots.latest_snapshot()
         if not snapshot:
             self.log.warning(
                 "after-trading whole-market snapshot is empty; nothing to persist",
@@ -877,140 +872,17 @@ class SnapshotRecorder(Actor):
     def _ensure_daily_target(
         self,
         trading_date: date,
-        snapshot_type: str,
-        asset_id: int | None,
         on_complete: SyncTaskCallback | None = None,
     ) -> None:
-        if self._strategy.orchestration is not None:
-            # Bootstrap owns archive loading; all new planning uses the same gate.
-            run_id = self._strategy.orchestration.request(
-                "daily_planning", expires_ns=self._strategy.orchestration.deadline())
-            if on_complete is not None:
-                on_complete("skipped", 0, {"reason": "delegated to task orchestration", "run_id": run_id})
-            return
-        if trading_date in self._applied_target_dates:
-            if on_complete is not None:
-                on_complete("skipped", 0, {"reason": "already applied in this process"})
-            return
-        signal_date = self._resolve_signal_date(trading_date)
-        archived = self.load_committed_plan(trading_date)
-        if archived is not None:
-            self._strategy.restore_committed_plan(trading_date, archived)
-            self._applied_target_dates.add(trading_date)
-            if on_complete is not None:
-                on_complete("skipped", 0, {"reason": "loaded committed planning version"})
-            return
-        # Reuse a persisted target for the (account, trader, date, signal_date)
-        # four-tuple across restarts; a before-trading target also satisfies a later
-        # continuous-trading start.
-        loaded = self._load_target(trading_date, signal_date)
-        if loaded:
-            self._apply_loaded_target(trading_date, loaded, signal_date)
-            self._applied_target_dates.add(trading_date)
-            if on_complete is not None:
-                on_complete(
-                    "skipped",
-                    0,
-                    {"reason": "loaded existing target", "existing_rows": len(loaded)},
-                )
-            return
-        self._generate_and_persist_target(
-            trading_date,
-            snapshot_type,
-            signal_date,
-            asset_id,
-            on_complete=on_complete,
-        )
-        self._applied_target_dates.add(trading_date)
-
-    def _generate_and_persist_target(
-        self,
-        trading_date: date,
-        snapshot_type: str,
-        signal_date: date | None,
-        asset_id: int | None,
-        on_complete: SyncTaskCallback | None = None,
-    ) -> None:
-        try:
-            plan = self._strategy.compute_daily_target_plan(trading_date)
-        except Exception as exc:
-            self.log.warning(f"daily target plan computation failed: {exc}")
-            if on_complete is not None:
-                on_complete("failed", 0, {"error": str(exc)})
-            return
-        if plan is None:
-            if on_complete is not None:
-                on_complete("skipped", 0, {"reason": "keeping current target after planning failure"})
-            return
-        if not plan.persistable:
-            self.persist_planning_attempt(PlanningAttempt(
-                plan.request_id or uuid4().hex, trading_date, "initial", None,
-                status="safety", inputs=self._strategy._latest_planning_inputs), plan)
-            version = self._strategy.plan_version(plan)
-            self._apply_target(
-                trading_date,
-                {
-                    target.instrument_id: int(target.quantity)
-                    for target in plan.targets
-                    if target.quantity is not None
-                },
-                plan.reason,
-                version,
-                plan.signal_date,
-            )
-            message = (
-                f"applied transient daily target without persistence: "
-                f"degraded_reason={plan.degraded_reason}"
-            )
-            self.log.warning(message)
-            if on_complete is not None:
-                on_complete(
-                    "failed",
-                    0,
-                    {"error": message, "degraded_reason": plan.degraded_reason},
-                )
-            return
-        self._persist_target_plan(
-            plan,
-            snapshot_type,
-            asset_id,
-            signal_date,
-            apply_target=True,
-            on_complete=on_complete,
-        )
-
-    def persist_strategy_target_plan(self, plan: Any) -> bool:
-        """Persist a plan generated by the strategy timer before it is executed."""
-        if not plan.persistable:
-            self.log.warning(
-                f"refusing to persist transient target plan: "
-                f"degraded_reason={plan.degraded_reason}",
-            )
-            return False
-        trading_date = plan.trading_date
-        signal_date = plan.signal_date
-        try:
-            asset_id = self._writer.asset_snapshot_id(
-                self.config.account_id,
-                self.config.trader_id,
-                trading_date,
-                CONTINUOUS_TRADING,
-            )
-        except Exception as exc:
-            self.log.warning(f"continuous target asset anchor lookup failed: {exc}")
-            asset_id = None
-        return self._persist_target_plan(
-            plan,
-            CONTINUOUS_TRADING,
-            asset_id,
-            signal_date,
-            apply_target=False,
-        )
+        run_id = self._strategy.orchestration.request(
+            "daily_planning", key=f"daily_planning:{trading_date}",
+            expires_ns=self._strategy.orchestration.deadline())
+        if on_complete is not None:
+            on_complete("skipped", 0, {"reason": "delegated to task orchestration", "run_id": run_id})
 
     def persist_planning_attempt(self, attempt: PlanningAttempt, plan=None) -> None:
         if plan is not None and plan.persistable:
-            if not self._persist_target_plan(plan, CONTINUOUS_TRADING, None, plan.signal_date,
-                                             apply_target=False, attempt=attempt):
+            if not self._persist_target_plan(plan, attempt):
                 raise RuntimeError("replanning archive transaction failed")
             return
         self._writer.write_planning_attempt(self.config.account_id, self.config.trader_id,
@@ -1020,22 +892,9 @@ class SnapshotRecorder(Actor):
         return self._writer.load_committed_target_plan(self.config.account_id, self.config.trader_id,
                                                       trading_date)
 
-    def _persist_target_plan(
-        self,
-        plan: Any,
-        snapshot_type: str,
-        asset_id: int | None,
-        signal_date: date | None,
-        apply_target: bool,
-        on_complete: SyncTaskCallback | None = None,
-        attempt: PlanningAttempt | None = None,
-    ) -> bool:
+    def _persist_target_plan(self, plan: Any, attempt: PlanningAttempt) -> bool:
         with self._strategy._trading_action_lock:
             trading_date = plan.trading_date
-            if attempt is None and (self._strategy._replanning_blocked
-                                    or plan.parent_version != (self._strategy._target_version or None)):
-                self.log.warning("initial planning result superseded; target not persisted")
-                return False
             # Raw total asset and the buffer-adjusted investable basis both come from the
             # plan (stamped by the strategy when it built the request) so the persisted
             # figures match exactly what was sent to the risk manager.
@@ -1049,7 +908,7 @@ class SnapshotRecorder(Actor):
                 if target.quantity is not None
             }
             version = self._strategy.plan_version(plan)
-            plan_signal_date = plan.signal_date or signal_date
+            plan_signal_date = plan.signal_date
             position_id = self._position_snapshot_anchor(trading_date)
             records: list[LiveTargetRecord] = []
             for target in plan.targets:
@@ -1078,11 +937,11 @@ class SnapshotRecorder(Actor):
                     LiveTargetRecord(
                         trade_date=trading_date,
                         write_time=self._now_naive(),
-                        snapshot_type=snapshot_type,
+                        snapshot_type=CONTINUOUS_TRADING,
                         account_id=self.config.account_id,
                         trader_id=self.config.trader_id,
                         signal_date=plan_signal_date,
-                        asset_snapshot_id=asset_id,
+                        asset_snapshot_id=None,
                         position_snapshot_id=position_id,
                         total_asset=self._decimal_or_none(total_asset),
                         investable_asset=self._decimal_or_none(investable_asset),
@@ -1109,10 +968,6 @@ class SnapshotRecorder(Actor):
                 )
             persisted = False
             try:
-                if attempt is None:
-                    attempt = PlanningAttempt(plan.request_id or uuid4().hex, trading_date, "initial",
-                                              plan.parent_version, status="committed",
-                                              inputs=self._strategy._latest_planning_inputs)
                 payload = attempt.payload(plan)
                 payload.update(quantities=target_qty, version=version, reason=plan.reason,
                                signal_date=plan_signal_date.isoformat() if plan_signal_date else None,
@@ -1120,26 +975,8 @@ class SnapshotRecorder(Actor):
                 self._writer.write_planning_attempt(self.config.account_id, self.config.trader_id,
                                                     trading_date, payload, records)
                 persisted = True
-                if on_complete is not None:
-                    on_complete(
-                        "success",
-                        len(records),
-                        {"signal_date": plan_signal_date},
-                    )
             except Exception as exc:
                 self.log.warning(f"target portfolio write failed: {exc}")
-                if on_complete is not None:
-                    on_complete(
-                        "failed",
-                        0,
-                        {
-                            "attempted_rows": len(records),
-                            "signal_date": plan_signal_date,
-                            "error": str(exc),
-                        },
-                    )
-            if apply_target and persisted:
-                self._apply_target(trading_date, target_qty, plan.reason, version, plan_signal_date)
             if persisted:
                 self.log.info(
                     f"generated & persisted daily target: date={trading_date} signal_date={plan_signal_date} "
@@ -1183,72 +1020,6 @@ class SnapshotRecorder(Actor):
             return None
         prev = [value for value in dates if value < trading_date]
         return max(prev) if prev else None
-
-    def _apply_loaded_target(
-        self,
-        trading_date: date,
-        rows: list[dict[str, Any]],
-        signal_date: date | None,
-    ) -> None:
-        target_qty: dict[str, int] = {}
-        version: str | None = None
-        reason = "loaded_target"
-        for row in rows:
-            instrument_id_text = str(row.get("instrument_id"))
-            qty = row.get("target_qty")
-            if qty is not None:
-                target_qty[instrument_id_text] = int(qty)
-            if version is None and row.get("target_version"):
-                version = str(row.get("target_version"))
-            if row.get("reason"):
-                reason = str(row.get("reason"))
-        if not target_qty:
-            return
-        self._apply_target(trading_date, target_qty, reason, version, signal_date)
-        self.log.info(
-            f"loaded persisted daily target: date={trading_date} "
-            f"frozen_qty={len(target_qty)} version={version}",
-            color=LogColor.GREEN,
-        )
-
-    def _apply_target(
-        self,
-        trading_date: date,
-        target_qty: dict[str, Any],
-        reason: str,
-        version: str | None,
-        signal_date: date | None = None,
-    ) -> None:
-        try:
-            self._strategy.update_target_quantities(
-                quantities=target_qty,
-                target_date=trading_date,
-                reason=reason,
-                version=version,
-                signal_date=signal_date,
-            )
-        except Exception as exc:
-            self.log.warning(f"update_target_quantities failed: {exc}")
-
-    def _load_target(self, trading_date: date, signal_date: date | None) -> list[dict[str, Any]]:
-        try:
-            archived = self.load_committed_plan(trading_date)
-            if archived is not None:
-                return [{"instrument_id": iid, "target_qty": qty, "target_version": archived["version"],
-                         "reason": archived["reason"], "signal_date": archived["signal_date"],
-                         "extra": archived.get("target_extra", {}).get(iid, {})}
-                        for iid, qty in archived["quantities"].items()]
-            return self._writer.load_target_portfolios(
-                self.config.account_id,
-                self.config.trader_id,
-                trading_date,
-                signal_date,
-                preferred_snapshot_type=BEFORE_TRADING,
-                fallback_to_continuous=True,
-            )
-        except Exception as exc:
-            self.log.warning(f"target load failed: {exc}")
-            return []
 
     def _load_target_signal_dates(self, trading_date: date) -> dict[str, date]:
         try:

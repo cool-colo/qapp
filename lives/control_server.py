@@ -693,7 +693,7 @@ class LiveControlServer:
         """
         snapshot = self._strategy._market_status.get(instrument_id_text)
         if snapshot is None or snapshot.open is None:
-            snapshot = self._strategy._whole_market_status.get(instrument_id_text)
+            snapshot = self._strategy.market_snapshots.latest_snapshot().get(instrument_id_text)
         if snapshot is None:
             return None
         open_price = _float_or_none(snapshot.open)
@@ -812,7 +812,7 @@ class LiveControlServer:
         relabel older dates on the dashboard side.
         """
         try:
-            snapshot = self._strategy.whole_market_snapshot()
+            snapshot = self._strategy.market_snapshots.latest_snapshot()
         except Exception:
             snapshot = {}
         rows: list[dict] = []
@@ -956,7 +956,7 @@ class LiveControlServer:
             except Exception:
                 recent = []
         return {
-            **self._strategy.replanning.state(),
+            **self._strategy.orchestration.planning_state(),
             "trading_paused": bool(self._strategy.trading_controller.is_paused()),
             "target_updates_paused": bool(
                 self._strategy.trading_controller.is_target_updates_paused()
@@ -968,7 +968,7 @@ class LiveControlServer:
         if self._control_writer is None:
             raise RuntimeError("persistent control writer is unavailable")
         self._control_writer.set_auto_replan_enabled(self._account_id, self._trader_id, enabled)
-        self._strategy.replanning.set_auto_enabled(enabled)
+        self._strategy.set_auto_replan_enabled(enabled)
         self._append_action("auto_replan", {"enabled": enabled}, "ok")
         return {"ok": True, "auto_replan_enabled": enabled}
 
@@ -1059,14 +1059,14 @@ class LiveControlServer:
                         self._send(200, server._control_state())
                     elif path == "/scheduler/state":
                         bridge = server._strategy.orchestration
-                        self._send(200, {"enabled": False} if bridge is None else bridge.state())
+                        self._send(200, bridge.state())
                     elif path == "/scheduler/commands":
                         bridge = server._strategy.orchestration
-                        self._send(200, {} if bridge is None else bridge.control_results())
+                        self._send(200, bridge.control_results())
                     elif path == "/scheduler/actions":
                         bridge = server._strategy.orchestration
                         query = parse_qs(parsed.query)
-                        records = [] if bridge is None else bridge.engine.actions(
+                        records = bridge.published_actions(
                             after_sequence=int(query.get("after_sequence", ["0"])[0]),
                             limit=int(query.get("limit", ["100"])[0]))
                         self._send(200, {"actions": records})
@@ -1123,8 +1123,6 @@ class LiveControlServer:
                     body = self._read_body()
                     if path == "/scheduler/control":
                         bridge = server._strategy.orchestration
-                        if bridge is None:
-                            raise ValueError("task orchestration is not configured")
                         command_id = bridge.submit_control(body.get("action"), body.get("arguments", {}))
                         self._send(202, {"command_id": command_id, "status": "accepted"})
                     elif path == "/control/replan":

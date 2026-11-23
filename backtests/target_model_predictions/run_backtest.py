@@ -49,7 +49,6 @@ from backtests.result_writers import SignalRecord  # noqa: E402
 from backtests.result_writers import SummaryMetricRecord  # noqa: E402
 from backtests.result_writers import TargetPortfolioRecord  # noqa: E402
 from backtests.result_writers import TradeRecord  # noqa: E402
-from backtests.result_writers.live_records import CONTINUOUS_TRADING  # noqa: E402
 from backtests.result_writers.live_writer import LiveSnapshotWriter  # noqa: E402
 from lives.snapshot_recorder import SnapshotRecorder  # noqa: E402
 from lives.snapshot_recorder import SnapshotRecorderConfig  # noqa: E402
@@ -113,7 +112,20 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
 
     def __init__(self, config: TargetModelPredictionsStrategyConfig) -> None:
         super().__init__(config)
+        self._replay_market_fields = {}
+        self._replay_market_day = None
+        self.market_snapshots.configure_source(lambda: dict(self._replay_market_fields))
         self._tick_missing_opens: dict[date, tuple[str, ...]] = {}
+
+    def _schedule_fetch(self, source):
+        # Replay sources are deterministic in-memory projections, never workers.
+        from concurrent.futures import Future
+        future = Future()
+        try:
+            future.set_result(source())
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
 
     def _price_limits(self, instrument_id_text: str) -> tuple[float | None, float | None]:
         if self._auction_replay_model is None:
@@ -184,14 +196,10 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
             subscribe_new_bars=False,
         )
         self.apply_full_tick_snapshot(data.full_tick_snapshot, "backtest_planning")
-        if data.opening_auction_snapshot and self.config.auction_enabled:
-            if self.accept_opening_auction_snapshot(data.trading_date, data.full_tick_snapshot, ts_init=data.ts_init):
-                self.process_opening_auction()
-        if data.opening_auction_execution_snapshot and self.config.auction_enabled:
-            self.apply_whole_market_full_tick_snapshot(data.full_tick_snapshot, "backtest_auction_execute")
-            if self.accept_opening_auction_execution_update(
-                    data.trading_date, ts_init=self._whole_market_status_updated_at_ns):
-                self.process_opening_auction_execution()
+        if self._replay_market_day != data.trading_date:
+            self._replay_market_fields = {}
+            self._replay_market_day = data.trading_date
+        self._replay_market_fields.update(data.full_tick_snapshot)
         if data.allow_planning:
             self._process_trading_day_once(data.trading_date, "planning_event")
 
@@ -960,14 +968,6 @@ def configure_target_plan_persistence(
         **mysql_connection_kwargs(),
     )
 
-    def load_target_portfolio(trading_date: date, signal_date: date | None):
-        return writer.load_target_portfolios(
-            experiment_id_value,
-            str(args.trader_id),
-            trading_date,
-            signal_date,
-            preferred_snapshot_type=CONTINUOUS_TRADING,
-        )
 
     def load_recent_target_dates(
         trading_date: date,
@@ -982,7 +982,6 @@ def configure_target_plan_persistence(
             stock_codes,
         )
 
-    strategy.configure_live_target_portfolio_loader(load_target_portfolio)
     strategy.configure_recent_target_loader(load_recent_target_dates)
     recorder = BacktestTargetPlanRecorder(
         config=SnapshotRecorderConfig(
@@ -995,7 +994,6 @@ def configure_target_plan_persistence(
         writer=writer,
         strategy_ref=strategy,
     )
-    strategy.configure_live_target_plan_persister(recorder.persist_strategy_target_plan)
     strategy.configure_planning_archive(recorder.persist_planning_attempt, recorder.load_committed_plan)
     engine.add_actor(recorder)
     return writer

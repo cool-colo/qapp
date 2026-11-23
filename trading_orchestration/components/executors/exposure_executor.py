@@ -1,13 +1,11 @@
 from task_orchestration.models import Decision, RunState
 from task_orchestration.components.validators.goal_validator import GoalValidator
-from task_orchestration.components.stabilizers.state_stabilizer import StateStabilizer
 
 
 class ExposureExecutor:
-    def __init__(self, bridge, *, validator: GoalValidator, stabilizer: StateStabilizer):
+    def __init__(self, bridge, *, validator: GoalValidator):
         self.bridge = bridge
         self.validator = validator
-        self.stabilizer = stabilizer
         self.plan = None
 
     def apply(self, context, goal):
@@ -26,11 +24,9 @@ class ExposureExecutor:
         self.bridge.execute(exposure=True)
         return Decision(RunState.RUNNING, "single_side_execution")
 
-    def hold(self, context):
-        result = self.stabilizer.stabilize(context)
-        if result.state == RunState.SUCCEEDED:
-            self.bridge.restore_formal()
-        return result
+    def release(self, context):
+        self.bridge.restore_formal()
+        self.plan = None
 
     def snapshot(self):
         return self.bridge.execution_state()

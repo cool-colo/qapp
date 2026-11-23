@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 class RunState(str, Enum):
     QUEUED = "queued"
+    PREPARING = "preparing"
     RUNNING = "running"
     WAITING = "waiting"
     SUSPENDING = "suspending"
@@ -29,8 +30,11 @@ class Decision:
     state: RunState = RunState.RUNNING
     reason: str = ""
     evidence: Mapping[str, Any] = field(default_factory=dict)
+    requires_stable: bool = False
 
     def __post_init__(self):
+        if self.requires_stable and self.state in TERMINAL:
+            raise ValueError("a terminal decision cannot request resumption after cleanup")
         object.__setattr__(self, "evidence", MappingProxyType(dict(self.evidence)))
 
 
@@ -39,6 +43,7 @@ class Proposal:
     key: str
     payload: Any = None
     expires_ns: int | None = None
+    trigger_evidence: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,8 @@ class TaskRun:
     process: Any = None
     reason: str = ""
     started: bool = False
+    phase: str = "queued"
+    cleanup_kind: str | None = None
+    interrupted: bool = False
     final_decision: Decision | None = None
     cleanup_decision: Decision | None = None
-

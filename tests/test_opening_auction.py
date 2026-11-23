@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from tests.orchestration_helpers import auction_contexts
+
+from tests.orchestration_helpers import committed_archive
+
 import csv
 import tempfile
 import unittest
@@ -144,6 +148,7 @@ def replay_fixture(*, persister=None, final_results=True, continuous=False,
                                             up_limit=price * 1.1, down_limit=price * .9)
                                for day in ([8, 9] if two_days else [8])
                                for code, price in prices),
+        task_orchestration_config=str(Path(__file__).parent / "fixtures/orchestration.yaml"),
         auction_enabled=auction_enabled, subscribe_bars=False, subscribe_quote_ticks=True,
         auction_min_buy_notional=Decimal(str(auction_min_buy_notional)),
         continuous_buy_min_notional=Decimal(str(continuous_buy_min_notional)),
@@ -166,7 +171,10 @@ def replay_fixture(*, persister=None, final_results=True, continuous=False,
     strategy._target_planner = planner
     strategy._auction_replay_model = model
     if persister is not None:
-        strategy.configure_live_target_plan_persister(persister)
+        def archive(attempt, plan):
+            if plan is not None and plan.persistable and not persister(plan):
+                raise RuntimeError("target plan persistence failed")
+        strategy.configure_planning_archive(archive)
     events, quotes = prepare_tick_replay_event_data(SimpleNamespace(exchange_timezone="Asia/Shanghai"), rows, instruments,
                                                        auction_start_time=config.auction_start_time,
                                                        auction_execution_time=config.auction_execution_time)
@@ -214,7 +222,7 @@ class OpeningAuctionTest(unittest.TestCase):
             quantities = {str(row.instrument_id): int(row.quantity) for _, row in orders.iterrows()}
             self.assertEqual(quantities, {"000002.SZ.QMT": 500, "000001.SZ.QMT": 200})
             self.assertEqual({o.ts_init for o in engine.cache.orders()},
-                             {timestamp("2026-07-08 09:24:50")})
+                             {timestamp("2026-07-08 09:24:50.500")})
             self.assertEqual({str(o.instrument_id): float(o.price) for o in engine.cache.orders()},
                              {"000001.SZ.QMT": 10.05, "000002.SZ.QMT": 20.10})
             self.assertEqual(len(planner.requests), 1)
@@ -222,7 +230,7 @@ class OpeningAuctionTest(unittest.TestCase):
             for _, fill in fills.iterrows():
                 self.assertEqual(int(fill.last_qty), 100)
                 self.assertGreaterEqual(pd.Timestamp(fill.ts_event).value, timestamp("2026-07-08 09:25:00"))
-            frozen = strategy.compute_daily_target_plan(date(2026, 7, 8))
+            frozen = strategy.trading_state.formal_model
             self.assertEqual(frozen.targets[0].target_context.price_source, "auction_indicative")
             self.assertEqual(frozen.targets[0].target_context.prediction_rank, 2)
             self.assertEqual(strategy._today_open["000001.SZ.QMT"], 10)
@@ -252,6 +260,7 @@ class OpeningAuctionTest(unittest.TestCase):
                     "prediction_rank": target.target_context.prediction_rank,
                 } for target in plan.targets},
             }
+            archived = committed_archive(archived)
         finally:
             engine.dispose()
 
@@ -265,7 +274,7 @@ class OpeningAuctionTest(unittest.TestCase):
                                            "ts_event": timestamp("2026-07-08 09:24:49")},
                           "000002.SZ.QMT": {"last_price": 20.2, "last_close": 20,
                                            "ts_event": timestamp("2026-07-08 09:24:49")}})
-        strategy.configure_whole_market_full_tick_source(source)
+        strategy.market_snapshots.configure_source(source)
         try:
             with patch.object(strategy, "_schedule_fetch", side_effect=lambda requested:
                               ready if requested is source else None), \
@@ -274,25 +283,26 @@ class OpeningAuctionTest(unittest.TestCase):
                            end=pd.Timestamp("2026-07-08 09:25:00", tz="Asia/Shanghai").to_pydatetime())
             loader.assert_called_once_with(day)
             self.assertEqual(planner.requests, [])
-            self.assertNotIn(day, strategy._auction_planning_contexts)
+            self.assertNotIn(day, auction_contexts(strategy))
             self.assertEqual(strategy._target_version, archived["version"])
             self.assertEqual(strategy._target_quantities, archived["quantities"])
-            self.assertEqual(strategy._auction_prediction_ranks,
+            self.assertEqual(strategy.auction_session.ranks,
                              {"000001.SZ.QMT": 2, "000002.SZ.QMT": 1})
+            # The owner starts on the next timer cycle and uses the newer 09:24:50 quote.
             self.assertEqual({str(order.instrument_id): float(order.price) for order in engine.cache.orders()},
-                             {"000001.SZ.QMT": 10.15, "000002.SZ.QMT": 20.30})
+                             {"000001.SZ.QMT": 10.05, "000002.SZ.QMT": 20.10})
             self.assertEqual({order.ts_init for order in engine.cache.orders()},
-                             {timestamp("2026-07-08 09:24:50")})
+                             {timestamp("2026-07-08 09:24:50.500")})
         finally:
             engine.dispose()
 
     def test_execution_only_replay_restores_an_empty_committed_target(self):
         day = date(2026, 7, 8)
         engine, strategy, planner, _ = replay_fixture()
-        loader = MagicMock(return_value={
+        loader = MagicMock(return_value=committed_archive({
             "quantities": {}, "reason": "empty", "version": "saved-empty",
             "signal_date": date(2026, 7, 7), "target_extra": {},
-        })
+        }))
         strategy.configure_planning_archive(None, loader)
         try:
             engine.run(start=pd.Timestamp("2026-07-08 09:24:20", tz="Asia/Shanghai").to_pydatetime(),
@@ -301,7 +311,7 @@ class OpeningAuctionTest(unittest.TestCase):
             self.assertEqual(planner.requests, [])
             self.assertEqual(strategy._target_version, "saved-empty")
             self.assertEqual(strategy._target_quantities, {})
-            self.assertIn(day, strategy._auction_frozen_dates)
+            self.assertIn(day, strategy.auction_session.frozen_dates)
             self.assertIn(day, strategy._processed_dates)
             self.assertEqual(engine.cache.orders(), [])
         finally:
@@ -337,6 +347,7 @@ class OpeningAuctionTest(unittest.TestCase):
         archive = {"quantities": {"000002.SZ.QMT": 500, "000001.SZ.QMT": 500},
                    "reason": "saved", "version": "saved", "signal_date": date(2026, 7, 7),
                    "target_extra": {}}
+        archive = committed_archive(archive)
         strategy.configure_planning_archive(None, lambda day: archive)
         try:
             engine.run()
@@ -349,7 +360,7 @@ class OpeningAuctionTest(unittest.TestCase):
         finally:
             engine.dispose()
 
-    def test_execution_snapshot_does_not_use_observations_received_after_its_timer(self):
+    def test_execution_snapshot_does_not_use_observations_received_after_its_request(self):
         def delay_late_observations(rows):
             return [replace(row, ts_init=row.ts_init + 2_000_000_000,
                             bid_price=row.bid_price * 1.02, ask_price=row.ask_price * 1.02)
@@ -362,7 +373,7 @@ class OpeningAuctionTest(unittest.TestCase):
             self.assertEqual(len(planner.requests), 1)
             self.assertEqual(strategy.auction_reference("000001.SZ.QMT").price, 10)
             self.assertEqual(strategy.auction_reference("000001.SZ.QMT").ts_init,
-                             timestamp("2026-07-08 09:24:50"))
+                             timestamp("2026-07-08 09:24:50.500"))
             self.assertEqual({str(o.instrument_id): float(o.price) for o in engine.cache.orders()},
                              {"000001.SZ.QMT": 10.05, "000002.SZ.QMT": 20.10})
         finally:
@@ -387,7 +398,7 @@ class OpeningAuctionTest(unittest.TestCase):
             self.assertEqual(float(sells[0].price), 10.15)
             self.assertEqual(int(sells[0].quantity), 900)
             self.assertEqual(strategy.auction_reference("000001.SZ.QMT").price, 10.2)
-            self.assertEqual(strategy._auction_planning_contexts[date(2026, 7, 9)].instruments[
+            self.assertEqual(auction_contexts(strategy)[date(2026, 7, 9)].instruments[
                              "000001.SZ.QMT"].price, 10)
             self.assertEqual(len(planner.requests), 2)
             self.assertLessEqual(strategy._auction_sell_committed_cost,
@@ -417,6 +428,7 @@ class OpeningAuctionTest(unittest.TestCase):
         archive = {"quantities": {"000002.SZ.QMT": 1000, "000001.SZ.QMT": 1000},
                    "reason": "saved", "version": "saved", "signal_date": date(2026, 7, 7),
                    "target_extra": {}}
+        archive = committed_archive(archive)
         strategy.configure_planning_archive(None, lambda day: archive)
         try:
             engine.run()
@@ -433,7 +445,7 @@ class OpeningAuctionTest(unittest.TestCase):
         try:
             engine.run()
             self.assertTrue(engine.trader.generate_orders_report().empty)
-            self.assertNotIn(date(2026, 7, 8), strategy._auction_frozen_dates)
+            self.assertNotIn(date(2026, 7, 8), strategy.auction_session.frozen_dates)
         finally:
             engine.dispose()
 
@@ -598,9 +610,11 @@ class OpeningAuctionTest(unittest.TestCase):
                 strategy.clock.set_time(ts)
                 strategy._last_market_data_ts_event = ts
                 self.assertFalse(strategy._within_cancel_window())
-                strategy.cancel_order(order)
-                strategy.cancel_orders([order])
-                strategy.cancel_all_orders(order.instrument_id)
+                for operation, args in ((strategy.cancel_order, (order,)),
+                                        (strategy.cancel_orders, ([order],)),
+                                        (strategy.cancel_all_orders, (order.instrument_id,))):
+                    with self.assertRaises(RuntimeError):
+                        operation(*args)
                 self.assertFalse(order.is_pending_cancel)
             for clock_time in ["09:30:00", "14:30:00", "14:56:59"]:
                 ts = timestamp(f"2026-07-08 {clock_time}")
@@ -616,11 +630,14 @@ class OpeningAuctionTest(unittest.TestCase):
             rows = [{"instrument_id": "000001.SZ.QMT", "target_qty": 1000,
                      "target_version": "persisted-auction", "reason": "test",
                      "extra": {"execution_phase": "opening_auction", "prediction_rank": 2}}]
-            strategy.configure_live_target_portfolio_loader(lambda day, signal: rows)
+            archive = committed_archive({"quantities": {"000001.SZ.QMT": 1000},
+                "version": "persisted-auction", "reason": "test", "signal_date": date(2026, 7, 7),
+                "target_extra": {"000001.SZ.QMT": rows[0]["extra"]}})
+            strategy.configure_planning_archive(None, lambda day: archive)
             engine.run()
             self.assertEqual(planner.requests, [])
-            self.assertIn(date(2026, 7, 8), strategy._auction_frozen_dates)
-            self.assertEqual(strategy._auction_prediction_ranks["000001.SZ.QMT"], 2)
+            self.assertIn(date(2026, 7, 8), strategy.auction_session.frozen_dates)
+            self.assertEqual(strategy.auction_session.ranks["000001.SZ.QMT"], 2)
             self.assertEqual(len(engine.cache.orders()), 1)
         finally:
             engine.dispose()
@@ -704,7 +721,7 @@ class OpeningAuctionTest(unittest.TestCase):
                 self.assertTrue(strategy._subscribed_order_book_depth_instruments)
                 self.assertTrue(strategy._depth_books)
                 self.assertEqual({o.ts_init for o in engine.cache.orders()},
-                                 {timestamp("2026-07-08 09:24:40")})
+                                 {timestamp("2026-07-08 09:24:40.500")})
                 self.assertEqual(engine.trader.generate_fills_report().last_qty.astype(int).sum(), 100)
                 self.assertIs(valuation_bars, bars)
                 self.assertEqual(strategy.config.auction_commission_rate, args.commission_rate)

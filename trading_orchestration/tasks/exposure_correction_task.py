@@ -1,21 +1,20 @@
 from __future__ import annotations
 
+from task_orchestration.components.processes.task_process import BusinessTask
 from task_orchestration.models import Decision, RunState
 from task_orchestration.components.assessors.progress_assessor import ProgressAssessor
 from task_orchestration.components.planners.goal_planner import GoalPlanner
 
 
-class ExposureCorrectionTask:
+class ExposureCorrectionTask(BusinessTask):
     def __init__(self, bridge, *, assessor: ProgressAssessor, planner: GoalPlanner,
-                 executor_factory, stabilizer_factory, risk_planner_factory, outcome_policy):
+                 executor_factory, risk_planner_factory, outcome_policy):
         self.bridge = bridge
         self.assessor, self.planner = assessor, planner
         self.executor_factory = executor_factory
-        self.stabilizer_factory = stabilizer_factory
         self.risk_planner_factory = risk_planner_factory
         self.outcome_policy = outcome_policy
         self.executor = executor_factory()
-        self.stabilizer = stabilizer_factory()
         self.active_plan = None
         self.risk_planner = None
 
@@ -42,7 +41,6 @@ class ExposureCorrectionTask:
                 return result
             bridge.exposure_block = self._fingerprint(bridge.snapshot_provider.capture())
             self.risk_planner = None
-            self.stabilizer = self.stabilizer_factory()
             return Decision(RunState.WAITING, "reassess_after_risk_manager",
                             {"planning_result": result.reason})
 
@@ -54,20 +52,13 @@ class ExposureCorrectionTask:
                 with bridge.operations(windows=bridge.config.exposure.windows):
                     host._reconcile_unfilled_orders(host._clock_date())
                 return Decision(RunState.WAITING, "awaiting_corrective_orders", assessment.evidence())
-            held = self.executor.hold(context)
-            if held.state != RunState.SUCCEEDED:
-                return held
-            self.active_plan = None
-            self.stabilizer = self.stabilizer_factory()
-            self.executor = self.executor_factory()
-            snapshot = bridge.snapshot_provider.capture()
-            assessment = self.assessor.assess(snapshot)
+            # The framework stops execution and drains orders before the next
+            # business pass. Completion must use the post-cleanup portfolio.
+            return Decision(RunState.WAITING, "correction_requires_fresh_state",
+                            assessment.evidence(), requires_stable=True)
 
-        stable = self.stabilizer.stabilize(context)
-        if stable.state != RunState.SUCCEEDED:
-            return stable
-        snapshot = bridge.snapshot_provider.capture()
-        assessment = self.assessor.assess(snapshot)
+        if snapshot.pending_orders:
+            return Decision(RunState.WAITING, "unexpected_pending_orders", requires_stable=True)
         if assessment.status == "satisfied":
             bridge.exposure_block = None
             return Decision(RunState.SUCCEEDED, "exposure_within_tolerance", assessment.evidence())
@@ -100,8 +91,13 @@ class ExposureCorrectionTask:
                         {**assessment.evidence(), "planned_notional": str(plan.notional),
                          "quantities": {k: str(v) for k, v in plan.quantities.items()}})
 
-    def quiesce(self, context):
+    def interrupt(self, context):
         if self.risk_planner is not None:
             self.risk_planner.abort()
-        return self.executor.hold(context)
+
+    def after_stable(self, context):
+        self.executor.release(context)
+        self.active_plan = None
+        self.risk_planner = None
+        self.executor = self.executor_factory()
 

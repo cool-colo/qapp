@@ -744,24 +744,7 @@ class LiveSnapshotWriter:
             result["signal_date"] = date.fromisoformat(result["signal_date"])
         return result
 
-    def restore_planning_state(self, account_id: str, trader_id: str, trade_date: date) -> dict[str, int]:
-        self._execute("UPDATE `live_target_plan` SET `status`='interrupted', "
-                      "`payload`=JSON_SET(`payload`,'$.status','interrupted','$.error','process restarted') "
-                      "WHERE `account_id`=%s "
-                      "AND `trader_id`=%s AND `trade_date`=%s AND `status` IN "
-                      "('pending','canceling','reconciling','planning')", (account_id, trader_id, trade_date))
-        rows = self._query("SELECT `source`,COUNT(*) FROM `live_target_plan` WHERE `account_id`=%s "
-                           "AND `trader_id`=%s AND `trade_date`=%s GROUP BY `source`",
-                           (account_id, trader_id, trade_date))
-        return {source: int(count) for source, count in rows if source in ("automatic", "manual")}
 
-    def load_latest_planning_attempt(self, account_id: str, trader_id: str, trade_date: date):
-        rows = self._query("SELECT `payload` FROM `live_target_plan` WHERE `account_id`=%s "
-                           "AND `trader_id`=%s AND `trade_date`=%s ORDER BY `id` DESC LIMIT 1",
-                           (account_id, trader_id, trade_date))
-        if not rows:
-            return None
-        return json.loads(rows[0][0]) if isinstance(rows[0][0], str) else dict(rows[0][0])
 
     def load_strategy_today_fills(self, account_id: str, trader_id: str, trade_date: date,
                                  strategy_id: str) -> list[dict[str, Any]]:
@@ -1568,71 +1551,6 @@ class LiveSnapshotWriter:
     def _distinct_codes(rows: Sequence[Any]) -> list[str]:
         return sorted({str(row[0]).strip() for row in rows if row and str(row[0]).strip()})
 
-    def load_target_portfolios(
-        self,
-        account_id: str,
-        trader_id: str,
-        trade_date: date,
-        signal_date: date | None,
-        preferred_snapshot_type: str | None = None,
-        fallback_to_continuous: bool = False,
-    ) -> list[dict[str, Any]]:
-        """
-        Load persisted target rows for the (account, trader, trade_date, signal_date)
-        four-tuple. Returns dict rows (column name -> value) so callers can rebuild the
-        frozen weights/quantities without a record round-trip. Empty list means "not
-        generated yet — generate and persist a fresh target".
-        """
-        if signal_date is None:
-            where = (
-                "`account_id`=%s AND `trader_id`=%s AND `trade_date`=%s AND `signal_date` IS NULL"
-            )
-            params: tuple[Any, ...] = (account_id, trader_id, trade_date)
-        else:
-            where = (
-                "`account_id`=%s AND `trader_id`=%s AND `trade_date`=%s AND `signal_date`=%s"
-            )
-            params = (account_id, trader_id, trade_date, signal_date)
-        columns = [
-            "instrument_id",
-            "stock_code",
-            "signal_date",
-            "asset_snapshot_id",
-            "position_snapshot_id",
-            "total_asset",
-            "investable_asset",
-            "request_id",
-            "target_version",
-            "target_weight",
-            "open_price",
-            "price_source",
-            "target_qty",
-            "current_qty",
-            "score",
-            "expected_return",
-            "is_locked",
-            "reason",
-            "snapshot_type",
-            "extra",
-        ]
-        base_sql = (
-            f"SELECT {', '.join('`' + c + '`' for c in columns)} "
-            f"FROM {self._target_table_sql} "
-        )
-        if preferred_snapshot_type is None:
-            rows = self._query(f"{base_sql}WHERE {where}", params)
-            return [dict(zip(columns, row)) for row in rows]
-        for snapshot_type_candidate in self._snapshot_type_candidates(
-            preferred_snapshot_type,
-            fallback_to_continuous=fallback_to_continuous,
-        ):
-            rows = self._query(
-                f"{base_sql}WHERE {where} AND `snapshot_type`=%s",
-                params + (snapshot_type_candidate,),
-            )
-            if rows:
-                return [dict(zip(columns, row)) for row in rows]
-        return []
 
     def load_recent_target_dates(
         self,

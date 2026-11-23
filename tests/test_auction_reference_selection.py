@@ -16,6 +16,7 @@ from nautilus_trader.model.objects import Price, Quantity
 from lives._target_model_node import LiveTargetModelPredictionsStrategy
 from strategies.target_quantities import DepthBookSnapshot
 from tests.test_opening_auction import replay_fixture, timestamp
+from tests.orchestration_helpers import committed_archive, flush_requests
 
 
 A = "000001.SZ.QMT"
@@ -45,7 +46,7 @@ class AuctionReferenceSelectionTest(TestCase):
         self.engine.dispose()
 
     def update(self, price=10, ts_event=NOW - 2_000_000_000):
-        self.strategy.apply_whole_market_full_tick_snapshot(
+        self.strategy.market_snapshots.publish(
             {A: {"last_price": price, "ts_event": ts_event}}, "test_execution",
         )
 
@@ -128,15 +129,15 @@ class AuctionSubmissionReferenceTest(TestCase):
 
     def test_native_replay_depth_supersedes_an_older_full_market_snapshot(self):
         engine, strategy, _, _ = replay_fixture(starting_cash=50000)
-        apply_snapshot = strategy.apply_whole_market_full_tick_snapshot
+        apply_snapshot = strategy.market_snapshots.publish
 
-        def apply_stale_snapshot(snapshot, trigger):
+        def apply_stale_snapshot(snapshot, trigger, **kwargs):
             snapshot = {instrument_id: dict(fields) for instrument_id, fields in snapshot.items()}
             snapshot[A].update(last_price=9.9, ts_event=NOW - 1_000_000_000)
-            apply_snapshot(snapshot, trigger)
+            return apply_snapshot(snapshot, trigger, **kwargs)
 
         try:
-            with patch.object(strategy, "apply_whole_market_full_tick_snapshot", side_effect=apply_stale_snapshot):
+            with patch.object(strategy.market_snapshots, "publish", side_effect=apply_stale_snapshot):
                 engine.run(end=pd.Timestamp("2026-07-08 09:24:59", tz="Asia/Shanghai").to_pydatetime())
             contexts = {event.instrument_id: event.extra["intent_context"]
                         for event in strategy.order_events if event.status == "submitted"}
@@ -153,48 +154,28 @@ class AuctionSubmissionReferenceTest(TestCase):
             engine.dispose()
 
     def test_live_execution_waits_for_the_update_and_can_use_depth_for_a_missing_tick(self):
+        from trading_orchestration.components.executors.auction_preparation import AuctionExecutionPreparation
+        from task_orchestration.models import TaskContext, Proposal, RunState
         engine, strategy, planner, _ = replay_fixture(strategy_type=lambda config:
             LiveTargetModelPredictionsStrategy(config, refresh_context=None))
         pending = Future()
-        day = date(2026, 7, 8)
-        strategy.configure_planning_archive(None, lambda trading_date: {
-            "quantities": {A: 1000}, "reason": "saved", "version": "saved",
-            "signal_date": date(2026, 7, 7), "target_extra": {},
-        })
-        strategy.configure_whole_market_full_tick_source(lambda: {})
+        strategy.market_snapshots.configure_source(lambda: {})
         try:
             strategy.clock.set_time(NOW)
+            strategy._roll_trading_day(date(2026, 7, 8))
+            strategy._target_date, strategy._target_version = date(2026, 7, 8), 'restored'
+            strategy._target_quantities = {A: 1000}
             strategy.on_order_book_depth(depth(A, 10.1, 10.3, NOW - 1))
-            with patch.object(strategy, "_schedule_fetch", return_value=pending), \
-                    patch.object(strategy, "_run_on_loop", side_effect=lambda callback: callback()), \
-                    patch.object(strategy, "execute_opening_auction") as execute:
-                strategy._on_opening_auction_execution_timer(None)
-                execute.assert_not_called()
-                pending.set_result({B: {"last_price": 20, "ts_event": NOW - 2}})
-                execute.assert_called_once_with()
-            self.assertNotIn(A, strategy._whole_market_status)
-            self.assertIn(day, strategy._auction_execution_snapshot_dates)
-            self.assertEqual(strategy._select_opening_auction_reference(A)[0].source, "order_book_depth")
+            prepare = AuctionExecutionPreparation(strategy.orchestration)
+            context = TaskContext(NOW, 1, 'test', 1, Proposal('test'))
+            with patch.object(strategy, '_schedule_fetch', return_value=pending), \
+                    patch.object(strategy, '_run_on_loop', side_effect=lambda callback: callback()):
+                self.assertEqual(prepare.prepare(context).state, RunState.WAITING)
+                pending.set_result({B: {'last_price': 20, 'ts_event': NOW - 2}})
+                self.assertEqual(prepare.prepare(context).state, RunState.SUCCEEDED)
+            self.assertNotIn(A, strategy.market_snapshots.latest_snapshot())
+            self.assertEqual(strategy._select_opening_auction_reference(A)[0].source, 'order_book_depth')
             self.assertEqual(planner.requests, [])
-        finally:
-            engine.dispose()
-
-    def test_planning_time_full_market_cache_does_not_satisfy_the_execution_update(self):
-        engine, strategy, _, _ = replay_fixture()
-        strategy.configure_planning_archive(None, lambda trading_date: {
-            "quantities": {A: 1000}, "reason": "saved", "version": "saved",
-            "signal_date": date(2026, 7, 7), "target_extra": {},
-        })
-        try:
-            strategy.clock.set_time(timestamp("2026-07-08 09:24:01"))
-            strategy.apply_whole_market_full_tick_snapshot(
-                {A: {"last_price": 10, "ts_event": timestamp("2026-07-08 09:24:00")}}, "planning",
-            )
-            received_at = strategy._whole_market_status_updated_at_ns
-            strategy.clock.set_time(NOW)
-            self.assertFalse(strategy.accept_opening_auction_execution_update(
-                date(2026, 7, 8), ts_init=received_at,
-            ))
             self.assertEqual(engine.cache.orders(), [])
         finally:
             engine.dispose()
@@ -250,6 +231,8 @@ class AuctionSubmissionReferenceTest(TestCase):
             self.assertLessEqual(strategy._auction_committed_cost, Decimal(20200))
             expected_notional = sum((o.quantity.as_decimal() * o.price.as_decimal() for o in buys), Decimal("0"))
             self.assertEqual(strategy._auction_buy_committed_notional, expected_notional)
-            self.assertEqual(strategy._deferred_buys[A], Decimal(1000))
+            # Engine shutdown enters framework cleanup and drops deferred work.
+            self.assertEqual(strategy._deferred_buys, {})
+            self.assertEqual(strategy._target_quantities[A], Decimal(1000))
         finally:
             engine.dispose()

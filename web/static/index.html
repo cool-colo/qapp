@@ -54,6 +54,7 @@
           <button class="nav-item nav-parent" data-tab="control">交易管理</button>
           <button class="nav-item nav-sub" data-tab="control" data-sub="control">控制</button>
           <button class="nav-item nav-sub" data-tab="control" data-sub="targets">当前目标</button>
+          <button class="nav-item nav-sub" data-tab="control" data-sub="scheduler">任务调度</button>
         </div>
       </nav>
     </aside>
@@ -467,6 +468,60 @@
           </div>
           <div id="tgt-table" class="table-wrap"></div>
         </div>
+        <div id="ctrl-scheduler" class="ctrl-sub-panel">
+          <div class="sched-toolbar">
+            <div><h2>任务调度</h2><p>查看任务配置、当前执行、待执行候选和执行记录</p></div>
+            <div class="subbar-controls">
+              <span id="sched-status" class="sched-badge">等待连接</span>
+              <button id="sched-refresh">刷新</button>
+              <label class="inline"><input type="checkbox" id="sched-auto" checked /> 自动刷新（10s）</label>
+            </div>
+          </div>
+          <div id="sched-meta" class="sched-meta" aria-live="polite"></div>
+          <div id="sched-message" class="sched-message" hidden role="status"></div>
+          <div id="sched-content" hidden>
+            <nav class="sched-jumps" aria-label="任务调度页面导航">
+              <a href="#sched-live-section">执行概览</a><a href="#sched-config-section">任务配置</a>
+              <a href="#sched-history-section">执行记录</a><a href="#sched-actions-section">调度日志</a>
+            </nav>
+            <div id="sched-summary" class="sched-summary"></div>
+            <div id="sched-live-section" class="sched-live-grid">
+              <section class="sched-section sched-current-section">
+                <div class="sched-section-head"><h3>现在正在执行</h3><span id="sched-current-count" class="hint"></span></div>
+                <div id="sched-current"></div>
+                <div id="sched-execution" class="sched-execution"></div>
+              </section>
+              <section class="sched-section">
+                <div class="sched-section-head"><h3>接下来执行什么</h3><span id="sched-queue-count" class="hint"></span></div>
+                <div id="sched-queue"></div>
+                <details class="sched-waiting" open>
+                  <summary>尚待触发的任务</summary>
+                  <p class="hint">以下任务还没有入队；到达时间或满足条件后，才可能执行。</p>
+                  <div id="sched-waiting"></div>
+                </details>
+              </section>
+            </div>
+            <section id="sched-config-section" class="sched-section">
+              <div class="sched-section-head"><h3>配置了哪些任务</h3><span class="hint">显示当前生效配置，含内置启动任务</span></div>
+              <div id="sched-tasks" class="table-wrap"></div>
+            </section>
+            <section id="sched-history-section" class="sched-section">
+              <div class="sched-section-head">
+                <h3>执行过哪些任务</h3>
+                <div class="subbar-controls">
+                  <label>任务 <select id="sched-history-task"><option value="">全部任务</option></select></label>
+                  <label>状态 <select id="sched-history-state"><option value="">全部状态</option></select></label>
+                </div>
+              </div>
+              <p id="sched-history-note" class="sched-meta"></p>
+              <div id="sched-history" class="table-wrap"></div>
+            </section>
+            <section id="sched-actions-section" class="sched-section">
+              <div class="sched-section-head"><h3>调度动作</h3><span class="hint">最近 100 条 · 展开详情查看决策上下文</span></div>
+              <div id="sched-actions" class="table-wrap"></div>
+            </section>
+          </div>
+        </div>
       </section>
 
       <!-- ============ Data-quality tab (数据质量 · DQC) ============ -->
@@ -526,6 +581,7 @@
   <div id="toast"></div>
   <script src="/stock_hover.js"></script>
   <script src="/stock_menu.js"></script>
+  <script src="/scheduler.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

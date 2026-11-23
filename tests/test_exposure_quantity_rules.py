@@ -148,7 +148,7 @@ class ExposureQuantityRulesTest(unittest.TestCase):
                     _held_instrument_ids=lambda: {iid}, _target_quantities={},
                     cache=SimpleNamespace(instrument=lambda _: reference), _current_quantity=lambda _: D(90),
                     _market_status={iid: SimpleNamespace(last_price=10, ts_event=10, market_status=None)},
-                    _whole_market_status={}, _depth_books={},
+                    market_snapshots=SimpleNamespace(latest_snapshot=lambda: {}), _depth_books={},
                     _planning_permissions=lambda *args, **kwargs: (True, True),
                     _limit_price=lambda *args: Price.from_str('10.00'), planning_sellable_quantity=lambda *args: 90,
                     config=SimpleNamespace(continuous_buy_min_notional=D(10000)),

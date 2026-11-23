@@ -1,0 +1,5 @@
+# Isolate ordinary planning/execution in shared replay fixtures. The framework
+# remains mandatory; correction scenarios supply their own task configuration.
+schema_version: 2
+exposure:
+  enabled: false

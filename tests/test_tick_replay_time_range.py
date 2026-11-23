@@ -218,7 +218,7 @@ class TickReplayTimeRangeTest(unittest.TestCase):
                 window = BacktestTimeRange.parse(args.start, args.end)
                 self.assertTrue(all(window.contains(row.ts_init) for row in engine.data))
                 runner.run_engine(engine, args)
-                self.assertEqual(planning_times, [timestamp("2026-07-08 14:30")])
+                self.assertEqual(planning_times, [timestamp("2026-07-08 14:30:01")])
                 self.assertTrue(engine.cache.orders())
                 self.assertTrue(all(window.contains(order.ts_init) for order in engine.cache.orders()))
                 self.assertFalse(any("opening_auction" in (order.tags or []) for order in engine.cache.orders()))
@@ -230,17 +230,17 @@ class TickReplayTimeRangeTest(unittest.TestCase):
                 engine.dispose()
 
     def test_engine_end_prevents_delayed_acceptance_after_the_interval(self):
-        engine, strategy, planner, _ = replay_fixture(auction_enabled=False, continuous=True, submission_latency_ms=2000,
+        engine, strategy, planner, _ = replay_fixture(auction_enabled=False, continuous=True, submission_latency_ms=10000,
                                                       starting_cash=25000)
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "strategy.yaml"
             self.config(config)
             args = self.args(config, "--tick-table", "ricequant_stock_tick", "--start", "2026-07-08 14:30",
-                             "--end", "2026-07-08 14:30:01")
+                             "--end", "2026-07-08 14:30:04")
             try:
                 runner.run_engine(engine, args)
                 self.assertTrue(planner.requests)
-                self.assertLess(engine.backtest_end.value, timestamp("2026-07-08 14:30:01"))
+                self.assertLess(engine.backtest_end.value, timestamp("2026-07-08 14:30:04"))
                 self.assertTrue(engine.trader.generate_fills_report().empty)
             finally:
                 engine.dispose()

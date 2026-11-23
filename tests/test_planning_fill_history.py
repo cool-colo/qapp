@@ -68,7 +68,7 @@ class PlanningFillHistoryTests(unittest.TestCase):
         return order, event
 
     def context(self):
-        return self.strategy.build_planning_context(DAY, snapshot={
+        return self.strategy.planning_context_builder.build(DAY, snapshot={
             A: {"last_price": 10, "open": 10, "last_close": 10},
             B: {"last_price": 20, "open": 20, "last_close": 20},
         })

@@ -31,13 +31,16 @@ class RiskManagerGoalPlanner:
             self.day = day
             self.epoch = context.owner_epoch
             self.deadline = context.now_ns + int(float(host.config.risk_manager_timeout_secs) * 1e9)
-            snapshot = self.planning_context or host.build_planning_context(day, stage="continuous")
+            snapshot = self.planning_context or host.planning_context_builder.build(day, stage="continuous")
             self.snapshot = snapshot
             self.request, self.exits, self.degraded = host.prepare_target_planning(day, snapshot)
             inputs = host.capture_planning_inputs(self.request, self.exits, snapshot)
             request_id = f"orchestration-{context.now_ns}-{context.run_id}"
             self.attempt = PlanningAttempt(request_id, day, self.source, self.parent,
-                                          status="planning", inputs=inputs)
+                                          status="planning", inputs=inputs,
+                                          triggers=[{"key": context.proposal.key}])
+            if context.proposal.payload is not None:
+                self.attempt.validity = context.proposal.payload
             host.archive_planning_attempt(self.attempt)
             host._latest_planning_inputs = inputs
             if self.degraded is not None:
@@ -48,6 +51,7 @@ class RiskManagerGoalPlanner:
                 # Only this independent request DTO and planner enter the worker.
                 self.future = host._async_scheduler.schedule(
                     asyncio.to_thread(host._target_planner.plan, self.request))
+                self.future.add_done_callback(lambda _: self.bridge.wake_event())
                 return Decision(RunState.WAITING, "optimizer_pending")
             else:
                 future = Future()

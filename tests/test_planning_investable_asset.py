@@ -41,7 +41,7 @@ class PlanningInvestableAssetTest(unittest.TestCase):
                 A: {"last_price": 9.4, "open": 9.4, "last_close": 10},
                 B: {"last_price": 20, "open": 20, "last_close": 20},
             }
-        context = self.strategy.build_planning_context(DAY, stage=stage, snapshot=snapshot)
+        context = self.strategy.planning_context_builder.build(DAY, stage=stage, snapshot=snapshot)
         quantities = quantities if quantities is not None else {A: 5000, B: 2500}
         with (
             patch.object(self.strategy, "_held_instrument_ids", return_value=set(quantities)),

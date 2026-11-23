@@ -16,17 +16,28 @@ class OrchestrationConfig:
     exposure: ExposureConfig = field(default_factory=ExposureConfig)
     poll_interval_secs: float = 0.5
     tasks: Mapping[str, TaskSpec] = field(default_factory=dict)
+    cleanup_component: str = "cancel_reconcile"
     exposure_components: Mapping[str, str] = field(default_factory=dict)
     execution_components: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    cleanup_reconciliation_enabled: bool = True
+    planning_components: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str) -> OrchestrationConfig:
         import yaml
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("task_orchestration_config must name a configuration file; orchestration is required")
         raw = yaml.safe_load(Path(path).read_text())
-        if not isinstance(raw, dict) or set(raw) - {"schema_version", "poll_interval_secs", "exposure", "tasks", "exposure_components"}:
+        if not isinstance(raw, dict) or set(raw) - {"schema_version", "poll_interval_secs", "exposure", "tasks", "exposure_components", "cleanup_component", "cleanup_reconciliation_enabled"}:
             raise ValueError("invalid orchestration configuration fields")
-        if raw.get("schema_version") != 1:
-            raise ValueError("orchestration schema_version must be 1")
+        if raw.get("schema_version") != 2:
+            raise ValueError("orchestration schema_version must be 2; move exposure_components.stabilizer to cleanup_component")
+        cleanup_component = raw.get("cleanup_component", "cancel_reconcile")
+        if not isinstance(cleanup_component, str) or not cleanup_component:
+            raise ValueError("cleanup_component must be a nonempty component ID")
+        cleanup_reconciliation_enabled = raw.get("cleanup_reconciliation_enabled", True)
+        if not isinstance(cleanup_reconciliation_enabled, bool):
+            raise ValueError("cleanup_reconciliation_enabled must be boolean")
         exposure_raw = raw.get("exposure", {})
         if not isinstance(exposure_raw, dict) or set(exposure_raw) - {f.name for f in fields(ExposureConfig)}:
             raise ValueError("invalid exposure configuration fields")
@@ -53,11 +64,19 @@ class OrchestrationConfig:
             raise ValueError("unknown task definition")
         result = {}
         profiles = {}
+        planners = {}
         for name, priority in defaults.items():
             values = configured.get(name, {})
-            if not isinstance(values, dict) or set(values) - {"enabled", "priority", "can_preempt", "preemptible", "splitter", "cancellation"}:
+            if not isinstance(values, dict) or set(values) - {"enabled", "priority", "can_preempt", "preemptible", "splitter", "cancellation", "planner"}:
                 raise ValueError(f"invalid task configuration: {name}")
             values = dict(values)
+            planning_names = {'daily_planning', 'auction_planning', 'scheduled_replan', 'price_limit_replan', 'manual_replan'}
+            if name in planning_names:
+                planners[name] = values.pop('planner', 'auction_goal' if name == 'auction_planning' else 'risk_manager')
+                if not isinstance(planners[name], str) or not planners[name]:
+                    raise ValueError('planner must be a nonempty component ID')
+            elif 'planner' in values:
+                raise ValueError(f'{name} is not a planning task')
             profile = {"splitter": values.pop("splitter", "existing_notional"),
                        "cancellation": values.pop("cancellation", "existing")}
             if any(not isinstance(value, str) or not value for value in profile.values()):
@@ -74,7 +93,7 @@ class OrchestrationConfig:
                                    interval_ns=int(exposure.interval_secs * 1e9)
                                    if name == "exposure_correction" else int(interval * 1e9))
         components = {"assessor": "position_ratio", "planner": "remaining_target",
-                      "executor": "nautilus_exposure", "stabilizer": "cancel_reconcile",
+                      "executor": "nautilus_exposure",
                       "risk_planner": "risk_manager", "validator": "formal_remainder",
                       "outcome": "capacity_replan"}
         custom = raw.get("exposure_components", {})
@@ -83,6 +102,6 @@ class OrchestrationConfig:
         if any(not isinstance(value, str) or not value for value in custom.values()):
             raise ValueError("component IDs must be nonempty strings")
         components.update(custom)
-        return cls(exposure, interval, MappingProxyType(result), MappingProxyType(components),
-                   MappingProxyType(profiles))
+        return cls(exposure, interval, MappingProxyType(result), cleanup_component, MappingProxyType(components),
+                   MappingProxyType(profiles), cleanup_reconciliation_enabled, MappingProxyType(planners))
 

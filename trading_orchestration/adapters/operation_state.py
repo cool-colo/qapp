@@ -6,6 +6,8 @@ class OperationState(threading.local):
 
     def __init__(self):
         self.driving = False
+        self.mode = None
+        self.execution_depth = 0
         self.operations_open = False
         self.profile_windows = None
         self.active_profile = None

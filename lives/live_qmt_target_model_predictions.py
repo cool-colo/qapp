@@ -170,15 +170,6 @@ def _add_snapshot_recorder(
         )
         raise
 
-    def _load_live_target_portfolio(trading_date: Any, signal_date: Any) -> list[dict[str, Any]]:
-        return writer.load_target_portfolios(
-            str(args.account_id),
-            str(args.trader_id),
-            trading_date,
-            signal_date,
-            preferred_snapshot_type=BEFORE_TRADING,
-            fallback_to_continuous=True,
-        )
 
     def _load_recent_target_dates(
         trading_date: Any,
@@ -206,7 +197,6 @@ def _add_snapshot_recorder(
             stock_codes,
         )
 
-    strategy.configure_live_target_portfolio_loader(_load_live_target_portfolio)
     strategy.configure_recent_target_loader(_load_recent_target_dates)
     strategy.configure_position_span_start_loader(_load_position_span_start_dates)
     recorder = SnapshotRecorder(
@@ -255,19 +245,12 @@ def _add_snapshot_recorder(
             f"[snapshot] pre-open latency restore skipped: {exc}",
             is_warning=True,
         )
-    strategy.configure_live_target_plan_persister(recorder.persist_strategy_target_plan)
     strategy.configure_planning_archive(recorder.persist_planning_attempt, recorder.load_committed_plan)
     archive_day = pd.Timestamp.now(tz=args.exchange_timezone).date()
     writer.initialize_strategy_trade_scope(str(args.account_id), str(args.trader_id), str(strategy.id))
     strategy.configure_today_fills_loader(lambda trading_date: writer.load_strategy_today_fills(
         str(args.account_id), str(args.trader_id), trading_date, str(strategy.id)))
     strategy.refresh_today_fills(archive_day)
-    if strategy.orchestration is None:
-        strategy.replanning.day = archive_day
-        strategy.replanning.counts.update(writer.restore_planning_state(
-            str(args.account_id), str(args.trader_id), archive_day))
-        strategy.replanning.last = writer.load_latest_planning_attempt(
-            str(args.account_id), str(args.trader_id), archive_day)
     node.trader.add_actor(recorder)
     _emit_snapshot_status(
         node,

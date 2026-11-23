@@ -56,7 +56,7 @@ class StrategyParams:
     trailing_take_profit_start: float = 0.0
     auto_replan_enabled: bool = True
     scheduled_replan_times: tuple[str, ...] = ()
-    task_orchestration_config: str = ""
+    task_orchestration_config: str = "configs/task_orchestration.yaml"
     min_listed_days: int = 120
     consecutive_up_limit_days: int = 3
     max_open_gap_up: float = 0.05
@@ -151,6 +151,8 @@ class StrategyParams:
         from strategies.opening_auction import validate_auction_config
         from strategies.replan_triggers import normalize_scheduled_replan_times
 
+        if not isinstance(self.task_orchestration_config, str) or not self.task_orchestration_config.strip():
+            raise ValueError("task_orchestration_config must name a configuration file; orchestration is required")
         validate_cancel_config(self)
         validate_auction_config(self)
         object.__setattr__(self, "scheduled_replan_times",

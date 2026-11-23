@@ -18,6 +18,12 @@ from strategies.model_prediction_targets import TargetModelPredictionsStrategy
 from tests.test_opening_auction import replay_fixture, timestamp
 
 
+def keep_comparison_clock_running(rows):
+    ts = timestamp("2026-07-08 09:30:12")
+    return rows + [HistoricalTick("000001.SZ", "quote", ts, ts, 10, 10.01,
+                                  10000, 10000, 10, 10)]
+
+
 class AuctionReplayReviewTest(unittest.TestCase):
     def test_live_limits_use_nautilus_when_only_prior_day_reference_exists(self):
         engine, strategy, _, _ = replay_fixture(
@@ -54,7 +60,7 @@ class AuctionReplayReviewTest(unittest.TestCase):
                     for row in rows]
 
         engine, strategy, planner, _ = replay_fixture(
-            auction_enabled=False, transform_rows=delay_second_result)
+            auction_enabled=False, transform_rows=lambda rows: keep_comparison_clock_running(delay_second_result(rows)))
         try:
             engine.run()
             self.assertEqual(len(planner.requests), 1)
@@ -70,7 +76,7 @@ class AuctionReplayReviewTest(unittest.TestCase):
                     for row in rows]
 
         engine, strategy, planner, _ = replay_fixture(
-            auction_enabled=False, transform_rows=delay_second_result)
+            auction_enabled=False, transform_rows=lambda rows: keep_comparison_clock_running(delay_second_result(rows)))
         planning_times = []
         original_plan = planner.plan
 
@@ -81,7 +87,7 @@ class AuctionReplayReviewTest(unittest.TestCase):
         planner.plan = record_time
         try:
             engine.run()
-            self.assertEqual(planning_times, [timestamp("2026-07-08 09:30:10")])
+            self.assertEqual(planning_times, [timestamp("2026-07-08 09:30:10.500")])
             self.assertEqual(len(planner.requests[0].candidates), 2)
         finally:
             engine.dispose()
@@ -99,7 +105,7 @@ class AuctionReplayReviewTest(unittest.TestCase):
     def test_comparison_does_not_wait_for_known_suspended_candidate(self):
         engine, strategy, planner, _ = replay_fixture(
             auction_enabled=False,
-            transform_rows=lambda rows: [row for row in rows if row.symbol != "000002.SZ"],
+            transform_rows=lambda rows: keep_comparison_clock_running([row for row in rows if row.symbol != "000002.SZ"]),
             transform_config=lambda config: type(config)(**{
                 **config.dict(), "suspended_by_date": {"2026-07-08": ["000002.SZ"]},
             }),

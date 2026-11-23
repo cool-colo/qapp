@@ -10,6 +10,7 @@ from nautilus_trader.model.events import OrderCancelRejected
 from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, StrategyId, TraderId
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.orders import LimitOrder
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.events import TestEventStubs as Events
 
 from task_orchestration.core.orchestrator import TaskOrchestrator
@@ -36,6 +37,7 @@ class CleanupBoundary:
             cancel_for_replanning=Mock(side_effect=self.cancel),
         )
         self.bootstrap_load = Mock()
+        self.discard_execution_requests = Mock()
 
     async def reconcile(self):
         pass
@@ -49,10 +51,10 @@ class CleanupBoundary:
     def operations(self):
         return nullcontext()
 
-    def add_order(self):
+    def add_order(self, key='order-1'):
         order = LimitOrder(trader_id=TraderId('TEST-001'), strategy_id=self.host.id,
                            instrument_id=InstrumentId.from_str('000001.SZ.QMT'),
-                           client_order_id=ClientOrderId('order-1'), order_side=OrderSide.BUY,
+                           client_order_id=ClientOrderId(key), order_side=OrderSide.BUY,
                            quantity=Quantity.from_int(100), price=Price.from_str('10.00'),
                            init_id=UUID4(), ts_init=0)
         order.apply(Events.order_submitted(order))
@@ -83,7 +85,7 @@ class StabilizerRecoveryTest(unittest.TestCase):
 
     def test_bootstrap_retries_failed_future_and_admits_next_task(self):
         boot = BootstrapTask(self.bridge)
-        engine = TaskOrchestrator()
+        engine = TaskOrchestrator(stabilizer_factory=lambda _scope: NautilusStateStabilizer(self.bridge))
         engine.register(TaskSpec('boot', 0), lambda: boot, bootstrap=True)
         process = SimpleNamespace(advance=Mock(return_value=Decision(RunState.RUNNING)))
         engine.register(TaskSpec('next', 1), lambda: process)
@@ -93,12 +95,15 @@ class StabilizerRecoveryTest(unittest.TestCase):
         engine.tick(1_000_000_000)
         self.assertEqual(engine.lifecycle, 'initializing')
         self.assertIsNone(engine.snapshot()['runs'][0]['final_result'])
-        self.assertIsNone(boot.stabilizer.future)
+        self.assertIsNone(engine._stabilizers["default"].future)
         engine.tick(5_000_000_000)
         self.assertEqual(len(self.bridge.futures), 1)
         engine.tick(6_000_000_000)
         self.bridge.futures[1].set_result(None)
-        for second in (7, 8, 9):
+        for second in range(7, 15):
+            for future in self.bridge.futures:
+                if not future.done():
+                    future.set_result(None)
             engine.tick(second * 1_000_000_000)
         self.assertEqual(engine.lifecycle, 'ready')
         self.assertEqual(engine.owner_task(), 'next')
@@ -108,13 +113,16 @@ class StabilizerRecoveryTest(unittest.TestCase):
         self.assertEqual(failure.evidence['error'], 'TimeoutError: transient')
 
     def test_cleanup_failure_keeps_owner_until_successful_retry(self):
-        engine = TaskOrchestrator()
+        self.bridge.host._execution_state_reconciler.is_configured = False
+        engine = TaskOrchestrator(stabilizer_factory=lambda _scope: NautilusStateStabilizer(self.bridge))
         done = SimpleNamespace(advance=lambda _: Decision(RunState.SUCCEEDED),
-                               quiesce=lambda _: Decision(RunState.SUCCEEDED))
+                               interrupt=lambda _: None, after_stable=lambda _: None)
         engine.register(TaskSpec('boot', 0), lambda: done, bootstrap=True)
         engine.start(0)
-        process = SimpleNamespace(advance=lambda _: Decision(RunState.SUCCEEDED, 'business_complete'),
-                                  quiesce=self.stabilizer.stabilize)
+        def complete(_):
+            self.bridge.host._execution_state_reconciler.is_configured = True
+            return Decision(RunState.SUCCEEDED, 'business_complete')
+        process = SimpleNamespace(advance=complete, interrupt=lambda _: None, after_stable=lambda _: None)
         engine.register(TaskSpec('work', 1), lambda: process)
         engine.submit('work', Proposal('work'))
         engine.tick(1)
@@ -162,7 +170,7 @@ class StabilizerRecoveryTest(unittest.TestCase):
         self.assertEqual(self.stabilizer.stabilize(context(8)).state, RunState.SUCCEEDED)
         self.assertFalse(self.bridge.host._replanning_blocked)
 
-    def test_exhaustion_reconciles_open_order_and_rearms_bounded_round(self):
+    def test_exhaustion_and_failed_query_never_rearm_cancellation_budget(self):
         order = self.bridge.add_order()
         for second in (0, 5, 10):
             self.stabilizer.stabilize(context(second))
@@ -180,7 +188,14 @@ class StabilizerRecoveryTest(unittest.TestCase):
         self.stabilizer.stabilize(context(31))
         self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 3)
         self.stabilizer.stabilize(context(32))
-        self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 4)
+        self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 3)
+        waiting = self.stabilizer.stabilize(context(56))
+        self.assertEqual(waiting.reason, 'reconciliation_observation_wait')
+        self.assertEqual(waiting.evidence['retry_at_ns'], 57_000_000_000)
+        self.assertTrue(waiting.evidence['manual_intervention_required'])
+        self.assertEqual(waiting.evidence['cancellations']['order-1']['attempts'], 3)
+        self.stabilizer.stabilize(context(57))
+        self.assertEqual(len(self.bridge.futures), 3)
 
     def test_pending_request_is_not_duplicated_and_timeout_reconciles(self):
         self.bridge.add_order()
@@ -243,3 +258,175 @@ class StabilizerRecoveryTest(unittest.TestCase):
         self.stabilizer.stabilize(context(7))
         self.assertEqual(self.stabilizer.stabilize(context(8)).state, RunState.SUCCEEDED)
         self.assertEqual(boundary.call_count, 2)
+
+    def exhaust(self, *orders):
+        for second in (0, 5, 10):
+            self.stabilizer.stabilize(context(second))
+            for order in orders:
+                self.bridge.reject(order)
+
+    def test_early_rejection_waits_for_entire_batch_before_retry(self):
+        first = self.bridge.add_order('first')
+        second = self.bridge.add_order('second')
+        self.stabilizer.stabilize(context(0))
+        self.bridge.reject(first)
+        result = self.stabilizer.stabilize(context(5))
+        self.assertEqual(result.reason, 'awaiting_cancellation_batch')
+        self.assertEqual(result.evidence['pending_orders'], ['second'])
+        self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 2)
+        self.assertEqual(self.bridge.futures, [])
+        self.bridge.reject(second)
+        self.stabilizer.stabilize(context(6))
+        self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 4)
+
+    def test_exhausted_member_does_not_query_while_another_is_pending(self):
+        first = self.bridge.add_order('first')
+        second = self.bridge.add_order('second')
+        for instant in (0, 5):
+            self.stabilizer.stabilize(context(instant))
+            self.bridge.reject(first)
+            self.bridge.reject(second)
+        self.stabilizer.stabilize(context(10))
+        self.bridge.reject(first)
+        self.assertEqual(self.stabilizer.stabilize(context(15)).reason, 'awaiting_cancellation_batch')
+        self.assertEqual(self.bridge.futures, [])
+        self.bridge.reject(second)
+        self.assertEqual(self.stabilizer.stabilize(context(16)).reason, 'reconciling')
+        self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 6)
+
+    def test_timeout_of_oldest_request_does_not_skip_younger_pending_request(self):
+        self.bridge.add_order('first')
+        self.stabilizer.stabilize(context(0))
+        second = self.bridge.add_order('second')
+        # A pending request inherited from before this order entered the cache.
+        second.apply(Events.order_pending_cancel(second))
+        self.stabilizer.stabilize(context(10))
+        waiting = self.stabilizer.stabilize(context(30))
+        self.assertEqual(waiting.reason, 'awaiting_cancellation_batch')
+        self.assertEqual(waiting.evidence['timed_out_orders'], ['first'])
+        self.assertEqual(self.bridge.futures, [])
+        result = self.stabilizer.stabilize(context(40))
+        self.assertEqual(result.reason, 'reconciling')
+        self.assertEqual(result.evidence['timed_out_orders'], ['first', 'second'])
+        self.stabilizer.stabilize(context(41))
+        self.assertEqual(len(self.bridge.futures), 1)
+        self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 1)
+
+    def test_unchanged_queries_back_off_and_never_rearm_attempts(self):
+        order = self.bridge.add_order()
+        self.exhaust(order)
+        instant = 15
+        for interval in (30, 60, 120, 240, 300, 300):
+            self.assertEqual(self.stabilizer.stabilize(context(instant)).reason, 'reconciling')
+            self.bridge.futures[-1].set_result(None)
+            instant += 1
+            result = self.stabilizer.stabilize(context(instant))
+            deadline = instant + interval
+            self.assertEqual(result.evidence['retry_at_ns'], deadline * 1_000_000_000)
+            self.bridge.host._execution_activity += 1  # Unrelated event is not progress.
+            self.assertEqual(self.stabilizer.stabilize(context(deadline - 1)).reason,
+                             'reconciliation_observation_wait')
+            self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 3)
+            instant = deadline
+
+    def test_terminal_reports_bypass_observation_delay_but_require_final_query(self):
+        order = self.bridge.add_order()
+        self.exhaust(order)
+        self.stabilizer.stabilize(context(15))
+        self.bridge.futures[-1].set_result(None)
+        self.stabilizer.stabilize(context(16))
+        self.bridge.orders.clear()
+        self.assertEqual(self.stabilizer.stabilize(context(17)).reason, 'reconciling')
+        self.bridge.futures[-1].set_result(None)
+        self.stabilizer.stabilize(context(18))
+        self.assertEqual(self.stabilizer.stabilize(context(19)).state, RunState.SUCCEEDED)
+
+    def test_progress_resets_observation_delay_without_rearming_cancel_budget(self):
+        first = self.bridge.add_order('first')
+        second = self.bridge.add_order('second')
+        self.exhaust(first, second)
+        self.stabilizer.stabilize(context(15))
+        self.bridge.futures[-1].set_result(None)
+        self.stabilizer.stabilize(context(16))
+        self.bridge.orders.remove(first)
+        result = self.stabilizer.stabilize(context(17))
+        self.assertEqual(result.reason, 'reconciling')
+        self.assertEqual(result.evidence['unchanged_rounds'], 0)
+        self.assertEqual(result.evidence['cancellations']['second']['attempts'], 3)
+        self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 6)
+
+    def test_new_order_has_own_budget_without_rearming_exhausted_order(self):
+        first = self.bridge.add_order('first')
+        self.exhaust(first)
+        self.stabilizer.stabilize(context(15))
+        self.bridge.futures[-1].set_result(None)
+        self.stabilizer.stabilize(context(16))
+        second = self.bridge.add_order('second')
+        self.stabilizer.stabilize(context(17))
+        self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 4)
+        self.bridge.host.cancel_for_replanning.assert_called_with(second)
+        self.assertEqual(self.stabilizer.cancellations['first'].attempts, 3)
+        self.assertEqual(self.stabilizer.unchanged_rounds, 1)
+
+    def test_partial_fill_is_progress_without_resetting_cancellation_budget(self):
+        order = self.bridge.add_order()
+        self.exhaust(order)
+        self.stabilizer.stabilize(context(15))
+        self.bridge.futures[-1].set_result(None)
+        self.stabilizer.stabilize(context(16))
+        instrument = TestInstrumentProvider.equity('000001.SZ', 'QMT')
+        order.apply(Events.order_filled(order, instrument, last_qty=Quantity.from_int(50)))
+        result = self.stabilizer.stabilize(context(17))
+        self.assertEqual(result.reason, 'reconciling')
+        self.assertEqual(result.evidence['unchanged_rounds'], 0)
+        self.assertEqual(result.evidence['cancellations']['order-1']['attempts'], 3)
+        self.assertEqual(self.bridge.host.cancel_for_replanning.call_count, 3)
+
+    def test_failed_queries_back_off_exponentially_with_a_cap(self):
+        instant = 0
+        for interval in (5, 10, 20, 40, 80, 160, 300, 300):
+            self.stabilizer.stabilize(context(instant))
+            self.bridge.futures[-1].set_exception(ConnectionError('unavailable'))
+            instant += 1
+            result = self.stabilizer.stabilize(context(instant))
+            self.assertIsNone(self.stabilizer.future)
+            self.assertEqual(result.evidence['retry_at_ns'], (instant + interval) * 1_000_000_000)
+            self.assertEqual(self.stabilizer.stabilize(context(instant + interval - 1)).reason,
+                             'reconciliation_retry_wait')
+            instant += interval
+        self.stabilizer.stabilize(context(instant))
+        self.bridge.futures[-1].set_result(None)
+        self.stabilizer.stabilize(context(instant + 1))
+        self.assertEqual(self.stabilizer.stabilize(context(instant + 2)).state, RunState.SUCCEEDED)
+
+    def test_disabled_reconciliation_keeps_cancel_and_quiet_state_requirements(self):
+        self.stabilizer = NautilusStateStabilizer(self.bridge, reconciliation_enabled=False)
+        self.bridge.host.config.cancel_reconverge_delay_secs = 2
+        order = self.bridge.add_order()
+        self.exhaust(order)
+        result = self.stabilizer.stabilize(context(15))
+        self.assertEqual(result.reason, 'cleanup_reconciliation_disabled')
+        self.assertFalse(result.evidence['reconciliation_enabled'])
+        self.assertTrue(result.evidence['manual_intervention_required'])
+        self.assertEqual(self.bridge.futures, [])
+        self.bridge.orders.clear()
+        self.assertEqual(self.stabilizer.stabilize(context(16)).state, RunState.WAITING)
+        self.assertEqual(self.stabilizer.stabilize(context(18)).state, RunState.SUCCEEDED)
+        self.assertEqual(self.bridge.futures, [])
+
+    def test_disabled_reconciliation_bootstrap_admits_only_after_terminal_report(self):
+        self.bridge.add_order()
+        engine = TaskOrchestrator(stabilizer_factory=lambda _scope: NautilusStateStabilizer(
+            self.bridge, reconciliation_enabled=False))
+        engine.register(TaskSpec('boot', 0), lambda: BootstrapTask(self.bridge), bootstrap=True)
+        engine.start(0)
+        engine.tick(31_000_000_000)
+        self.assertEqual(engine.lifecycle, 'initializing')
+        self.bridge.bootstrap_load.assert_not_called()
+        self.assertEqual(self.bridge.futures, [])
+        self.bridge.orders.clear()
+        for instant in (32, 33, 34):
+            engine.tick(instant * 1_000_000_000)
+        self.assertEqual(engine.lifecycle, 'ready')
+        self.bridge.bootstrap_load.assert_called_once()
+        self.assertEqual(self.bridge.futures, [])

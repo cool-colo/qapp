@@ -79,6 +79,13 @@ A local, read-only dashboard for the live trading data this repo persists:
   multi-select controls minute candles, tick/BBO, broker orders/trades, and local
   states/events independently; diagnostics flag price marketability and broker/local
   discrepancies without treating a crossed tick as proof of fill eligibility.
+- **交易管理 → 任务调度** — current task and execution progress, queued candidates,
+  definitions waiting for a trigger, effective configuration, execution history and
+  scheduling actions with expandable reasons/evidence. Business results and order
+  cleanup are displayed separately: a successful task may still own execution while
+  cancellation or reconciliation is pending. Queued tasks are ordered by priority
+  and enqueue order; conditional tasks are not promised future executions. This page
+  sends only GET requests and refreshes every 10 seconds while visible (optional).
 
 Every table goes through one shared renderer, which prefixes a leading **序号**
 row-number column: it numbers the *visible* rows, so it follows the current sort/filter
@@ -203,6 +210,7 @@ All endpoints return JSON (Decimals as floats). Interactive docs at `/api/docs`.
 | `GET /api/realtime/minutes` | `stock_code, trade_date?` (default today in Asia/Shanghai) |
 | `GET /api/strategy/targets` | `account, trader` |
 | `GET /api/control/state` | `account, trader` |
+| `GET /api/scheduler` | `account, trader, history_limit=100` (1–500) |
 | `POST /api/control/suspend` | `account, trader` |
 | `POST /api/control/resume` | `account, trader` |
 | `POST /api/control/pause_target_updates` | `account, trader` |
@@ -220,6 +228,21 @@ map keyed by `"account_id/trader_id"` (**not** per source) — see `config.examp
 The node's `X-Control-Token` stays server-side. `GET /api/accounts` returns a
 `has_node_api` flag per account so the UI enables the 实时信息 / 交易管理 tabs only for
 accounts that have a node configured.
+
+The scheduler page reads `/scheduler/state` and a bounded `/scheduler/actions`
+journal from that node. Both read an already-published revision without acquiring
+trading, scheduler, or command locks. Readers never invoke trigger evaluation,
+planning, reconciliation, or execution/cache queries. Configuration is described
+once when the bridge is constructed; projection and time formatting run in the web
+process. Actions newer than the captured state revision are excluded. A snapshot
+can lag the owner's current scheduling turn; its logical timestamp is shown.
+
+History covers the current node process and resets on restart. Execution counts
+exclude tasks that never obtained execution ownership. The page shows the latest
+100 execution instances by default and 100 actions; the web projection obtains at
+most 1,000 actions to derive timestamps. Older start/end timestamps outside that
+window are shown as `—`, rather than inferred. Disabled orchestration, missing node
+configuration and failed connections have separate empty/error states.
 
 `GET /api/signal_quality` also reads the node's read-only `GET
 /realtime/whole_market_ticks` (whole 京沪深A full-tick snapshot: `stock_code, open,
@@ -242,3 +265,11 @@ This tool has **no authentication**. Keep it on `127.0.0.1`. Database credential
 come from `web/config.yaml` / env / `.env` — do not hardcode them. Note the repo
 currently contains committed credentials in `.envs/` and `start_*.sh`; treat those as
 compromised and rotate them.
+
+Scheduler cleanup is framework-owned. `preparing` reserves a scope while validating
+its state, before business execution begins; it is not counted as an executed task.
+`phase` and `cleanup_kind` distinguish entry, exit, and a task's request to resume
+from a clean state. Order acknowledgements continue during cleanup, but new orders
+are forbidden. The dashboard reads completed-cycle snapshots and never triggers
+checks inside an executor's order loop. Orchestration configuration uses schema 2,
+with the shared `cleanup_component` at the top level.

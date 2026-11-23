@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from tests.orchestration_helpers import auction_contexts
+
+from tests.orchestration_helpers import committed_archive
+
 import asyncio
 from dataclasses import replace
 from datetime import date, datetime
@@ -28,6 +32,7 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Equity
 from tests.test_opening_auction import replay_fixture, timestamp
+from tests.orchestration_helpers import evaluate_plan, start_runtime
 
 
 DAY = date(2026, 7, 8)
@@ -52,7 +57,7 @@ class ReplanningTests(unittest.TestCase):
         self.engine.dispose()
 
     def context(self, price=10):
-        return self.strategy.build_planning_context(DAY, stage="continuous", snapshot={
+        return self.strategy.planning_context_builder.build(DAY, stage="continuous", snapshot={
             A: {"last_price": price, "open": 10, "last_close": 10},
             B: {"last_price": 20, "open": 20, "last_close": 20},
         })
@@ -67,7 +72,7 @@ class ReplanningTests(unittest.TestCase):
         self.strategy._frozen_instruments[A] = "up_limit"
         with patch.object(self.strategy._target_planner, "plan", side_effect=RuntimeError("infeasible")), \
              patch.object(self.strategy, "_local_safety_plan") as safety:
-            result = self.strategy.compute_daily_target_plan(DAY, planning_context=self.context())
+            result = evaluate_plan(self.strategy, DAY, planning_context=self.context())
         self.assertIsNone(result)
         safety.assert_not_called()
         self.assertEqual(self.strategy._target_version, "existing")
@@ -76,7 +81,7 @@ class ReplanningTests(unittest.TestCase):
 
     def test_infeasible_without_target_uses_safety_plan(self):
         with patch.object(self.strategy._target_planner, "plan", side_effect=RuntimeError("infeasible")):
-            result = self.strategy.compute_daily_target_plan(DAY, planning_context=self.context())
+            result = evaluate_plan(self.strategy, DAY, planning_context=self.context())
         self.assertFalse(result.persistable)
         self.assertEqual(result.degraded_reason, "risk_manager_failure")
 
@@ -97,7 +102,7 @@ class ReplanningTests(unittest.TestCase):
         self.strategy.restore_today_fills(DAY, [{"trade_id": "buy1", "instrument_id": A, "side": "buy", "quantity": 400}])
         with patch.object(self.strategy, "_held_instrument_ids", return_value={A}), \
              patch.object(self.strategy, "_current_quantity", return_value=Decimal(1000)):
-            plan = self.strategy.compute_daily_target_plan(DAY, planning_context=self.context(9.4))
+            plan = evaluate_plan(self.strategy, DAY, planning_context=self.context(9.4))
         request = self.planner.requests[-1]
         holding = next(h for h in request.current_holdings if h.instrument_id == A)
         self.assertEqual(holding.quantity, 400)
@@ -120,7 +125,7 @@ class ReplanningTests(unittest.TestCase):
             self.strategy._daily_stock_data[row_key], up_limit=12.88, down_limit=10.54,
         )
         self.assertEqual(self.strategy._price_limits(A), (12.88, 10.54))
-        context = self.strategy.build_planning_context(DAY, stage="continuous", snapshot={
+        context = self.strategy.planning_context_builder.build(DAY, stage="continuous", snapshot={
             A: {"last_price": 10.540000000000001, "open": 10.54, "last_close": 11.71},
             B: {"last_price": 20, "open": 20, "last_close": 20},
         })
@@ -152,331 +157,22 @@ class ReplanningTests(unittest.TestCase):
                 other = OrderSide.BUY if side == OrderSide.SELL else OrderSide.SELL
                 self.assertIsNone(self.strategy._price_limit_reason(A, other))
 
-    def test_manual_replan_works_with_auto_disabled_and_preserves_user_pause(self):
-        async def scenario():
-            self.current_target()
-            self.strategy.update_target_quantities({}, DAY, SELL_ALL_REASON, version="manual-liquidation")
-            self.strategy.replanning.auto_enabled = False
-            self.strategy.trading_controller.set_paused(True)
-            self.strategy.trading_controller.set_target_updates_paused(True)
-            records = []
-            self.strategy.configure_planning_archive(lambda attempt, plan: records.append(attempt.payload(plan)))
-            request_id = self.strategy.request_replanning()
-            self.assertTrue(self.strategy._replanning_blocked)
-            with self.assertRaises(ReplanningBusyError):
-                self.strategy.request_replanning()
-            with self.assertRaises(ReplanningBusyError):
-                self.strategy.trading_controller.sell(None, "manual_sell_all")
-            await self.strategy.replanning.task
-            self.assertFalse(self.strategy._replanning_blocked)
-            self.assertEqual(self.strategy.replanning.last["status"], "committed")
-            self.assertIn(request_id, self.strategy._target_version)
-            self.assertNotEqual(self.strategy._target_reason, SELL_ALL_REASON)
-            self.assertTrue(self.strategy._trading_paused)
-            self.assertTrue(self.strategy._target_updates_paused)
-            self.assertEqual(records[-1]["status"], "committed")
-        asyncio.run(scenario())
-
-    def test_replan_infeasible_never_accepts_a_new_target(self):
-        async def scenario():
-            self.current_target({A: 500})
-            self.strategy._pending_replacements[A] = "old replacement"
-            with patch.object(self.strategy._target_planner, "plan", side_effect=RuntimeError("infeasible")), \
-                 patch.object(self.strategy, "accept_model_target_plan") as accept:
-                self.strategy.request_replanning()
-                await self.strategy.replanning.task
-            accept.assert_not_called()
-            self.assertEqual(self.strategy._target_version, "existing")
-            self.assertEqual(self.strategy._pending_replacements[A], "old replacement")
-            self.assertEqual(self.strategy.replanning.last["status"], "keep_current")
-        asyncio.run(scenario())
-
-    def test_archive_failure_does_not_apply_new_target(self):
-        async def scenario():
-            self.current_target({A: 500})
-            def archive(attempt, plan):
-                if plan is not None:
-                    raise RuntimeError("database unavailable")
-            self.strategy.configure_planning_archive(archive)
-            self.strategy.request_replanning()
-            await self.strategy.replanning.task
-            self.assertEqual(self.strategy._target_version, "existing")
-            self.assertEqual(self.strategy.replanning.last["status"], "failed")
-            self.assertFalse(self.strategy._replanning_blocked)
-        asyncio.run(scenario())
-
-    def test_cancel_and_late_fill_settle_before_planner(self):
-        async def scenario():
-            order = SimpleNamespace(client_order_id="pending", is_pending_cancel=False)
-            pending = [order]
-            reconciled = []
-            self.strategy.replanning_orders = MagicMock(side_effect=lambda: list(pending))
-            async def cancel_result():
-                await asyncio.sleep(0)
-                pending.clear()
-                await asyncio.sleep(.02)
-                self.strategy._execution_activity += 1
-            def cancel(_):
-                order.is_pending_cancel = True
-                asyncio.create_task(cancel_result())
-            self.strategy.cancel_for_replanning = MagicMock(side_effect=cancel)
-            async def reconcile():
-                reconciled.append(self.strategy._execution_activity)
-            self.strategy._execution_state_reconciler.reconcile_once = reconcile
-            self.strategy.request_replanning()
-            await self.strategy.replanning.task
-            self.assertEqual(len(self.planner.requests), 1)
-            self.assertTrue(reconciled)
-            self.assertEqual(reconciled[-1], 1)
-            self.strategy.cancel_for_replanning.assert_called_once()
-        asyncio.run(scenario())
 
     def test_empty_committed_plan_restores_without_calling_planner(self):
         archive = {"quantities": {}, "reason": "empty", "version": "saved-empty", "signal_date": date(2026, 7, 7)}
+        archive = committed_archive(archive)
         self.strategy.configure_planning_archive(None, lambda day: archive)
         self.strategy._convergence_suspended = True
-        self.assertTrue(self.strategy._process_trading_day(DAY))
+        start_runtime(self.strategy)
         self.assertEqual(self.strategy._target_version, "saved-empty")
         self.assertEqual(self.planner.requests, [])
 
-    def test_manual_sell_targets_survive_limit_triggers_until_daily_refresh(self):
-        held = {A: Decimal(100), B: Decimal(200)}
-        with patch.object(self.strategy, "control_open_long_quantities", return_value=held), \
-             patch.object(self.strategy, "control_sellable_quantity", side_effect=lambda iid: held[iid]), \
-             patch.object(self.strategy, "_held_instrument_ids", return_value=set(held)), \
-             patch.object(self.strategy, "_current_quantity", side_effect=lambda iid: held[str(iid)]), \
-             patch.object(self.strategy, "_converge_to_target_locked") as execute:
-            for instrument_ids, reason in ((None, SELL_ALL_REASON), ([A], SELL_REASON)):
-                with self.subTest(reason=reason):
-                    self.current_target(held)
-                    self.strategy._convergence_suspended = False
-                    self.strategy.apply_full_tick_snapshot({
-                        A: {"last_price": 11, "open": 10, "last_close": 10},
-                        B: {"last_price": 20, "open": 20, "last_close": 20},
-                    }, "test")
-                    result = self.strategy.trading_controller.sell(instrument_ids, reason)
-                    self.assertEqual(result["target_qty"][A], 0)
-                    self.assertFalse(self.strategy.replanning.busy)
-                    self.assertFalse(self.strategy._replanning_blocked)
-                    self.assertEqual(self.strategy._target_quantities[A], Decimal(0))
-                    self.assertTrue(execute.called)
-                    self.strategy.on_price_snapshot(DAY)
-                    self.assertFalse(self.strategy.check_replanning_trigger(DAY))
-                    self.assertEqual(self.strategy.replanning.counts["automatic"], 0)
-
-            # The ordinary daily target-loading path takes control again; no user
-            # pause or automatic-replanning setting needs to be changed.
-            self.strategy.configure_live_target_portfolio_loader(lambda day, signal: [
-                {"instrument_id": A, "target_qty": 200, "reason": "daily-model",
-                 "target_version": "daily-model"},
-            ])
-            self.assertTrue(self.strategy._process_trading_day(DAY))
-            self.assertEqual(self.strategy._target_reason, "daily-model")
-            self.assertTrue(self.strategy.replanning.busy)
-            self.assertEqual(self.strategy.replanning.counts["automatic"], 1)
-
-    def _late_limit_scenario(self, *, opens_again):
-        async def scenario():
-            self.current_target({A: 1000, B: 500})
-            loop = asyncio.get_running_loop()
-            started, release = asyncio.Event(), threading.Event()
-            original = self.planner.plan
-
-            def plan(request):
-                if not self.planner.requests:
-                    loop.call_soon_threadsafe(started.set)
-                    if not release.wait(5):
-                        raise TimeoutError("test did not release optimizer")
-                return original(request)
-
-            self.planner.plan = plan
-            self.strategy._schedule_convergence.side_effect = self.strategy._converge_to_target
-            with patch.object(self.strategy, "_converge_to_target_locked"):
-                self.strategy.apply_full_tick_snapshot({
-                    A: {"last_price": 11, "open": 10, "last_close": 10},
-                    B: {"last_price": 20, "open": 20, "last_close": 20},
-                }, "test")
-                first_task = self.strategy.replanning.task
-                try:
-                    await asyncio.wait_for(started.wait(), timeout=3)
-                    first_attempt = self.strategy.replanning.current
-                    self.strategy.apply_full_tick_snapshot({
-                        B: {"last_price": 22, "open": 20, "last_close": 20},
-                    }, "test")
-                    self.assertIs(self.strategy.replanning.task, first_task)
-                    if opens_again:
-                        self.strategy.apply_full_tick_snapshot({
-                            B: {"last_price": 20, "open": 20, "last_close": 20},
-                        }, "test")
-                finally:
-                    release.set()
-                await first_task
-                if opens_again:
-                    self.assertFalse(self.strategy.replanning.busy)
-                    self.assertEqual(len(self.planner.requests), 1)
-                    self.assertFalse(self.strategy.check_replanning_trigger(DAY))
-                else:
-                    self.assertTrue(self.strategy.replanning.busy)
-                    second_task = self.strategy.replanning.task
-                    self.assertIsNot(second_task, first_task)
-                    await second_task
-                    self.assertEqual(len(self.planner.requests), 2)
-                    self.assertEqual(self.strategy.replanning.counts["automatic"], 2)
-                    self.assertFalse(self.strategy.replanning.busy)
-                    self.assertEqual(first_attempt.inputs["request"]["open_prices"][B], 20)
-                    self.assertNotIn(B, {trigger.instrument_id for trigger in first_attempt.triggers})
-                    follow_up = self.strategy.replanning.last
-                    self.assertIn(B, {trigger["instrument_id"] for trigger in follow_up["triggers"]})
-                    second_request = self.planner.requests[-1]
-                    self.assertEqual(second_request.open_prices[B], 22)
-                    self.assertFalse(next(c for c in second_request.candidates if c.instrument_id == B).can_buy)
-        asyncio.run(scenario())
-
-    def test_limit_after_snapshot_runs_follow_up_planning(self):
-        self._late_limit_scenario(opens_again=False)
-
-    def test_late_limit_that_opens_again_does_not_force_another_plan(self):
-        self._late_limit_scenario(opens_again=True)
-
-    def test_limit_before_snapshot_is_included_in_current_attempt(self):
-        async def scenario():
-            self.current_target({A: 1000, B: 500})
-            cancel_requested = asyncio.Event()
-            order = SimpleNamespace(client_order_id="pending", is_pending_cancel=False)
-            pending = [order]
-            self.strategy.replanning_orders = MagicMock(side_effect=lambda: list(pending))
-
-            def cancel(_):
-                order.is_pending_cancel = True
-                cancel_requested.set()
-
-            self.strategy.cancel_for_replanning = MagicMock(side_effect=cancel)
-            self.strategy._schedule_convergence.side_effect = self.strategy._converge_to_target
-            with patch.object(self.strategy, "_converge_to_target_locked"):
-                self.strategy.apply_full_tick_snapshot({
-                    A: {"last_price": 11, "open": 10, "last_close": 10},
-                }, "test")
-                task = self.strategy.replanning.task
-                await asyncio.wait_for(cancel_requested.wait(), timeout=3)
-                self.strategy.apply_full_tick_snapshot({
-                    B: {"last_price": 22, "open": 20, "last_close": 20},
-                }, "test")
-                pending.clear()
-                await task
-            self.assertFalse(self.strategy.replanning.busy)
-            self.assertEqual(len(self.planner.requests), 1)
-            self.assertEqual(self.planner.requests[0].open_prices[B], 22)
-            self.assertEqual({trigger["instrument_id"] for trigger in self.strategy.replanning.last["triggers"]},
-                             {A, B})
-        asyncio.run(scenario())
-
-    def test_stop_before_coroutine_entry_releases_gate_and_allows_restart(self):
-        async def scenario():
-            records = []
-            self.strategy.configure_planning_archive(lambda attempt, plan: records.append(attempt.payload(plan)))
-            self.strategy.request_replanning()
-            old_attempt, old_task = self.strategy.replanning.current, self.strategy.replanning.task
-            self.strategy.on_stop()
-            with self.assertRaises(asyncio.CancelledError):
-                await old_task
-            await asyncio.sleep(0)
-            self.assertFalse(self.strategy.replanning.busy)
-            self.assertFalse(self.strategy._replanning_blocked)
-            self.assertEqual(self.strategy.replanning.last["status"], "interrupted")
-            self.assertEqual(len(records), 1)
-            self.assertEqual(self.planner.requests, [])
-            self.strategy._schedule_convergence.assert_not_called()
-
-            self.strategy.on_start()
-            new_id = self.strategy.request_replanning()
-            new_task = self.strategy.replanning.task
-            # A delayed completion from the canceled request cannot release the
-            # next request's gate or overwrite its recorded state.
-            self.strategy.replanning._finish(old_attempt, None)
-            self.assertTrue(self.strategy._replanning_blocked)
-            self.assertEqual(self.strategy.replanning.current.request_id, new_id)
-            await asyncio.wrap_future(new_task)
-            self.assertFalse(self.strategy.replanning.busy)
-            self.assertFalse(self.strategy._replanning_blocked)
-            self.assertEqual(self.strategy.replanning.last["status"], "committed")
-        asyncio.run(scenario())
-
-    def test_stop_before_entry_on_configured_node_loop_releases_gate(self):
-        async def scenario():
-            self.strategy._async_scheduler.set_loop(asyncio.get_running_loop())
-            records = []
-            self.strategy.configure_planning_archive(lambda attempt, plan: records.append(attempt.payload(plan)))
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always", RuntimeWarning)
-                self.strategy.request_replanning()
-                task = self.strategy.replanning.task
-                self.strategy.on_stop()
-                with self.assertRaises(asyncio.CancelledError):
-                    await asyncio.wrap_future(task)
-                await asyncio.sleep(0)
-                await asyncio.sleep(0)
-                self.assertFalse(self.strategy._replanning_blocked)
-                self.assertFalse(self.strategy.replanning.busy)
-                self.assertEqual(len(records), 1)
-                self.assertEqual(records[0]["status"], "interrupted")
-                self.assertEqual(self.planner.requests, [])
-                self.assertEqual([str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)], [])
-        asyncio.run(scenario())
-
-    def test_stop_after_coroutine_entry_archives_interruption_once(self):
-        async def scenario():
-            records, entered = [], asyncio.Event()
-            self.strategy.configure_planning_archive(lambda attempt, plan: records.append(attempt.payload(plan)))
-
-            async def reconcile():
-                entered.set()
-                await asyncio.Event().wait()
-
-            self.strategy._execution_state_reconciler.reconcile_once = reconcile
-            self.strategy.request_replanning()
-            task = self.strategy.replanning.task
-            await asyncio.wait_for(entered.wait(), timeout=3)
-            self.strategy.on_stop()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-            await asyncio.sleep(0)
-            self.assertFalse(self.strategy.replanning.busy)
-            self.assertFalse(self.strategy._replanning_blocked)
-            self.assertEqual(sum(row["status"] == "interrupted" for row in records), 1)
-            self.strategy._schedule_convergence.assert_not_called()
-        asyncio.run(scenario())
-
-    def test_cross_thread_cancellation_keeps_gate_until_started_coroutine_stops(self):
-        async def scenario():
-            self.strategy._async_scheduler.set_loop(asyncio.get_running_loop())
-            records, entered = [], asyncio.Event()
-            self.strategy.configure_planning_archive(lambda attempt, plan: records.append(attempt.payload(plan)))
-
-            async def reconcile():
-                entered.set()
-                await asyncio.Event().wait()
-
-            self.strategy._execution_state_reconciler.reconcile_once = reconcile
-            self.strategy.request_replanning()
-            task = self.strategy.replanning.task
-            await asyncio.wait_for(entered.wait(), timeout=3)
-            self.strategy.on_stop()
-            self.assertTrue(task.cancelled())
-            self.assertTrue(self.strategy._replanning_blocked)
-            with self.assertRaises(asyncio.CancelledError):
-                await asyncio.wrap_future(task)
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-            self.assertFalse(self.strategy.replanning.busy)
-            self.assertFalse(self.strategy._replanning_blocked)
-            self.assertEqual(sum(row["status"] == "interrupted" for row in records), 1)
-            self.strategy._schedule_convergence.assert_not_called()
-        asyncio.run(scenario())
 
     def test_auction_replay_restores_committed_empty_target_without_replanning(self):
         engine, strategy, planner, _ = replay_fixture(continuous=True)
         archive = {"quantities": {}, "reason": "saved-empty", "version": "saved-empty",
                    "signal_date": date(2026, 7, 7), "target_extra": {}}
+        archive = committed_archive(archive)
         strategy.configure_planning_archive(None, lambda day: archive)
         try:
             engine.run()
@@ -493,13 +189,14 @@ class ReplanningTests(unittest.TestCase):
         archive = {"quantities": {A: 1000}, "reason": "saved-auction", "version": "saved-auction",
                    "signal_date": date(2026, 7, 7),
                    "target_extra": {A: {"execution_phase": "opening_auction", "prediction_rank": 2}}}
+        archive = committed_archive(archive)
         strategy.configure_planning_archive(None, lambda day: archive)
         try:
             engine.run()
             self.assertEqual(planner.requests, [])
             self.assertEqual(strategy._target_version, "saved-auction")
-            self.assertIn(DAY, strategy._auction_frozen_dates)
-            self.assertEqual(strategy._auction_prediction_ranks[A], 2)
+            self.assertIn(DAY, strategy.auction_session.frozen_dates)
+            self.assertEqual(strategy.auction_session.ranks[A], 2)
             self.assertEqual(len(engine.cache.orders()), 1)
         finally:
             engine.dispose()
@@ -514,6 +211,7 @@ class ReplanningTests(unittest.TestCase):
         )
         archive = {"quantities": {A: 1000}, "reason": "saved-continuous", "version": "saved-continuous",
                    "signal_date": date(2026, 7, 7), "target_extra": {}}
+        archive = committed_archive(archive)
         loaded_days = []
 
         def load_committed(day):
@@ -527,8 +225,8 @@ class ReplanningTests(unittest.TestCase):
             self.assertEqual(planner.requests, [])
             self.assertEqual(strategy._target_version, "saved-continuous")
             self.assertEqual(strategy._target_quantities, {A: Decimal(1000)})
-            self.assertIn(DAY, strategy._auction_frozen_dates)
-            self.assertIn(DAY, strategy._auction_planning_contexts)
+            self.assertIn(DAY, strategy.auction_session.frozen_dates)
+            self.assertIn(DAY, auction_contexts(strategy))
             orders = engine.cache.orders()
             self.assertEqual(len(orders), 1)
             self.assertEqual(str(orders[0].instrument_id), A)
@@ -544,13 +242,14 @@ class ReplanningTests(unittest.TestCase):
         archive = {"quantities": {A: 1000}, "reason": "saved-continuous", "version": "saved-continuous",
                    "signal_date": date(2026, 7, 7),
                    "target_extra": {A: {"planning_stage": "continuous"}}}
+        archive = committed_archive(archive)
         strategy.configure_planning_archive(None, lambda day: archive)
         try:
             engine.run()
             self.assertEqual(planner.requests, [])
             self.assertEqual(strategy._target_version, "saved-continuous")
-            self.assertIn(DAY, strategy._auction_frozen_dates)
-            self.assertEqual(strategy._auction_prediction_ranks[A], 2)
+            self.assertIn(DAY, strategy.auction_session.frozen_dates)
+            self.assertEqual(strategy.auction_session.ranks[A], 2)
             orders = engine.cache.orders()
             self.assertEqual(len(orders), 1)
             self.assertEqual(str(orders[0].instrument_id), A)
@@ -561,14 +260,13 @@ class ReplanningTests(unittest.TestCase):
             engine.dispose()
 
     def test_repeated_auction_processing_does_not_reload_or_duplicate_orders(self):
-        class RepeatedAuctionStrategy(BacktestTargetModelPredictionsStrategy):
-            def process_opening_auction(self):
-                super().process_opening_auction()
-                super().process_opening_auction()
-
-        engine, strategy, planner, _ = replay_fixture(strategy_type=RepeatedAuctionStrategy)
+        engine, strategy, planner, _ = replay_fixture()
+        receive = strategy.orchestration.scheduled_triggers['auction_planning'].emit
+        strategy.orchestration.scheduled_triggers['auction_planning'].emit = lambda occurrence: (
+            receive(occurrence), receive(occurrence))
         archive = {"quantities": {A: 1000}, "reason": "saved-continuous", "version": "saved-continuous",
                    "signal_date": date(2026, 7, 7), "target_extra": {}}
+        archive = committed_archive(archive)
         loader = MagicMock(return_value=archive)
         strategy.configure_planning_archive(None, loader)
         try:
@@ -593,27 +291,12 @@ class ReplanningTests(unittest.TestCase):
             self.strategy.submit_order_list(None)
         with self.assertRaises(RuntimeError):
             self.strategy.modify_order(None)
-        self.strategy.cancel_order(None)
-        self.strategy.cancel_orders([])
-        self.strategy.cancel_all_orders(None)
+        for operation, args in ((self.strategy.cancel_order, (None,)),
+                                (self.strategy.cancel_orders, ([],)),
+                                (self.strategy.cancel_all_orders, (None,))):
+            with self.assertRaises(RuntimeError):
+                operation(*args)
 
-    def test_cache_query_error_aborts_before_planning(self):
-        async def scenario():
-            self.current_target({A: 500})
-            with patch.object(self.strategy, "replanning_orders", side_effect=RuntimeError("cache unavailable")):
-                self.strategy.request_replanning()
-                await self.strategy.replanning.task
-            self.assertEqual(self.planner.requests, [])
-            self.assertEqual(self.strategy._target_version, "existing")
-            self.assertEqual(self.strategy.replanning.last["status"], "failed")
-        asyncio.run(scenario())
-
-    def test_initial_planning_also_excludes_concurrent_planning(self):
-        self.strategy.replanning.initial_in_progress = True
-        with self.assertRaises(ReplanningBusyError):
-            self.strategy.request_replanning()
-        with self.assertRaises(ReplanningBusyError):
-            self.strategy.compute_daily_target_plan(DAY)
 
     def test_live_trailing_comparison_uses_corporate_action_adjustment_not_intraday_high(self):
         previous = date(2026, 7, 7)
@@ -635,37 +318,12 @@ class ReplanningTests(unittest.TestCase):
                                    account_id="a", trader_id="t", control_writer=writer)
         server._set_auto_replan(False)
         writer.set_auto_replan_enabled.assert_called_once_with("a", "t", False)
-        self.assertFalse(self.strategy.replanning.auto_enabled)
+        self.assertFalse(self.strategy._auto_replan_enabled)
         writer.set_auto_replan_enabled.side_effect = RuntimeError("write failed")
         with self.assertRaises(RuntimeError):
             server._set_auto_replan(True)
-        self.assertFalse(self.strategy.replanning.auto_enabled)
+        self.assertFalse(self.strategy._auto_replan_enabled)
 
-    def test_superseded_initial_result_cannot_replace_a_committed_target(self):
-        plan = self.strategy.compute_daily_target_plan(DAY, planning_context=self.context())
-        self.current_target({A: 500})
-        writer = MagicMock()
-        recorder = SnapshotRecorder(SnapshotRecorderConfig(account_id="a", trader_id="t"),
-                                    writer, self.strategy)
-        self.engine.add_actor(recorder)
-        self.assertFalse(recorder.persist_strategy_target_plan(plan))
-        writer.write_planning_attempt.assert_not_called()
-        self.assertEqual(self.strategy._target_version, "existing")
-
-    def test_cancellation_timeout_does_not_call_optimizer(self):
-        async def scenario():
-            self.current_target({A: 500})
-            self.strategy._execution_state_reconciler._timeout_secs = .05
-            order = SimpleNamespace(client_order_id="pending", is_pending_cancel=False)
-            self.strategy.replanning_orders = MagicMock(return_value=[order])
-            self.strategy.cancel_for_replanning = MagicMock()
-            self.strategy.request_replanning()
-            await self.strategy.replanning.task
-            self.assertEqual(self.planner.requests, [])
-            self.assertEqual(self.strategy._target_version, "existing")
-            self.assertFalse(self.strategy._replanning_blocked)
-            self.assertIn("terminal orders", self.strategy.replanning.last["error"])
-        asyncio.run(scenario())
 
     def test_auto_trigger_in_backtest_cancels_pending_orders_then_uses_latest_prices(self):
         from backtests.data_providers.historical_ticks import HistoricalTick
@@ -687,9 +345,10 @@ class ReplanningTests(unittest.TestCase):
                 return original(request)
             self.assertEqual(strategy.replanning_orders(), [])
             planner.requests.append(request)
-            self.assertEqual(request.open_prices[A], 11)
+            # Framework cleanup crosses the 14:30:02 quote: the limit has opened.
+            self.assertEqual(request.open_prices[A], 10)
             candidate = next(c for c in request.candidates if c.instrument_id == A)
-            self.assertFalse(candidate.can_buy)
+            self.assertTrue(candidate.can_buy)
             return ModelTargetPlan(DAY, request.signal_date, [
                 TargetInfo("000002.SZ", None, 500, TargetContext(), None, B, False),
             ], "replanned")
@@ -697,8 +356,8 @@ class ReplanningTests(unittest.TestCase):
         try:
             engine.run()
             self.assertEqual(len(planner.requests), 2)
-            self.assertEqual(strategy.replanning.counts["automatic"], 1)
-            self.assertEqual(strategy.replanning.last["status"], "committed")
+            self.assertEqual(strategy.orchestration.planning_state()["replan_counts"]["automatic"], 1)
+            self.assertEqual(strategy.orchestration.planning_state()["last_planning"]["status"], "committed")
             self.assertTrue(any(order.is_canceled for order in engine.cache.orders()))
             self.assertEqual(strategy._target_reason, "replanned")
             self.assertEqual(records[-1]["status"], "committed")
@@ -772,12 +431,6 @@ class ReplanningArchiveTests(unittest.TestCase):
                                     {"trade_id": "t3", "instrument_id": B, "side": "sell", "quantity": 300}])
         self.assertEqual(writer._query.call_args.args[1][-1], "strategy")
 
-    def test_restart_marks_unfinished_attempts_interrupted_and_restores_counts(self):
-        writer = LiveSnapshotWriter.for_testing(MagicMock())
-        writer._execute = MagicMock()
-        writer._query = MagicMock(return_value=[("initial", 1), ("automatic", 3), ("manual", 2)])
-        self.assertEqual(writer.restore_planning_state("a", "t", DAY), {"automatic": 3, "manual": 2})
-        self.assertIn("interrupted", writer._execute.call_args.args[0])
 
     def test_unset_auto_override_preserves_yaml_setting(self):
         writer = LiveControlWriter(engine=SimpleNamespace(), create_tables=False)

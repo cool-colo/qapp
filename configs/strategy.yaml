@@ -54,8 +54,8 @@ order_slice_notional: 300000     # CNY cap per slice; 0 disables this cap; instr
 continuous_buy_min_notional: 10000  # Each continuous BUY must exceed this; 0 disables.
 limit_stop_mode: freeze_symbol
 auto_replan_enabled: true        # shared switch for price-limit and scheduled replanning
-# Opt in to task orchestration and the separately configured exposure correction:
-# task_orchestration_config: configs/task_orchestration.yaml
+# Required task runtime configuration; empty/missing files fail at startup:
+task_orchestration_config: configs/task_orchestration.yaml
 scheduled_replan_times: ["13:50:00"]  # Daily replan in strategy timezone; continuous sessions only.
 # Scheduled replanning updates today's accepted targets; execution_windows still gate orders.
 leave_non_targets: false         # false => exit holdings absent from latest targets

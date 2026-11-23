@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
+import pandas as pd
 from datetime import time
 
 from strategies.cancellation import cancel_window_index
@@ -25,22 +27,26 @@ class CancellationWindowsTest(unittest.TestCase):
             for method in ("cancel_order", "cancel_orders", "cancel_all_orders"):
                 with self.subTest(time=clock_time, api=method):
                     engine, strategy, _, _ = replay_fixture(auction_enabled=False, continuous=True)
+                    commands = []
+                    execute = engine.kernel.exec_engine.execute
                     try:
-                        engine.run()
+                        engine.run(start=pd.Timestamp("2026-07-08 14:30:00", tz="Asia/Shanghai"),
+                                   end=pd.Timestamp("2026-07-08 14:30:02", tz="Asia/Shanghai"), streaming=True)
                         order = engine.cache.orders_open()[0]
-                        commands = []
-                        execute = engine.kernel.exec_engine.execute
                         strategy.msgbus.deregister("ExecEngine.execute", execute)
                         strategy.msgbus.register("ExecEngine.execute", commands.append)
                         ts = timestamp(f"2026-07-08 {clock_time}")
                         strategy.clock.set_time(ts)
                         strategy._last_market_data_ts_event = ts
-                        if method == "cancel_order":
-                            strategy.cancel_order(order)
-                        elif method == "cancel_orders":
-                            strategy.cancel_orders([order])
-                        else:
-                            strategy.cancel_all_orders(order.instrument_id)
+                        # Isolate the executor's exchange-window gate; ownership is
+                        # exercised separately by the orchestration boundary tests.
+                        with patch.object(strategy.orchestration, "reject_unowned_operation"):
+                            if method == "cancel_order":
+                                strategy.cancel_order(order)
+                            elif method == "cancel_orders":
+                                strategy.cancel_orders([order])
+                            else:
+                                strategy.cancel_all_orders(order.instrument_id)
                         self.assertEqual(len(commands), int(allowed))
                     finally:
                         strategy.msgbus.deregister("ExecEngine.execute", commands.append)
@@ -64,24 +70,27 @@ class CancellationWindowsTest(unittest.TestCase):
         finally:
             engine.dispose()
 
-    def test_automatic_cancel_after_stop_time_does_not_submit_replacements(self):
+    def test_auction_cleanup_waits_for_fresh_market_time_without_replacements(self):
         engine, strategy, _, _ = replay_fixture(closing_cancel_time="14:56:59")
         try:
             engine.run()
             orders = engine.cache.orders()
             self.assertEqual(len(orders), 2)
             self.assertTrue(all(order.is_canceled for order in orders))
-            self.assertTrue(all(order.ts_last == timestamp("2026-07-08 14:56:59") for order in orders))
+            # This fixture has no market data between 09:25 and 14:56:58.
+            # The exchange-window gate waits for fresh market time, then cleanup
+            # cancels immediately instead of repricing the previous task's orders.
+            self.assertTrue(all(order.ts_last == timestamp("2026-07-08 14:56:58") for order in orders))
             self.assertTrue(strategy._stop_time_reached())
             self.assertFalse(strategy._within_execution_window())
         finally:
             engine.dispose()
 
-    def test_automatic_cancel_is_blocked_at_closing_auction_start(self):
+    def test_closing_auction_does_not_revive_cleaned_auction_orders(self):
         engine, strategy, _, _ = replay_fixture(closing_cancel_time="14:57:00")
         try:
             engine.run()
             self.assertEqual(len(engine.cache.orders()), 2)
-            self.assertFalse(any(order.is_canceled for order in engine.cache.orders()))
+            self.assertTrue(all(order.is_canceled for order in engine.cache.orders()))
         finally:
             engine.dispose()

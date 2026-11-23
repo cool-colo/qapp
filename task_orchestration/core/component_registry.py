@@ -13,9 +13,9 @@ class ComponentRegistry:
             raise ValueError(f"duplicate component: {category}/{name}")
         self._factories[key] = factory
 
-    def build(self, category: str, name: str):
+    def build(self, category: str, name: str, **dependencies):
         key = category, name
         if key not in self._factories:
             raise ValueError(f"unknown component: {category}/{name}")
-        return self._factories[key]()
+        return self._factories[key](**dependencies)
 

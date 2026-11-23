@@ -371,7 +371,7 @@ class BuildCurrentHoldingsTest(unittest.TestCase):
 class ComputeDailyTargetPlanTest(unittest.TestCase):
     def _make_stub(self, *, signals: list[dict]):
         class PlanStub:
-            compute_daily_target_plan = TargetModelPredictionsStrategy.compute_daily_target_plan
+            prepare_target_planning = TargetModelPredictionsStrategy.prepare_target_planning
             _has_expected_signal_date = TargetModelPredictionsStrategy._has_expected_signal_date
             _resolve_signal_date = TargetModelPredictionsStrategy._resolve_signal_date
 
@@ -380,14 +380,7 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
         signal_date = date(2026, 7, 7)
         strategy.log = MagicMock()
         strategy._seed_active_positions_from_portfolio = MagicMock()
-        strategy._target_plan = MagicMock(
-            return_value=ModelTargetPlan(
-                trading_date=date(2026, 7, 8),
-                signal_date=signal_date,
-                targets=[],
-                reason="test",
-            ),
-        )
+        strategy._target_planning_request = MagicMock(return_value=("request", {}))
         strategy._signals_by_date = {signal_date: signals}
         strategy._trading_dates = [signal_date, date(2026, 7, 8)]
         strategy._active_positions = {}
@@ -407,13 +400,13 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
             ],
         )
 
-        strategy.compute_daily_target_plan(date(2026, 7, 8))
+        _, _, degraded = strategy.prepare_target_planning(date(2026, 7, 8), "snapshot")
 
         strategy._seed_active_positions_from_portfolio.assert_called_once_with(date(2026, 7, 8))
-        strategy._target_plan.assert_called_once_with(
+        strategy._target_planning_request.assert_called_once_with(
             date(2026, 7, 8),
             signal_date,
-            degraded_reason=None,
+            planning_context="snapshot",
         )
 
     def test_builds_transient_plan_and_reports_when_previous_signal_data_is_missing(self) -> None:
@@ -421,14 +414,15 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
         strategy._signals_by_date = {date(2026, 7, 6): []}
         strategy._target_alert_reporter = MagicMock(return_value=True)
 
-        strategy.compute_daily_target_plan(date(2026, 7, 8))
+        _, _, degraded = strategy.prepare_target_planning(date(2026, 7, 8), "snapshot")
 
         strategy._seed_active_positions_from_portfolio.assert_called_once_with(date(2026, 7, 8))
-        strategy._target_plan.assert_called_once_with(
+        strategy._target_planning_request.assert_called_once_with(
             date(2026, 7, 8),
             date(2026, 7, 7),
-            degraded_reason="missing_signal_data",
+            planning_context="snapshot",
         )
+        self.assertEqual(degraded, "missing_signal_data")
         strategy.log.error.assert_called_once()
         strategy._target_alert_reporter.assert_called_once_with(
             "TARGET-MODEL-SIGNAL-DATA-MISSING",
@@ -442,12 +436,12 @@ class ComputeDailyTargetPlanTest(unittest.TestCase):
     def test_present_signal_date_with_no_candidates_is_not_degraded(self) -> None:
         strategy = self._make_stub(signals=[])
 
-        strategy.compute_daily_target_plan(date(2026, 7, 8))
+        _, _, degraded = strategy.prepare_target_planning(date(2026, 7, 8), "snapshot")
 
-        strategy._target_plan.assert_called_once_with(
+        strategy._target_planning_request.assert_called_once_with(
             date(2026, 7, 8),
             date(2026, 7, 7),
-            degraded_reason=None,
+            planning_context="snapshot",
         )
 
 
@@ -847,7 +841,6 @@ class BuildCandidatesTest(unittest.TestCase):
 class TargetPlanAuthorityTest(unittest.TestCase):
     def _make_stub(self, *, authoritative: bool):
         class PlanStub:
-            _target_plan = TargetModelPredictionsStrategy._target_plan
             capture_planning_inputs = MagicMock(return_value={})
             finish_target_planning = TargetModelPredictionsStrategy.finish_target_planning
             _validate_planning_permissions = staticmethod(TargetModelPredictionsStrategy._validate_planning_permissions)
@@ -870,9 +863,9 @@ class TargetPlanAuthorityTest(unittest.TestCase):
         strategy = PlanStub()
         strategy._target_version = ""
         strategy.config = SimpleNamespace(local_exit_authoritative=authoritative)
-        strategy.build_planning_context = MagicMock(return_value=ModelTargetPlanningContext(
+        strategy.planning_context_builder = SimpleNamespace(build=MagicMock(return_value=ModelTargetPlanningContext(
             request.trading_date, "continuous", {},
-        ))
+        )))
         strategy._target_planning_request = MagicMock(
             return_value=(request, {"000001.SZ.QMT": ForcedExit("stop_triggered", 0)}),
         )
@@ -886,7 +879,9 @@ class TargetPlanAuthorityTest(unittest.TestCase):
     def test_enabled_authority_applies_explicit_overrides(self) -> None:
         strategy = self._make_stub(authoritative=True)
 
-        strategy._target_plan(date(2026, 7, 8), date(2026, 7, 7))
+        request, exits = strategy._target_planning_request()
+        strategy.finish_target_planning(request, exits, strategy.planning_context_builder.build(),
+                                       strategy._target_planner.plan.return_value)
 
         strategy._apply_forced_exit_overrides.assert_called_once()
 
@@ -935,16 +930,17 @@ class TargetPlanAuthorityTest(unittest.TestCase):
     def test_disabled_authority_keeps_optimizer_plan_unchanged(self) -> None:
         strategy = self._make_stub(authoritative=False)
 
-        strategy._target_plan(date(2026, 7, 8), date(2026, 7, 7))
+        request, exits = strategy._target_planning_request()
+        strategy.finish_target_planning(request, exits, strategy.planning_context_builder.build(),
+                                       strategy._target_planner.plan.return_value)
 
         strategy._apply_forced_exit_overrides.assert_not_called()
 
     def test_risk_manager_failure_uses_transient_safety_plan(self) -> None:
         strategy = self._make_stub(authoritative=False)
         error = RuntimeError("unavailable")
-        strategy._target_planner.plan.side_effect = error
-
-        strategy._target_plan(date(2026, 7, 8), date(2026, 7, 7))
+        request, exits = strategy._target_planning_request()
+        strategy.finish_target_planning(request, exits, strategy.planning_context_builder.build(), None, error=error)
 
         strategy._report_risk_manager_failure.assert_called_once_with(
             date(2026, 7, 8),

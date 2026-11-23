@@ -467,22 +467,6 @@ class TestableTargetQuantityStrategy:
     _run_on_loop = TargetQuantityStrategy._run_on_loop
     _schedule_fetch = TargetQuantityStrategy._schedule_fetch
     _resolve_fetch_source = staticmethod(TargetQuantityStrategy._resolve_fetch_source)
-    _start_whole_market_full_tick_refresh = TargetQuantityStrategy._start_whole_market_full_tick_refresh
-    _schedule_whole_market_prefetch = TargetQuantityStrategy._schedule_whole_market_prefetch
-    _on_whole_market_prefetch_timer = TargetQuantityStrategy._on_whole_market_prefetch_timer
-    _on_whole_market_refresh_timer = TargetQuantityStrategy._on_whole_market_refresh_timer
-    _schedule_whole_market_final_refresh = TargetQuantityStrategy._schedule_whole_market_final_refresh
-    _on_whole_market_final_refresh_timer = TargetQuantityStrategy._on_whole_market_final_refresh_timer
-    _within_whole_market_refresh_window = TargetQuantityStrategy._within_whole_market_refresh_window
-    request_whole_market_full_tick_refresh = TargetQuantityStrategy.request_whole_market_full_tick_refresh
-    _run_whole_market_full_tick_fetch = TargetQuantityStrategy._run_whole_market_full_tick_fetch
-    _on_whole_market_full_tick_done = TargetQuantityStrategy._on_whole_market_full_tick_done
-    _apply_whole_market_full_tick_and_notify = TargetQuantityStrategy._apply_whole_market_full_tick_and_notify
-    _notify_whole_market_observers = TargetQuantityStrategy._notify_whole_market_observers
-    _notify_whole_market_completion = TargetQuantityStrategy._notify_whole_market_completion
-    _apply_whole_market_full_tick = TargetQuantityStrategy._apply_whole_market_full_tick
-    whole_market_snapshot = TargetQuantityStrategy.whole_market_snapshot
-    whole_market_final_refresh_succeeded = TargetQuantityStrategy.whole_market_final_refresh_succeeded
 
     def request_instrument(self, instrument_id) -> None:
         self.requested_instruments.append(instrument_id)
@@ -617,18 +601,10 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             strategy.config.full_tick_prefetch_time,
         )
         strategy._full_tick_task = None
-        strategy._whole_market_status = {}
-        strategy._whole_market_full_tick_source = None
-        strategy._whole_market_full_tick_time = TargetQuantityStrategy._parse_hh_mm(
-            strategy.config.whole_market_full_tick_time,
-        )
-        strategy._whole_market_full_tick_task = None
-        strategy._whole_market_final_refresh_time = TargetQuantityStrategy._parse_hh_mm(
-            strategy.config.whole_market_final_refresh_time,
-        )
-        strategy._whole_market_final_success_dates = set()
-        strategy._whole_market_fetch_observers = []
-        strategy._whole_market_fresh_requests = []
+        from trading_orchestration.services.whole_market_snapshot import WholeMarketSnapshotService
+        from trading_orchestration.adapters.market_runtime import NautilusMarketRuntime
+        strategy.market_snapshots = WholeMarketSnapshotService(strategy.config, NautilusMarketRuntime(strategy))
+
         book_ts = china_ts_ns("2026-07-02 14:30:00")
         strategy._depth_books = {
             str(instrument_id): depth_book_snapshot(
@@ -2662,24 +2638,12 @@ class TargetQuantityStrategyTest(unittest.TestCase):
     def test_whole_market_refresh_continues_after_trading_stop(self) -> None:
         strategy = self.make_strategy()
         strategy.clock.now = pd.Timestamp("2026-07-02 06:56:00", tz="UTC")
-        strategy._run_whole_market_full_tick_fetch = MagicMock()
+        strategy.market_snapshots.refresh = MagicMock()
 
-        strategy._on_whole_market_refresh_timer(None)
+        strategy.market_snapshots._periodic()
 
-        strategy._run_whole_market_full_tick_fetch.assert_called_once_with(
-            trigger="refresh",
-        )
-
-    def test_whole_market_final_refresh_timer_fetches(self) -> None:
-        strategy = self.make_strategy()
-        strategy._schedule_whole_market_final_refresh = MagicMock()
-        strategy._run_whole_market_full_tick_fetch = MagicMock()
-
-        strategy._on_whole_market_final_refresh_timer(None)
-
-        strategy._schedule_whole_market_final_refresh.assert_called_once_with()
-        strategy._run_whole_market_full_tick_fetch.assert_called_once_with(
-            trigger="final",
+        strategy.market_snapshots.refresh.assert_called_once_with(
+            "refresh",
         )
 
     def test_whole_market_final_success_is_set_only_after_final_time(self) -> None:
@@ -2688,14 +2652,13 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy.clock.now = pd.Timestamp("2026-07-02 07:01:00", tz="UTC")
         strategy._trading_day = trading_date
 
-        strategy._apply_whole_market_full_tick(
+        strategy.market_snapshots.publish(
             {str(INST_A): {"last_price": 10.2}},
             "final",
-            0.0,
         )
 
-        self.assertTrue(strategy.whole_market_final_refresh_succeeded(trading_date))
-        self.assertEqual(strategy.whole_market_snapshot()[str(INST_A)].last_price, 10.2)
+        self.assertTrue(strategy.market_snapshots.final_refresh_succeeded(trading_date))
+        self.assertEqual(strategy.market_snapshots.latest_snapshot()[str(INST_A)].last_price, 10.2)
 
     def test_whole_market_request_notifies_after_snapshot_applied(self) -> None:
         strategy = self.make_strategy()
@@ -2704,12 +2667,12 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         snapshot = {str(INST_A): {"last_price": 10.2}}
         future = Future()
         future.set_result(snapshot)
-        strategy._whole_market_full_tick_source = MagicMock(return_value=snapshot)
+        strategy.market_snapshots.source = MagicMock(return_value=snapshot)
         strategy._schedule_fetch = MagicMock(return_value=future)
         strategy._run_on_loop = MagicMock(side_effect=lambda fn: fn())
         completed = MagicMock()
 
-        strategy.request_whole_market_full_tick_refresh(
+        strategy.market_snapshots.refresh(
             "after_trading_final",
             on_complete=completed,
         )
@@ -2718,7 +2681,7 @@ class TargetQuantityStrategyTest(unittest.TestCase):
             "success",
             {"instruments": 1, "error": None},
         )
-        self.assertEqual(strategy.whole_market_snapshot()[str(INST_A)].last_price, 10.2)
+        self.assertEqual(strategy.market_snapshots.latest_snapshot()[str(INST_A)].last_price, 10.2)
 
     def test_whole_market_request_attaches_to_in_flight_fetch(self) -> None:
         strategy = self.make_strategy()
@@ -2726,13 +2689,13 @@ class TargetQuantityStrategyTest(unittest.TestCase):
         strategy._trading_day = date(2026, 7, 2)
         snapshot = {str(INST_A): {"last_price": 10.2}}
         future = Future()
-        strategy._whole_market_full_tick_source = MagicMock(return_value=snapshot)
+        strategy.market_snapshots.source = MagicMock(return_value=snapshot)
         strategy._schedule_fetch = MagicMock(return_value=future)
         strategy._run_on_loop = MagicMock(side_effect=lambda fn: fn())
         completed = MagicMock()
 
-        strategy._run_whole_market_full_tick_fetch("refresh")
-        strategy.request_whole_market_full_tick_refresh(
+        strategy.market_snapshots.refresh("refresh")
+        strategy.market_snapshots.refresh(
             "after_trading_final",
             on_complete=completed,
         )

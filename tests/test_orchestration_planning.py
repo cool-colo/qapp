@@ -17,14 +17,14 @@ class PlanningBoundaryTest(unittest.TestCase):
         host = SimpleNamespace(
             _clock_date=lambda: day, _execution_activity=1, _target_version="v1",
             config=SimpleNamespace(risk_manager_timeout_secs=10),
-            build_planning_context=Mock(return_value="frozen"),
+            planning_context_builder=SimpleNamespace(build=Mock(return_value="frozen")),
             prepare_target_planning=Mock(return_value=("request", [], None)),
             capture_planning_inputs=Mock(return_value={}), archive_planning_attempt=Mock(),
             _async_scheduler=SimpleNamespace(has_running_loop=False),
             _target_planner=SimpleNamespace(plan=Mock(return_value=plan)),
             replanning_orders=Mock(return_value=[]), finish_target_planning=Mock(return_value=plan),
             _last_planning_error="optimizer unavailable")
-        bridge = SimpleNamespace(host=host, install_model=Mock())
+        bridge = SimpleNamespace(host=host, install_model=Mock(), wake_event=Mock())
         return host, bridge, RiskManagerGoalPlanner(bridge), TaskContext(1, 1, "run-1", 1, Proposal("test"))
 
     def test_committed_before_install_and_parent_is_preserved(self):
@@ -76,7 +76,6 @@ class PlanningBoundaryTest(unittest.TestCase):
         from task_orchestration.models import Decision
         bridge = SimpleNamespace(bootstrap_load=Mock())
         task = BootstrapTask(bridge)
-        task.stabilizer = SimpleNamespace(stabilize=lambda ctx: Decision(RunState.SUCCEEDED))
         self.assertEqual(task.advance(None).state, RunState.SUCCEEDED)
         bridge.bootstrap_load.side_effect = RuntimeError("bad archive")
         self.assertEqual(task.advance(None).state, RunState.WAITING)
@@ -84,11 +83,14 @@ class PlanningBoundaryTest(unittest.TestCase):
     def test_manual_execution_retains_explicit_pause_bypass(self):
         from strategies.convergence import ConvergenceTrigger
         from trading_orchestration.tasks.manual_execution_task import ManualExecutionTask
-        host = SimpleNamespace(_trading_paused=True, _within_execution_window=lambda: True)
-        bridge = SimpleNamespace(host=host, execute=Mock(), target_satisfied=lambda: False)
+        host = SimpleNamespace(_trading_paused=True, _within_execution_window=lambda: True,
+                               _clock_date=lambda: date(2026, 7, 8))
+        bridge = SimpleNamespace(host=host, execute=Mock(), install_quantities=Mock(), target_satisfied=lambda: False)
         task = ManualExecutionTask(bridge)
         trigger = ConvergenceTrigger.MANUAL_SELL_ALL
-        ctx = TaskContext(1, 1, "manual-1", 1, Proposal("manual", trigger))
+        from trading_orchestration.contexts.manual_target import ManualTarget
+        target = ManualTarget((), date(2026, 7, 8), "manual", "manual-v1", trigger)
+        ctx = TaskContext(1, 1, "manual-1", 1, Proposal("manual", target))
         self.assertEqual(task.advance(ctx).state, RunState.RUNNING)
         bridge.execute.assert_called_once_with(trigger=trigger)
         self.assertTrue(host._trading_paused)

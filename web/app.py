@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from web import change_records, compare_presets
 from web import order_execution_report
 from web import trade_loss_report
+from web.scheduler_report import build_scheduler_report
 from web.realtime_minute_report import query_realtime_minutes
 from web.config import AppConfig, load_config
 from web.db import actual_local_fill_filter
@@ -1635,6 +1636,27 @@ def realtime_minutes(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     payload["stock_name"] = data.resolve_names([payload["stock_code"]]).get(payload["stock_code"], "")
     return payload
+
+
+@app.get("/api/scheduler")
+def scheduler_overview(
+    account: str,
+    trader: str,
+    history_limit: int = Query(100, ge=1, le=500),
+    data: DataAccess = Depends(get_data),
+) -> dict[str, Any]:
+    """Read a published node snapshot and bounded journal; aggregate off-node."""
+    client = _node_api(data, account, trader)
+    try:
+        snapshot = client.get("/scheduler/state")
+        if not snapshot.get("enabled", False):
+            return {"enabled": False}
+        actions = client.get("/scheduler/actions", {
+            "after_sequence": max(0, int(snapshot["revision"]) - 1000), "limit": 1000,
+        })
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return build_scheduler_report(snapshot, actions["actions"], history_limit=history_limit)
 
 
 @app.get("/api/control/state")

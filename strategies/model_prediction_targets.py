@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from uuid import uuid4
 from datetime import date
 from datetime import timedelta
-from decimal import Decimal
 from typing import Any
 from typing import Callable
 
@@ -37,10 +35,9 @@ from strategies.model_target_planners.base import ForcedExit
 from strategies.replan_triggers import ReplanTriggerTracker, price_limit_state
 from strategies.replan_triggers import PRICE_COMPARISON_TOLERANCE
 from strategies.replan_triggers import (
-    PriceLimitReplanTriggerPolicy, ScheduledReplanTriggerPolicy, ReplanValidity,
+    PriceLimitReplanTriggerPolicy,
 )
-from strategies.replanning import PlanningAttempt, ReplanningBusyError, ReplanningCoordinator, planning_json
-from strategies.convergence import ConvergenceTrigger
+from strategies.replanning import PlanningAttempt, planning_json
 from strategies.opening_auction import auction_time
 from strategies.trading_control import SELL_REASON, SELL_ALL_REASON
 from strategies.target_quantities import TargetQuantityStrategy
@@ -84,7 +81,7 @@ class TargetModelPredictionsStrategyConfig(TargetQuantityStrategyConfig, kw_only
     process_targets_interval_secs: float = 2.0
     auto_replan_enabled: bool = True
     scheduled_replan_times: tuple[str, ...] = ()
-    task_orchestration_config: str = ""
+    task_orchestration_config: str = "configs/task_orchestration.yaml"
 
 
 class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantityStrategy):
@@ -100,14 +97,10 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
     _PRICE_COMPARISON_TOLERANCE = PRICE_COMPARISON_TOLERANCE
 
     def __init__(self, config: TargetModelPredictionsStrategyConfig) -> None:
-        self.orchestration = None
         super().__init__(config)
         self._auction_replay_model = None
-        self._auction_planning_contexts: dict[date, ModelTargetPlanningContext] = {}
-        self._auction_execution_snapshot_dates: set[date] = set()
-        self._auction_snapshot_failed_dates: set[date] = set()
-        self._frozen_auction_plans: dict[date, ModelTargetPlan] = {}
-        self._auction_frozen_dates: set[date] = set()
+        from trading_orchestration.components.planners.planning_context_builder import PlanningContextBuilder
+        self.planning_context_builder = PlanningContextBuilder(self)
         if not isinstance(config.auto_replan_enabled, bool):
             raise ValueError("auto_replan_enabled must be a boolean")
         if int(config.consecutive_up_limit_days) < 0:
@@ -139,8 +132,6 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
         self._active_positions = normalize_initial_active_positions(config.initial_active_positions)
         self._processed_dates: set[date] = set()
         self._target_planner = build_model_target_planner(config, self.log)
-        self._live_target_portfolio_loader: Callable[[date, date | None], list[dict[str, Any]]] | None = None
-        self._live_target_plan_persister: Callable[[ModelTargetPlan], bool] | None = None
         self._recent_target_loader: Callable[[date, date, list[str]], dict[str, date]] | None = None
         self._position_span_start_loader: Callable[[date, date, list[str]], dict[str, date]] | None = None
         self._divid_events_loader: Callable[[list[str]], dict[str, list[tuple[date, float]]]] | None = None
@@ -149,18 +140,16 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
         self._entry_cost_adjust_warnings: set[tuple[date, str]] = set()
         self._stop_cost_adjust_warnings: set[tuple[date, str]] = set()
         self.signal_events: list[ModelPredictionSignalEvent] = []
-        self.replanning = ReplanningCoordinator(self)
+        self._auto_replan_enabled = config.auto_replan_enabled
         self._replan_triggers = ReplanTriggerTracker()
         self._price_limit_replan_triggers = PriceLimitReplanTriggerPolicy(self._replan_triggers)
-        self._scheduled_replan_triggers = ScheduledReplanTriggerPolicy(self, config.scheduled_replan_times)
         self._planning_attempt_persister = None
         self._committed_plan_loader = None
         self._latest_planning_inputs: dict[str, Any] = {}
         self.planning_attempts: dict[str, dict[str, Any]] = {}
-        if config.task_orchestration_config:
-            from trading_orchestration.configuration.orchestration_config import OrchestrationConfig
-            from trading_orchestration.adapters.strategy_bridge import StrategyBridge
-            self.orchestration = StrategyBridge(self, OrchestrationConfig.load(config.task_orchestration_config))
+        from trading_orchestration.configuration.orchestration_config import OrchestrationConfig
+        from trading_orchestration.adapters.strategy_bridge import StrategyBridge
+        self.orchestration = StrategyBridge(self, OrchestrationConfig.load(config.task_orchestration_config))
 
     def configure_planning_archive(self, persister, loader=None) -> None:
         self._planning_attempt_persister = persister
@@ -169,9 +158,6 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
     def archive_planning_attempt(self, attempt: PlanningAttempt, plan=None) -> None:
         if self._planning_attempt_persister is not None:
             self._planning_attempt_persister(attempt, plan)
-        elif plan is not None and plan.persistable and self._live_target_plan_persister is not None:
-            if not self._live_target_plan_persister(plan):
-                raise RuntimeError("target plan persistence failed")
         self.planning_attempts[attempt.request_id] = attempt.payload(plan)
 
     def accept_model_target_plan(self, plan: ModelTargetPlan, *, bypass_pause: bool = False) -> None:
@@ -181,91 +167,30 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
                                       version=self._plan_version(plan), signal_date=plan.signal_date,
                                       bypass_pause=bypass_pause, bypass_replanning=True)
 
-    def replan_resume_trigger(self) -> ConvergenceTrigger:
-        return ConvergenceTrigger.TIMER
-
     def request_replanning(self) -> str:
-        if self.orchestration is not None:
-            from strategies.replan_triggers import ExecutionWindowReplanValidity
-            validity = ExecutionWindowReplanValidity()
-            if not validity.allows(self, self._clock_date(), starting=True):
-                raise ValueError("manual replanning requires execution and cancellation windows")
-            return self.orchestration.request("manual_replan", validity,
-                                              expires_ns=self.orchestration.deadline())
-        return self.replanning.request("manual")
+        from strategies.replan_triggers import ExecutionWindowReplanValidity
+        validity = ExecutionWindowReplanValidity()
+        if not validity.allows(self, self._clock_date(), starting=True):
+            raise ValueError("manual replanning requires execution and cancellation windows")
+        return self.orchestration.request("manual_replan", validity,
+                                          expires_ns=self.orchestration.deadline())
+
+    def set_auto_replan_enabled(self, enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise ValueError("auto_replan_enabled must be a boolean")
+        with self._trading_action_lock:
+            if enabled and not self._auto_replan_enabled:
+                self._replan_triggers.reset()
+            self._auto_replan_enabled = enabled
 
     def automatic_replanning_allowed(self) -> bool:
-        # Manual sell targets remain authoritative until an ordinary model target
-        # update (or an explicit manual replan) replaces them.
-        return (self.replanning.auto_enabled and not self._trading_paused
+        return (self._auto_replan_enabled and not self._trading_paused
                 and not self._target_updates_paused
                 and self._target_reason not in (SELL_REASON, SELL_ALL_REASON))
 
-    def check_replanning_trigger(self, trading_date: date) -> bool:
-        if self.orchestration is not None:
-            if not self.orchestration.driving:
-                self.orchestration.wake()
-            return False
-        coordinator = self.replanning
-        with self._trading_action_lock:
-            if (coordinator.initial_in_progress or not self.automatic_replanning_allowed()
-                    or not self._target_version):
-                return False
-            triggers = self._price_limit_replan_triggers.collect(self, trading_date)
-            if triggers:
-                self.submit_automatic_replanning(triggers, self._price_limit_replan_triggers.validity)
-                return True
-            return coordinator.busy
-
-    def submit_automatic_replanning(self, triggers, validity: ReplanValidity) -> str | None:
-        """All automatic trigger policies enter the same order/planning coordinator."""
-        if self.orchestration is not None:
-            return self.orchestration.request("scheduled_replan", validity, key=repr(triggers),
-                                              expires_ns=self.orchestration.deadline())
-        try:
-            return self.replanning.request("automatic", triggers, validity=validity)
-        except ReplanningBusyError:
-            return None
-
-    def run_pending_replanning(self) -> None:
-        self._scheduled_replan_triggers.drain()
-
-    def replanning_trigger_state(self) -> dict:
-        return self._scheduled_replan_triggers.state()
-
     def on_stop(self) -> None:
-        if self.orchestration is not None:
-            self.orchestration.stop()
-        self.replanning.stopped = True
-        self._scheduled_replan_triggers.stop()
-        if "MODEL-REPLAN-STEP" in self.clock.timer_names:
-            self.clock.cancel_timer("MODEL-REPLAN-STEP")
-        task = self.replanning.task
-        if task is not None and not task.done():
-            task.cancel()
-        elif self.replanning.current is not None:
-            self.replanning.interrupt(self.replanning.current)
+        self.orchestration.stop()
         super().on_stop()
-
-    def configure_live_target_portfolio_loader(
-        self,
-        loader: Callable[[date, date | None], list[dict[str, Any]]] | None,
-    ) -> None:
-        """
-        Inject a loader for persisted daily live targets.
-
-        The strategy remains storage-agnostic: live wiring owns MySQL access and
-        provides rows from its configured target-portfolio table. Callers without a
-        persisted daily target leave this unset and use the computed plan path.
-        """
-        self._live_target_portfolio_loader = loader
-
-    def configure_live_target_plan_persister(
-        self,
-        persister: Callable[[ModelTargetPlan], bool] | None,
-    ) -> None:
-        """Inject persistence for plans generated by the live strategy timer."""
-        self._live_target_plan_persister = persister
 
     def configure_recent_target_loader(
         self,
@@ -399,7 +324,7 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
             today = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).date()
         except Exception:
             return
-        if not (self.config.auction_enabled and today in self._auction_frozen_dates):
+        if not (self.config.auction_enabled and today in self.auction_session.frozen_dates):
             self._processed_dates.discard(today)
         if self._within_trading_window():
             self._process_trading_day_once(today, "refresh")
@@ -409,12 +334,9 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
         self._process_trading_day_once(trading_date, "bar")
 
     def on_start(self) -> None:
-        self.replanning.stopped = False
         super().on_start()
         self._start_process_targets_timer()
-        self._scheduled_replan_triggers.start()
-        if self.orchestration is not None:
-            self.orchestration.start()
+        self.orchestration.start()
 
     def _start_process_targets_timer(self) -> None:
         interval_secs = float(self.config.process_targets_interval_secs)
@@ -436,486 +358,22 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
             return False
         if trading_date in self._processed_dates:
             return False
-        if self.orchestration is not None and not self.orchestration.driving:
-            self.orchestration.request("daily_planning", expires_ns=self.orchestration.deadline())
-            return False
-        if self._process_trading_day(trading_date) is False:
-            return False
-        self._processed_dates.add(trading_date)
-        self.log.info(
-            f"processed model target day from {trigger}: date={trading_date}",
-            color=LogColor.BLUE,
-        )
-        return True
-
-    def _process_trading_day(self, trading_date: date) -> bool:
-        if self._restore_saved_target(trading_date):
-            return True
-        plan = self.compute_daily_target_plan(trading_date)
-        if plan is None:
-            return True
-        persister = self._live_target_plan_persister
-        if not plan.persistable:
-            self.archive_planning_attempt(PlanningAttempt(
-                plan.request_id or uuid4().hex, trading_date, "initial", self._target_version or None,
-                status="safety", inputs=self._latest_planning_inputs), plan)
-        elif persister is not None:
-            try:
-                # Persist the newly generated plan before it becomes executable. The
-                # live wiring owns the MySQL implementation; the strategy stays DB-free.
-                persisted = persister(plan)
-            except Exception as exc:
-                self.log.warning(f"could not persist generated live target plan: {exc}")
-                return False
-            if not persisted:
-                self.log.warning("generated live target plan was not persisted; target not applied")
-                return False
-        # The risk-manager planner commits explicit share counts (固定目标股数); the
-        # executor trades toward those quantities. Weights on the plan are audit-only
-        # and are not consulted for execution.
-        with self._trading_action_lock:
-            if self._replanning_blocked or plan.parent_version != (self._target_version or None):
-                return False
-            self.update_target_quantities(
-                quantities=self._target_quantities_from_plan(plan),
-                target_date=trading_date,
-                reason=plan.reason,
-                version=self._plan_version(plan),
-                signal_date=plan.signal_date,
-            )
-
-        return True
-
-    def _restore_saved_target(self, trading_date: date) -> bool:
-        """Restore the committed version before consulting per-instrument rows.
-
-        An empty committed plan has no projection rows but is still a saved target.
-        Daily and auction planning must make the same distinction.
-        """
-        if self.orchestration is not None:
-            # Bootstrap is the only archive-loading owner in orchestration mode.
-            return self._target_date == trading_date and bool(self._target_version)
-        if self._committed_plan_loader is not None:
-            archived = self._committed_plan_loader(trading_date)
-            if archived is not None:
-                self.restore_committed_plan(trading_date, archived)
-                return True
-        loaded_target = self._live_target_portfolio_target(trading_date)
-        if loaded_target is not None:
-            quantities, reason, version, signal_date = loaded_target
-            self.update_target_quantities(
-                quantities=quantities,
-                target_date=trading_date,
-                reason=reason,
-                version=version,
-                signal_date=signal_date,
-            )
-            return True
+        self.orchestration.request("daily_planning", expires_ns=self.orchestration.deadline())
         return False
 
     def restore_committed_plan(self, trading_date: date, archived: dict[str, Any]) -> None:
-        if self.orchestration is not None:
-            from trading_orchestration.adapters.plan_archive_adapter import plan_from_archive
-            model = plan_from_archive(archived)
-            if model is not None:
-                self.trading_state.planned_models[archived["version"]] = model
+        from trading_orchestration.adapters.plan_archive_adapter import plan_from_archive
+        model = plan_from_archive(archived)
+        self.trading_state.planned_models[archived["version"]] = model
         self._roll_trading_day(trading_date)
         for iid, extra in archived.get("target_extra", {}).items():
             if extra.get("execution_phase") == "opening_auction":
-                self._auction_frozen_dates.add(trading_date)
+                self.auction_session.frozen_dates.add(trading_date)
                 if extra.get("prediction_rank") is not None:
-                    self._auction_prediction_ranks[iid] = int(extra["prediction_rank"])
+                    self.auction_session.ranks[iid] = int(extra["prediction_rank"])
         self.update_target_quantities(archived["quantities"], target_date=trading_date,
                                       reason=archived["reason"], version=archived["version"],
                                       signal_date=archived["signal_date"])
-
-    def on_price_snapshot(self, trading_date: date) -> None:
-        if self._target_date == trading_date and self._within_execution_window():
-            self.check_replanning_trigger(trading_date)
-
-    def _live_target_portfolio_target(
-        self,
-        trading_date: date,
-    ) -> tuple[dict[str, int], str, str | None, date | None] | None:
-        loader = self._live_target_portfolio_loader
-        if loader is None:
-            self._log_live_target_portfolio_info(
-                f"live target portfolio loader is not configured: date={trading_date}",
-            )
-            return None
-        signal_date = self._resolve_signal_date(trading_date)
-        rows = loader(trading_date, signal_date)
-        if not rows:
-            self._log_live_target_portfolio_info(
-                f"live target portfolio not found: date={trading_date} signal_date={signal_date}",
-            )
-            return None
-        quantities, reason, version = self._target_quantities_from_live_target_rows(rows)
-        if self.config.auction_enabled:
-            import json
-
-            auction_rows = False
-            for row in rows:
-                extra = row.get("extra") or {}
-                if isinstance(extra, str):
-                    extra = json.loads(extra)
-                if extra.get("execution_phase") == "opening_auction":
-                    auction_rows = True
-                    rank = extra.get("prediction_rank")
-                    if rank is not None:
-                        self._auction_prediction_ranks[str(row["instrument_id"])] = int(rank)
-            if auction_rows:
-                self._auction_frozen_dates.add(trading_date)
-        self._log_live_target_portfolio_info(
-            f"loaded live target portfolio: date={trading_date} signal_date={signal_date} "
-            f"frozen_qty={len(quantities)} version={version}",
-            color=LogColor.GREEN,
-        )
-        return quantities, reason, version, signal_date
-
-    def _log_live_target_portfolio_info(
-        self,
-        message: str,
-        color: LogColor = LogColor.BLUE,
-    ) -> None:
-        if self.log is None:
-            return
-        self.log.info(message, color=color)
-
-    @staticmethod
-    def _target_quantities_from_live_target_rows(
-        rows: list[dict[str, Any]],
-    ) -> tuple[dict[str, int], str, str | None]:
-        quantities: dict[str, int] = {}
-        reason = "loaded_target"
-        version: str | None = None
-        for row in rows:
-            instrument_id = str(row["instrument_id"] or "").strip()
-            if not instrument_id:
-                raise RuntimeError("live_target_portfolio row has empty instrument_id")
-            qty = row.get("target_qty")
-            if qty is None:
-                continue
-            quantity = int(qty)
-            if quantity < 0:
-                raise RuntimeError(
-                    f"live_target_portfolio row has negative target_qty: instrument_id={instrument_id}",
-                )
-            quantities[instrument_id] = quantity
-            if version is None and row.get("target_version"):
-                version = str(row["target_version"])
-            if row.get("reason"):
-                reason = str(row["reason"])
-        if not quantities:
-            raise RuntimeError("live_target_portfolio rows contain no target_qty values")
-        return quantities, reason, version
-
-    def build_planning_context(
-        self, trading_date: date, *, stage: str | None = None,
-        snapshot: dict[str, dict[str, Any]] | None = None,
-        ts_init: int | None = None,
-    ) -> ModelTargetPlanningContext:
-        """Capture inputs once; planning helpers never reread mutable price caches."""
-        if stage is None:
-            now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
-            stage = "pre_open" if now.time() < auction_time("09:30") else "continuous"
-        instruments: dict[str, ModelTargetInstrumentContext] = {}
-        if snapshot is None:
-            # Preserve the existing bar-based path when no full-tick was supplied.
-            for i in self._today_open.keys() | self._last_close.keys() | self._market_status.keys():
-                tick = self._market_status.get(i)
-                if tick is None:
-                    price = self._today_open.get(i)
-                    source = "open" if price is not None else None
-                else:
-                    price = tick.last_price
-                    if price is not None and (not math.isfinite(price) or price <= 0):
-                        price = None
-                    source = "full_tick_last" if price is not None else None
-                instruments[i] = ModelTargetInstrumentContext(
-                    price=price, open_price=self._today_open.get(i),
-                    previous_close=self._last_close.get(i),
-                    market_status=None if tick is None else tick.market_status,
-                    price_source=source,
-                    price_ts_event=None if tick is None else tick.ts_event,
-                )
-        else:
-            instruments = {i: ModelTargetInstrumentContext(previous_close=close)
-                           for i, close in self._last_close.items()}
-            for instrument_id, fields in snapshot.items():
-                i = str(instrument_id)
-                tick = TickSnapshot.from_fields(fields)
-                price = tick.last_price
-                if price is not None and (not math.isfinite(price) or price <= 0):
-                    price = None
-                open_price = tick.open
-                if open_price is not None and (not math.isfinite(open_price) or open_price <= 0):
-                    open_price = None
-                close = tick.last_close
-                if close is None or not math.isfinite(close) or close <= 0:
-                    close = self._last_close.get(i)
-                instruments[i] = ModelTargetInstrumentContext(
-                    price=price, open_price=open_price, previous_close=close,
-                    market_status=tick.market_status,
-                    price_source=("auction_indicative" if stage == "opening_auction" else "full_tick_last")
-                                 if price is not None else None,
-                    price_ts_event=tick.ts_event,
-                )
-        return ModelTargetPlanningContext(
-            trading_date=trading_date, stage=stage, instruments=instruments,
-            ts_init=(self._market_status_updated_at_ns if snapshot is None and ts_init is None else ts_init),
-        )
-
-    def accept_opening_auction_snapshot(
-        self, trading_date: date, snapshot: dict[str, dict[str, Any]], *, ts_init: int,
-    ) -> bool:
-        """Accept exactly one completed auction batch; missing prices fail the batch."""
-        if (trading_date in self._auction_planning_contexts
-                or trading_date in self._auction_snapshot_failed_dates):
-            return False
-        if trading_date != self._clock_date():
-            self.log.warning(f"Opening auction snapshot belongs to another day: {trading_date}")
-            return False
-        self._roll_trading_day(trading_date)
-        self.apply_full_tick_snapshot(snapshot, "auction_prepare")
-        context = self.build_planning_context(trading_date, stage="opening_auction",
-                                              snapshot=snapshot, ts_init=ts_init)
-        signal_date = self._resolve_signal_date(trading_date)
-        required = self._held_instrument_ids() | {
-            str(self._instrument_by_stock[signal["stock_code"]])
-            for signal in self._signals_by_date.get(signal_date, [])
-            if signal["stock_code"] in self._instrument_by_stock
-        }
-        if not self._validate_opening_auction_snapshot(context, required, snapshot):
-            return False
-        self._auction_planning_contexts[trading_date] = context
-        return True
-
-    def _validate_opening_auction_snapshot(
-        self, context: ModelTargetPlanningContext, required: set[str],
-        snapshot: dict[str, dict[str, Any]],
-    ) -> bool:
-        trading_date = context.trading_date
-        suspended = self._suspended_by_date.get(trading_date, set())
-        missing = []
-        for i in sorted(required):
-            inputs = context.instruments.get(i)
-            if (inputs is None or inputs.price is None) and (
-                    self._stock_code_for_instrument(i) not in suspended
-                    and (inputs is None or inputs.market_status != MarketStatusAction.SUSPEND)):
-                missing.append(i)
-        if missing or not snapshot:
-            self.fail_opening_auction_snapshot(trading_date, f"missing last_price: {missing}")
-            return False
-        return True
-
-    def accept_opening_auction_execution_update(
-        self, trading_date: date, *, ts_init: int,
-    ) -> bool:
-        """Validate updated caches without freezing the execution reference prices."""
-        if (trading_date != self._clock_date()
-                or trading_date in self._auction_execution_snapshot_dates
-                or trading_date in self._auction_snapshot_failed_dates
-                or not self._within_auction_submit_time() or trading_date not in self._trading_dates
-                or self._trading_paused or self._target_updates_paused or self._replanning_blocked):
-            return False
-        self._roll_trading_day(trading_date)
-        if self._awaiting_pre_open_reconcile():
-            self.log.warning("Opening auction execution skipped: pre-open reconciliation is pending")
-            return False
-        if not self._restore_opening_auction_target(trading_date):
-            return False
-        if ts_init is None or ts_init <= 0:
-            self.fail_opening_auction_snapshot(trading_date, "execution full-market update is not ready")
-            return False
-        updated_at = pd.Timestamp(ts_init, unit="ns", tz="UTC").tz_convert(self.config.timezone_name)
-        if (self._whole_market_status_updated_at_ns != ts_init or not self._whole_market_status
-                or updated_at.date() != trading_date
-                or updated_at.time() < auction_time(self.config.auction_execution_time)):
-            self.fail_opening_auction_snapshot(trading_date, "execution full-market update is not ready")
-            return False
-        snapshot = {i: dataclasses.asdict(tick) for i, tick in self._whole_market_status.items()}
-        self.apply_full_tick_snapshot(snapshot, "auction_execute")
-        required = self._held_instrument_ids() | set(self._target_quantities)
-        suspended = self._suspended_by_date.get(trading_date, set())
-        missing = [i for i in sorted(required)
-                   if self._stock_code_for_instrument(i) not in suspended
-                   and not self._is_suspended_status(i)
-                   and self._select_opening_auction_reference(i)[0] is None]
-        if missing:
-            self.fail_opening_auction_snapshot(trading_date, f"missing auction reference: {missing}")
-            return False
-        self._auction_execution_snapshot_dates.add(trading_date)
-        return True
-
-    def _restore_opening_auction_target(self, trading_date: date) -> bool:
-        """Recover a same-day target before validating execution prices, without planning."""
-        with self._trading_action_lock:
-            if self._trading_paused or self._target_updates_paused or self._replanning_blocked:
-                return False
-            has_current_target = self._target_date == trading_date and (
-                bool(self._target_version) or trading_date in self._auction_frozen_dates
-            )
-            if not has_current_target and not self._restore_saved_target(trading_date):
-                self.log.warning(f"Opening auction execution skipped: date={trading_date} no accepted or saved target")
-                return False
-            signal_date = self._resolve_signal_date(trading_date)
-            for stock_code, rank in self._prediction_ranks_by_date.get(signal_date, {}).items():
-                if stock_code in self._instrument_by_stock:
-                    self._auction_prediction_ranks.setdefault(str(self._instrument_by_stock[stock_code]), rank)
-            self._auction_frozen_dates.add(trading_date)
-            self._processed_dates.add(trading_date)
-            return True
-
-    def fail_opening_auction_snapshot(self, trading_date: date, reason: str) -> None:
-        self._auction_snapshot_failed_dates.add(trading_date)
-        self.log.warning(f"Opening auction skipped: date={trading_date} {reason}")
-
-    def process_opening_auction(self) -> None:
-        """Plan or restore the day's fixed auction targets, without submitting orders."""
-        now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name)
-        trading_date = now.date()
-        if (not self.config.auction_enabled or trading_date not in self._trading_dates
-                or not auction_time(self.config.auction_start_time) <= now.time()
-                < auction_time(self.config.auction_submit_cutoff)
-                or trading_date in self._auction_snapshot_failed_dates
-                or self._trading_paused or self._target_updates_paused):
-            return
-        if self.orchestration is not None and not self.orchestration.driving:
-            self.orchestration.request("auction_planning", expires_ns=self.orchestration.deadline(auction=True))
-            return
-        self._roll_trading_day(trading_date)
-        if self._awaiting_pre_open_reconcile():
-            self.log.warning("Opening auction skipped: pre-open reconciliation is pending")
-            return
-        context = self._auction_planning_contexts.get(trading_date)
-        if context is None:
-            return
-        signal_date = self._resolve_signal_date(trading_date)
-        if trading_date not in self._auction_frozen_dates:
-            self._auction_prediction_ranks = {
-                str(self._instrument_by_stock[stock_code]): rank
-                for stock_code, rank in self._prediction_ranks_by_date.get(signal_date, {}).items()
-                if stock_code in self._instrument_by_stock
-            }
-            # Target provenance and prior daily processing do not restrict auction
-            # execution. Keep an accepted same-day target ahead of persisted state.
-            has_current_target = self._target_date == trading_date and bool(self._target_version)
-            if not has_current_target and not self._restore_saved_target(trading_date):
-                try:
-                    plan = self.compute_daily_target_plan(trading_date, planning_context=context)
-                    if plan is None or not plan.persistable:
-                        return
-                    persister = self._live_target_plan_persister
-                    if persister is not None and not persister(plan):
-                        return
-                except Exception as exc:
-                    self.log.warning(f"Opening auction planning failed: {exc}")
-                    return
-                if pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time() >= auction_time(self.config.auction_submit_cutoff):
-                    self.log.warning("Opening auction planning missed submission cutoff")
-                    return
-                self._frozen_auction_plans[trading_date] = plan
-                self._auction_prediction_ranks.update({
-                    target.instrument_id: target.target_context.prediction_rank
-                    for target in plan.targets if target.target_context.prediction_rank is not None
-                })
-                self.update_target_quantities(self._target_quantities_from_plan(plan),
-                                              target_date=trading_date, reason=plan.reason,
-                                              version=self._plan_version(plan), signal_date=plan.signal_date)
-            self._auction_frozen_dates.add(trading_date)
-            self._processed_dates.add(trading_date)
-            self.log.info(
-                f"Opening auction target ready: date={trading_date} "
-                f"target_version={self._target_version} reason={self._target_reason}",
-            )
-
-    def process_opening_auction_execution(self) -> None:
-        """Submit fixed targets only after the execution phase's fresh snapshot."""
-        if self.orchestration is not None and not self.orchestration.driving:
-            self.orchestration.request("auction_execution", expires_ns=self.orchestration.deadline(auction=True))
-            return
-        trading_date = self._clock_date()
-        if (not self._within_auction_submit_time() or trading_date not in self._trading_dates
-                or trading_date in self._auction_snapshot_failed_dates
-                or self._trading_paused or self._target_updates_paused):
-            return
-        if (trading_date not in self._auction_frozen_dates or self._target_date != trading_date
-                or trading_date not in self._auction_execution_snapshot_dates):
-            self.log.warning(f"Opening auction execution skipped: date={trading_date} plan or snapshot is not ready")
-            return
-        if self._awaiting_pre_open_reconcile():
-            self.log.warning("Opening auction execution skipped: pre-open reconciliation is pending")
-            return
-        self.execute_opening_auction()
-
-    def compute_daily_target_plan(
-        self, trading_date: date, *, planning_context: ModelTargetPlanningContext | None = None,
-    ) -> ModelTargetPlan | None:
-        with self.replanning._lock:
-            if self.replanning.busy:
-                raise ReplanningBusyError("planning is already in progress")
-            self.replanning.initial_in_progress = True
-            parent_version = self._target_version or None
-        try:
-            if self.config.auction_enabled and trading_date in self._frozen_auction_plans:
-                return self._frozen_auction_plans[trading_date]
-            if planning_context is None:
-                planning_context = self.build_planning_context(trading_date)
-            if planning_context.trading_date != trading_date:
-                raise ValueError("Planning context trading date does not match request")
-            plan = self._compute_daily_target_plan(trading_date, planning_context=planning_context)
-            if plan is not None:
-                plan = dataclasses.replace(plan, parent_version=parent_version)
-                self.trading_state.planned_models[self._plan_version(plan)] = plan
-            if plan is None:
-                self.archive_planning_attempt(PlanningAttempt(
-                    uuid4().hex, trading_date, "initial", self._target_version,
-                    status="keep_current", inputs=self._latest_planning_inputs,
-                    error=self._last_planning_error))
-            return plan
-        finally:
-            with self.replanning._lock:
-                self.replanning.initial_in_progress = False
-            self._scheduled_replan_triggers.wake_pending()
-
-    def _compute_daily_target_plan(
-        self, trading_date: date, *, planning_context: ModelTargetPlanningContext | None = None,
-    ) -> ModelTargetPlan | None:
-        """
-        Build the day's target request and return the resulting plan
-        **without submitting orders or accepting the target**.
-
-        Two independent inputs are built and filtered separately (no merge):
-
-        * **candidates** — the signal stocks, minus entry-ineligible ones (name
-          prefixes, ST, suspension, minimum listed days, missing sizing price).
-        * **current_holdings** — the held positions, minus the ones a local hard-exit
-          rule (ST / stop-loss / trailing take-profit) fires on. Suspended holdings
-          remain frozen in current state.
-
-        Missing signal data and planner failures retain an accepted target. Without
-        an accepted target they use the existing transient local safety plan.
-
-        The bar/timer path (_process_trading_day) uses this and then applies the plan
-        via update_target_quantities. The snapshot recorder uses it before-trading to
-        derive the day's frozen share counts. Both paths therefore run the same logic.
-        """
-        self._seed_active_positions_from_portfolio(trading_date)
-        signal_date = self._resolve_signal_date(trading_date)
-        has_signal_data = self._has_expected_signal_date(trading_date)
-        today_signals = self._signals_by_date.get(signal_date, []) if signal_date else []
-        self.log.info(
-            f"model target day {trading_date}: signal_date={signal_date} "
-            f"signals={len(today_signals)} active={len(self._active_positions)}",
-            color=LogColor.BLUE,
-        )
-        return self._target_plan(
-            trading_date,
-            signal_date,
-            degraded_reason=None if has_signal_data else "missing_signal_data",
-            planning_context=planning_context,
-        )
 
     def _has_expected_signal_date(self, trading_date: date) -> bool:
         expected_signal_date = previous_trading_date(self._trading_dates, trading_date)
@@ -1253,29 +711,6 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
             f"holding will not be sent to the planner and may be liquidated as a non-target",
             color=LogColor.YELLOW,
         )
-
-    def _target_plan(
-        self,
-        trading_date: date,
-        signal_date: date | None,
-        degraded_reason: str | None = None,
-        *,
-        planning_context: ModelTargetPlanningContext | None = None,
-    ) -> ModelTargetPlan | None:
-        if planning_context is None:
-            planning_context = self.build_planning_context(trading_date)
-        request, forced_exits = self._target_planning_request(
-            trading_date, signal_date, planning_context=planning_context)
-        self._latest_planning_inputs = self.capture_planning_inputs(request, forced_exits, planning_context)
-        if degraded_reason is not None:
-            return self.finish_target_planning(request, forced_exits, planning_context, None,
-                                               degraded_reason=degraded_reason)
-        try:
-            plan = self._target_planner.plan(request)
-        except Exception as exc:
-            return self.finish_target_planning(request, forced_exits, planning_context, None, error=exc)
-        self._latest_planning_inputs["optimizer_result"] = planning_json(plan)
-        return self.finish_target_planning(request, forced_exits, planning_context, plan)
 
     def prepare_target_planning(self, trading_date: date, context: ModelTargetPlanningContext):
         self._seed_active_positions_from_portfolio(trading_date)

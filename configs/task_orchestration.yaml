@@ -1,35 +1,123 @@
-# Opt in by setting task_orchestration_config: configs/task_orchestration.yaml
-# in the existing strategy YAML. All values below are process-local configuration.
-schema_version: 1
+# Task orchestration is mandatory. This file configures its components and tasks.
+# All values below are process-local configuration.
+schema_version: 2
+# Nautilus timer interval; must not exceed exposure.interval_secs.
 poll_interval_secs: 0.5
+
+# Framework-owned cleanup before admission and on every task transition.
+# No new orders while cleaning; cancel as soon as the cancel window permits.
+cleanup_component: cancel_reconcile
+# Request Nautilus reconciliation during bootstrap and task-transition cleanup.
+# false skips these queries only; terminal orders and a quiet state remain required.
+# Does not disable the node's startup, pre-open or reference-refresh reconciliation.
+cleanup_reconciliation_enabled: true
 
 exposure_components:
   assessor: position_ratio
   planner: remaining_target
   executor: nautilus_exposure
-  stabilizer: cancel_reconcile
   risk_planner: risk_manager
   validator: formal_remainder
   outcome: capacity_replan
 
 exposure:
+  # Defaults for tasks.exposure_correction; explicit task fields take precedence.
   enabled: true
-  tolerance: "0.05"  # percentage points, inclusive completion boundary
+  tolerance: "0.05"  # Absolute ratio difference: 0.05 = 5 percentage points, inclusive.
   windows: "09:30-11:30,13:00-14:56"
   interval_secs: 1.0
   priority: 300
+  # Fee estimates for correction planning, not actual venue/backtest fee settings.
   commission_rate: "0.000085"
   minimum_fee: "5"
   quote_max_age_secs: 4.0
 
+# Every supported per-task field is explicit below:
+# enabled: accept new runs; disabling does not cancel an active run.
+# priority: larger values run first; equal priorities use enqueue order.
+# can_preempt: this task may preempt a lower-priority task.
+# preemptible: a higher-priority task may preempt this task after cleanup.
+# splitter: ordinary execution splitter; auction keeps its dedicated splitter.
+# cancellation: execution cancellation policy, separate from task cleanup.
+# Scheduled triggers use the strategy clock times; they do not poll evaluate().
+# Planning tasks select their goal planner; auction_goal owns fresh-market preparation.
+# Task timing still comes from strategy.yaml; correction timing uses exposure.
+# Bootstrap is fixed at priority 1000 and cannot be configured here.
 tasks:
-  daily_planning: {priority: 100}
-  auction_planning: {priority: 100}
-  auction_execution: {priority: 100}
-  normal_execution: {priority: 100}
-  scheduled_replan: {priority: 200}
-  price_limit_replan: {priority: 200}
-  exposure_correction: {priority: 300}
-  manual_replan: {priority: 500}
-  manual_execution: {priority: 500}
+  daily_planning:
+    planner: risk_manager
+    enabled: true
+    priority: 100
+    can_preempt: true
+    preemptible: true
+    splitter: existing_notional
+    cancellation: existing
 
+  auction_planning:
+    planner: auction_goal
+    enabled: true
+    priority: 100
+    can_preempt: true
+    preemptible: true
+    splitter: existing_notional
+    cancellation: existing
+
+  auction_execution:
+    enabled: true
+    priority: 100
+    can_preempt: true
+    preemptible: true
+    splitter: existing_notional
+    cancellation: existing
+
+  normal_execution:
+    enabled: true
+    priority: 100
+    can_preempt: true
+    preemptible: true
+    splitter: existing_notional
+    cancellation: existing
+
+  scheduled_replan:
+    planner: risk_manager
+    enabled: true
+    priority: 200
+    can_preempt: true
+    preemptible: true
+    splitter: existing_notional
+    cancellation: existing
+
+  price_limit_replan:
+    planner: risk_manager
+    enabled: true
+    priority: 200
+    can_preempt: true
+    preemptible: true
+    splitter: existing_notional
+    cancellation: existing
+
+  exposure_correction:
+    # Explicit values override exposure.enabled and exposure.priority above.
+    enabled: true
+    priority: 300
+    can_preempt: true
+    preemptible: true
+    splitter: existing_notional
+    cancellation: existing
+
+  manual_replan:
+    planner: risk_manager
+    enabled: true
+    priority: 500
+    can_preempt: true
+    preemptible: true
+    splitter: existing_notional
+    cancellation: existing
+
+  manual_execution:
+    enabled: true
+    priority: 500
+    can_preempt: true
+    preemptible: true
+    splitter: existing_notional
+    cancellation: existing

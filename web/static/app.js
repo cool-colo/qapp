@@ -212,6 +212,7 @@ async function loadAccounts() {
 }
 
 function onAccountChanged() {
+  invalidateSchedulerAccount();
   if (!state.account) return;
   loadSnapshotDates();
   // Apply the account's configured report window as defaults.
@@ -238,7 +239,7 @@ function refreshActiveTab() {
   else if (tab === "rline") { if ($("#rline-code").value.trim()) plotRline(); }
   else if (tab === "realtime") loadRealtime();
   else if (tab === "stratinfo") loadStratInfo();
-  else if (tab === "control") { loadControl(); loadTargets(); }
+  else if (tab === "control") loadControlPage();
   else if (tab === "dqc") loadDqc();
   else if (tab === "changes") loadChangeRecords();
 }
@@ -292,12 +293,13 @@ function activateNavItem(btn, { load = true } = {}) {
     else if (tab === "sigqual") loadSignalQuality();
     else if (tab === "realtime") loadRealtime();
     else if (tab === "stratinfo") loadStratInfo();
-    else if (tab === "control") { loadControl(); loadTargets(); }
+    else if (tab === "control") loadControlPage();
     else if (tab === "dqc") loadDqc();
     else if (tab === "changes") loadChangeRecords();
     else if (tab === "minute") plotRealtimeMinute(true);
   }
   setTimeout(resizeCharts, 0);
+  scheduleSchedulerRefresh();
 }
 
 $$(".nav-item").forEach((btn) => {
@@ -327,7 +329,7 @@ function showRealtimeSub(sub) {
   if (target) target.classList.add("active");
 }
 
-// Toggle between the 控制 (#ctrl-control) and 当前目标 (#ctrl-targets) sub-panels.
+// Select a trading-management sub-page; inactive scheduler pages do not poll.
 function showControlSub(sub) {
   $$(".ctrl-sub-panel").forEach((p) => p.classList.remove("active"));
   const target = $(`#ctrl-${sub}`);
@@ -3428,6 +3430,108 @@ $("#tgt-auto").addEventListener("change", (e) => {
   clearInterval(tgtTimer);
   if (e.target.checked) tgtTimer = setInterval(loadTargets, 15000);
 });
+
+// Published scheduler snapshots only. This page never posts trading controls.
+let schedulerTimer = null;
+let schedulerRequest = 0;
+let schedulerPendingAccount = null;
+let schedulerData = null;
+let schedulerAccount = null;
+
+function schedulerIdentity() {
+  return state.account ? `${state.source}|${accountKey(state.account)}` : null;
+}
+function invalidateSchedulerAccount() {
+  const account = schedulerIdentity();
+  if (account === schedulerAccount && account !== null) return;
+  ++schedulerRequest;
+  clearTimeout(schedulerTimer);
+  schedulerAccount = account;
+  schedulerPendingAccount = null;
+  $("#sched-refresh").disabled = false;
+  $("#sched-status").textContent = account ? "等待获取状态" : "未选择账户";
+  $("#sched-status").className = "sched-badge neutral";
+  $("#sched-meta").textContent = "";
+  schedulerMessage(account ? "正在获取当前账户的任务状态…" : "请先选择配置了运行节点的账户。");
+}
+function schedulerVisible() {
+  return $("#tab-control").classList.contains("active") &&
+    $("#ctrl-scheduler").classList.contains("active") && !document.hidden;
+}
+function scheduleSchedulerRefresh() {
+  clearTimeout(schedulerTimer);
+  if (schedulerVisible() && $("#sched-auto").checked && schedulerPendingAccount === null) {
+    schedulerTimer = setTimeout(loadScheduler, 10000);
+  }
+}
+function schedulerMessage(message, { error = false } = {}) {
+  schedulerData = null;
+  $("#sched-content").hidden = true;
+  $("#sched-message").hidden = false;
+  $("#sched-message").textContent = message;
+  $("#sched-message").className = "sched-message" + (error ? " error" : "");
+}
+async function loadScheduler() {
+  clearTimeout(schedulerTimer);
+  const account = schedulerIdentity();
+  if (account && schedulerPendingAccount === account) return;
+  const request = ++schedulerRequest;
+  if (!account || !hasNodeApi()) {
+    schedulerPendingAccount = null;
+    $("#sched-refresh").disabled = false;
+    $("#sched-status").textContent = "未连接节点";
+    $("#sched-status").className = "sched-badge neutral";
+    $("#sched-meta").textContent = "";
+    schedulerMessage("当前账户未配置运行节点，无法获取任务状态。");
+    return;
+  }
+  if (schedulerAccount !== account) {
+    schedulerAccount = account;
+    schedulerMessage("正在获取当前账户的任务状态…");
+  }
+  schedulerPendingAccount = account;
+  $("#sched-refresh").disabled = true;
+  $("#sched-status").textContent = "正在刷新";
+  $("#sched-status").className = "sched-badge neutral";
+  try {
+    const data = await api("/api/scheduler", { account: state.account.account_id, trader: state.account.trader_id });
+    if (request !== schedulerRequest || account !== schedulerIdentity()) return;
+    if (!data.enabled) {
+      $("#sched-status").textContent = "未启用编排";
+      $("#sched-meta").textContent = accountLabel(state.account);
+      schedulerMessage("当前节点未启用任务编排，暂无任务配置和运行记录。");
+      return;
+    }
+    schedulerData = data;
+    $("#sched-message").hidden = true;
+    $("#sched-content").hidden = false;
+    $("#sched-meta").textContent = `${accountLabel(state.account)} · 快照 ${SchedulerUI.time(data.snapshot_time)} · ` +
+      `时区 ${data.timezone} · 记录范围：本次节点运行`;
+    SchedulerUI.render(data, renderTable);
+  } catch (error) {
+    if (request !== schedulerRequest || account !== schedulerIdentity()) return;
+    $("#sched-status").textContent = "获取失败";
+    $("#sched-meta").textContent = accountLabel(state.account);
+    schedulerMessage(`无法获取当前节点状态：${error.message}`, { error: true });
+  } finally {
+    if (request === schedulerRequest) {
+      schedulerPendingAccount = null;
+      $("#sched-refresh").disabled = false;
+      scheduleSchedulerRefresh();
+    }
+  }
+}
+function loadControlPage() {
+  if ($("#ctrl-scheduler").classList.contains("active")) loadScheduler();
+  else if ($("#ctrl-targets").classList.contains("active")) loadTargets();
+  else loadControl();
+}
+$("#sched-refresh").addEventListener("click", loadScheduler);
+$("#sched-auto").addEventListener("change", scheduleSchedulerRefresh);
+for (const id of ["#sched-history-task", "#sched-history-state"]) {
+  $(id).addEventListener("change", () => { if (schedulerData) SchedulerUI.renderHistory(schedulerData, renderTable); });
+}
+document.addEventListener("visibilitychange", scheduleSchedulerRefresh);
 
 // ---------------------------------------------------------------------------
 // Data quality (数据质量 · DQC)

@@ -6,6 +6,7 @@ from dataclasses import replace
 from decimal import Decimal
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -27,7 +28,13 @@ class WeightedPlanner(FixedPlanner):
 def morning_rows(rows):
     base = [r for r in rows if r.ts_init == timestamp("2026-07-08 09:30:00")]
     rows = [r for r in rows if r.ts_init <= timestamp("2026-07-08 09:30:00")]
-    return rows + [replace(r, ts_init=timestamp(f"2026-07-08 09:30:{second:02}"),
+    # Preserve a real deficit after the first continuous book is matched. Timer
+    # arbitration intentionally runs at cycle boundaries, after market callbacks.
+    rows = [replace(r, ask_size=100, bid_size=100) if r in base else r for r in rows]
+    # Later quotes cross the correction limit prices so this fixture tests
+    # post-fill cleanup/completion rather than an indefinitely resting bid.
+    return rows + [replace(r, bid_price=r.bid_price - (.05 if second >= 3 else 0),
+                           ask_price=r.ask_price - (.05 if second >= 3 else 0), ts_init=timestamp(f"2026-07-08 09:30:{second:02}"),
                            ts_event=timestamp(f"2026-07-08 09:30:{second:02}"))
                    for second in range(1, 12) for r in base]
 
@@ -40,7 +47,7 @@ class OrchestrationReplayTest(unittest.TestCase):
     def run_morning(self, *, exposure=True, deny_second=False, cleanup_delay=0):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.yaml"
-            path.write_text("schema_version: 1\nexposure:\n  enabled: " +
+            path.write_text("schema_version: 2\nexposure:\n  enabled: " +
                             ("true" if exposure else "false") + "\n")
             engine, strategy, _, _ = replay_fixture(
                 continuous=True, final_results=False, starting_cash=100000,
@@ -79,6 +86,61 @@ class OrchestrationReplayTest(unittest.TestCase):
         self.assertFalse([o for o in orders if o[3] >= timestamp("2026-07-08 09:30:00")])
         self.assertFalse([r for r in records if r[2] == "exposure_correction"])
 
+    def test_normal_execution_acknowledges_first_depth_after_actual_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.yaml"
+            path.write_text("schema_version: 2\nexposure:\n  enabled: false\n")
+            engine, strategy, _, _ = replay_fixture(
+                continuous=True, starting_cash=100000,
+                transform_config=lambda c: config_replace(
+                    c, task_orchestration_config=str(path), cancel_reconverge_delay_secs=0))
+            try:
+                engine.run()
+                self.assertTrue(strategy._depth_converged_today)
+                # A raw executor call outside a framework callback is forbidden.
+                from strategies.convergence import ConvergenceTrigger
+                with self.assertRaisesRegex(RuntimeError, "active orchestration owner"):
+                    strategy.orchestration.execute(trigger=ConvergenceTrigger.ORDER_BOOK_DEPTH)
+            finally:
+                engine.dispose()
+
+    def test_complete_auction_goal_acknowledges_depth_without_new_orders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.yaml"
+            path.write_text("schema_version: 2\nexposure:\n  enabled: false\n")
+            engine, strategy, _, _ = replay_fixture(
+                continuous=True, starting_cash=100000,
+                transform_rows=lambda rows: [replace(r, bid_size=100000, ask_size=100000)
+                                             if r.kind == "auction" else r for r in rows],
+                transform_config=lambda c: config_replace(
+                    c, task_orchestration_config=str(path), cancel_reconverge_delay_secs=0))
+            try:
+                engine.run()
+                self.assertTrue(strategy._depth_converged_today)
+                self.assertEqual(len(engine.cache.orders()), 2)
+                self.assertFalse([r for r in strategy.orchestration.engine.records
+                                  if r.task_id == "normal_execution"])
+            finally:
+                engine.dispose()
+
+    def test_queued_depth_does_not_acknowledge_a_completed_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.yaml"
+            path.write_text("schema_version: 2\nexposure:\n  enabled: false\n")
+            engine, strategy, _, _ = replay_fixture(transform_config=lambda c: config_replace(
+                c, task_orchestration_config=str(path)))
+            try:
+                from strategies.convergence import ConvergenceTrigger
+                now = timestamp("2026-07-08 14:30:00")
+                strategy.clock.set_time(now)
+                strategy._last_market_data_ts_event = now
+                self.assertTrue(strategy._within_execution_window())
+                self.assertFalse(strategy.orchestration.execution_requested(
+                    ConvergenceTrigger.ORDER_BOOK_DEPTH))
+                self.assertFalse(strategy._depth_converged_today)
+            finally:
+                engine.dispose()
+
     def test_identical_replay_has_identical_decisions_and_orders(self):
         self.assertEqual(self.run_morning(), self.run_morning())
 
@@ -98,19 +160,21 @@ class OrchestrationReplayTest(unittest.TestCase):
     def test_unknown_configuration_fails_fast(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.yaml"
-            path.write_text("schema_version: 1\nexposure:\n  tolreance: 0.05\n")
+            path.write_text("schema_version: 2\nexposure:\n  tolreance: 0.05\n")
             with self.assertRaises(ValueError):
                 OrchestrationConfig.load(str(path))
 
     def test_operation_permit_does_not_leak_to_another_thread(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.yaml"
-            path.write_text("schema_version: 1\n")
+            path.write_text("schema_version: 2\n")
             engine, strategy, _, _ = replay_fixture(transform_config=lambda c: config_replace(
                 c, task_orchestration_config=str(path)))
             try:
                 bridge = strategy.orchestration
-                with bridge.operations(), ThreadPoolExecutor(max_workers=1) as pool:
+                # Isolate the thread-local permit from account/market setup.
+                with patch.object(bridge.engine, "operation_phase", return_value="execute"), \
+                        bridge.operations(), ThreadPoolExecutor(max_workers=1) as pool:
                     bridge.reject_unowned_operation()
                     future = pool.submit(bridge.reject_unowned_operation)
                     with self.assertRaisesRegex(RuntimeError, "active orchestration owner"):
@@ -123,7 +187,7 @@ class OrchestrationReplayTest(unittest.TestCase):
     def run_bootstrap_archive(self, *, corrupt=False):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.yaml"
-            path.write_text("schema_version: 1\nexposure:\n  enabled: true\n")
+            path.write_text("schema_version: 2\nexposure:\n  enabled: true\n")
             engine, strategy, planner, _ = replay_fixture(
                 continuous=True, final_results=False, starting_cash=100000,
                 transform_rows=morning_rows,
@@ -160,7 +224,7 @@ class OrchestrationReplayTest(unittest.TestCase):
     def test_correction_increases_small_buy_to_legal_notional_in_real_executor(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.yaml"
-            path.write_text("schema_version: 1\nexposure:\n  enabled: true\n")
+            path.write_text("schema_version: 2\nexposure:\n  enabled: true\n")
             engine, strategy, planner, _ = replay_fixture(
                 continuous=True, final_results=False, auction_enabled=False,
                 starting_cash=100000, continuous_buy_min_notional=17000,

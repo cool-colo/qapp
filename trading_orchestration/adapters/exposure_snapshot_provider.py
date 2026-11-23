@@ -41,7 +41,7 @@ class ExposureSnapshotProvider:
                 continue
             qty = host._current_quantity(instrument_id)
             tick = host._market_status.get(iid)
-            whole = host._whole_market_status.get(iid)
+            whole = host.market_snapshots.latest_snapshot().get(iid)
             book = host._depth_books.get(iid)
             prices = []
             for value in (tick, whole):

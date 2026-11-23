@@ -12,14 +12,6 @@ class TargetStateOwner:
         self.trading_state.market.market_status = value
 
     @property
-    def _whole_market_status(self):
-        return self.trading_state.market.whole_market_status
-
-    @_whole_market_status.setter
-    def _whole_market_status(self, value):
-        self.trading_state.market.whole_market_status = value
-
-    @property
     def _depth_books(self):
         return self.trading_state.market.depth_books
 
