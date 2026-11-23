@@ -24,7 +24,7 @@ exposure:
   # Defaults for tasks.exposure_correction; explicit task fields take precedence.
   enabled: true
   tolerance: "0.05"  # Absolute ratio difference: 0.05 = 5 percentage points, inclusive.
-  windows: "09:30-11:30,13:00-14:56"
+  windows: "09:35-11:30"
   interval_secs: 1.0
   priority: 300
   # Fee estimates for correction planning, not actual venue/backtest fee settings.
