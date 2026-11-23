@@ -52,6 +52,8 @@ order_slice_notional: 300000     # CNY notional per order slice; 0 disables spli
 continuous_buy_min_notional: 10000  # Each continuous BUY must exceed this; 0 disables.
 limit_stop_mode: freeze_symbol
 auto_replan_enabled: true        # shared switch for price-limit and scheduled replanning
+# Required task runtime configuration.
+task_orchestration_config: configs/task_orchestration.yaml
 scheduled_replan_times: ["13:50:00"]  # Daily replan in strategy timezone; continuous sessions only.
 # Scheduled replanning updates today's accepted targets; execution_windows still gate orders.
 leave_non_targets: false         # false => exit holdings absent from latest targets
@@ -79,8 +81,8 @@ exchange_trading_windows: "09:30-11:30,13:00-14:59"
 execution_windows: "13:35-14:10"
 exchange_execution_windows: "13:35-14:10"
 # Cancellation is independent of submission windows; end times are exclusive.
-cancel_windows: "09:30-11:30,13:00-14:56"
-exchange_cancel_windows: "09:30-11:30,13:00-14:56"
+cancel_windows: "09:35-11:30,13:00-14:56"
+exchange_cancel_windows: "09:35-11:30,13:00-14:56"
 # Retained latency-probe settings; they cannot bypass the execution window.
 preopen_latency_execution_enabled: false
 preopen_latency_max_advance_ms: 3000
@@ -102,6 +104,13 @@ auction_min_buy_notional: 10000  # Partial auction BUY must exceed this; whole s
 # --- Full-tick snapshot ---
 full_tick_refresh_secs: 1.0
 full_tick_prefetch_time: "09:27"
+
+# --- Whole-market full-tick snapshot (live) ---
+whole_market_full_tick_enabled: true
+whole_market_full_tick_time: "09:26"
+whole_market_full_tick_interval_secs: 600.0
+whole_market_refresh_windows: "09:26-11:30,13:00-15:00"
+whole_market_final_refresh_time: "15:01"
 
 # --- Order tagging (live) ---
 order_id_tag: "001"

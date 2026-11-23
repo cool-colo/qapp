@@ -31,7 +31,7 @@ initial_cash: 1000000
 # --- Order lifecycle / cash gating ---
 resubmit_check_interval_secs: 0.5  # convergence and cancel-validation cadence
 process_targets_interval_secs: 2.0 # daily target-processing trigger cadence
-submission_book_max_age_secs: 4.0  # skip submission and warn when the book is older
+submission_book_max_age_secs: 5.0  # skip submission and warn when the book is older
 cancel_book_max_age_secs: 4.0      # skip cancel validation when the book is older
 same_side_price_improvement_threshold: 20  # below this price, quote at same-side best
 price_mismatch_cancel_delay_secs: 30.0
@@ -85,8 +85,8 @@ exchange_execution_windows: "14:30-14:56"
 # Independent cancel windows: inclusive start, exclusive end (seconds supported).
 # Cancellation checks continue after stop_time; replacements keep execution_windows.
 # 14:56:59 can cancel; 14:57:00 cannot cancel during the closing auction.
-cancel_windows: "09:30-11:30,13:00-14:56"
-exchange_cancel_windows: "09:30-11:30,13:00-14:56"
+cancel_windows: "09:35-11:30,13:00-14:56"
+exchange_cancel_windows: "09:35-11:30,13:00-14:56"
 # Retained latency-probe settings. The 14:30 execution window is authoritative;
 # even when enabled, a pre-open trigger cannot submit outside that window.
 preopen_latency_execution_enabled: false
