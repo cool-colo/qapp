@@ -14,9 +14,10 @@ Design boundaries:
 - QMT-reported fields (from ``account.last_event.info`` and position reports) are the
   authoritative values and land in the unprefixed columns; Nautilus-derived values
   land in ``nt_`` columns for comparison. Both raw payloads are kept as JSON.
-- Snapshots are idempotent: each phase (before/continuous/after-trading) writes once
-  per day, guarded by the table unique keys and pre-checks. If the process misses the
-  09:26-09:29 before-trading catch-up window, startup records continuous-trading
+- Snapshots are idempotent: each phase writes once per day, guarded by the table
+  unique keys and pre-checks. The 09:24 before-auction phase captures assets and
+  positions only and is never backfilled after auction fills. If the process misses
+  the 09:26-09:29 before-trading catch-up window, startup records continuous-trading
   instead; readers that expect before-trading data should fall back to continuous-
   trading when needed.
 """
@@ -49,6 +50,7 @@ from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
 
 from backtests.result_writers.live_records import AFTER_TRADING
+from backtests.result_writers.live_records import BEFORE_AUCTION
 from backtests.result_writers.live_records import BEFORE_TRADING
 from backtests.result_writers.live_records import CONTINUOUS_TRADING
 from backtests.result_writers.live_records import SOURCE_FALLBACK
@@ -94,6 +96,7 @@ class SnapshotRecorderConfig(ActorConfig, frozen=True):
     trader_id: str
     broker_name: str = "QMT"
     timezone_name: str = "Asia/Shanghai"
+    before_auction_time: str = "09:24"
     before_time: str = "09:27"
     # After-trading snapshot fires shortly after market close (15:00). Note QMT may not
     # have finished end-of-day settlement yet at 15:03: frozen cash can still be locked
@@ -120,6 +123,7 @@ class SnapshotRecorderConfig(ActorConfig, frozen=True):
 class SnapshotRecorder(Actor):
     """Persists daily snapshots, frozen targets, and order/trade events."""
 
+    _BEFORE_AUCTION_ALERT = "SNAPSHOT-BEFORE-AUCTION"
     _BEFORE_ALERT = "SNAPSHOT-BEFORE-TRADING"
     _AFTER_ALERT = "SNAPSHOT-AFTER-TRADING"
     _KEEPALIVE_TIMER = "SNAPSHOT-DB-KEEPALIVE"
@@ -166,6 +170,7 @@ class SnapshotRecorder(Actor):
         )
         self._latency_write_futures: set[Future[Any]] = set()
         self._latency_write_lock = threading.Lock()
+        self._before_auction_time = self._parse_hh_mm(config.before_auction_time)
         self._before_time = self._parse_hh_mm(config.before_time)
         self._after_time = self._parse_hh_mm(config.after_time)
         # Guards so each phase applies the frozen target to the strategy at most once
@@ -181,6 +186,10 @@ class SnapshotRecorder(Actor):
         self._strategy.add_order_decision_listener(self._on_order_decision)
         for event in tuple(self._strategy.order_decision_events):
             self._on_order_decision(event)
+        if self._before_auction_time is not None:
+            self._schedule_daily(
+                self._BEFORE_AUCTION_ALERT, self._before_auction_time, self._on_before_auction_timer,
+            )
         if self._before_time is not None:
             self._schedule_daily(self._BEFORE_ALERT, self._before_time, self._on_before_timer)
         if self._after_time is not None:
@@ -302,6 +311,25 @@ class SnapshotRecorder(Actor):
         if missed_before:
             self._run_continuous_trading(today, allow_fallback=not self._within_trading_window())
 
+    def _on_before_auction_timer(self, _event: Any) -> None:
+        started = time.monotonic()
+        self._schedule_daily(
+            self._BEFORE_AUCTION_ALERT, self._before_auction_time, self._on_before_auction_timer,
+        )
+        today = self._now().date()
+        if today not in self._strategy._trading_dates:
+            return
+        try:
+            self._run_before_auction(today)
+        except Exception as exc:
+            self._report_event(
+                self._BEFORE_AUCTION_ALERT,
+                "failed",
+                started,
+                {"trading_date": today, "snapshot_type": BEFORE_AUCTION, "error": str(exc)},
+            )
+            raise
+
     def _on_before_timer(self, _event: Any) -> None:
         started = time.monotonic()
         self._schedule_daily(self._BEFORE_ALERT, self._before_time, self._on_before_timer)
@@ -394,6 +422,25 @@ class SnapshotRecorder(Actor):
 
     # ---- phase runners -------------------------------------------------------
 
+    def _run_before_auction(self, trading_date: date) -> None:
+        """Capture assets and holdings before auction fills; do not create targets."""
+        for table, record in (
+            ("live_asset_snapshot", self._record_asset),
+            ("live_position_snapshot", self._record_positions),
+        ):
+            record(
+                trading_date,
+                BEFORE_AUCTION,
+                SOURCE_LIVE,
+                on_complete=self._sync_task_callback(
+                    self._BEFORE_AUCTION_ALERT,
+                    table,
+                    trading_date,
+                    BEFORE_AUCTION,
+                    self.config.before_auction_time,
+                ),
+            )
+
     def _run_before_trading(
         self,
         trading_date: date,
@@ -470,7 +517,7 @@ class SnapshotRecorder(Actor):
                     on_complete=tick_callback,
                 )
 
-        before_trading_stock_codes = self._writer.load_before_trading_stock_codes(
+        before_auction_stock_codes = self._writer.load_before_auction_stock_codes(
             self.config.account_id,
             self.config.trader_id,
             trading_date,
@@ -483,7 +530,7 @@ class SnapshotRecorder(Actor):
                 if tick_callback is None
                 else lambda error: tick_callback("failed", 0, {"error": error})
             ),
-            extra_stock_codes=before_trading_stock_codes,
+            extra_stock_codes=before_auction_stock_codes,
         )
         asset_id = self._record_asset(
             trading_date,
@@ -1544,7 +1591,7 @@ class SnapshotRecorder(Actor):
             if self._fetch_open_prices is None:
                 if on_failed is not None:
                     on_failed(
-                        "full-tick source for before-trading positions is not configured",
+                        "full-tick source for extra positions is not configured",
                     )
                 return
             try:
@@ -1553,13 +1600,13 @@ class SnapshotRecorder(Actor):
                 )
             except Exception as exc:
                 self.log.warning(
-                    f"snapshot before-trading-position full-tick fetch failed: {exc}",
+                    f"snapshot extra-position full-tick fetch failed: {exc}",
                 )
                 if on_failed is not None:
                     on_failed(str(exc))
                 return
             if not isinstance(additional_result, dict):
-                error = "before-trading-position full-tick snapshot is invalid"
+                error = "extra-position full-tick snapshot is invalid"
                 self.log.warning(error)
                 if on_failed is not None:
                     on_failed(error)

@@ -2,6 +2,7 @@ from argparse import Namespace
 from datetime import date, datetime
 from decimal import Decimal
 import unittest
+import sqlite3
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -388,6 +389,64 @@ class DailyReturnCalculationTests(unittest.TestCase):
         self.assertEqual(records[("account", "trader")][-1]["return_amount"], Decimal("1100.0000"))
         self.assertEqual(records[("fallback", "trader")][-1]["return_amount"], Decimal("100.0000"))
         self.assertEqual(records[("fallback", "trader")][-1]["reference_amount"], Decimal("1000.0000"))
+
+    def test_tick_query_falls_back_to_same_day_whole_market_for_auction_exit(self) -> None:
+        # Execute the production price query against real rows so precedence and
+        # date/instrument matching are checked independently of mocked SQL text.
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.execute(
+            "CREATE TABLE live_stock_tick_snapshot (trade_date TEXT, snapshot_type TEXT, "
+            "instrument_id TEXT, stock_code TEXT, last_price TEXT, open TEXT, last_close TEXT)",
+        )
+        db.executemany(
+            "INSERT INTO live_stock_tick_snapshot VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("2026-11-23", "whole_market", "000779.SZ.BIGQMT", "000779.SZ", "6.85", "6.64", "6.77"),
+                ("2026-11-20", "after_trading", "000779.SZ.BIGQMT", "000779.SZ", "6.77", "6.94", "7.08"),
+                ("2026-11-23", "after_trading", "000001.SZ.BIGQMT", "000001.SZ", "12", "11", "10"),
+                ("2026-11-23", "whole_market", "000001.SZ.BIGQMT", "000001.SZ", "99", "99", "99"),
+                ("2026-11-20", "whole_market", "000002.SZ.BIGQMT", "000002.SZ", "9", "9", "9"),
+            ],
+        )
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = {"pretrade_date": date(2026, 11, 20)}
+        trade = {
+            "account_id": "8886569186", "trader_id": "BIGQMT-PROD-001",
+            "instrument_id": "000779.SZ.BIGQMT", "stock_code": "000779.SZ",
+            "side": "sell", "quantity": 1300, "price": "6.64",
+            "trade_time": "2026-11-23 09:25:00",
+        }
+
+        def fetchall():
+            sql, params = cursor.execute.call_args.args
+            if "FROM `live_stock_tick_snapshot`" in sql:
+                return [dict(row) for row in db.execute(sql.replace("%s", "?"), params)]
+            if "FROM `live_trade`" in sql:
+                return [trade]
+            return []
+
+        cursor.fetchall.side_effect = fetchall
+        trades, before, after, ticks, _, _ = fetch_mysql_inputs(
+            connection, Namespace(account_id="8886569186", trader_id="BIGQMT-PROD-001"), "2026-11-23",
+        )
+        self.assertEqual(len(ticks), 2)
+        prices = {row["stock_code"]: row for row in ticks}
+        self.assertEqual(prices["000001.SZ"]["last_price"], "12")
+        self.assertEqual(prices["000779.SZ"]["last_close"], "6.77")
+        rows = calculate_records("2026-11-23", trades, before, after, ticks)
+        sold = next(row for row in rows if row["calculation_type"] == "sell")
+        self.assertEqual(sold["return_amount"], Decimal("-174.4316"))
+
+        # Yesterday's snapshot must not hide a missing price today.
+        db.execute("DELETE FROM live_stock_tick_snapshot WHERE trade_date='2026-11-23' AND stock_code='000779.SZ'")
+        trades, before, after, ticks, _, _ = fetch_mysql_inputs(
+            connection, Namespace(account_id="8886569186", trader_id="BIGQMT-PROD-001"), "2026-11-23",
+        )
+        with self.assertRaisesRegex(ValueError, "missing last_close"):
+            calculate_records("2026-11-23", trades, before, after, ticks)
 
     def test_fetches_after_trading_assets_for_current_and_exact_previous_trading_day(self) -> None:
         connection = MagicMock()

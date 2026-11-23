@@ -1399,17 +1399,17 @@ class LiveSnapshotWriter:
                 return True
         return False
 
-    def load_before_trading_stock_codes(
+    def load_before_auction_stock_codes(
         self,
         account_id: str,
         trader_id: str,
         trade_date: date,
     ) -> list[str]:
-        """Return stocks in this account's before-trading position snapshot."""
+        """Return stocks held before auction fills, including names sold at auction."""
         sql = (
             "SELECT DISTINCT `stock_code` FROM `live_position_snapshot` "
             "WHERE `account_id`=%s AND `trader_id`=%s AND `trade_date`=%s "
-            "AND `snapshot_type`='before_trading' "
+            "AND `snapshot_type`='before_auction' "
             "AND `stock_code` IS NOT NULL AND `stock_code` <> ''"
         )
         rows = self._query(sql, (account_id, trader_id, trade_date))

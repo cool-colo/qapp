@@ -63,7 +63,7 @@ def test_log_id_matches_persisted_decision_and_cycle_logging_does_not_enqueue_db
         writer=MagicMock(), strategy_ref=strategy,
         order_event_writer=MagicMock(), order_decision_writer=decisions,
     )
-    recorder._before_time = recorder._after_time = None
+    recorder._before_auction_time = recorder._before_time = recorder._after_time = None
     recorder._catch_up_on_start = lambda: None
     recorder._subscribe_order_events = lambda: None
     recorder._now_naive = lambda: datetime(2026, 7, 2)

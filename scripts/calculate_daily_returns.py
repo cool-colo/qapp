@@ -34,6 +34,9 @@ back to the sum of the per-stock returns above. Pass
 ``--account-return-method positions-and-trades`` to always calculate the summary
 from positions and trades instead.
 
+Prices prefer the day's ``after_trading`` tick snapshot. Stocks absent from that
+snapshot use the same day's ``whole_market`` snapshot, including auction exits.
+
 Usage::
 
     python -m scripts.calculate_daily_returns --trade-date 2026-07-27
@@ -538,11 +541,20 @@ def fetch_mysql_inputs(connection, args: argparse.Namespace, trade_date: str) ->
             [trade_date, *scope_params],
         )
         trades = list(cursor.fetchall())
+        # Prefer one complete after-trading row per instrument. Auction exits may
+        # only exist in the same day's whole-market snapshot.
         cursor.execute(
             "SELECT `instrument_id`, `stock_code`, `last_price`, `open`, `last_close` "
             "FROM `live_stock_tick_snapshot` "
-            "WHERE `trade_date` = %s AND `snapshot_type` = 'after_trading'",
-            (trade_date,),
+            "WHERE `trade_date` = %s AND `snapshot_type` = 'after_trading' "
+            "UNION ALL "
+            "SELECT w.`instrument_id`, w.`stock_code`, w.`last_price`, w.`open`, w.`last_close` "
+            "FROM `live_stock_tick_snapshot` w "
+            "WHERE w.`trade_date` = %s AND w.`snapshot_type` = 'whole_market' "
+            "AND NOT EXISTS (SELECT 1 FROM `live_stock_tick_snapshot` a "
+            "WHERE a.`trade_date` = w.`trade_date` AND a.`instrument_id` = w.`instrument_id` "
+            "AND a.`snapshot_type` = 'after_trading')",
+            (trade_date, trade_date),
         )
         ticks = list(cursor.fetchall())
         asset_columns = "`account_id`, `trader_id`, `trade_date`, `market_value`, `cash`, `frozen_cash`"

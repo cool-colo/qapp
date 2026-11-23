@@ -70,6 +70,7 @@ def _apply_snapshot_args(args: Any) -> None:
     the shared parser.
     """
     env = os.environ.get
+    args.snapshot_before_auction_time = env("MODEL_SNAPSHOT_BEFORE_AUCTION_TIME", "09:24")
     args.snapshot_before_time = env("MODEL_SNAPSHOT_BEFORE_TIME", "09:27")
     args.snapshot_after_time = env("MODEL_SNAPSHOT_AFTER_TIME", "15:03")
     args.mysql_host = env("MYSQL_HOST", "127.0.0.1")
@@ -215,6 +216,7 @@ def _add_snapshot_recorder(
             trader_id=str(args.trader_id),
             broker_name=args.broker_name,
             timezone_name=args.exchange_timezone,
+            before_auction_time=args.snapshot_before_auction_time,
             before_time=args.snapshot_before_time,
             after_time=args.snapshot_after_time,
             trading_windows=strategy.config.trading_windows,
@@ -271,6 +273,7 @@ def _add_snapshot_recorder(
     _emit_snapshot_status(
         node,
         f"[snapshot] recorder enabled: account={args.account_id} "
+        f"before_auction={args.snapshot_before_auction_time} "
         f"before={args.snapshot_before_time} after={args.snapshot_after_time}",
     )
 
