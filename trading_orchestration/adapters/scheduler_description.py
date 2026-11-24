@@ -45,8 +45,7 @@ def describe_scheduler(config: OrchestrationConfig, strategy: StrategySchedule) 
             "trigger": triggers[name], "builtin": False,
         }
     exposure = asdict(config.exposure)
-    for key in ("tolerance", "commission_rate", "minimum_fee"):
-        exposure[key] = str(exposure[key])
+    exposure["tolerance"] = str(exposure["tolerance"])
     return {"timezone": strategy.timezone_name, "poll_interval_secs": config.poll_interval_secs,
             "tasks": definitions, "exposure": exposure,
             "cleanup_component": config.cleanup_component,

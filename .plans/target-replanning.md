@@ -120,6 +120,47 @@ new planning and requires the normal pause, reconciliation and submission gates.
 
 ## Controls and runtime
 
+### Continuous execution windows
+
+Normal execution uses matching local-clock and exchange-event sessions. Configure
+morning and afternoon separately so a still-fresh morning quote cannot authorize
+an order during lunch. The topn_003 execution windows are
+`10:00-11:30,13:00-14:10`. Submission windows and their quote windows use
+`[start, end)`, including exposure execution profiles, so 11:30:00 and 14:10:00
+cannot start a new order. At 13:00, an afternoon market event is required. Trading
+observation windows retain their existing boundary behavior; cancellation keeps
+its independent exchange-session gate.
+
+### Exposure correction
+
+- Detection and correction estimates capture Nautilus holdings and fresh mark
+  prices without computing buy/sell limit prices. Estimates ignore commissions
+  and minimum fees; the removed exposure fee configuration keys now raise.
+- Detection uses a separate position snapshot and values only current holdings.
+  Missing prices for unheld targets cannot block exposure assessment. Planning
+  starts with a new position/account snapshot, reassesses the direction, and reads
+  permissions, lot rules and sellability only for candidates on that side.
+  Candidate input errors are local exclusions; wait for missing inputs only when
+  the fresh usable candidates cannot reach the tolerance band. Missing prices for
+  actual holdings still block assessment. Mark freshness is 15 seconds in the
+  shipped task configuration.
+- Target validation captures a new planning snapshot. Every physical order
+  captures new holdings plus the selected instrument and pending commitments,
+  without depending on unrelated target stocks or reusing detection-time facts.
+- A deviation outside the configured tolerance starts correction. Allocate the
+  remaining formal targets toward zero deviation, choosing the nearest legal lot
+  subject to cash, sellability, directional permissions, minimum buy notional and
+  the opposite tolerance boundary. When the center is unreachable, reaching the
+  tolerance band is acceptable; insufficient capacity to reach that band requests
+  a new formal plan.
+- Physical admission uses the selected order's actual limit price for minimum buy
+  notional. It subtracts pending commitments from the amount needed to reach the
+  center. An active correction may continue after partial fills enter the band;
+  normal detection does not start a new correction within tolerance.
+- Correction defaults to priority 50, below normal execution's 100, and cannot
+  preempt. Normal execution may preempt correction through the existing cleanup
+  and reconciliation boundary. The correction window remains independent.
+
 ### Scheduled trigger policy
 
 `scheduled_replan_times` is an optional YAML list (default `[]`), shared by live and

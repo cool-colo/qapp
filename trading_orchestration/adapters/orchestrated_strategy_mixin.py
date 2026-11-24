@@ -93,8 +93,8 @@ class OrchestratedStrategyMixin:
         bridge = self.orchestration
         if bridge.engine.owner_task() == "exposure_correction":
             quantity = bridge.exposure_admission.quantity(
-                bridge.snapshot_provider.capture(), str(intent.instrument_id),
-                intent.side.name.lower(), quantity)
+                bridge.snapshot_provider.capture_order(str(intent.instrument_id)), str(intent.instrument_id),
+                intent.side.name.lower(), quantity, order_price=intent.price.as_decimal())
             if quantity <= 0:
                 intent.context.record(skip_reason="exposure_admission_blocked")
                 return False

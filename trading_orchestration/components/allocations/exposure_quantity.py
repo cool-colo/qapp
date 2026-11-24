@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, ROUND_FLOOR
 
 from trading_orchestration.contexts.exposure_context import InstrumentSnapshot
 
@@ -23,25 +23,29 @@ def liquidation_quantity(item: InstrumentSnapshot, target: Decimal,
 
 
 def corrective_quantity(item: InstrumentSnapshot, direction: str, *, needed: Decimal,
-                        room: Decimal, cap: Decimal,
+                        room: Decimal, cap: Decimal, order_price: Decimal,
                         liquidation: Decimal = Decimal(0)) -> Decimal:
-    """Choose a legal corrective quantity without crossing any caller's upper bound."""
+    """Choose the legal quantity closest to the center within the caller's bounds.
+
+    Planning supplies the mark as order_price; physical admission supplies the
+    actual limit price to enforce the minimum buy notional only at execution.
+    """
+    if needed <= 0:
+        return Decimal(0)
     ceiling = min(cap, room / item.price)
-    required = (needed / item.price / item.increment).to_integral_value(
-        rounding=ROUND_CEILING) * item.increment
     minimum = item.minimum
     if direction == "buy":
-        if item.buy_price is None or not item.buy_price.is_finite() or item.buy_price <= 0:
+        if not order_price.is_finite() or order_price <= 0:
             return Decimal(0)
         # The executor requires notional strictly greater than the configured minimum.
-        minimum = max(minimum, round_down(item.minimum_buy_notional / item.buy_price,
+        minimum = max(minimum, round_down(item.minimum_buy_notional / order_price,
                                           item.increment) + item.increment)
-    regular = min(round_down(ceiling, item.increment), max(minimum, required))
-    if regular < minimum:
-        regular = Decimal(0)
-    # Full liquidation may be below the regular minimum or include a residual lot.
-    # Prefer the smaller regular correction when it already reaches the boundary.
-    if (direction == "sell" and 0 < liquidation <= ceiling
-            and (regular == 0 or regular * item.price < needed)):
-        return liquidation
-    return max(Decimal(0), regular)
+    candidates = {Decimal(0)}
+    largest = round_down(ceiling, item.increment)
+    if largest >= minimum:
+        lower = round_down(needed / item.price, item.increment)
+        for quantity in (lower, lower + item.increment):
+            candidates.add(min(largest, max(minimum, quantity)))
+    if direction == "sell" and 0 < liquidation <= ceiling:
+        candidates.add(liquidation)
+    return min(candidates, key=lambda quantity: (abs(needed - quantity * item.price), quantity))

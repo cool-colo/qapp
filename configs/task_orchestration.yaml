@@ -26,11 +26,9 @@ exposure:
   tolerance: "0.05"  # Absolute ratio difference: 0.05 = 5 percentage points, inclusive.
   windows: "09:35-11:30"
   interval_secs: 1.0
-  priority: 300
-  # Fee estimates for correction planning, not actual venue/backtest fee settings.
-  commission_rate: "0.000085"
-  minimum_fee: "5"
-  quote_max_age_secs: 4.0
+  priority: 50
+  # Correction estimates use mark prices without fees and aim for zero deviation.
+  quote_max_age_secs: 15.0
 
 # Every supported per-task field is explicit below:
 # enabled: accept new runs; disabling does not cancel an active run.
@@ -99,8 +97,8 @@ tasks:
   exposure_correction:
     # Explicit values override exposure.enabled and exposure.priority above.
     enabled: true
-    priority: 300
-    can_preempt: true
+    priority: 50  # Lower than normal_execution (100).
+    can_preempt: false
     preemptible: true
     splitter: existing_notional
     cancellation: existing

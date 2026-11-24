@@ -15,6 +15,8 @@ import uvloop
 
 from tests.test_opening_auction import replay_fixture, FixedPlanner, timestamp
 from trading_orchestration.configuration.orchestration_config import OrchestrationConfig
+from trading_orchestration.components.triggers.exposure_trigger import ExposureTrigger
+from nautilus_trader.adapters.bigqmt.common import parse_full_tick_as_order_book_depth10
 from strategies.model_target_planners.base import ModelTargetPlan, TargetInfo, TargetContext
 from strategies.replanning import planning_json
 
@@ -160,9 +162,41 @@ class OrchestrationReplayTest(unittest.TestCase):
     def test_unknown_configuration_fails_fast(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.yaml"
-            path.write_text("schema_version: 2\nexposure:\n  tolreance: 0.05\n")
-            with self.assertRaises(ValueError):
-                OrchestrationConfig.load(str(path))
+            for key in ('tolreance', 'commission_rate', 'minimum_fee'):
+                with self.subTest(key=key):
+                    path.write_text(f"schema_version: 2\nexposure:\n  {key}: 0.05\n")
+                    with self.assertRaises(ValueError):
+                        OrchestrationConfig.load(str(path))
+
+    def test_detection_before_normal_window_does_not_validate_order_prices(self):
+        engine, host, _, _ = replay_fixture(auction_enabled=False, transform_config=lambda c: config_replace(
+            c, task_orchestration_config='configs/task_orchestration.yaml',
+            execution_windows='10:00-14:10', exchange_execution_windows='10:00-14:10',
+            submission_book_max_age_secs=5.0))
+        try:
+            now = timestamp('2026-07-08 09:46:38.439')
+            old = timestamp('2026-07-08 09:46:33')
+            day = date(2026, 7, 8)
+            host.clock.set_time(now)
+            host._roll_trading_day(day)
+            host._convergence_suspended = True
+            iid = host.config.instrument_ids[0]
+            host.update_target_quantities({str(iid): Decimal(1000)}, day, 'test', version='test')
+            host.on_order_book_depth(parse_full_tick_as_order_book_depth10(iid, {
+                'bidPrice': [10], 'askPrice': [10.01], 'bidVol': [100], 'askVol': [100],
+                'time': old // 1_000_000}, old + 1_000_000_000))
+            self.assertFalse(host._within_execution_window())
+            self.assertTrue(host.orchestration.exposure_allowed())
+            with patch.object(host, '_limit_price', side_effect=AssertionError('detection priced an order')) as price, \
+                 patch.object(host, '_execution_book_validation', wraps=host._execution_book_validation) as validate, \
+                 patch.object(host, 'submit_order', wraps=host.submit_order) as submit:
+                self.assertIsNone(ExposureTrigger(host.orchestration).evaluate(now))
+                price.assert_not_called()
+                validate.assert_not_called()
+                submit.assert_not_called()
+            self.assertEqual(host.execution_book_windows(), '10:00-14:10')
+        finally:
+            engine.dispose()
 
     def test_operation_permit_does_not_leak_to_another_thread(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -221,7 +255,7 @@ class OrchestrationReplayTest(unittest.TestCase):
         self.assertFalse(any(task != "bootstrap" and action == "ADMITTED"
                              for task, action, _ in records))
 
-    def test_correction_increases_small_buy_to_legal_notional_in_real_executor(self):
+    def test_correction_buys_to_center_above_minimum_notional_in_real_executor(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.yaml"
             path.write_text("schema_version: 2\nexposure:\n  enabled: true\n")
@@ -242,10 +276,10 @@ class OrchestrationReplayTest(unittest.TestCase):
                 engine.run()
                 orders = engine.cache.orders()
                 self.assertEqual(len(orders), 1)
-                self.assertEqual(orders[0].quantity.as_decimal(), Decimal(900))
+                self.assertEqual(orders[0].quantity.as_decimal(), Decimal(1000))
                 self.assertGreater(orders[0].quantity.as_decimal() * orders[0].price.as_decimal(),
                                    Decimal(17000))
-                self.assertEqual(orders[0].filled_qty.as_decimal(), Decimal(900))
+                self.assertEqual(orders[0].filled_qty.as_decimal(), Decimal(1000))
                 self.assertEqual(len(planner.requests), 0)
                 self.assertTrue(any(r.action == "TERMINATED" and r.task_id == "exposure_correction"
                                     and r.reason == "exposure_within_tolerance"

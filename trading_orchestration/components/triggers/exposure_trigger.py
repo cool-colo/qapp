@@ -10,7 +10,7 @@ class ExposureTrigger:
     def evaluate(self, now_ns):
         if not self.bridge.exposure_allowed():
             return None
-        snapshot = self.bridge.snapshot_provider.capture()
+        snapshot = self.bridge.snapshot_provider.capture_positions()
         result = self.assessor.assess(snapshot)
         self.bridge.last_exposure_assessment = result.evidence()
         if result.status == "correction":

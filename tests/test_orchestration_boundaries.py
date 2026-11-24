@@ -204,6 +204,40 @@ class FrameworkBoundaryTest(unittest.TestCase):
 
 
 class BridgeBoundaryTest(unittest.TestCase):
+    def test_correction_cannot_preempt_normal_execution_and_yields_to_it(self):
+        with TemporaryDirectory() as directory:
+            defaults = Path(directory) / 'tasks.yaml'
+            defaults.write_text('schema_version: 2\nexposure:\n  enabled: true\n')
+            for path in (defaults, Path('configs/task_orchestration.yaml')):
+                with self.subTest(path=path):
+                    config = OrchestrationConfig.load(str(path))
+                    environment = Environment()
+                    engine = TaskOrchestrator(stabilizer_factory=environment.stabilizer)
+                    engine.register(TaskSpec('bootstrap', 1000, preemptible=False),
+                                    lambda: Work(environment, done=True), bootstrap=True)
+                    normal, correction = Work(environment), Work(environment)
+                    correction_factory = Mock(return_value=correction)
+                    engine.register(config.tasks['normal_execution'], lambda: normal)
+                    engine.register(config.tasks['exposure_correction'], correction_factory)
+                    engine.start(0)
+                    engine.tick(0)
+                    engine.submit('normal_execution', Proposal('normal'))
+                    engine.tick(1)
+                    engine.submit('exposure_correction', Proposal('correction'))
+                    engine.tick(2)
+                    self.assertEqual(engine.owner_task(), 'normal_execution')
+                    self.assertEqual(normal.interrupted, 0)
+                    correction_factory.assert_not_called()
+                    normal.done = True
+                    engine.tick(3)
+                    engine.tick(4)
+                    self.assertEqual(engine.owner_task(), 'exposure_correction')
+                    normal.done = False
+                    engine.submit('normal_execution', Proposal('next_normal'))
+                    engine.tick(5)
+                    self.assertEqual(engine.owner_task(), 'normal_execution')
+                    self.assertEqual(correction.interrupted, 1)
+
     def test_event_and_control_callbacks_only_queue_until_next_cycle(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.yaml"

@@ -11,12 +11,12 @@ class ExposureOrderAdmission:
     def __init__(self, tolerance=Decimal("0.05")):
         self.assessor = ExposureAssessor(tolerance)
 
-    def quantity(self, context, instrument_id, direction, requested):
-        assessment = self.assessor.assess(context)
-        if assessment.status != "correction" or assessment.direction != direction:
+    def quantity(self, context, instrument_id, direction, requested, *, order_price: Decimal):
+        assessment = self.assessor.assess(context.position_snapshot())
+        if assessment.status == "unknown" or assessment.direction != direction:
             return Decimal(0)
         item = context.instruments.get(instrument_id)
-        if (item is None or item.price <= 0 or item.increment <= 0
+        if (item is None or item.quality_error or item.price <= 0 or item.increment <= 0
                 or not (item.can_buy if direction == "buy" else item.can_sell)
                 or context.pending_orders != len(context.pending)):
             return Decimal(0)
@@ -25,12 +25,12 @@ class ExposureOrderAdmission:
             if pending.direction != direction:
                 return Decimal(0)
             priced = context.instruments.get(pending.instrument_id)
-            if priced is None or priced.price <= 0:
+            if priced is None or priced.quality_error or priced.price <= 0:
                 return Decimal(0)
             pending_value += pending.quantity * priced.price
             if pending.instrument_id == instrument_id:
                 pending_quantity += pending.quantity
-        needed = max(Decimal(0), assessment.minimum_notional - pending_value)
+        needed = max(Decimal(0), assessment.center_notional - pending_value)
         if needed == 0:
             return Decimal(0)
         room = max(Decimal(0), assessment.maximum_notional - pending_value)
@@ -42,5 +42,5 @@ class ExposureOrderAdmission:
             cap = min(cap, item.sellable)
             liquidation = liquidation_quantity(item, target, pending_quantity)
         return corrective_quantity(item, direction, needed=needed, room=room, cap=cap,
-                                   liquidation=liquidation)
+                                   order_price=order_price, liquidation=liquidation)
 

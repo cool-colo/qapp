@@ -42,9 +42,8 @@ class OrchestrationConfig:
         if not isinstance(exposure_raw, dict) or set(exposure_raw) - {f.name for f in fields(ExposureConfig)}:
             raise ValueError("invalid exposure configuration fields")
         exposure_raw = dict(exposure_raw)
-        for name in ("tolerance", "commission_rate", "minimum_fee"):
-            if name in exposure_raw:
-                exposure_raw[name] = Decimal(str(exposure_raw[name]))
+        if "tolerance" in exposure_raw:
+            exposure_raw["tolerance"] = Decimal(str(exposure_raw["tolerance"]))
         exposure = ExposureConfig(**exposure_raw)
         from strategies.cancellation import parse_cancel_windows
         windows = parse_cancel_windows(exposure.windows)
@@ -89,6 +88,7 @@ class OrchestrationConfig:
             if not isinstance(chosen_priority, int) or isinstance(chosen_priority, bool):
                 raise ValueError("priority must be integer")
             enabled = values.pop("enabled", exposure.enabled if name == "exposure_correction" else True)
+            values.setdefault("can_preempt", name != "exposure_correction")
             result[name] = TaskSpec(name, chosen_priority, enabled=enabled, **values,
                                    interval_ns=int(exposure.interval_secs * 1e9)
                                    if name == "exposure_correction" else int(interval * 1e9))

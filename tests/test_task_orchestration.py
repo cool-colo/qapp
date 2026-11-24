@@ -366,8 +366,7 @@ def snapshot(quantity="9000", target_qty="8000", weight="0.8", *, assets="100000
     quantity, target_qty = D(quantity), D(target_qty)
     target = FormalTarget("v1", "2026-07-08", {"A": target_qty}, {"A": D(weight)},
                           D(buffer), D(assets) - D(buffer))
-    item = InstrumentSnapshot(quantity, D(10), quantity if sellable is None else D(sellable),
-                              buy_price=D(10), sell_price=D(10))
+    item = InstrumentSnapshot(quantity, D(10), quantity if sellable is None else D(sellable))
     return ExposureContext(0, "2026-07-08", 1, D(assets), D(assets) - quantity * 10,
                            {"A": item}, target, pending)
 
@@ -378,27 +377,27 @@ class ExposurePolicyTest(unittest.TestCase):
         self.planner = RemainingTargetExposurePlanner(ExposureConfig())
 
     def test_five_percentage_points_is_inclusive(self):
-        self.assertEqual(self.assessor.assess(snapshot("8500")).status, "satisfied")
-        self.assertEqual(self.assessor.assess(snapshot("7500")).status, "satisfied")
-        self.assertEqual(self.assessor.assess(snapshot("8501")).direction, "sell")
-        self.assertEqual(self.assessor.assess(snapshot("7499")).direction, "buy")
+        self.assertEqual(self.assessor.assess(snapshot("8500").position_snapshot()).status, "satisfied")
+        self.assertEqual(self.assessor.assess(snapshot("7500").position_snapshot()).status, "satisfied")
+        self.assertEqual(self.assessor.assess(snapshot("8501").position_snapshot()).direction, "sell")
+        self.assertEqual(self.assessor.assess(snapshot("7499").position_snapshot()).direction, "buy")
 
     def test_fixed_buffer_is_not_recomputed_percentage(self):
         first = snapshot("8000", assets="100000", buffer="12000")
         changed = replace(first, total_assets=D(102000))
-        self.assertEqual(self.assessor.assess(changed).denominator, D(90000))
+        self.assertEqual(self.assessor.assess(changed.position_snapshot()).denominator, D(90000))
         self.assertEqual(changed.target.buffer_amount, D(12000))
 
-    def test_sells_only_to_nearest_boundary(self):
+    def test_sells_to_center(self):
         result = self.planner.plan(snapshot())
         self.assertEqual(result.status, "planned")
-        self.assertEqual(result.quantities["A"], D(8500))
-        self.assertEqual(result.notional, D(5000))
+        self.assertEqual(result.quantities["A"], D(8000))
+        self.assertEqual(result.notional, D(10000))
 
-    def test_buys_only_to_nearest_boundary(self):
+    def test_buys_to_center(self):
         result = self.planner.plan(snapshot("7000"))
         self.assertEqual(result.status, "planned")
-        self.assertEqual(result.quantities["A"], D(7500))
+        self.assertEqual(result.quantities["A"], D(8000))
 
     def test_capacity_insufficient_even_with_tradable_stocks(self):
         result = self.planner.plan(snapshot(target_qty="8900"))
@@ -425,17 +424,17 @@ class ExposurePolicyTest(unittest.TestCase):
 
     def test_pending_orders_prevent_duplicate_plan_and_completion(self):
         self.assertEqual(self.planner.plan(snapshot(pending=1)).status, "waiting")
-        self.assertEqual(self.assessor.assess(snapshot("8500", pending=1)).status, "settling")
+        self.assertEqual(self.assessor.assess(snapshot("8500", pending=1).position_snapshot()).status, "settling")
 
     def test_missing_data_is_unknown_not_infeasible(self):
         ctx = replace(snapshot(), quality_error="stale_price")
         self.assertEqual(self.planner.plan(ctx).status, "unknown")
-        self.assertEqual(self.assessor.assess(replace(snapshot(), total_assets=D(0))).status, "unknown")
+        self.assertEqual(self.assessor.assess(replace(snapshot(), total_assets=D(0)).position_snapshot()).status, "unknown")
 
-    def test_sellable_constraint_and_buy_fees_are_applied(self):
+    def test_sellable_constraint_and_fee_free_buy_cash_are_applied(self):
         self.assertEqual(self.planner.plan(snapshot(sellable="100")).status, "replan")
         ctx = replace(snapshot("7000"), free_cash=D(5000))
-        self.assertEqual(self.planner.plan(ctx).status, "replan")
+        self.assertEqual(self.planner.plan(ctx).quantities["A"], D(7500))
 
     def test_context_mappings_are_immutable(self):
         ctx = snapshot()
@@ -447,20 +446,20 @@ class ExposurePolicyTest(unittest.TestCase):
     def test_physical_orders_include_pending_commitments(self):
         ctx = snapshot("7000")
         admission = ExposureOrderAdmission()
-        self.assertEqual(admission.quantity(ctx, "A", "buy", D(1000)), D(500))
+        self.assertEqual(admission.quantity(ctx, "A", "buy", D(1000), order_price=D(10)), D(1000))
         ctx = replace(ctx, pending_orders=1, pending=(PendingExposureOrder("A", "buy", D(300)),))
-        self.assertEqual(admission.quantity(ctx, "A", "buy", D(1000)), D(200))
+        self.assertEqual(admission.quantity(ctx, "A", "buy", D(1000), order_price=D(10)), D(700))
         ctx = replace(ctx, pending=(PendingExposureOrder("A", "buy", D(500)),))
-        self.assertEqual(admission.quantity(ctx, "A", "buy", D(1000)), D(0))
+        self.assertEqual(admission.quantity(ctx, "A", "buy", D(1000), order_price=D(10)), D(500))
 
     def test_physical_order_blocks_opposite_pending_and_boundary(self):
         admission = ExposureOrderAdmission()
         ctx = replace(snapshot("7000"), pending_orders=1,
                       pending=(PendingExposureOrder("A", "sell", D(100)),))
-        self.assertEqual(admission.quantity(ctx, "A", "buy", D(500)), D(0))
-        self.assertEqual(admission.quantity(snapshot("7500"), "A", "buy", D(100)), D(0))
+        self.assertEqual(admission.quantity(ctx, "A", "buy", D(500), order_price=D(10)), D(0))
+        self.assertEqual(admission.quantity(snapshot("7500"), "A", "buy", D(100), order_price=D(10)), D(100))
 
     def test_order_never_exceeds_formal_remaining_quantity(self):
         ctx = snapshot("7000", target_qty="7100")
-        self.assertEqual(ExposureOrderAdmission().quantity(ctx, "A", "buy", D(500)), D(100))
+        self.assertEqual(ExposureOrderAdmission().quantity(ctx, "A", "buy", D(500), order_price=D(10)), D(100))
 

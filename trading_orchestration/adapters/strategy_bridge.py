@@ -413,15 +413,6 @@ class StrategyBridge:
                 self.host.clock.cancel_timer(self.TIMER)
 
     @contextmanager
-    def pricing_windows(self, windows):
-        previous = self.profile_windows
-        self.profile_windows = windows
-        try:
-            yield
-        finally:
-            self.profile_windows = previous
-
-    @contextmanager
     def operations(self, *, windows=None):
         mode = self.engine.operation_phase()
         if mode not in {"execute", "cleanup", "release"}:
@@ -449,14 +440,15 @@ class StrategyBridge:
         host, now = self.host, self.local_now()
         if now.date() not in host._trading_dates:
             return False
-        index = host._time_window_index(now.time(), windows)
+        index = host._time_window_index(now.time(), windows, end_exclusive=True)
         stamp = ts_event or host._last_market_data_ts_event
         if index is None or not stamp or stamp > host.clock.timestamp_ns():
             return False
         event = datetime.fromtimestamp(stamp / 1e9, ZoneInfo(host.config.timezone_name))
         return (event.date() == now.date()
-                and host._time_window_index(event.time(), windows) == index
-                and host._time_window_index(now.time(), host.config.exchange_trading_windows) is not None)
+                and host._time_window_index(event.time(), windows, end_exclusive=True) == index
+                and host._time_window_index(now.time(), host.config.exchange_trading_windows,
+                                            end_exclusive=True) is not None)
 
     def exposure_allowed(self):
         return (self.in_windows(self.config.exposure.windows)

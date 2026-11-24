@@ -1,5 +1,5 @@
 from decimal import Decimal
-from trading_orchestration.contexts.exposure_context import ExposureContext, ExposureAssessment
+from trading_orchestration.contexts.exposure_context import ExposurePositionContext, ExposureAssessment
 
 
 class ExposureAssessor:
@@ -8,7 +8,7 @@ class ExposureAssessor:
             raise ValueError("invalid exposure tolerance")
         self.tolerance = tolerance
 
-    def assess(self, context: ExposureContext) -> ExposureAssessment:
+    def assess(self, context: ExposurePositionContext) -> ExposureAssessment:
         if context.quality_error:
             return ExposureAssessment("unknown", context.quality_error)
         target = context.target
@@ -18,7 +18,7 @@ class ExposureAssessor:
         if not assets.is_finite() or assets <= target.buffer_amount:
             return ExposureAssessment("unknown", "invalid_asset_denominator")
         value = Decimal(0)
-        for item in context.instruments.values():
+        for item in context.positions.values():
             if not item.quantity.is_finite() or item.quantity < 0:
                 return ExposureAssessment("unknown", "invalid_position")
             if item.quantity > 0:
@@ -29,13 +29,13 @@ class ExposureAssessor:
         actual = value / denominator
         delta = actual - target.ratio
         common = dict(target_ratio=target.ratio, actual_ratio=actual, deviation=delta,
-                      denominator=denominator, market_value=value)
+                      denominator=denominator, market_value=value,
+                      direction="sell" if delta > 0 else "buy" if delta < 0 else None,
+                      minimum_notional=max(Decimal(0), abs(delta) - self.tolerance) * denominator,
+                      center_notional=abs(delta) * denominator,
+                      maximum_notional=(abs(delta) + self.tolerance) * denominator)
         if abs(delta) <= self.tolerance:
             status = "settling" if context.pending_orders else "satisfied"
             return ExposureAssessment(status, "within_tolerance", **common)
-        direction = "sell" if delta > 0 else "buy"
-        return ExposureAssessment("correction", "outside_tolerance", **common,
-                                  direction=direction,
-                                  minimum_notional=(abs(delta) - self.tolerance) * denominator,
-                                  maximum_notional=(abs(delta) + self.tolerance) * denominator)
+        return ExposureAssessment("correction", "outside_tolerance", **common)
 

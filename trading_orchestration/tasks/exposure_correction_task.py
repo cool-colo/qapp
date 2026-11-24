@@ -30,8 +30,8 @@ class ExposureCorrectionTask(BusinessTask):
             return Decision(RunState.EXPIRED, "correction_window_closed")
         if not host.automatic_replanning_allowed():
             return Decision(RunState.WAITING, "automatic_execution_paused")
-        snapshot = bridge.snapshot_provider.capture()
-        assessment = self.assessor.assess(snapshot)
+        positions = bridge.snapshot_provider.capture_positions()
+        assessment = self.assessor.assess(positions)
         if assessment.status == "unknown":
             return Decision(RunState.WAITING, assessment.reason, assessment.evidence())
 
@@ -39,16 +39,15 @@ class ExposureCorrectionTask(BusinessTask):
             result = self.risk_planner.plan(context)
             if result.state == RunState.WAITING:
                 return result
-            bridge.exposure_block = self._fingerprint(bridge.snapshot_provider.capture())
+            bridge.exposure_block = self._fingerprint(bridge.snapshot_provider.capture_planning())
             self.risk_planner = None
             return Decision(RunState.WAITING, "reassess_after_risk_manager",
                             {"planning_result": result.reason})
 
         if self.active_plan is not None:
-            same_direction = (assessment.status == "correction"
-                              and assessment.direction == self.active_plan.direction
-                              and snapshot.target.version == self.active_plan.parent_version)
-            if snapshot.pending_orders and same_direction:
+            same_direction = (assessment.direction == self.active_plan.direction
+                              and positions.target.version == self.active_plan.parent_version)
+            if positions.pending_orders and same_direction:
                 with bridge.operations(windows=bridge.config.exposure.windows):
                     host._reconcile_unfilled_orders(host._clock_date())
                 return Decision(RunState.WAITING, "awaiting_corrective_orders", assessment.evidence())
@@ -57,11 +56,13 @@ class ExposureCorrectionTask(BusinessTask):
             return Decision(RunState.WAITING, "correction_requires_fresh_state",
                             assessment.evidence(), requires_stable=True)
 
-        if snapshot.pending_orders:
+        if positions.pending_orders:
             return Decision(RunState.WAITING, "unexpected_pending_orders", requires_stable=True)
         if assessment.status == "satisfied":
             bridge.exposure_block = None
             return Decision(RunState.SUCCEEDED, "exposure_within_tolerance", assessment.evidence())
+        snapshot = bridge.snapshot_provider.capture_planning()
+        assessment = self.assessor.assess(snapshot.position_snapshot())
         plan = self.planner.plan(snapshot)
         action = self.outcome_policy.decide(plan)
         if action == "wait":

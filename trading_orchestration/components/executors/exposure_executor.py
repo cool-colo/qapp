@@ -9,7 +9,7 @@ class ExposureExecutor:
         self.plan = None
 
     def apply(self, context, goal):
-        snapshot = self.bridge.snapshot_provider.capture()
+        snapshot = self.bridge.snapshot_provider.capture_planning()
         if not self.bridge.engine.owns(context) or not self.validator.validate(snapshot, goal):
             return Decision(RunState.FAILED, "temporary_target_stale")
         self.bridge.install_quantities(dict(goal.quantities),

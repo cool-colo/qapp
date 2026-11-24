@@ -4248,7 +4248,9 @@ class TargetQuantityStrategy(TargetStateOwner, Strategy):
         if for_cancel:
             if not self._within_cancel_window(ts_event):
                 return (False, "outside_cancel_window", None)
-        elif self._time_window_index(event_time.time(), self.execution_book_windows()) is None:
+        elif self._time_window_index(
+            event_time.time(), self.execution_book_windows(), end_exclusive=True,
+        ) is None:
             return (False, "outside_execution_window", None)
 
         now_ns = int(self.clock.timestamp_ns())
@@ -4832,7 +4834,9 @@ class TargetQuantityStrategy(TargetStateOwner, Strategy):
         return start <= now < end
 
     @staticmethod
-    def _time_window_index(current: Any, windows: str) -> int | None:
+    def _time_window_index(
+        current: Any, windows: str, *, end_exclusive: bool = False,
+    ) -> int | None:
         for index, session in enumerate(str(windows).split(",")):
             session = session.strip()
             if not session or "-" not in session:
@@ -4843,7 +4847,8 @@ class TargetQuantityStrategy(TargetStateOwner, Strategy):
                 close_t = pd.Timestamp(close_str.strip()).time()
             except Exception:
                 continue
-            if open_t <= current <= close_t:
+            before_end = current < close_t if end_exclusive else current <= close_t
+            if open_t <= current and before_end:
                 return index
         return None
 
@@ -4863,7 +4868,7 @@ class TargetQuantityStrategy(TargetStateOwner, Strategy):
             now = pd.Timestamp(self.clock.utc_now()).tz_convert(self.config.timezone_name).time()
         except Exception:
             return None
-        return self._time_window_index(now, self.config.execution_windows)
+        return self._time_window_index(now, self.config.execution_windows, end_exclusive=True)
 
     def _within_trading_time(self) -> bool:
         """True when the clock is inside a scheduled trading session (time only).
@@ -4907,7 +4912,7 @@ class TargetQuantityStrategy(TargetStateOwner, Strategy):
         return self._within_exchange_trading_time(ts_event, session_index=local_window_index)
 
     def _within_execution_window(self, ts_event: int | None = None) -> bool:
-        """Require both local time and current market event time in the order window."""
+        """Require local and current market event time in the same [start, end) order window."""
         local_window_index = self._local_execution_window_index()
         if local_window_index is None:
             return False
@@ -4925,6 +4930,7 @@ class TargetQuantityStrategy(TargetStateOwner, Strategy):
         event_window_index = self._time_window_index(
             event_time.time(),
             self.config.exchange_execution_windows,
+            end_exclusive=True,
         )
         return event_window_index == local_window_index
 

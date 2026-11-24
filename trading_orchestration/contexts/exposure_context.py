@@ -45,11 +45,10 @@ class InstrumentSnapshot:
     minimum: Decimal = Decimal(100)
     can_buy: bool = True
     can_sell: bool = True
-    buy_price: Decimal | None = None
-    sell_price: Decimal | None = None
     block_reason: str = ""
     minimum_buy_notional: Decimal = Decimal(0)
     allow_odd_lot_sell: bool = False
+    quality_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -60,7 +59,32 @@ class PendingExposureOrder:
 
 
 @dataclass(frozen=True)
+class HoldingSnapshot:
+    quantity: Decimal
+    price: Decimal
+
+
+@dataclass(frozen=True)
+class ExposurePositionContext:
+    """Facts needed to assess total exposure, without order-planning inputs."""
+
+    now_ns: int
+    trading_date: str
+    execution_revision: int
+    total_assets: Decimal
+    positions: Mapping[str, HoldingSnapshot]
+    target: FormalTarget | None
+    pending_orders: int = 0
+    quality_error: str = ""
+    pending: tuple[PendingExposureOrder, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "positions", MappingProxyType(dict(self.positions)))
+
+
+@dataclass(frozen=True)
 class ExposureContext:
+    """Fresh valuation and candidate inputs for planning or physical admission."""
     now_ns: int
     trading_date: str
     execution_revision: int
@@ -75,6 +99,13 @@ class ExposureContext:
     def __post_init__(self):
         object.__setattr__(self, "instruments", MappingProxyType(dict(self.instruments)))
 
+    def position_snapshot(self) -> ExposurePositionContext:
+        return ExposurePositionContext(
+            self.now_ns, self.trading_date, self.execution_revision, self.total_assets,
+            {iid: HoldingSnapshot(item.quantity, item.price)
+             for iid, item in self.instruments.items() if item.quantity != 0},
+            self.target, self.pending_orders, self.quality_error, self.pending)
+
 
 @dataclass(frozen=True)
 class ExposureAssessment:
@@ -87,6 +118,7 @@ class ExposureAssessment:
     market_value: Decimal | None = None
     direction: str | None = None
     minimum_notional: Decimal = Decimal(0)
+    center_notional: Decimal = Decimal(0)
     maximum_notional: Decimal = Decimal(0)
 
     def evidence(self) -> dict:
