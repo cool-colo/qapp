@@ -351,12 +351,24 @@ class PermissionAndConfigurationTest(unittest.TestCase):
                         for operation in ("submit", "modify", "cancel"):
                             with case.assertRaises(RuntimeError):
                                 bridge.reject_unowned_operation(operation)
+                def after_cleanup_skipped(self, context):
+                    phases.append(bridge.engine.operation_phase())
+                    with bridge.operations():
+                        for operation in ("submit", "modify", "cancel"):
+                            with case.assertRaises(RuntimeError):
+                                bridge.reject_unowned_operation(operation)
             bridge.engine = TaskOrchestrator(stabilizer_factory=lambda _scope: Cleaner())
             bridge.engine.register(TaskSpec("boot", 1000), Probe, bootstrap=True)
             try:
                 bridge.engine.start(0)
                 self.assertEqual(phases, ["cleanup", "execute", "interrupt", "cleanup", "release"])
                 self.assertEqual(bridge.engine.lifecycle, "ready")
+                phases.clear()
+                bridge.engine.register(TaskSpec("skip", 1, skip_entry_cleanup=True,
+                                                skip_exit_cleanup=True), Probe)
+                bridge.engine.submit("skip", Proposal("normal"))
+                bridge.engine.tick(1)
+                self.assertEqual(phases, ["execute", "interrupt", "release"])
                 with self.assertRaises(RuntimeError), bridge.operations():
                     pass
                 from strategies.convergence import ConvergenceTrigger

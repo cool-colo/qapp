@@ -18,6 +18,7 @@ class AuctionPlannerPreparationTest(TestCase):
         self.engine, self.host, self.optimizer, _ = replay_fixture()
         self.addCleanup(self.engine.dispose)
         self.host.clock.set_time(timestamp('2026-07-08 09:24:01'))
+        self.host._roll_trading_day(DAY)
         self.work = []
         def fetch(source):
             result = Future()
@@ -82,7 +83,7 @@ class AuctionPlannerPreparationTest(TestCase):
 
     def test_late_result_cannot_plan_after_cutoff(self):
         self.planner.plan(self.context())
-        self.host.clock.set_time(timestamp('2026-07-08 09:24:59'))
+        self.host.clock.set_time(timestamp('2026-07-08 09:25:00'))
         self.work[0].set_result(self.fields())
         self.assertEqual(self.planner.plan(self.context()).state, RunState.EXPIRED)
         self.factory.assert_not_called()
@@ -116,26 +117,73 @@ class AuctionPlannerPreparationTest(TestCase):
         self.assertEqual(self.planner.plan(self.context()).reason, 'auction_planning_market_wrong_date')
         self.factory.assert_not_called()
 
-    def test_execution_requires_its_own_fresh_batch(self):
+    def test_execution_reuses_cached_prices_without_another_batch(self):
         self.host._target_date, self.host._target_version = DAY, 'restored'
         self.ready()
         self.host.clock.set_time(timestamp('2026-07-08 09:24:50'))
         prepare = AuctionExecutionPreparation(self.host.orchestration)
-        self.assertEqual(prepare.prepare(self.context()).state, RunState.WAITING)
-        self.assertEqual(len(self.work), 2)
-        self.assertFalse(prepare.ready)
-        self.work[1].set_result(self.fields())
-        self.assertEqual(prepare.prepare(self.context()).state, RunState.SUCCEEDED)
+        result = prepare.prepare(self.context())
+        self.assertEqual(result.state, RunState.SUCCEEDED)
+        self.assertEqual(result.evidence['prepared_at_ns'], self.host.clock.timestamp_ns())
+        self.assertEqual(len(self.work), 1)
+        self.assertTrue(prepare.ready)
         self.assertEqual(self.engine.cache.orders(), [])
 
-    def test_execution_validates_targets_not_all_planning_candidates(self):
+    def test_execution_preparation_does_not_require_all_planning_candidate_prices(self):
         self.host._target_date, self.host._target_version = DAY, 'restored'
         self.host._target_quantities = {A: 100}
         self.host.clock.set_time(timestamp('2026-07-08 09:24:50'))
+        self.host.market_snapshots.publish({A: self.fields()[A]}, 'test')
         prepare = AuctionExecutionPreparation(self.host.orchestration)
-        prepare.prepare(self.context())
-        self.work[0].set_result({A: self.fields()[A]})
         self.assertEqual(prepare.prepare(self.context()).state, RunState.SUCCEEDED)
+        self.fetch.assert_not_called()
+
+    def test_missing_execution_prices_do_not_block_preparation_or_fetch(self):
+        self.host._target_date, self.host._target_version = DAY, 'restored'
+        self.host._target_quantities = {A: 100}
+        self.host.clock.set_time(timestamp('2026-07-08 09:24:58'))
+        prepare = AuctionExecutionPreparation(self.host.orchestration)
+        with patch.object(self.host, '_select_opening_auction_reference') as select:
+            result = prepare.prepare(self.context())
+        select.assert_not_called()
+        self.assertEqual((result.state, result.reason),
+                         (RunState.SUCCEEDED, 'auction_execution_ready'))
+        self.assertNotIn(DAY, self.host.auction_session.failed_dates)
+        self.assertIn(DAY, self.host.auction_session.execution_ready_dates)
+        self.fetch.assert_not_called()
+        self.assertEqual(self.engine.cache.orders(), [])
+
+    def test_missing_price_for_a_non_target_holding_does_not_block_preparation(self):
+        self.host._target_date, self.host._target_version = DAY, 'restored'
+        self.host._target_quantities = {A: 100}
+        self.host.market_snapshots.publish({A: self.fields()[A]}, 'test')
+        prepare = AuctionExecutionPreparation(self.host.orchestration)
+        with patch.object(self.host, '_held_instrument_ids', return_value={B}):
+            result = prepare.prepare(self.context())
+        self.assertEqual(result.state, RunState.SUCCEEDED)
+        self.fetch.assert_not_called()
+
+    def test_execution_exempts_suspended_targets_with_missing_prices(self):
+        self.host._target_date, self.host._target_version = DAY, 'restored'
+        self.host._target_quantities = {A: 100, B: 100}
+        self.host._suspended_by_date[DAY] = {'000002.SZ'}
+        self.host.market_snapshots.publish({A: self.fields()[A]}, 'test')
+        prepare = AuctionExecutionPreparation(self.host.orchestration)
+        self.assertEqual(prepare.prepare(self.context()).state, RunState.SUCCEEDED)
+        self.fetch.assert_not_called()
+
+    def test_execution_retains_pause_and_reconciliation_gates(self):
+        self.host._target_date, self.host._target_version = DAY, 'restored'
+        self.host._target_quantities = {A: 100}
+        self.host.market_snapshots.publish({A: self.fields()[A]}, 'test')
+        prepare = AuctionExecutionPreparation(self.host.orchestration)
+        self.host._trading_paused = True
+        self.assertEqual(prepare.prepare(self.context()).reason, 'user_paused')
+        self.host._trading_paused = False
+        with patch.object(self.host, '_awaiting_pre_open_reconcile', return_value=True):
+            self.assertEqual(prepare.prepare(self.context()).reason, 'awaiting_pre_open_reconciliation')
+        self.assertFalse(prepare.ready)
+        self.fetch.assert_not_called()
 
     def test_execution_without_a_target_does_not_fetch(self):
         self.host.clock.set_time(timestamp('2026-07-08 09:24:50'))

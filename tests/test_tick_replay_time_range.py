@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import csv
 from datetime import date
+from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
+from msgspec.structs import replace as replace_config
 
 from nautilus_trader.adapters.qmt.common import parse_equity
 from nautilus_trader.config import LoggingConfig
@@ -20,7 +24,9 @@ from backtests.data_providers.ricequant_ticks import ClickHouseRicequantTickData
 from backtests.target_model_predictions import run_backtest as runner
 from backtests.time_range import BacktestTimeRange
 from market_data import DailyStockData
+from strategies.target_quantities import TargetQuantityOrderEvent
 from tests.test_opening_auction import FixedPlanner, replay_fixture, timestamp
+from backtests.target_model_predictions.exposure_reporting import ExposureReplayRecorder, exposure_replay_reports
 
 
 DAY = date(2026, 7, 8)
@@ -28,6 +34,123 @@ CODES = ("000001.SZ", "000002.SZ")
 
 
 class TickReplayTimeRangeTest(unittest.TestCase):
+    def test_correction_report_attributes_by_order_and_separates_late_fills(self):
+        def order(order_id, version):
+            return TargetQuantityOrderEvent(order_id, DAY, '000001.SZ.QMT', 'buy', 100,
+                Decimal(100), 'submitted', None, {'target_version': version,
+                    'intent_context': {'execution_phase': 'continuous'}})
+        strategy = SimpleNamespace(order_events=[order('correction', 'exposure:day:1'),
+            order('normal', 'formal:day:1')], config=SimpleNamespace(timezone_name='Asia/Shanghai'),
+            orchestration=SimpleNamespace(config=SimpleNamespace(exposure=SimpleNamespace(
+                windows='09:35-09:55')), engine=SimpleNamespace(records=[])))
+        fills = pd.DataFrame([dict(client_order_id=oid, instrument_id='000001.SZ.QMT',
+            ts_event=pd.Timestamp(stamp, tz='Asia/Shanghai'), order_side=side,
+            last_qty=qty, last_px=price) for oid, stamp, side, qty, price in (
+                ('correction', '2026-07-08 09:40', 'BUY', 100, 10),
+                ('normal', '2026-07-08 09:45', 'BUY', 100, 20),
+                ('correction', '2026-07-08 09:55', 'SELL', 50, 12))])
+        reports = exposure_replay_reports(strategy, [{'trading_date': DAY.isoformat(),
+                                                       'stage': 'session_end'}], fills)
+        summary = reports['daily_exposure_correction'].iloc[0]
+        self.assertEqual(summary.correction_buy_amount, Decimal(1000))
+        self.assertEqual(summary.correction_sell_amount, Decimal(600))
+        self.assertEqual(summary.late_correction_fill_amount, Decimal(600))
+        self.assertEqual(reports['execution_fill_attribution'].phase.tolist(),
+                         ['exposure_correction', 'normal_execution', 'exposure_correction'])
+
+    def test_daily_window_repeats_and_clips_global_datetime_boundaries(self):
+        window = BacktestTimeRange.parse('2026-07-08 09:20', '2026-07-09 10:00',
+                                         daily_window='09:15-10:30')
+        self.assertEqual([(a.strftime('%m-%d %H:%M'), b.strftime('%m-%d %H:%M'))
+                          for a, b in window.sessions],
+                         [('07-08 09:20', '07-08 10:30'), ('07-09 09:15', '07-09 10:00')])
+        for stamp, expected in (('2026-07-08 09:19:59.999999999', False),
+                                ('2026-07-08 09:20', True), ('2026-07-08 10:30', False),
+                                ('2026-07-08 14:30', False), ('2026-07-09 09:15', True),
+                                ('2026-07-09 10:00', False)):
+            self.assertEqual(window.contains(timestamp(stamp)), expected)
+
+    def test_invalid_daily_windows_fail(self):
+        for value in ('9:15-10:30', '09:15', '10:30-09:15', '09:15-09:15', '25:00-26:00'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                BacktestTimeRange.parse('2026-07-08', '2026-07-09', daily_window=value)
+        with self.assertRaises(ValueError):
+            BacktestTimeRange.parse('2026-07-08 14:00', '2026-07-08 15:00', daily_window='09:15-10:30')
+
+    def test_ricequant_daily_window_queries_only_each_morning(self):
+        provider = ClickHouseRicequantTickDataProvider(ClickHouseConnectionConfig(), data_latency_ms=250)
+        rows = [[dict(self.ricequant_row('09:30'), datetime=f'2026-07-{day} 09:30')]
+                for day in ('08', '09')]
+        with patch.object(provider.client, 'fetch_json_each_row', side_effect=rows) as fetch:
+            ticks = provider.load(start='2026-07-08', end='2026-07-09', symbols={CODES[0]},
+                                  daily_window='09:15-10:30')
+        self.assertEqual(len(ticks), 2)
+        for day, call in zip(('08', '09'), fetch.call_args_list):
+            self.assertIn(f"datetime >= toDateTime64('2026-07-{day} 09:14:59.750000000'", call.args[0])
+            self.assertIn(f"datetime < toDateTime64('2026-07-{day} 10:29:59.750000000'", call.args[0])
+
+    def test_csv_daily_window_filters_each_day_by_receipt_time(self):
+        rows = [self.csv_row(f'2026-07-{day}T{clock}+08:00')
+                for day in ('08', '09') for clock in ('09:30', '10:29:59.999999999', '10:30', '14:30')]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ticks.csv'
+            self.write_csv(path, rows)
+            ticks = HistoricalTickDataProvider().load(str(path), start='2026-07-08', end='2026-07-09',
+                                                       symbols={CODES[0]}, daily_window='09:15-10:30')
+        self.assertEqual(len(ticks), 4)
+        self.assertEqual({pd.Timestamp(t.ts_init, unit='ns', tz='UTC').tz_convert('Asia/Shanghai').date()
+                          for t in ticks}, {DAY, date(2026, 7, 9)})
+
+    def test_daily_replay_keeps_native_inventory_cash_and_t_plus_one(self):
+        window = BacktestTimeRange.parse('2026-07-08', '2026-07-09', daily_window='09:15-10:30')
+        def morning_ticks(rows):
+            result = [r for r in rows if window.contains(r.ts_init)]
+            for day in ('08', '09'):
+                for r in rows:
+                    if r.ts_init == timestamp(f'2026-07-{day} 09:25'):
+                        for clock in ('10:00:01', '10:00:31', '10:01:01'):
+                            stamp = timestamp(f'2026-07-{day} {clock}')
+                            result.append(replace(r, kind='quote', ts_event=stamp, ts_init=stamp))
+            return result
+        engine, strategy, planner, _ = replay_fixture(starting_cash=50000, second_day_exit=True,
+            transform_rows=morning_ticks, transform_config=lambda c: replace_config(c,
+                execution_windows='10:00-10:30', exchange_execution_windows='10:00-10:30'))
+        strategy.configure_replay_time_range(window)
+        sellability = {}
+        class SellabilityRecorder(ExposureReplayRecorder):
+            def capture(self, stage):
+                super().capture(stage)
+                day = strategy._clock_date()
+                sellability[(day, stage)] = {
+                    iid: strategy.planning_sellable_quantity(iid, day)
+                    for iid in strategy._held_instrument_ids()}
+        recorder = SellabilityRecorder(strategy, window)
+        engine.add_actor(recorder)
+        try:
+            runner.run_engine(engine, SimpleNamespace(start='2026-07-08', end='2026-07-09',
+                exchange_timezone='Asia/Shanghai', daily_window='09:15-10:30', tick_file=None, tick_table='test'))
+            fills = engine.trader.generate_fills_report()
+            sell_days = [pd.Timestamp(r.ts_event).tz_convert('Asia/Shanghai').date()
+                         for r in fills.itertuples() if str(r.order_side) == 'SELL']
+            self.assertTrue(sell_days)
+            self.assertEqual(set(sell_days), {date(2026, 7, 9)})
+            self.assertEqual(len(planner.requests), 2)
+            holdings = planner.requests[1].current_holdings
+            self.assertEqual({h.stock_code: h.quantity for h in holdings},
+                             {'000001.SZ': 1000, '000002.SZ': 500})
+            self.assertTrue(all(h.can_sell for h in holdings))
+            self.assertEqual(set(sellability[(DAY, 'session_end')].values()), {0})
+            self.assertEqual(sellability[(date(2026, 7, 9), 'correction_0_before')],
+                             {'000001.SZ.QMT': 1000, '000002.SZ.QMT': 500})
+            self.assertTrue(all(window.contains(o.ts_init) for o in engine.cache.orders()))
+            self.assertTrue(all(window.contains(pd.Timestamp(t).value) for t in fills.ts_event))
+            self.assertTrue(recorder.rows)
+            self.assertEqual({r['trading_date'] for r in recorder.rows}, {'2026-07-08', '2026-07-09'})
+            cash = strategy.portfolio.account(venue=strategy._instrument_ids[0].venue).balance_total().as_decimal()
+            self.assertEqual(cash, Decimal(49970))
+        finally:
+            engine.dispose()
+
     def test_date_only_range_includes_end_date(self):
         window = BacktestTimeRange.parse("2026-07-08", "2026-07-08")
         self.assertFalse(window.has_time)

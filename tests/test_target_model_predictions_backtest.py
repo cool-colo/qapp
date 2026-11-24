@@ -277,6 +277,7 @@ class BacktestPlanningEventTest(unittest.TestCase):
             config=str(config),
             tick_file=None,
             tick_table=None,
+            daily_window=None,
             start=first_trade_date.isoformat(),
             end=second_trade_date.isoformat(),
             exchange_timezone=self.timezone_name,

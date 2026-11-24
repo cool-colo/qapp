@@ -42,8 +42,9 @@ class ClickHouseRicequantTickDataProvider:
         self.delay_ns = int(data_latency_ms * 1_000_000)
         self.client = ClickHouseBarDataProvider(connection, ClickHouseBarSchema())
 
-    def load(self, *, start: str, end: str, symbols: set[str]) -> list[HistoricalTick]:
-        time_range = BacktestTimeRange.parse(start, end)
+    def load(self, *, start: str, end: str, symbols: set[str],
+             daily_window: str | None = None) -> list[HistoricalTick]:
+        time_range = BacktestTimeRange.parse(start, end, daily_window=daily_window)
         if not symbols:
             raise ValueError("RiceQuant tick replay requires a nonempty universe")
         # The inspected RiceQuant source covers SH/SZ only. Do not invent a BJ
@@ -63,9 +64,11 @@ class ClickHouseRicequantTickDataProvider:
             return value.strftime("%Y-%m-%d %H:%M:%S") + f".{value.microsecond * 1000 + value.nanosecond:09d}"
 
         while day <= last_day:
+            receive_start, receive_end = time_range.bounds_for_date(day)
+            query_start, query_end = receive_start - delay, receive_end - delay
             session_start = pd.Timestamp(f"{day.isoformat()} 09:15", tz="Asia/Shanghai")
             session_end = pd.Timestamp(f"{day.isoformat()} 15:00", tz="Asia/Shanghai")
-            if exchange_start > session_end or exchange_end <= session_start:
+            if receive_start >= receive_end or query_start > session_end or query_end <= session_start:
                 day += timedelta(days=1)
                 continue
             for offset in range(0, len(mapping), 100):
@@ -78,8 +81,8 @@ PREWHERE trading_date = toDate({quote_literal(day.isoformat())})
      AND order_book_id IN ({','.join(quote_literal(code) for code in chunk)})
 WHERE datetime >= toDateTime64({quote_literal(day.isoformat() + ' 09:15:00')},9,'Asia/Shanghai')
   AND datetime <= toDateTime64({quote_literal(day.isoformat() + ' 15:00:00')},9,'Asia/Shanghai')
-  AND datetime >= toDateTime64({quote_literal(sql_time(exchange_start))},9,'Asia/Shanghai')
-  AND datetime < toDateTime64({quote_literal(sql_time(exchange_end))},9,'Asia/Shanghai')
+  AND datetime >= toDateTime64({quote_literal(sql_time(query_start))},9,'Asia/Shanghai')
+  AND datetime < toDateTime64({quote_literal(sql_time(query_end))},9,'Asia/Shanghai')
 ORDER BY datetime, order_book_id, tick_sequence
 FORMAT JSONEachRow
 """

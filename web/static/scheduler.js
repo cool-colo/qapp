@@ -14,12 +14,16 @@
   };
   const ACTIONS = {
     QUEUED: "任务入队", COALESCED: "合并触发", ADMITTED: "获准执行", PROGRESS: "执行进展",
-    OUTCOME_DECIDED: "任务结果已确定", CLEANUP_REQUESTED: "框架请求清理", CLEANUP_REDIRECTED: "清理后退出任务", STABLE_STATE_REQUESTED: "业务请求干净状态", RESUMED_CLEAN: "清理后继续业务", WAITING_CLEANUP: "等待清理",
-    CLEANUP_COMPLETED: "清理完成", TERMINATED: "任务终结", SUSPENDED: "任务挂起",
+    OUTCOME_DECIDED: "任务结果已确定", CLEANUP_REQUESTED: "框架请求清理", CLEANUP_REDIRECTED: "调整清理流程", STABLE_STATE_REQUESTED: "业务请求干净状态", RESUMED_CLEAN: "清理后继续业务", WAITING_CLEANUP: "等待清理",
+    CLEANUP_COMPLETED: "清理完成", CLEANUP_SKIPPED: "按任务配置跳过清理", TERMINATED: "任务终结", SUSPENDED: "任务挂起",
     COMPONENT_ERROR: "组件异常", TRIGGER_ERROR: "触发评估异常", AUDIT_ERROR: "记录异常",
   };
   const REASONS = {
     trigger: "触发条件满足", new_trigger: "收到新触发，合并到已有任务", priority_and_scope: "按优先级获得执行权",
+    priority_and_stable_scope: "按优先级获得执行权，状态已稳定",
+    priority_and_cleanup_policy: "按优先级及任务清理配置获得执行权",
+    cleanup_skipped_by_task_policy: "按任务配置跳过本次清理，未确认状态稳定",
+    forced_cleanup_after_skip: "跳过清理后收到中断请求，转入强制清理",
     initialized_from_business_facts: "已根据当前交易状态完成初始化", formal_target_committed: "正式目标已提交",
     reuse_current_target: "沿用当前正式目标", target_achieved: "当前执行目标已达成", target_remaining: "仍有目标数量待执行",
     proposal_expired: "触发请求已超过有效期限", auction_submit_window_closed: "竞价报单窗口已结束",
@@ -29,7 +33,7 @@
     awaiting_cancellation_batch: "等待整批撤单结束或超时", awaiting_terminal_orders: "等待订单终结", retrying_cancellations: "重试被拒撤单",
     reconciliation_observation_wait: "订单无进展，对账退避等待", cleanup_reconciliation_disabled: "清理对账已关闭，等待订单终结",
     external_orders_in_account: "账户存在其他策略的未完成订单", existing_planning_in_progress: "等待已有规划完成",
-    auction_planning_market_pending: "竞价规划等待新行情", auction_execution_market_pending: "竞价执行等待新行情",
+    auction_planning_market_pending: "竞价规划等待新行情",
     invalid_auction_planning_snapshot: "竞价规划行情不完整", auction_target_unavailable: "竞价缺少当日目标",
     scheduled_planning_not_applicable: "定时规划业务条件不满足",
     reconciling: "正在对账", reconciliation_failed: "对账失败，等待重试", reconciliation_retry_wait: "等待对账重试时间",
@@ -87,8 +91,9 @@
   }
   function outcome(result, cleanup = false) {
     if (!result) return `<span class="hint">${cleanup ? "尚未开始清理" : "尚未产生最终结果"}</span>`;
-    const label = cleanup ? ({ succeeded: "清理已完成", waiting: "等待清理确认", failed: "清理异常" }[result.state]) : null;
-    return `${badge(result.state, label)}<span>${escape(reason(result.reason))}</span>`;
+    const skipped = cleanup && result.evidence && result.evidence.cleanup_skipped === true;
+    const label = skipped ? "清理已跳过" : cleanup ? ({ succeeded: "清理已完成", waiting: "等待清理确认", failed: "清理异常" }[result.state]) : null;
+    return `${badge(skipped ? "neutral" : result.state, label)}<span>${escape(reason(result.reason))}</span>`;
   }
   function configurationDetails(task, configuration) {
     const periodic = task.trigger.kind === "condition";
@@ -101,6 +106,9 @@
       ["拆单组件", task.splitter || "由内置流程处理"],
       ["执行撤单组件", task.cancellation || "由内置流程处理"],
       ["框架清理组件", configuration.cleanup_component],
+      ["入场清理", task.skip_entry_cleanup ? "跳过（不确认状态稳定）" : "执行完整清理"],
+      ["正常成功退出清理", task.skip_exit_cleanup ? "跳过（仍中断异步业务并释放临时状态）" : "执行完整清理"],
+      ["强制清理", "抢占、暂停、停止、取消、失败、无法达成、过期及业务请求干净状态时始终执行"],
       ["下次条件检查", task.enabled ? time(task.next_evaluation_at) : "停用期间不检查"],
     ];
     if (task.trigger.cutoff) rows.push(["报单截止", task.trigger.cutoff]);
@@ -200,7 +208,7 @@
       },
     });
   }
-  const ui = { render, renderHistory, triggerText, name, reason, escape, time };
+  const ui = { render, renderHistory, triggerText, outcome, configurationDetails, name, reason, escape, time };
   root.SchedulerUI = ui;
   if (typeof module !== "undefined" && module.exports) module.exports = ui;
 })(globalThis);

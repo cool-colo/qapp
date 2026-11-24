@@ -14,6 +14,7 @@ from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.data import BookOrder
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.objects import Money
 
 from backtests.data_providers.historical_ticks import HistoricalTick
@@ -109,6 +110,19 @@ class AuctionReplayModule(SimulationModule):
         super().__init__(SimulationModuleConfig())
         self.fill_model = fill_model
         self.rows = rows
+        # DAY validity is a venue rule, independent of strategy cancel windows.
+        # Wait for any supplied closing result before expiring its unfilled remainder.
+        expirations = {}
+        for row in rows.values():
+            bucket = row.ts_event // 86_400_000_000_000
+            if bucket not in expirations:
+                day = pd.Timestamp(row.ts_event, unit='ns', tz='UTC').tz_convert('Asia/Shanghai').normalize()
+                expirations[bucket] = (day + pd.Timedelta(hours=15)).value + 1
+            if row.kind == 'closing_auction':
+                expirations[bucket] = max(expirations[bucket], row.ts_init + 1)
+        self.expirations = tuple(sorted(expirations.values()))
+        self.expiration_index = 0
+        self.expiration_events = []
 
     def pre_process(self, data):
         key = (str(data.instrument_id), int(data.ts_init))
@@ -116,12 +130,26 @@ class AuctionReplayModule(SimulationModule):
             self.fill_model.observe(key[0], self.rows[key])
 
     def process(self, ts_now):
-        return
+        while self.expiration_index < len(self.expirations):
+            deadline = self.expirations[self.expiration_index]
+            if ts_now < deadline:
+                return
+            for order in self.exchange.cache.orders_open(venue=self.exchange.id):
+                if order.time_in_force == TimeInForce.DAY and order.ts_init < deadline:
+                    self.expiration_events.append(dict(
+                        time_ns=ts_now, deadline_ns=deadline,
+                        order_id=str(order.client_order_id), instrument_id=str(order.instrument_id),
+                        side=order.side.name.lower(), leaves_qty=order.leaves_qty.as_decimal(),
+                        filled_qty=order.filled_qty.as_decimal(), reason='market_session_closed'))
+                    self.exchange.get_matching_engine(order.instrument_id).expire_order(order)
+            self.expiration_index += 1
 
     def log_diagnostics(self, logger):
         return
 
     def reset(self):
+        self.expiration_index = 0
+        self.expiration_events.clear()
         self.fill_model.auction_results.clear()
         self.fill_model.closing_auction_results.clear()
         self.fill_model.final_observations.clear()

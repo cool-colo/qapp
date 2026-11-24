@@ -102,9 +102,12 @@ Daily and opening-auction planning share the committed-target restore path. Rest
 empty versions before consulting projection rows or generating targets. The auction
 planning timer uses an accepted same-day target first, otherwise restores a committed
 target or plans a new one from its full-tick batch, without submitting orders. A
-separate execution timer updates the whole-market full-tick cache. Before each physical
-auction order, execution compares its cached last price with subscribed depth by each
-stock's exchange timestamp. Newer depth supplies the best-bid/best-ask midpoint (or
+separate execution timer prepares auction state without a whole-market request or
+a batch-wide price gate. Before each physical auction order, execution compares its
+cached last price with subscribed depth by each stock's exchange timestamp. A
+missing reference skips only that instrument in the current convergence cycle;
+other instruments continue. A later cycle may submit the skipped instrument if
+its price becomes valid before the cutoff. Newer depth supplies the best-bid/best-ask midpoint (or
 the only valid side); equal timestamps prefer the full-tick cache. Invalid prices or
 missing/wrong-day timestamps cannot participate. Selected prices and sources are
 recorded in order logs and decision context; allocation and commitments use that same
@@ -114,11 +117,37 @@ Tick replay dispatches historical depth through Nautilus subscriptions for targe
 and holdings, using the same subscription refresh as live execution without its
 network warm-up wait. Daily-bar replay has no depth stream and does not subscribe.
 After a restart between the two alerts, execution restores the same-day committed
-target before validating target/holding prices, including empty targets and saved
+target before per-order price validation, including empty targets and saved
 auction ranks. An accepted same-day target takes precedence. Recovery performs no
 new planning and requires the normal pause, reconciliation and submission gates.
 
 ## Controls and runtime
+
+### Per-task cleanup policy
+
+Task definitions accept strict boolean `skip_entry_cleanup` and `skip_exit_cleanup`
+in orchestration schema 2; both default to false. The shipped configuration enables
+only `auction_execution.skip_entry_cleanup`. Eligible admission bypasses stabilizer
+creation, cancellation, reconciliation and quiet-state waiting in the same scheduling
+cycle, while the previous owner's unfinished exit cleanup still blocks admission.
+Skipped cleanup does not establish a stable scope for another candidate.
+
+Exit skipping applies only to normal `SUCCEEDED` completion. Preemption, pause,
+shutdown, cancellation, failure, unachievable outcomes, expiry, bootstrap and
+`Decision.requires_stable` always require actual cleanup. Even a skipped normal
+exit invokes `interrupt()` and `after_cleanup_skipped()` under restricted lifecycle
+capabilities. `after_stable()` is reserved for successful actual cleanup. A hook
+error retains ownership and forces actual cleanup without overwriting the latched
+business result. Exposure correction releases its temporary executor state through
+either release hook.
+
+Snapshots and task configuration expose both flags. Audit records use
+`CLEANUP_SKIPPED` with the stage and configuration evidence, and the dashboard shows
+skipping separately from completed cleanup. The shipped auction submission window
+is [09:24:58, 09:25:00). Auction planning still acquires its own full-tick batch;
+execution uses cached references and does not request another batch. Missing prices
+skip only the affected instrument; pause/reconciliation and ownership gates still
+apply to the task.
 
 ### Continuous execution windows
 
@@ -212,6 +241,35 @@ The daily-bar replay only observes its supplied snapshots; tick replay can exerc
 intraday touches and openings.
 
 ## Verification
+
+Per-instrument missing auction references verified on 2026-11-24: 60 targeted
+tests pass. Execution preparation has no batch-wide price gate; native Nautilus
+replay verifies that either ranked stock can lack a reference without delaying
+the other's submission, that all-missing references create no price-wait state,
+and that a skipped stock can submit after recovery inside the existing window.
+Pause/reconciliation gates, cutoff and cleanup remain covered. No live restart.
+
+Cached auction execution verified on 2026-11-24: all four strategy YAML files and
+strategy/replay defaults use 09:24:58 execution and a 09:25:00 exclusive cutoff.
+The complete suite finished with 847 passes and one test that mocked away depth
+subscriptions and expected an execution-time full-tick refresh. That test now
+keeps real subscriptions and verifies depth repricing with an immutable planning
+context; it passed in an eight-test follow-up including the default/config checks.
+The full run loaded the earlier test before its update; no second all-green full
+run is claimed. Replay also verifies same-cycle cached-price submission, missing
+references waiting without acquisition, deadline expiry, full exit cleanup and
+the submission boundaries. JavaScript syntax and diff checks pass. No live
+deployment or restart was performed.
+
+Task cleanup policies verified on 2026-11-24: the final targeted run has 72 passes,
+including all policy combinations, forced cleanup, ownership handoff, lifecycle
+capabilities, hook errors, re-arbitration, deadlines, dashboard projection and real
+auction replay. The complete suite finished with 840 passes and one old assertion
+requiring a 500 ms auction entry delay. That assertion was updated to require
+submission in the skipped-entry admission cycle and passed in the final targeted
+run. The full suite had loaded the earlier test before this assertion update; no
+second full-suite result is claimed. Compilation, JavaScript syntax/display checks
+and `git diff --check` pass. No live deployment or restart was performed.
 
 `tests/test_replanning.py` uses real Nautilus strategy/engine construction and covers
 direction limits, actual same-day fills, partial stop residuals, existing/empty-target

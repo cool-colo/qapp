@@ -97,6 +97,12 @@ class ExposureCorrectionTask(BusinessTask):
             self.risk_planner.abort()
 
     def after_stable(self, context):
+        self._release_temporary_state(context)
+
+    def after_cleanup_skipped(self, context):
+        self._release_temporary_state(context)
+
+    def _release_temporary_state(self, context):
         self.executor.release(context)
         self.active_plan = None
         self.risk_planner = None

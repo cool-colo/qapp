@@ -36,6 +36,7 @@ def describe_scheduler(config: OrchestrationConfig, strategy: StrategySchedule) 
     definitions = {
         "bootstrap": {"priority": 1000, "can_preempt": True, "preemptible": False,
                       "interval_ns": 1_000_000_000, "scope": "default",
+                      "skip_entry_cleanup": False, "skip_exit_cleanup": False,
                       "trigger": triggers["bootstrap"], "builtin": True},
     }
     for name, spec in config.tasks.items():

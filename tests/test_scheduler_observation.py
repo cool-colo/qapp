@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 from msgspec.structs import replace as config_replace
 
+from task_orchestration.components.processes.task_process import BusinessTask
 from task_orchestration.core.orchestrator import TaskOrchestrator
 from task_orchestration.models import Decision, Proposal, RunState, TaskSpec
 from tests.test_opening_auction import replay_fixture
@@ -29,7 +30,7 @@ class RejectLock:
         return False
 
 
-class Process:
+class Process(BusinessTask):
     def __init__(self, *, done=False, clean=True):
         self.done, self.clean = done, clean
 
@@ -119,7 +120,7 @@ class SchedulerReportTest(unittest.TestCase):
         self.engine.start(self.now)
 
     def snapshot(self):
-        return {**self.engine.snapshot(), "enabled": True, "configuration": self.definition,
+        return {**self.engine.snapshot(), "enabled": True, "configuration": deepcopy(self.definition),
                 "execution": {"version": "v1", "complete": False, "pending_orders": 1,
                               "remaining": {"a": "100", "b": "0"}, "frozen": {"c": "limit"}}}
 
@@ -146,6 +147,44 @@ class SchedulerReportTest(unittest.TestCase):
         finished = next(r for r in self.report()["history"] if r["task_id"] == "normal_execution")
         self.assertEqual(finished["reason"], "target_achieved")
         self.assertEqual(finished["finished_at"], "2026-11-23T14:30:02.000+08:00")
+
+    def test_skipped_cleanup_and_policies_survive_read_only_projection(self):
+        path = Path(self.directory.name) / "skip-tasks.yaml"
+        path.write_text("schema_version: 2\ntasks:\n  normal_execution:\n"
+                        "    skip_entry_cleanup: true\n    skip_exit_cleanup: true\n")
+        config = OrchestrationConfig.load(str(path))
+        self.definition = describe_scheduler(config, SimpleNamespace(
+            timezone_name="Asia/Shanghai", auction_enabled=True,
+            auction_start_time="09:24:01", auction_execution_time="09:24:58",
+            auction_submit_cutoff="09:25:00", execution_windows="10:00-11:30,13:00-14:10",
+            scheduled_replan_times=()))
+        process = Process()
+        # Use the real configured task ID in both the engine and its immutable view.
+        engine = TaskOrchestrator(stabilizer_factory=lambda _: ObservationStabilizer(engine))
+        engine.register(TaskSpec("bootstrap", 1000), lambda: Process(done=True), bootstrap=True)
+        for name, spec in config.tasks.items():
+            engine.register(spec, lambda name=name: process if name == "normal_execution" else Process())
+        engine.start(self.now)
+        self.engine = engine
+        engine.submit("normal_execution", Proposal("normal"))
+        engine.tick(self.now + 1)
+        report = self.report()
+        self.assertTrue(report["current"][0]["cleanup_result"]["evidence"]["cleanup_skipped"])
+        task = next(t for t in report["tasks"] if t["task_id"] == "normal_execution")
+        self.assertTrue(task["skip_entry_cleanup"])
+        self.assertTrue(task["skip_exit_cleanup"])
+        self.assertFalse(report["configuration"]["tasks"]["bootstrap"]["skip_entry_cleanup"])
+        process.done = True
+        engine.tick(self.now + 2)
+        report = self.report()
+        finished = next(r for r in report["history"] if r["task_id"] == "normal_execution")
+        self.assertEqual(finished["final_result"]["state"], "succeeded")
+        self.assertEqual(finished["cleanup_result"]["reason"], "cleanup_skipped_by_task_policy")
+        self.assertEqual(finished["cleanup_result"]["evidence"]["kind"], "exit")
+        self.assertEqual([a["evidence"]["kind"] for a in report["actions"]
+                          if a["action"] == "CLEANUP_SKIPPED"], ["exit", "entry"])
+        report["configuration"]["tasks"]["normal_execution"]["skip_entry_cleanup"] = False
+        self.assertTrue(self.report()["configuration"]["tasks"]["normal_execution"]["skip_entry_cleanup"])
 
     def test_queue_priority_fifo_waiting_conditions_and_effective_overrides(self):
         for name in ("scheduled_replan", "price_limit_replan", "normal_execution", "manual_replan"):

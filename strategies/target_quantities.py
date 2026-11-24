@@ -36,7 +36,9 @@ from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.events import OrderExpired
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.trading.strategy import Strategy
@@ -385,8 +387,8 @@ class TargetQuantityStrategyConfig(StrategyConfig, kw_only=True, frozen=True):
     # Opening call auction; independent of continuous execution windows.
     auction_enabled: bool = True
     auction_start_time: str = "09:24:01"
-    auction_execution_time: str = "09:24:57"
-    auction_submit_cutoff: str = "09:24:59"
+    auction_execution_time: str = "09:24:58"
+    auction_submit_cutoff: str = "09:25:00"
     auction_buy_offset_bps: float = 80.0
     auction_sell_offset_bps: float = 50.0
     auction_commission_rate: float = 0.000085
@@ -1874,6 +1876,12 @@ class TargetQuantityStrategy(TargetStateOwner, Strategy):
                 current_date=self._clock_date(),
                 trigger=ConvergenceTrigger.SELL_FILL,
             )
+
+    def on_order_expired(self, event: OrderExpired) -> None:
+        self._execution_activity += 1
+        client_order_id = str(event.client_order_id)
+        self._forget_submitted_order(client_order_id)
+        self._forget_order_quote_state(client_order_id)
 
     def on_order_canceled(self, event: Any) -> None:
         self._execution_activity += 1
@@ -3735,6 +3743,7 @@ class TargetQuantityStrategy(TargetStateOwner, Strategy):
             order_side=intent.side,
             quantity=intent.instrument.make_qty(quantity),
             price=intent.price,
+            time_in_force=TimeInForce.DAY,
             **({"tags": ["opening_auction"]}
                if self.config.auction_enabled and self._auction_execution_active else {}),
         )

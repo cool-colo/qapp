@@ -87,11 +87,9 @@ class DailyPlanningEvent(Data):
         ts_init: int,
         allow_planning: bool = True,
         opening_auction_snapshot: bool = False,
-        opening_auction_execution_snapshot: bool = False,
     ) -> None:
         self.allow_planning = allow_planning
         self.opening_auction_snapshot = opening_auction_snapshot
-        self.opening_auction_execution_snapshot = opening_auction_execution_snapshot
         self.trading_date = trading_date
         self.full_tick_snapshot = full_tick_snapshot
         self.previous_closes = previous_closes
@@ -116,6 +114,29 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         self._replay_market_day = None
         self.market_snapshots.configure_source(lambda: dict(self._replay_market_fields))
         self._tick_missing_opens: dict[date, tuple[str, ...]] = {}
+        self._replay_time_range: BacktestTimeRange | None = None
+        self._auction_replay_module = None
+        self.exposure_replay_recorder = None
+
+    def configure_replay_time_range(self, window: BacktestTimeRange) -> None:
+        self._replay_time_range = window
+
+    def _replay_time_allowed(self, ts_event: int | None = None) -> bool:
+        window = self._replay_time_range
+        return window is None or (window.contains(self.clock.timestamp_ns())
+                                  and (ts_event is None or window.contains(ts_event)))
+
+    def _within_execution_window(self, ts_event: int | None = None) -> bool:
+        return self._replay_time_allowed(ts_event) and super()._within_execution_window(ts_event)
+
+    def _within_cancel_window(self, ts_event: int | None = None) -> bool:
+        return self._replay_time_allowed(ts_event) and super()._within_cancel_window(ts_event)
+
+    def _within_auction_submit_time(self) -> bool:
+        return self._replay_time_allowed() and super()._within_auction_submit_time()
+
+    def automatic_replanning_allowed(self) -> bool:
+        return self._replay_time_allowed() and super().automatic_replanning_allowed()
 
     def _schedule_fetch(self, source):
         # Replay sources are deterministic in-memory projections, never workers.
@@ -136,6 +157,8 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         return (None, None) if row is None else (row.up_limit, row.down_limit)
 
     def _process_trading_day_once(self, trading_date: date, trigger: str) -> bool:
+        if not self._replay_time_allowed():
+            return False
         if trading_date in self._processed_dates:
             return False
         if self._auction_replay_model is not None:
@@ -253,6 +276,8 @@ def parse_args() -> argparse.Namespace:
                         help="Start date, or tick-replay datetime YYYY-MM-DD HH:MM (inclusive, exchange timezone).")
     parser.add_argument("--end", default=env("BACKTEST_END_DATE", "2025-12-31"),
                         help="End date (whole day), or tick-replay datetime YYYY-MM-DD HH:MM (exclusive).")
+    parser.add_argument("--daily-window", default=env("BACKTEST_DAILY_WINDOW"),
+                        help="Tick replay receive-time window repeated each day, e.g. 09:15-10:30 (end exclusive).")
     parser.add_argument(
         "--config",
         default=env("STRATEGY_CONFIG_FILE"),
@@ -328,11 +353,12 @@ def parse_args() -> argparse.Namespace:
     if args.tick_file and args.tick_table:
         parser.error("select only one tick source: --tick-file or --tick-table")
     try:
-        time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
+        time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone,
+                                            daily_window=args.daily_window)
     except ValueError as exc:
         parser.error(str(exc))
-    if time_range.has_time and not (args.tick_file or args.tick_table):
-        parser.error("datetime --start/--end require --tick-file or --tick-table")
+    if (time_range.has_time or args.daily_window) and not (args.tick_file or args.tick_table):
+        parser.error("datetime boundaries and --daily-window require --tick-file or --tick-table")
     if params.auction_enabled and not (args.tick_file or args.tick_table):
         parser.error("auction_enabled requires --tick-file or --tick-table; daily bars cannot simulate opening auction")
     if not 0 < args.auction_participation_rate <= 1:
@@ -568,8 +594,7 @@ def prepare_backtest_event_data(
     return planning_events, heartbeats, normalized_bars
 
 
-def prepare_tick_replay_event_data(args, rows, instruments_by_stock, *, auction_start_time="09:24:01",
-                                   auction_execution_time="09:24:50"):
+def prepare_tick_replay_event_data(args, rows, instruments_by_stock, *, auction_start_time="09:24:01"):
     from backtests.data_providers.historical_ticks import validate_final_auction_results
 
     validate_final_auction_results(rows, args.exchange_timezone)
@@ -599,29 +624,26 @@ def prepare_tick_replay_event_data(args, rows, instruments_by_stock, *, auction_
         batch["previous_closes"][str(instrument.id)] = row.previous_close
         batch["ts_event"] = max(batch["ts_event"], row.ts_event)
         batch["allow_planning"] |= row.kind != "indicative"
-    # Each auction phase captures a separate complete batch using only historical
-    # observations received by that phase's timestamp. Execution never mutates the
-    # earlier planning context or looks ahead to clearing results.
+    # Only planning captures a complete batch. Execution uses cached references
+    # and subscribed depth, driven by the same strategy timer as live trading.
     daily_latest = {}
     for row in sorted(rows, key=lambda r: (r.ts_init, r.symbol, r.ts_event)):
         day = pd.Timestamp(row.ts_init, unit="ns", tz="UTC").tz_convert(args.exchange_timezone).date()
-        for phase_time in (auction_start_time, auction_execution_time):
-            capture_ns = exchange_timestamp_ns(day, phase_time, args.exchange_timezone)
-            latest = daily_latest.setdefault((day, phase_time), {})
-            if row.ts_init <= capture_ns and row.ts_event <= capture_ns:
-                latest[str(instruments_by_stock[row.symbol].id)] = {
-                    "open": row.open_price, "last_price": row.bid_price,
-                    "last_close": row.previous_close,
-                    "open_int": 12 if row.kind == "indicative" else 13,
-                    "ts_event": row.ts_event,
-                }
-    for (day, phase_time), snapshot in sorted(daily_latest.items()):
-        capture_ns = exchange_timestamp_ns(day, phase_time, args.exchange_timezone)
+        capture_ns = exchange_timestamp_ns(day, auction_start_time, args.exchange_timezone)
+        latest = daily_latest.setdefault(day, {})
+        if row.ts_init <= capture_ns and row.ts_event <= capture_ns:
+            latest[str(instruments_by_stock[row.symbol].id)] = {
+                "open": row.open_price, "last_price": row.bid_price,
+                "last_close": row.previous_close,
+                "open_int": 12 if row.kind == "indicative" else 13,
+                "ts_event": row.ts_event,
+            }
+    for day, snapshot in sorted(daily_latest.items()):
+        capture_ns = exchange_timestamp_ns(day, auction_start_time, args.exchange_timezone)
         event = DailyPlanningEvent(
             day, snapshot, {i: fields["last_close"] for i, fields in snapshot.items()},
             capture_ns, capture_ns, allow_planning=False,
-            opening_auction_snapshot=phase_time == auction_start_time,
-            opening_auction_execution_snapshot=phase_time == auction_execution_time,
+            opening_auction_snapshot=True,
         )
         events.append(CustomData(DataType(DailyPlanningEvent), event))
     for (ts_init, trading_date), batch in sorted(batches.items()):
@@ -635,10 +657,12 @@ def prepare_tick_replay_event_data(args, rows, instruments_by_stock, *, auction_
 
 def run_engine(engine, args) -> None:
     """Bound both replay data and engine timers by the requested datetime range."""
-    time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
-    if (args.tick_file or args.tick_table) and time_range.has_time:
+    time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone,
+                                        daily_window=args.daily_window)
+    if (args.tick_file or args.tick_table) and (time_range.has_time or args.daily_window):
         # Nautilus includes its end timestamp; the CLI interval excludes it.
-        engine.run(start=time_range.start_ns, end=time_range.end_ns - 1)
+        lower, upper = time_range.sessions[0][0], time_range.sessions[-1][1]
+        engine.run(start=lower.value, end=upper.value - 1)
     else:
         engine.run()
 
@@ -673,11 +697,11 @@ def load_tick_replay_data(args, bundle, bars_by_stock):
         from backtests.data_providers.ricequant_ticks import ClickHouseRicequantTickDataProvider
         return ClickHouseRicequantTickDataProvider(
             build_connection(args), args.tick_table, args.tick_data_latency_ms,
-        ).load(start=args.start, end=args.end, symbols=symbols)
+        ).load(start=args.start, end=args.end, symbols=symbols, daily_window=args.daily_window)
     from backtests.data_providers.historical_ticks import HistoricalTickDataProvider
     return HistoricalTickDataProvider().load(
         args.tick_file, start=args.start, end=args.end, symbols=symbols,
-        timezone=args.exchange_timezone,
+        timezone=args.exchange_timezone, daily_window=args.daily_window,
     )
 
 
@@ -723,6 +747,7 @@ def build_engine(
     params.log(engine.logger, source=args.config)
     historical_ticks = None
     replay_model = None
+    replay_module = None
     replay_options = {}
     if args.tick_file or args.tick_table:
         from backtests.target_model_predictions.auction_simulation import AuctionReplayFillModel
@@ -737,9 +762,10 @@ def build_engine(
                 for row in historical_ticks}
         if len(rows) != len(historical_ticks):
             raise ValueError("Historical replay contains ambiguous symbol/receive timestamps")
+        replay_module = AuctionReplayModule(replay_model, rows)
         replay_options = dict(
             fill_model=replay_model,
-            modules=[AuctionReplayModule(replay_model, rows)],
+            modules=[replay_module],
             fee_model=AShareReplayFeeModel(args.commission_rate, args.minimum_commission,
                                           args.stamp_duty_rate),
             latency_model=LatencyModel(base_latency_nanos=0, insert_latency_nanos=int(args.submission_latency_ms * 1e6),
@@ -798,9 +824,9 @@ def build_engine(
     else:
         planning_events, heartbeats = prepare_tick_replay_event_data(
             args, historical_ticks, instruments_by_stock, auction_start_time=params.auction_start_time,
-            auction_execution_time=params.auction_execution_time,
         )
-        time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone)
+        time_range = BacktestTimeRange.parse(args.start, args.end, args.exchange_timezone,
+                                            daily_window=args.daily_window)
         # Auction preparation events are synthetic timestamps and must obey the
         # interval as well. A midday replay must not execute a morning plan.
         planning_events = [event for event in planning_events if time_range.contains(event.ts_init)]
@@ -909,6 +935,12 @@ def build_engine(
         ),
     )
     strategy._auction_replay_model = replay_model
+    strategy._auction_replay_module = replay_module
+    if historical_ticks is not None:
+        strategy.configure_replay_time_range(time_range)
+        from backtests.target_model_predictions.exposure_reporting import ExposureReplayRecorder
+        strategy.exposure_replay_recorder = ExposureReplayRecorder(strategy, time_range)
+        engine.add_actor(strategy.exposure_replay_recorder)
     engine.add_strategy(strategy)
     return engine, strategy, execution_bars_by_stock
 
@@ -1109,6 +1141,7 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "base.end_date": time_range.end_date.isoformat(),
         "base.start_time": time_range.start.isoformat(),
         "base.end_time_exclusive": time_range.end.isoformat(),
+        "base.daily_window": args.daily_window,
         "base.initial_cash": args.starting_cash,
         **benchmark_run_config(args),
         **REPORT_PROCESSOR.tearsheet_run_config(args),
@@ -1256,6 +1289,13 @@ def build_complete_report(
         from backtests.target_model_predictions.auction_simulation import auction_execution_report
         replay_reports["auction_execution"] = auction_execution_report(
             engine, strategy, strategy._auction_replay_model)
+        if strategy._auction_replay_module is not None:
+            replay_reports['market_session_expirations'] = pd.DataFrame(
+                strategy._auction_replay_module.expiration_events)
+        if strategy.exposure_replay_recorder is not None:
+            from backtests.target_model_predictions.exposure_reporting import exposure_replay_reports
+            replay_reports.update(exposure_replay_reports(
+                strategy, strategy.exposure_replay_recorder.rows, fills_report))
     return REPORT_PROCESSOR.complete_report(
         engine=engine,
         daily_portfolio=daily_portfolio,

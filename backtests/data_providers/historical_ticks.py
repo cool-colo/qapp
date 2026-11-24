@@ -62,8 +62,9 @@ class HistoricalTickDataProvider:
     }
 
     def load(self, path: str, *, start: str, end: str,
-             symbols: set[str], timezone: str = "Asia/Shanghai") -> list[HistoricalTick]:
-        time_range = BacktestTimeRange.parse(start, end, timezone)
+             symbols: set[str], timezone: str = "Asia/Shanghai",
+             daily_window: str | None = None) -> list[HistoricalTick]:
+        time_range = BacktestTimeRange.parse(start, end, timezone, daily_window=daily_window)
         result = []
         keys = set()
         with Path(path).open(newline="", encoding="utf-8") as source:

@@ -11,10 +11,10 @@ No launcher or running account is changed automatically.
 Set `auction_enabled: true` in the account's strategy YAML. Two independent daily
 time alerts drive the auction: `auction_start_time` (default 09:24:01) fetches a
 planning snapshot and freezes targets without submitting orders;
-`auction_execution_time` (default 09:24:50) fetches another snapshot and submits
-those target quantities using the new prices and the existing BP offsets. Times
+`auction_execution_time` (default 09:24:58) prepares auction state
+and submits those target quantities using the latest valid references and BP offsets. Times
 must satisfy `09:15 <= auction_start_time < auction_execution_time < auction_submit_cutoff <= 15:00`.
-Submissions stop at `auction_submit_cutoff` (default 09:24:59),
+Submissions stop at `auction_submit_cutoff` (default 09:25:00, exclusive),
 and no order is canceled before 09:30. Subsequent submissions and replacements obey both
 `execution_windows` and `exchange_execution_windows`. Cancellations independently
 obey `cancel_windows` and `exchange_cancel_windows`, which default to
@@ -25,17 +25,19 @@ Local and exchange timestamps must be on the same day and in the same continuous
 session; stale books still cannot trigger automatic cancellation. Resting exchange orders can
 still fill outside these windows.
 
-Each phase requests its own complete whole-market full-tick batch through the existing
-live infrastructure. An older in-flight fetch completes before the new phase's request
-starts; its result cannot substitute for the new request. Planning and execution each
-use their batch's positive `last_price`;
-for this feed, pre-open `last_price` is the indicative matching price. Snapshot
-preparation does not require depth subscriptions. No equal-book,
-exchange-timestamp or four-second age filter is applied. A failed request or a missing
-required price skips auction participation, without retrying that phase or using the
-planning prices for execution. Planning validates candidate/holding prices; execution
-validates target/holding prices and requires a completed same-day target. A fetch
-completed after the cutoff cannot submit orders.
+Planning requests its own complete whole-market full-tick batch through the existing
+live infrastructure and freezes candidate/holding inputs. Execution does not request
+another batch and does not wait for complete target/holding price coverage. Each
+order requires a positive finite reference with an exchange timestamp from the
+current trading day. Missing references skip only that instrument in the current
+convergence cycle; other orders continue. Later cycles may submit it if its price
+recovers before the cutoff. Before each physical order,
+including slices, execution compares cached full-tick last price with subscribed depth
+by exchange timestamp. Newer depth supplies the valid best-bid/best-ask midpoint (or
+the only valid side); ties prefer full tick. The ordinary submission-book age threshold
+is not applied to the auction path. Suspension checks and daily price limits remain
+required. Execution requires a completed same-day target and cannot submit at or after
+the cutoff. The original planning context remains immutable.
 If the process restarts between planning and execution, the execution phase restores
 the latest committed same-day target before validating its target/holding prices.
 An already accepted same-day target takes precedence; empty committed targets remain
@@ -122,8 +124,8 @@ applies to initial, deferred and replacement orders. Whole small buys have no
 exception in continuous trading. SELL orders are not subject to either buy minimum.
 Small omitted tails remain outstanding; targets are not increased or marked achieved.
 
-Buy/sell limits use the preparation snapshot price plus/minus the configured offsets
-(50 bps, or 0.5%, by default),
+Buy/sell limits use the selected cached reference plus/minus the configured offsets
+(80 bps for buys and 50 bps for sells by default),
 at least one price tick, clamped to the published daily price limits. Missing limits
 skip that instrument. Indicative prices are stored separately from the actual open.
 Open-dependent entry filters and stop-loss decisions explicitly use the planning
@@ -164,10 +166,13 @@ assumed receive delay to exchange `datetime`; test this assumption together with
 submission/cancel delays. The inspected 2026-10-14 `000001.XSHE` sample had 4,821
 usable records, including a 09:25 open of 11.57 and 361,200 auction shares.
 Auction indicative observations in that sample were nine seconds apart. The replay
-uses each stock’s latest observation received by `auction_start_time` for the planning
-batch and by `auction_execution_time` for a separate execution batch. Only the second
-batch prices submissions; the original planning context remains immutable. Observations
-received later and final clearing prices cannot repair either captured batch.
+uses observations received by `auction_start_time` for the planning batch. Historical
+depth updates subscribed targets and holdings as observations arrive. No synthetic
+whole-market snapshot is captured at `auction_execution_time`; the shared strategy
+timer starts execution. Execution reads
+the latest cached references before each physical submission; observations received
+after that submission cannot change its price. Final clearing prices cannot repair
+earlier inputs, and the original planning context remains immutable.
 
 ## Historical data contract
 
@@ -249,6 +254,49 @@ and daily valuation bars load for the included exchange dates. `daily_portfolio`
 and `daily_positions` retain their daily-close valuation basis; a partial-day run
 does not turn those reports into valuation at the requested end minute. Run
 metadata records the normalized start and exclusive end timestamps.
+
+For multiple dates with the same intraday interval, add `--daily-window`:
+
+```bash
+python -m backtests.target_model_predictions.run_backtest \
+  --config /tmp/qapp_backtest.yaml \
+  --start 2026-10-14 --end 2026-10-20 --daily-window 09:15-10:30 \
+  --all-stocks --tick-table ricequant_stock_tick \
+  --report-dir output/five_day_morning
+```
+
+The daily window includes its start and excludes its end, and intersects the
+overall date/datetime bounds. It requires a tick source and cannot cross midnight.
+RiceQuant queries only these daily receipt intervals, adjusted for modeled delay;
+CSV observations and synthetic planning events use the same filter. One Nautilus
+engine runs continuously across the dates and retains its native cash, positions
+and pending orders. Pending A-share DAY orders expire after that day's market close;
+they do not persist into the next session. Timers advance overnight; replay guards restrict new orders,
+cancellations and automatic replanning to the included intervals. Existing shared
+strategy sellability rules provide T+1. No state copying or daily engine reset occurs.
+
+Set the experiment YAML's execution windows separately (for example 10:00-10:30),
+and use a copied task YAML for `exposure.windows` (for example 09:35-09:55).
+Replay bounds do not replace task windows. The read-only recorder exports
+`exposure_snapshots.csv`, `execution_fill_attribution.csv` and
+`daily_exposure_correction.csv`. Snapshots capture correction boundaries, normal
+execution start and session end using current holdings and fresh mark prices.
+Correction BUY/SELL amounts are actual fill notional, excluding fees, attributed
+to the originating exposure order; late corrective fills are identified separately.
+Raw exposure is market value divided by total assets; the correction assessor uses
+assets minus the formal target's fixed cash buffer. Both bases are reported. These
+intraday snapshots are distinct from daily-close portfolio valuation.
+
+A-share limit orders explicitly use Nautilus `TimeInForce.DAY` in both live and
+backtest. Live venues enforce their normal day validity; the replay venue module
+emits native `OrderExpired` events after 15:00, independently of strategy cancellation
+windows. Supplied delayed closing-auction results settle before the remaining order
+quantity expires. Native accounting releases its cash reservation and keeps fills
+and positions. Ending a daily data window at 10:30 does not expire orders at 10:30.
+For a multi-day replay, timers apply the day-end expiry before the next session even
+without afternoon quotes. A replay ending before market close still reports orders
+open at that requested endpoint. Venue day-end removals appear in
+`market_session_expirations.csv` when any occur.
 
 ```bash
 python -m backtests.target_model_predictions.run_backtest \

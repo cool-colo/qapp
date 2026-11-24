@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from concurrent.futures import Future
 from datetime import date
 from unittest import TestCase
 from unittest.mock import patch
@@ -122,8 +121,8 @@ class AuctionSubmissionReferenceTest(TestCase):
             for context in contexts:
                 self.assertTrue(context["depth_reference_valid"])
                 self.assertEqual(context["depth_ts_event"], NOW)
-                self.assertEqual(context["whole_market_ts_event"], NOW)
-                self.assertEqual(context["price_source"], "whole_market_full_tick")
+                self.assertLess(context["whole_market_ts_event"], NOW)
+                self.assertEqual(context["price_source"], "order_book_depth")
         finally:
             engine.dispose()
 
@@ -145,7 +144,7 @@ class AuctionSubmissionReferenceTest(TestCase):
             self.assertEqual(contexts[A]["reference_price"], 10)
             self.assertEqual(contexts[A]["reference_ts_event"], NOW)
             self.assertEqual(contexts[A]["whole_market_ts_event"], NOW - 1_000_000_000)
-            self.assertEqual(contexts[B]["price_source"], "whole_market_full_tick")
+            self.assertEqual(contexts[B]["price_source"], "order_book_depth")
             orders = {str(order.instrument_id): order for order in engine.cache.orders()}
             self.assertEqual(float(orders[A].price), 10.05)
             self.assertIn("price_source=order_book_depth",
@@ -153,13 +152,11 @@ class AuctionSubmissionReferenceTest(TestCase):
         finally:
             engine.dispose()
 
-    def test_live_execution_waits_for_the_update_and_can_use_depth_for_a_missing_tick(self):
+    def test_live_execution_uses_depth_without_requesting_a_full_tick_update(self):
         from trading_orchestration.components.executors.auction_preparation import AuctionExecutionPreparation
         from task_orchestration.models import TaskContext, Proposal, RunState
         engine, strategy, planner, _ = replay_fixture(strategy_type=lambda config:
             LiveTargetModelPredictionsStrategy(config, refresh_context=None))
-        pending = Future()
-        strategy.market_snapshots.configure_source(lambda: {})
         try:
             strategy.clock.set_time(NOW)
             strategy._roll_trading_day(date(2026, 7, 8))
@@ -168,11 +165,11 @@ class AuctionSubmissionReferenceTest(TestCase):
             strategy.on_order_book_depth(depth(A, 10.1, 10.3, NOW - 1))
             prepare = AuctionExecutionPreparation(strategy.orchestration)
             context = TaskContext(NOW, 1, 'test', 1, Proposal('test'))
-            with patch.object(strategy, '_schedule_fetch', return_value=pending), \
-                    patch.object(strategy, '_run_on_loop', side_effect=lambda callback: callback()):
-                self.assertEqual(prepare.prepare(context).state, RunState.WAITING)
-                pending.set_result({B: {'last_price': 20, 'ts_event': NOW - 2}})
+            with patch.object(strategy.market_snapshots, 'request_fresh') as request, \
+                    patch.object(strategy, '_schedule_fetch') as fetch:
                 self.assertEqual(prepare.prepare(context).state, RunState.SUCCEEDED)
+                request.assert_not_called()
+                fetch.assert_not_called()
             self.assertNotIn(A, strategy.market_snapshots.latest_snapshot())
             self.assertEqual(strategy._select_opening_auction_reference(A)[0].source, 'order_book_depth')
             self.assertEqual(planner.requests, [])
@@ -199,7 +196,7 @@ class AuctionSubmissionReferenceTest(TestCase):
             context = events[A].extra["intent_context"]
             self.assertEqual(context["price_source"], "order_book_depth")
             self.assertEqual(context["reference_ts_event"], NOW + 1)
-            self.assertEqual(context["whole_market_ts_event"], NOW)
+            self.assertLess(context["whole_market_ts_event"], NOW)
             self.assertEqual(strategy.auction_reference(A).source, "order_book_depth")
             self.assertIn("price_source=order_book_depth", strategy._order_intent_contexts[str(orders[A].client_order_id)].log_text())
             expected = sum((o.quantity.as_decimal() * o.price.as_decimal()

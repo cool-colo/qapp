@@ -18,6 +18,7 @@ from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.identifiers import InstrumentId
@@ -161,6 +162,7 @@ class FakeOrder:
     leaves_qty: Decimal | None = None
     events: list = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    time_in_force: TimeInForce = TimeInForce.GTC
 
     def __post_init__(self) -> None:
         if not isinstance(self.filled_qty, FakeMoney):
@@ -183,7 +185,7 @@ class FakeOrderFactory:
     def __init__(self) -> None:
         self.count = 0
 
-    def limit(self, instrument_id, order_side, quantity, price) -> FakeOrder:
+    def limit(self, instrument_id, order_side, quantity, price, time_in_force=TimeInForce.GTC) -> FakeOrder:
         self.count += 1
         return FakeOrder(
             client_order_id=f"O-{self.count}",
@@ -191,6 +193,7 @@ class FakeOrderFactory:
             side=order_side,
             quantity=quantity,
             price=price,
+            time_in_force=time_in_force,
         )
 
     def market(self, instrument_id, order_side, quantity) -> FakeOrder:

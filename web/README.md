@@ -273,3 +273,12 @@ from a clean state. Order acknowledgements continue during cleanup, but new orde
 are forbidden. The dashboard reads completed-cycle snapshots and never triggers
 checks inside an executor's order loop. Orchestration configuration uses schema 2,
 with the shared `cleanup_component` at the top level.
+
+Task definitions expose `skip_entry_cleanup` and `skip_exit_cleanup`, strict
+booleans defaulting to false. The shipped auction execution task skips entry
+cleanup; normal successful exit remains configured to clean. Skipping entry never
+bypasses an earlier owner's exit cleanup. Bootstrap, preemption, pause, shutdown,
+cancellation, failure, unachievable outcomes, expiry and requests for a stable state
+always clean. The configuration panel displays both policies and their forced
+cleanup exceptions. `CLEANUP_SKIPPED` and `cleanup_result.evidence.cleanup_skipped`
+display as “清理已跳过”, without claiming the scope is stable or cleanup completed.

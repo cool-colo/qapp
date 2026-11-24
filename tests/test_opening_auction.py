@@ -173,14 +173,14 @@ def replay_fixture(*, persister=None, final_results=True, continuous=False,
     planner = FixedPlanner(second_day_exit=second_day_exit, second_day_rotate=second_day_rotate)
     strategy._target_planner = planner
     strategy._auction_replay_model = model
+    strategy._auction_replay_module = module
     if persister is not None:
         def archive(attempt, plan):
             if plan is not None and plan.persistable and not persister(plan):
                 raise RuntimeError("target plan persistence failed")
         strategy.configure_planning_archive(archive)
     events, quotes = prepare_tick_replay_event_data(SimpleNamespace(exchange_timezone="Asia/Shanghai"), rows, instruments,
-                                                       auction_start_time=config.auction_start_time,
-                                                       auction_execution_time=config.auction_execution_time)
+                                                       auction_start_time=config.auction_start_time)
     engine.add_data(prepare_tick_replay_depth_data(rows, instruments), sort=False)
     engine.add_data(quotes, sort=False)
     engine.add_data(events, client_id=PLANNING_CLIENT_ID, sort=False)
@@ -190,6 +190,40 @@ def replay_fixture(*, persister=None, final_results=True, continuous=False,
 
 
 class OpeningAuctionTest(unittest.TestCase):
+    def test_replay_captures_planning_only_and_preserves_received_tick_updates(self):
+        planning_ns = timestamp("2026-07-08 09:24:25")
+        execution_ns = timestamp("2026-07-08 09:24:58")
+        instruments = {code: parse_equity(code, {}, 0, 0)
+                       for code in ("000001.SZ", "000002.SZ")}
+        rows = [
+            HistoricalTick("000001.SZ", "indicative", planning_ns - 2_000_000_000,
+                           planning_ns - 1_000_000_000, 10, 10, 100, 100, 10, 0),
+            HistoricalTick("000002.SZ", "indicative", planning_ns - 2_000_000_000,
+                           planning_ns - 1_000_000_000, 20, 20, 100, 100, 20, 0),
+            # Earlier exchange time does not make a late receipt available to planning.
+            HistoricalTick("000001.SZ", "indicative", planning_ns - 1_000_000_000,
+                           planning_ns + 1_000_000_000, 10.1, 10.1, 100, 100, 10, 0),
+            HistoricalTick("000001.SZ", "indicative", execution_ns - 1_000_000_000,
+                           execution_ns - 1_000_000_000, 10.2, 10.2, 100, 100, 10, 0),
+        ]
+        events, quotes = prepare_tick_replay_event_data(
+            SimpleNamespace(exchange_timezone="Asia/Shanghai"), rows, instruments,
+            auction_start_time="09:24:25",
+        )
+        captures = [event.data for event in events if event.data.opening_auction_snapshot]
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(captures[0].ts_init, planning_ns)
+        self.assertFalse(captures[0].allow_planning)
+        self.assertEqual({iid: fields["last_price"] for iid, fields
+                          in captures[0].full_tick_snapshot.items()},
+                         {"000001.SZ.QMT": 10, "000002.SZ.QMT": 20})
+        updates = [event.data for event in events if not event.data.opening_auction_snapshot]
+        self.assertEqual({event.ts_init for event in updates}, {row.ts_init for row in rows})
+        self.assertFalse(any(event.ts_init == execution_ns for event in events))
+        self.assertEqual(next(event for event in updates if event.ts_init == execution_ns - 1_000_000_000)
+                         .full_tick_snapshot["000001.SZ.QMT"]["last_price"], 10.2)
+        self.assertEqual(len(quotes), len(rows))
+
     def test_auction_config_validation(self):
         for start, execution, cutoff in [("09:15", "09:24:50", "09:25"),
                                           ("10:42:01", "10:50:00", "10:50:59"),
@@ -201,7 +235,7 @@ class OpeningAuctionTest(unittest.TestCase):
                        {"auction_start_time": "09:24:59"}, {"auction_start_time": "09:14:59"},
                        {"auction_execution_time": "09:24:01"},
                        {"auction_execution_time": "09:24:00"},
-                       {"auction_execution_time": "09:24:59"},
+                       {"auction_execution_time": "09:25:00"},
                        {"auction_execution_time": "invalid"},
                        {"auction_commission_rate": 1},
                        {"auction_min_buy_notional": -1}]:
@@ -363,7 +397,7 @@ class OpeningAuctionTest(unittest.TestCase):
         finally:
             engine.dispose()
 
-    def test_execution_snapshot_does_not_use_observations_received_after_its_request(self):
+    def test_execution_does_not_use_depth_received_after_submission(self):
         def delay_late_observations(rows):
             return [replace(row, ts_init=row.ts_init + 2_000_000_000,
                             bid_price=row.bid_price * 1.02, ask_price=row.ask_price * 1.02)
@@ -376,7 +410,8 @@ class OpeningAuctionTest(unittest.TestCase):
             self.assertEqual(len(planner.requests), 1)
             self.assertEqual(strategy.auction_reference("000001.SZ.QMT").price, 10)
             self.assertEqual(strategy.auction_reference("000001.SZ.QMT").ts_init,
-                             timestamp("2026-07-08 09:24:50.500"))
+                             timestamp("2026-07-08 09:24:48"))
+            self.assertEqual(strategy.auction_reference("000001.SZ.QMT").source, "order_book_depth")
             self.assertEqual({str(o.instrument_id): float(o.price) for o in engine.cache.orders()},
                              {"000001.SZ.QMT": 10.05, "000002.SZ.QMT": 20.10})
         finally:
@@ -687,7 +722,8 @@ class OpeningAuctionTest(unittest.TestCase):
                             ts_event=f"2026-07-08T{clock_time}+08:00", ts_init=f"2026-07-08T{clock_time}+08:00",
                             bid_price=price, ask_price=price, bid_size=10000, ask_size=10000,
                             previous_close=price, open_price=price if kind == "auction" else 0))
-            args = SimpleNamespace(config=str(config), tick_file=str(data), tick_table=None, start="2026-07-08", end="2026-07-08",
+            args = SimpleNamespace(config=str(config), tick_file=str(data), tick_table=None, daily_window=None,
+                                   start="2026-07-08", end="2026-07-08",
                                    trader_id="TEST-001", log_level="ERROR", max_positions=50,
                                    starting_cash=Decimal(12500), exchange_timezone="Asia/Shanghai",
                                    auction_participation_rate=.01, submission_latency_ms=0,
@@ -723,8 +759,12 @@ class OpeningAuctionTest(unittest.TestCase):
                 self.assertTrue(strategy.config.subscribe_order_book_depth)
                 self.assertTrue(strategy._subscribed_order_book_depth_instruments)
                 self.assertTrue(strategy._depth_books)
-                self.assertEqual({o.ts_init for o in engine.cache.orders()},
-                                 {timestamp("2026-07-08 09:24:40.500")})
+                admitted = next(r for r in strategy.orchestration.engine.records
+                                if r.task_id == "auction_execution" and r.action == "ADMITTED")
+                self.assertEqual(admitted.reason, "priority_and_cleanup_policy")
+                self.assertEqual({o.ts_init for o in engine.cache.orders()}, {admitted.now_ns})
+                self.assertGreaterEqual(admitted.now_ns, timestamp("2026-07-08 09:24:40"))
+                self.assertLess(admitted.now_ns, timestamp("2026-07-08 09:24:40.500"))
                 self.assertEqual(engine.trader.generate_fills_report().last_qty.astype(int).sum(), 100)
                 self.assertIs(valuation_bars, bars)
                 self.assertEqual(strategy.config.auction_commission_rate, args.commission_rate)

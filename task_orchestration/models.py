@@ -55,6 +55,14 @@ class TaskSpec:
     can_preempt: bool = True
     preemptible: bool = True
     interval_ns: int = 1_000_000_000
+    skip_entry_cleanup: bool = False
+    skip_exit_cleanup: bool = False
+
+    def __post_init__(self):
+        for key, value in (("skip_entry_cleanup", self.skip_entry_cleanup),
+                           ("skip_exit_cleanup", self.skip_exit_cleanup)):
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} must be boolean")
 
 
 @dataclass(frozen=True)
@@ -93,3 +101,4 @@ class TaskRun:
     interrupted: bool = False
     final_decision: Decision | None = None
     cleanup_decision: Decision | None = None
+    cleanup_forced: bool = False

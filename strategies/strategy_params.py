@@ -116,8 +116,8 @@ class StrategyParams:
     # Opening call auction; independent of continuous execution windows.
     auction_enabled: bool = True
     auction_start_time: str = "09:24:01"
-    auction_execution_time: str = "09:24:57"
-    auction_submit_cutoff: str = "09:24:59"
+    auction_execution_time: str = "09:24:58"
+    auction_submit_cutoff: str = "09:25:00"
     auction_buy_offset_bps: float = 80.0
     auction_sell_offset_bps: float = 50.0
     auction_commission_rate: float = 0.000085

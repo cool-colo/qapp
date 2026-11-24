@@ -66,7 +66,7 @@ class OrchestrationConfig:
         planners = {}
         for name, priority in defaults.items():
             values = configured.get(name, {})
-            if not isinstance(values, dict) or set(values) - {"enabled", "priority", "can_preempt", "preemptible", "splitter", "cancellation", "planner"}:
+            if not isinstance(values, dict) or set(values) - {"enabled", "priority", "can_preempt", "preemptible", "skip_entry_cleanup", "skip_exit_cleanup", "splitter", "cancellation", "planner"}:
                 raise ValueError(f"invalid task configuration: {name}")
             values = dict(values)
             planning_names = {'daily_planning', 'auction_planning', 'scheduled_replan', 'price_limit_replan', 'manual_replan'}
@@ -81,7 +81,7 @@ class OrchestrationConfig:
             if any(not isinstance(value, str) or not value for value in profile.values()):
                 raise ValueError("execution component IDs must be nonempty strings")
             profiles[name] = MappingProxyType(profile)
-            for key in ("enabled", "can_preempt", "preemptible"):
+            for key in ("enabled", "can_preempt", "preemptible", "skip_entry_cleanup", "skip_exit_cleanup"):
                 if key in values and not isinstance(values[key], bool):
                     raise ValueError(f"{name}.{key} must be boolean")
             chosen_priority = values.pop("priority", priority)

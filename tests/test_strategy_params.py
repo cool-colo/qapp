@@ -39,13 +39,21 @@ class StrategyParamsPriceTrendTest(unittest.TestCase):
 
 
 class StrategyParamsBuyMinimumTest(unittest.TestCase):
+    def test_default_auction_window_matches_all_strategy_configs(self):
+        from strategies.target_quantities import TargetQuantityStrategyConfig
+
+        for config in (StrategyParams(), TargetQuantityStrategyConfig(instrument_ids=[], bar_types={})):
+            self.assertEqual(config.auction_execution_time, "09:24:58")
+            self.assertEqual(config.auction_submit_cutoff, "09:25:00")
+
     def test_all_repository_configs_load_new_minimums(self):
         for path in Path("configs").glob("strategy*.yaml"):
             with self.subTest(path=path):
                 params = StrategyParams.from_yaml(str(path))
                 self.assertEqual(params.auction_min_buy_notional, Decimal(10000))
                 self.assertEqual(params.continuous_buy_min_notional, Decimal(10000))
-                self.assertEqual(params.auction_execution_time, "09:24:57")
+                self.assertEqual(params.auction_execution_time, "09:24:58")
+                self.assertEqual(params.auction_submit_cutoff, "09:25:00")
                 self.assertEqual(params.auction_buy_offset_bps, 80.0)
                 self.assertEqual(params.auction_sell_offset_bps, 50.0)
 

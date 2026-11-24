@@ -59,7 +59,7 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
         finally:
             engine.dispose()
 
-    def test_auction_execution_refreshes_prices_without_changing_planning_context(self):
+    def test_auction_execution_uses_depth_without_changing_planning_context(self):
         def change_later_quotes(rows):
             return [replace(
                 r, ts_event=r.ts_event - (123_000_000 if r.symbol == "000001.SZ" else 457_000_000),
@@ -69,7 +69,8 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
 
         engine, strategy, planner, _ = replay_fixture(transform_rows=change_later_quotes)
         try:
-            with patch.object(strategy, "_refresh_order_book_depth_subscriptions") as subscribe:
+            with patch.object(strategy, "_refresh_order_book_depth_subscriptions",
+                              wraps=strategy._refresh_order_book_depth_subscriptions) as subscribe:
                 engine.run()
             subscribe.assert_called_once_with({A: 1000, B: 500})
             self.assertEqual(len(planner.requests), 1)
@@ -86,7 +87,8 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
             self.assertEqual(strategy.auction_reference(B).ts_event,
                              timestamp("2026-07-08 09:24:49.543"))
             self.assertEqual(strategy.auction_reference(A).ts_init,
-                             timestamp("2026-07-08 09:24:50.500"))
+                             timestamp("2026-07-08 09:24:50"))
+            self.assertEqual(strategy.auction_reference(A).source, "order_book_depth")
         finally:
             engine.dispose()
 
