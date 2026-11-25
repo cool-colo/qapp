@@ -17,6 +17,8 @@ class AuctionExecutionTask(BusinessTask):
             return prepared
         with self.bridge.operations():
             host.execute_opening_auction()
+        if host.opening_auction_orders_accepted():
+            return Decision(RunState.SUCCEEDED, 'auction_orders_accepted', prepared.evidence)
         return Decision(RunState.RUNNING, 'auction_orders_tracked', prepared.evidence)
 
     def interrupt(self, context):

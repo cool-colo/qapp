@@ -41,6 +41,7 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
     def test_latest_price_sizes_candidates_but_fixed_open_filters_gap(self):
         engine, strategy, planner, _ = replay_fixture(auction_enabled=False)
         try:
+            engine.run(end=timestamp("2026-07-08 09:23:00"))
             strategy.clock.set_time(timestamp("2026-07-08 10:00:00"))
             strategy._roll_trading_day(DAY)
             context = strategy.planning_context_builder.build(DAY, stage="continuous", snapshot={
@@ -148,14 +149,53 @@ class ModelTargetPlanningContextTest(unittest.TestCase):
 
         def record_plan(request):
             planning_times.append(strategy.clock.timestamp_ns())
-            return original_plan(request)
+            plan = original_plan(request)
+            eligible = {candidate.instrument_id for candidate in request.candidates}
+            return replace(plan, targets=[target for target in plan.targets
+                                          if target.instrument_id in eligible])
 
         planner.plan = record_plan
         try:
             engine.run()
-            self.assertTrue(all(ts >= timestamp("2026-07-08 09:25:00") for ts in planning_times))
-            self.assertNotIn(DAY, strategy.auction_session.frozen_dates)
-            self.assertTrue(engine.trader.generate_orders_report().empty)
-            self.assertIn(DAY, strategy.auction_session.failed_dates)
+            self.assertEqual(planning_times, [timestamp("2026-07-08 09:24:01.500")])
+            self.assertEqual([candidate.instrument_id for candidate in planner.requests[0].candidates], [A])
+            self.assertTrue(any(event.instrument_id == B and event.extra.get("reason") == "missing_open_price"
+                                for event in strategy.signal_events))
+            self.assertIn(DAY, strategy.auction_session.frozen_dates)
+            self.assertEqual({str(order.instrument_id) for order in engine.cache.orders()}, {A})
+            self.assertNotIn(DAY, strategy.auction_session.failed_dates)
+        finally:
+            engine.dispose()
+
+    def test_auction_missing_holding_price_uses_previous_close(self):
+        engine, strategy, _, _ = replay_fixture()
+        try:
+            strategy.clock.set_time(timestamp("2026-07-08 09:24:01"))
+            strategy._roll_trading_day(DAY)
+            context = strategy.planning_context_builder.build(DAY, stage="opening_auction", snapshot={
+                A: {"last_close": 10},
+                B: {"last_price": 20, "last_close": 20},
+            })
+            with patch.object(strategy, "_held_instrument_ids", return_value={A}), \
+                 patch.object(strategy, "_current_quantity", return_value=100):
+                holdings = strategy._build_current_holdings(DAY, date(2026, 7, 7), {},
+                                                           planning_context=context)
+            self.assertEqual([(holding.instrument_id, holding.price, holding.quantity)
+                              for holding in holdings], [(A, 10, 100)])
+        finally:
+            engine.dispose()
+
+    def test_auction_stop_loss_uses_previous_close_when_price_missing(self):
+        engine, strategy, _, _ = replay_fixture()
+        try:
+            strategy.clock.set_time(timestamp("2026-07-08 09:24:01"))
+            strategy._roll_trading_day(DAY)
+            strategy._active_positions[A] = {"entry_price": 10, "high_price": 10}
+            context = strategy.planning_context_builder.build(DAY, stage="opening_auction", snapshot={
+                A: {"last_close": 9.4},
+            })
+            self.assertEqual(strategy._holding_exclusion(DAY, date(2026, 7, 7), A, 1,
+                                                        planning_context=context), "stop_triggered")
+            self.assertEqual(strategy.signal_events[-1].extra["open_price"], 9.4)
         finally:
             engine.dispose()

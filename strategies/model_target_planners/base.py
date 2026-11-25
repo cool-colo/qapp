@@ -129,6 +129,7 @@ class ModelTargetPlanningRequest:
     total_asset: float | None = None  # raw total asset
     investable_asset: float | None = None  # total asset net of trading buffer (sizing basis)
     open_prices: dict[str, float] = field(default_factory=dict)  # instrument_id -> price
+    account_id: str | None = None
 
 
 class ModelTargetPlanner:

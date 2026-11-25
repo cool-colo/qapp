@@ -113,7 +113,6 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
         self._replay_market_fields = {}
         self._replay_market_day = None
         self.market_snapshots.configure_source(lambda: dict(self._replay_market_fields))
-        self._tick_missing_opens: dict[date, tuple[str, ...]] = {}
         self._replay_time_range: BacktestTimeRange | None = None
         self._auction_replay_module = None
         self.exposure_replay_recorder = None
@@ -161,27 +160,6 @@ class BacktestTargetModelPredictionsStrategy(TargetModelPredictionsStrategy):
             return False
         if trading_date in self._processed_dates:
             return False
-        if self._auction_replay_model is not None:
-            signal_date = self._resolve_signal_date(trading_date)
-            required = self._held_instrument_ids() | {
-                str(self._instrument_by_stock[signal["stock_code"]])
-                for signal in self._signals_by_date.get(signal_date, [])
-                if signal["stock_code"] in self._instrument_by_stock
-                and self._entry_skip_reason(signal["stock_code"], trading_date) is None
-            }
-            suspended = self._suspended_by_date.get(trading_date, set())
-            missing = sorted(i for i in required
-                             if self._stock_code_for_instrument(i) not in suspended
-                             and not self._is_suspended_status(i)
-                             and self._today_open_price(i) is None)
-            if missing:
-                # Gate every entry point, including inherited timers and refreshes.
-                # Missing data never freezes a partially populated comparison plan.
-                if self._tick_missing_opens.get(trading_date) != tuple(missing):
-                    self._tick_missing_opens[trading_date] = tuple(missing)
-                    self.log.warning(f"Tick planning deferred: date={trading_date}, missing_opens={missing}")
-                return False
-            self._tick_missing_opens.pop(trading_date, None)
         return super()._process_trading_day_once(trading_date, trigger)
 
     def on_start(self) -> None:

@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import json
+
 from web.app import realtime_trade_loss
 from web.trade_loss_report import (
     build_minute_trade_loss,
@@ -48,8 +50,9 @@ class FakeMySql:
 
     def query(self, sql, params):
         self.calls.append((sql, params))
-        if "FROM live_target_portfolio" in sql:
-            return self.targets
+        if "FROM live_target_plan" in sql:
+            return [{"request_id": "p1", "target_version": "v1", "updated_at": "2026-11-13 09:24:30",
+                     "payload": json.dumps({"quantities": {row["stock_code"] + ".BIGQMT": row["target_qty"] for row in self.targets}})}] if self.targets else []
         if "FROM live_position_snapshot" in sql:
             return self.positions
         if "FROM live_asset_snapshot" in sql:
@@ -154,10 +157,10 @@ def test_query_uses_latest_targets_and_preopen_positions_with_fixed_symbols():
     assert len(mysql.calls) == 2
     target_sql = mysql.calls[0][0]
     assert "snapshot_type" not in target_sql
-    assert "ORDER BY write_time DESC, id DESC" in target_sql
-    assert "snapshot_type = 'before_trading'" in mysql.calls[1][0]
+    assert "ORDER BY updated_at DESC, id DESC" in target_sql
+    assert "snapshot_type = 'before_auction'" in mysql.calls[1][0]
+    assert "status = 'committed'" in target_sql
     for sql, params in mysql.calls:
-        assert "status = 'ok'" in sql
         assert params == {"account_id": "A1", "trader_id": "T1", "trade_date": "2026-11-13"}
     assert len(clickhouse.calls) == 1
     sql = clickhouse.calls[0]
@@ -170,54 +173,46 @@ def test_query_uses_latest_targets_and_preopen_positions_with_fixed_symbols():
     assert "datetime <= now64" in sql
 
 
-@pytest.mark.parametrize("latest_phase", ["before_trading", "continuous_trading", "after_trading"])
-def test_latest_target_version_is_one_complete_book_across_snapshot_phases(latest_phase):
+def test_archived_target_selection_uses_one_complete_book_and_planning_time():
     with closing(sqlite3.connect(":memory:")) as connection:
         connection.row_factory = sqlite3.Row
-        connection.execute("""
-            CREATE TABLE live_target_portfolio (
-                id INTEGER, write_time TEXT, account_id TEXT, trader_id TEXT,
-                trade_date TEXT, snapshot_type TEXT, status TEXT,
-                stock_code TEXT, target_qty INTEGER, target_version TEXT
-            )
-        """)
+        connection.execute("""CREATE TABLE live_target_plan (
+            id INTEGER, updated_at TEXT, account_id TEXT, trader_id TEXT,
+            trade_date TEXT, status TEXT, request_id TEXT, target_version TEXT, payload TEXT
+        )""")
         rows = [
-            (1, "09:00:00", "A1", "T1", "2026-11-13", "before_trading", "ok", "000001.SZ", 100, "z-old"),
-            (2, "09:00:00", "A1", "T1", "2026-11-13", "before_trading", "ok", "300001.SZ", 100, "z-old"),
-            (3, "11:00:00", "A1", "T1", "2026-11-13", "before_trading", "ok", "000001.SZ", 100, "a-new"),
-            (4, "11:00:00", "A1", "T1", "2026-11-13", latest_phase, "ok", "600000.SH", 100, "a-new"),
-            (5, "11:00:00", "A1", "T1", "2026-11-13", latest_phase, "ok", "000001.SZ", 200, "a-new"),
-            (6, "08:00:00", "A1", "T1", "2026-11-13", "after_trading", "ok", "000001.SZ", 999, "z-old"),
-            (7, "15:00:00", "A2", "T1", "2026-11-13", latest_phase, "ok", "000001.SZ", 999, "other-account"),
-            (8, "15:00:00", "A1", "T1", "2026-11-12", latest_phase, "ok", "000001.SZ", 999, "other-day"),
-            (9, "15:00:00", "A1", "T1", "2026-11-13", latest_phase, "failed", "000001.SZ", 999, "failed"),
-            (10, "15:00:00", "A1", "T2", "2026-11-13", latest_phase, "ok", "000001.SZ", 999, "other-trader"),
+            (1, "09:24:00", "A1", "T1", "2026-11-13", "committed", "old", "z-old", json.dumps({"quantities": {"000001.SZ.BIGQMT": 100, "300001.SZ.BIGQMT": 100}})),
+            (2, "11:00:00", "A1", "T1", "2026-11-13", "committed", "new", "a-new", json.dumps({"quantities": {"000001.SZ.BIGQMT": 200, "600000.SH.BIGQMT": 100}})),
+            (3, "15:00:00", "A2", "T1", "2026-11-13", "committed", "other", "other", json.dumps({"quantities": {}})),
+            (4, "15:00:00", "A1", "T1", "2026-11-13", "failed", "failed", "failed", json.dumps({"quantities": {}})),
         ]
-        connection.executemany("INSERT INTO live_target_portfolio VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", reversed(rows))
+        connection.executemany("INSERT INTO live_target_plan VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
 
-        class TargetTableMySql(FakeMySql):
+        class PlanTableMySql(FakeMySql):
             def query(self, sql, params):
-                if "FROM live_target_portfolio" not in sql:
+                if "FROM live_target_plan" not in sql:
                     return super().query(sql, params)
-                self.calls.append((sql, params))
                 for name in params:
                     sql = sql.replace(f"%({name})s", f":{name}")
                 return [dict(row) for row in connection.execute(sql, params)]
 
-        result = query_report(TargetTableMySql(), FakeClickHouse(minutes=[]))
-
-    assert result["status"] == "ok"
-    assert result["target_versions"] == ["a-new"]
-    trades = {row["stock_code"]: row for row in result["trades"]}
-    assert trades["000001.SZ"]["side"] == "BUY"
-    assert trades["000001.SZ"]["trade_qty"] == 200
-    assert trades["600000.SH"]["side"] == "SELL"
-    assert trades["600000.SH"]["trade_qty"] == 100
-    # A stock removed from the latest target becomes an exit from preopen holdings.
-    assert trades["300001.SZ"]["target_qty"] == 0
-    assert trades["300001.SZ"]["trade_qty"] == 100
-    assert trades["300002.SZ"]["trade_qty"] == 50
-    assert result["stock_count"] == 4
+        mysql = PlanTableMySql()
+        result = query_report(mysql, FakeClickHouse(minutes=[]))
+        assert result["target_versions"] == ["a-new"]
+        assert result["planning_time"] == "11:00:00"
+        assert result["selected_request_id"] == "new"
+        assert len(result["target_plans"]) == 2
+        trades = {row["stock_code"]: row for row in result["trades"]}
+        assert trades["000001.SZ"]["trade_qty"] == 200
+        assert trades["300001.SZ"]["target_qty"] == 0
+        old = query_minute_trade_loss(mysql, FakeClickHouse(minutes=[]), account="A1", trader="T1",
+                                    trading_date="2026-11-13", request_id="old")
+        assert old["target_versions"] == ["z-old"]
+        assert old["planning_time"] == "09:24:00"
+        assert "300001.SZ" not in {row["stock_code"] for row in old["trades"]}
+        with pytest.raises(ValueError, match="does not exist"):
+            query_minute_trade_loss(mysql, FakeClickHouse(), account="A1", trader="T1",
+                                   trading_date="2026-11-13", request_id="other")
 
 
 def test_minute_query_supports_beijing_symbol_and_rejects_invalid_input():
@@ -331,3 +326,18 @@ def test_missing_open_keeps_individual_raw_bp_but_never_reweights_remaining_stoc
     buy = result["stock_series"][0]
     assert buy["points"][0]["price_change_bps"] == 1000
     assert buy["points"][0]["weighted_loss_bps"] is None
+
+
+def test_committed_empty_plan_sells_all_preauction_holdings():
+    class EmptyPlanMySql(FakeMySql):
+        def query(self, sql, params):
+            if "FROM live_target_plan" in sql:
+                return [{"request_id": "empty", "target_version": "v-empty", "updated_at": "09:24:00",
+                         "payload": json.dumps({"quantities": {}})}]
+            return super().query(sql, params)
+
+    result = query_report(EmptyPlanMySql(), FakeClickHouse(minutes=[]))
+    assert result["status"] == "ok"
+    assert result["target_versions"] == ["v-empty"]
+    assert result["stock_count"] == len(POSITIONS)
+    assert all(row["side"] == "SELL" and row["target_qty"] == 0 for row in result["trades"])

@@ -769,7 +769,7 @@ async function loadSnapshot() {
   const base = accountParams();
   try {
     const [asset, pos, tgt, orders, trades] = await Promise.all([
-      api("/api/asset", { ...base, start: date, end: date, snapshot_type: phase || "after_trading" }),
+      api("/api/asset", { ...base, start: date, end: date, snapshot_type: phase }),
       api("/api/positions", { ...base, date, snapshot_type: phase }),
       api("/api/target", { ...base, date, snapshot_type: phase }),
       api("/api/orders", { ...base, date }),
@@ -2667,7 +2667,7 @@ function renderRealtimeTradeSummary(summary) {
   ).join("");
   const unpricedCount = slippage.total.unpriced_stock_count;
   const pricingNote = unpricedCount
-    ? `<div class="trade-summary-meta">${unpricedCount} 只股票缺少有效开盘价，成交数量和金额已计入；相关滑点暂不可用。</div>`
+    ? `<div class="trade-summary-meta">${unpricedCount} 只股票缺少有效开盘价或集合竞价成交价冲突，成交数量和金额已计入；相关滑点暂不可用。</div>`
     : "";
   el.innerHTML =
     `<div class="trade-summary-meta">${escapeHtml(summary.trade_date)} · ${assetText}</div>` +
@@ -2682,17 +2682,17 @@ function renderRealtimeTradeSummary(summary) {
     `<div id="rt-order-table" class="table-wrap trade-slippage-table"></div>`;
   renderTable("#rt-slippage-table", slippage.stocks || [], {
     columns: [
-      "stock_code", "stock_name", "side", "order_count", "trade_count", "traded_qty",
+      "stock_code", "stock_name", "side", "signal_rank", "order_count", "trade_count", "traded_qty",
       "traded_amount", "avg_open_price", "avg_trade_price",
-      "slippage_amount", "slippage_bps",
+      "slippage_amount", "slippage_bps", "pricing_error",
     ],
     headers: {
-      stock_code: "证券代码", stock_name: "证券名称", side: "方向", order_count: "委托数",
+      stock_code: "证券代码", stock_name: "证券名称", side: "方向", signal_rank: "信号排名", order_count: "委托数",
       trade_count: "成交笔数", traded_qty: "成交数量", traded_amount: "成交金额",
       avg_open_price: "加权开盘价", avg_trade_price: "加权成交价",
-      slippage_amount: "滑点金额", slippage_bps: "滑点(bp)",
+      slippage_amount: "滑点金额", slippage_bps: "滑点(bp)", pricing_error: "开盘价异常",
     },
-    intCols: new Set(["order_count", "trade_count", "traded_qty"]),
+    intCols: new Set(["signal_rank", "order_count", "trade_count", "traded_qty"]),
     defaultSort: { col: "side", dir: "asc" },
     linkStock: true,
     stockInfoDate: summary.trade_date,
@@ -2700,7 +2700,7 @@ function renderRealtimeTradeSummary(summary) {
       if (col === "side") {
         return `<td class="text ${String(value).toLowerCase() === "buy" ? "pos" : "neg"}">${String(value).toUpperCase() === "BUY" ? "买入" : "卖出"}</td>`;
       }
-      if (value === null) return '<td>—</td>';
+      if (value === null || col === "signal_rank" && value === undefined) return '<td>—</td>';
       return undefined;
     },
   });
@@ -2711,21 +2711,21 @@ function renderRealtimeTradeSummary(summary) {
   }));
   renderTable("#rt-order-table", orders, {
     columns: [
-      "stock_code", "stock_name", "side", "status_text", "quantity", "filled_qty", "unfilled_qty",
+      "stock_code", "stock_name", "side", "signal_rank", "status_text", "quantity", "filled_qty", "unfilled_qty",
       "limit_price", "avg_fill_price", "venue_order_id",
     ],
     headers: {
-      stock_code: "证券代码", stock_name: "证券名称", side: "方向", status_text: "状态",
+      stock_code: "证券代码", stock_name: "证券名称", side: "方向", signal_rank: "信号排名", status_text: "状态",
       quantity: "委托数量", filled_qty: "成交数量", unfilled_qty: "未成交数量",
       limit_price: "委托价", avg_fill_price: "成交均价", venue_order_id: "委托编号",
     },
-    intCols: new Set(["quantity", "filled_qty", "unfilled_qty"]),
+    intCols: new Set(["signal_rank", "quantity", "filled_qty", "unfilled_qty"]),
     defaultSort: { col: "side", dir: "asc" },
     linkStock: true,
     stockInfoDate: summary.trade_date,
     cellFn: (col, value) => col === "side"
       ? `<td class="text ${value === "BUY" ? "pos" : "neg"}">${value === "BUY" ? "买入" : "卖出"}</td>`
-      : undefined,
+      : col === "signal_rank" && value == null ? '<td>—</td>' : undefined,
   });
   $("#rt-include-auction").addEventListener("change", (event) => {
     state.includeAuctionSlippage = event.target.checked;
@@ -2733,13 +2733,40 @@ function renderRealtimeTradeSummary(summary) {
   });
 }
 
+const signalRankCache = new Map();
+async function loadCurrentSignalRanks(params) {
+  const key = `${params.account}/${params.trader}`;
+  const cached = signalRankCache.get(key);
+  if (cached && Date.now() - cached.loadedAt < 60000) return cached.ranks;
+  const signals = await api("/api/strategy/signals", { account: params.account, trader: params.trader });
+  const ranks = new Map();
+  if (signals.signal_date) {
+    const complete = await api("/api/snapshot_signals", {
+      account: params.account, trader: params.trader, date: signals.signal_date,
+      predictions_table: signals.predictions_table, predictions_database: signals.predictions_database,
+    });
+    (complete.signals || []).forEach((row) => ranks.set(row.stock_code, row.rank));
+  }
+  signalRankCache.set(key, { loadedAt: Date.now(), ranks });
+  return ranks;
+}
+function attachSignalRanks(rows, ranks) {
+  (rows || []).forEach((row) => { row.signal_rank = ranks.get(row.stock_code) ?? null; });
+}
+
 async function loadRealtimeTradeSummary() {
+  const params = accountParams();
   try {
     const includeAuction = state.includeAuctionSlippage;
     const summary = await api("/api/realtime/trade-summary", {
-      ...accountParams(), include_auction: includeAuction,
+      ...params, include_auction: includeAuction,
     });
-    if (includeAuction !== state.includeAuctionSlippage) return;
+    try {
+      const ranks = await loadCurrentSignalRanks(params);
+      attachSignalRanks(summary.slippage.stocks, ranks);
+      attachSignalRanks(summary.orders, ranks);
+    } catch (e) { toast(`信号排名获取失败：${e.message}`); }
+    if (includeAuction !== state.includeAuctionSlippage || !pendingAccountMatches(params)) return;
     renderRealtimeTradeSummary(summary);
   } catch (e) {
     $("#rt-trades").innerHTML = '<div class="empty">获取失败</div>';
@@ -2810,19 +2837,19 @@ function renderPendingTradeProjection(payload) {
 
   renderTable("#rt-pending-table", payload.trades, {
     columns: [
-      "side", "stock_code", "name", "current_qty", "target_qty", "trade_qty",
+      "side", "signal_rank", "stock_code", "name", "current_qty", "target_qty", "trade_qty",
       "open_price", "current_price", "day_change", "price_change", "open_amount",
       "current_amount", "loss_amount",
     ],
     headers: {
-      side: "方向", stock_code: "证券代码", name: "证券名称",
+      side: "方向", signal_rank: "信号排名", stock_code: "证券代码", name: "证券名称",
       current_qty: "当前数量", target_qty: "目标数量", trade_qty: "待交易数量",
       open_price: "开盘价", current_price: "现价", day_change: "当日涨幅",
       price_change: "现价较开盘",
       open_amount: "开盘价执行金额", current_amount: "现价执行金额",
       loss_amount: "损失金额",
     },
-    intCols: new Set(["current_qty", "target_qty", "trade_qty"]),
+    intCols: new Set(["signal_rank", "current_qty", "target_qty", "trade_qty"]),
     rateCols: new Set(["day_change", "price_change"]),
     signCols: new Set(["day_change", "price_change", "loss_amount"]),
     defaultSort: { col: "side", dir: "asc" },
@@ -2833,6 +2860,7 @@ function renderPendingTradeProjection(payload) {
         const buy = String(value).toUpperCase() === "BUY";
         return `<td class="text ${buy ? "pos" : "neg"}">${buy ? "买入" : "卖出"}</td>`;
       }
+      if (col === "signal_rank" && value == null) return '<td>—</td>';
       if (col === "name" && row.frozen) {
         return `<td class="text" title="${escapeHtml(row.frozen_reason || "冻结")}">${escapeHtml(value || "")} ❄</td>`;
       }
@@ -2868,8 +2896,8 @@ function renderMinuteTradeLoss(payload, error = null) {
   const raw = $("#rt-loss-raw").checked, weighted = $("#rt-loss-weighted").checked;
   const statusMessages = {
     missing_preopen_target: "暂无当天目标快照",
-    missing_preopen_positions: "暂无当天盘前持仓快照",
-    no_trades: "最新目标与盘前持仓一致，无计划交易",
+    missing_preopen_positions: "暂无当天 09:24 before_auction 持仓快照",
+    no_trades: "所选目标与盘前持仓一致，无计划交易",
   };
   const points = payload ? payload.points || [] : [];
   const stocks = payload ? payload.stock_series || [] : [];
@@ -2985,6 +3013,10 @@ async function loadPendingTradeSnapshot(params) {
   }
   try {
     const payload = await api("/api/realtime/pending-trades", params);
+    try {
+      const ranks = await loadCurrentSignalRanks(params);
+      attachSignalRanks(payload.trades, ranks);
+    } catch (e) { toast(`信号排名获取失败：${e.message}`); }
     if (!pendingAccountMatches(params)) return;
     renderPendingTradeProjection(payload);
   } catch (e) {
@@ -2995,10 +3027,24 @@ async function loadPendingTradeSnapshot(params) {
   }
 }
 
+let lossPlanAccount = null;
+$("#rt-loss-plan").addEventListener("change", () => loadMinuteTradeLoss(accountParams()));
 async function loadMinuteTradeLoss(params) {
+  const account = JSON.stringify(params);
+  if (lossPlanAccount !== account) {
+    lossPlanAccount = account;
+    $("#rt-loss-plan").innerHTML = '<option value="">最新规划</option>';
+  }
+  const requestId = $("#rt-loss-plan").value;
   try {
-    const payload = await api("/api/realtime/trade-loss", params);
-    if (pendingAccountMatches(params)) renderMinuteTradeLoss(payload);
+    const payload = await api("/api/realtime/trade-loss", { ...params, request_id: requestId });
+    if (pendingAccountMatches(params) && $("#rt-loss-plan").value === requestId) {
+      $("#rt-loss-plan").innerHTML = '<option value="">最新规划（自动跟随）</option>' +
+        (payload.target_plans || []).map((plan) => `<option value="${escapeHtml(plan.request_id)}">${escapeHtml(plan.planning_time)} · ${escapeHtml(plan.target_version)}</option>`).join("");
+      $("#rt-loss-plan").value = requestId;
+      $("#rt-loss-plan-time").textContent = payload.planning_time ? `规划落库时间：${payload.planning_time} · 持仓基准：09:24 before_auction` : "";
+      renderMinuteTradeLoss(payload);
+    }
   } catch (e) {
     if (!pendingAccountMatches(params)) return;
     renderMinuteTradeLoss(null, "交易损失曲线获取失败");

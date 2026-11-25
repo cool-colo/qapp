@@ -38,6 +38,7 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.events import OrderFilled
+from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderExpired
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue
@@ -2197,6 +2198,31 @@ class TargetQuantityStrategy(TargetStateOwner, Strategy):
             return self._converge_to_target(self._clock_date(), ConvergenceTrigger.OPENING_AUCTION)
         finally:
             self._auction_execution_active = False
+
+    def opening_auction_orders_accepted(self) -> bool:
+        """Complete submission only after every participating member is acknowledged.
+
+        Auction allocation may intentionally submit only part of a target. Remaining
+        position convergence belongs to normal execution, not this acknowledgment gate.
+        Members without a submitted order remain eligible until the auction cutoff.
+        """
+        day = self._clock_date()
+        orders = [
+            order for order in self.cache.orders(strategy_id=self.id)
+            if "opening_auction" in (order.tags or [])
+            and pd.Timestamp(order.ts_init, unit="ns", tz="UTC").tz_convert(
+                self.config.timezone_name).date() == day
+        ]
+        submitted_members = {str(order.instrument_id) for order in orders}
+        for instrument_id, quantity in self._desired_quantities().items():
+            if (self._current_quantity(InstrumentId.from_str(instrument_id)) != quantity
+                    and instrument_id not in submitted_members):
+                return False
+        return all(
+            any(isinstance(event, OrderAccepted) for event in order.events)
+            and (not order.is_closed or order.status == OrderStatus.FILLED)
+            for order in orders
+        )
 
     def _initialize_auction_budget(self, current_date: date, free_cash: Decimal) -> None:
         """Recover same-day auction commitments before capturing a fixed budget."""

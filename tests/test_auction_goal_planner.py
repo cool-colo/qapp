@@ -58,14 +58,23 @@ class AuctionPlannerPreparationTest(TestCase):
         self.assertEqual(self.planner.snapshot.instruments[A].price, 10)
         self.assertEqual(self.engine.cache.orders(), [])
 
-    def test_missing_required_price_fails_without_optimizer(self):
+    def test_missing_candidate_price_is_delegated_to_shared_planning(self):
         self.planner.plan(self.context())
         self.work[0].set_result({A: self.fields()[A]})
         result = self.planner.plan(self.context())
-        self.assertEqual(result.reason, 'invalid_auction_planning_snapshot')
-        self.assertEqual(result.evidence['missing_instruments'], [B])
+        self.assertEqual(result.state, RunState.SUCCEEDED)
+        self.factory.assert_called_once_with(self.planner.snapshot)
+        self.assertNotIn(B, self.planner.snapshot.instruments)
+        self.assertNotIn(DAY, self.host.auction_session.failed_dates)
+
+    def test_empty_snapshot_still_fails_without_optimizer(self):
+        self.planner.plan(self.context())
+        self.work[0].set_result({})
+        result = self.planner.plan(self.context())
+        self.assertEqual(result.state, RunState.FAILED)
+        self.assertEqual(result.reason,
+                         'auction_planning_market_failed: whole-market snapshot is empty or invalid')
         self.factory.assert_not_called()
-        self.assertIn(DAY, self.host.auction_session.failed_dates)
 
     def test_suspended_missing_price_is_permitted(self):
         self.host._suspended_by_date[DAY] = {'000002.SZ'}

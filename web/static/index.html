@@ -76,9 +76,10 @@
             <label>阶段
               <select id="snap-phase">
                 <option value="after_trading">after_trading</option>
+                <option value="before_auction">before_auction</option>
                 <option value="before_trading">before_trading</option>
                 <option value="continuous_trading">continuous_trading</option>
-                <option value="">(全部)</option>
+                <option value="all">(全部)</option>
               </select>
             </label>
             <button id="snap-refresh">刷新</button>
@@ -319,7 +320,9 @@
         <div id="rt-pending" class="rt-sub-panel">
           <div id="rt-pending-projection"></div>
           <div class="pending-section-title">盘前计划交易损失（bp）</div>
-          <div class="pending-loss-note">交易数量＝当天最新版本目标－盘前持仓；盘前持有但不在最新目标中的股票按清仓计算，成交后仍纳入估算。<br />损失 bp＝[买入数量×（分钟收盘价－开盘价）＋卖出数量×（开盘价－分钟收盘价）] / 买卖开盘总金额×10000。正值表示损失，负值表示价格改善。</div>
+          <label>规划目标 <select id="rt-loss-plan"><option value="">最新规划</option></select></label>
+          <span id="rt-loss-plan-time" class="trade-summary-meta"></span>
+          <div class="pending-loss-note">交易数量＝所选规划目标－09:24 before_auction 持仓；盘前持有但不在所选目标中的股票按清仓计算，成交后仍纳入估算。<br />损失 bp＝[买入数量×（分钟收盘价－开盘价）＋卖出数量×（开盘价－分钟收盘价）] / 买卖开盘总金额×10000。正值表示损失，负值表示价格改善。</div>
           <div id="rt-trade-loss-meta" class="trade-summary-meta"></div>
           <div class="subbar trade-loss-controls">
             <div class="subbar-controls">

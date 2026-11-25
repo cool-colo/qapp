@@ -274,6 +274,15 @@ class SnapshotRecorder(Actor):
         now = self._now()
         today = now.date()
         current = now.time()
+        # A restart just after the alert was due otherwise schedules it for
+        # tomorrow. Only catch up before 09:25 auction fills change the holdings.
+        if self._before_auction_time is not None:
+            auction_start = now.normalize() + pd.Timedelta(
+                hours=self._before_auction_time[0], minutes=self._before_auction_time[1],
+            )
+            auction_end = now.normalize() + pd.Timedelta(hours=9, minutes=25)
+            if auction_start <= now < auction_end and today in self._strategy._trading_dates:
+                self._run_before_auction(today)
         try:
             after_t = pd.Timestamp(self.config.after_time).time()
         except Exception:

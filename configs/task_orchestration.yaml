@@ -74,7 +74,7 @@ tasks:
     can_preempt: true
     preemptible: true
     skip_entry_cleanup: true
-    skip_exit_cleanup: false
+    skip_exit_cleanup: true  # Keep accepted auction orders working until matching.
     splitter: existing_notional
     cancellation: existing
 

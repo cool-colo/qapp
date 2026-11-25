@@ -113,6 +113,35 @@ class RealtimePositionPnlTests(unittest.TestCase):
         self.assertAlmostEqual(row["day_change"], -0.03125)
         self.assertAlmostEqual(row["unrealized_pnl"], -4208.227390180878)
 
+    def test_closed_position_uses_actual_sells_instead_of_reconciled_average(self):
+        server = self.server([
+            filled_order("auction", [416, 384], "25.29"),
+            filled_order("afternoon", [200], "24.18"),
+            filled_order("synthetic", [200], "27.39", reconciliation=True),
+            filled_order("previous", [200], "30.00", day=DAY - timedelta(days=1)),
+        ])
+        server._strategy._market_status[str(IID)] = SimpleNamespace(
+            last_price=23.78, last_close=25.8,
+        )
+        position = SimpleNamespace(
+            avg_px_open=27.390555555555554, avg_px_close=26.496,
+            peak_qty=Quantity.from_int(1200),
+        )
+        row = server._closed_row(position, str(IID))
+        self.assertAlmostEqual(row["day_pnl"], -732.0)
+        self.assertEqual(row["last_price"], 23.78)
+        self.assertEqual(row["volume"], 0)
+
+    def test_closed_position_without_actual_fills_leaves_day_pnl_unknown(self):
+        server = self.server([
+            filled_order("synthetic", [1200], "27.39", reconciliation=True),
+        ])
+        position = SimpleNamespace(
+            avg_px_open=27.39, avg_px_close=26.496,
+            peak_qty=Quantity.from_int(1200),
+        )
+        self.assertIsNone(server._closed_row(position, str(IID))["day_pnl"])
+
     def test_reconciliation_order_tags_previous_day_and_buys_are_excluded(self):
         server = self.server([
             filled_order("actual", [100], "3.50"),

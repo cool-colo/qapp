@@ -53,7 +53,7 @@ class AuctionReplayReviewTest(unittest.TestCase):
         finally:
             engine.dispose()
 
-    def test_comparison_waits_for_open_results_received_50_ms_apart(self):
+    def test_comparison_uses_available_prices_when_opens_arrive_50_ms_apart(self):
         def delay_second_result(rows):
             return [replace(row, ts_init=row.ts_init + 50_000_000)
                     if row.symbol == "000002.SZ" and row.kind == "auction" else row
@@ -69,7 +69,7 @@ class AuctionReplayReviewTest(unittest.TestCase):
         finally:
             engine.dispose()
 
-    def test_comparison_timer_cannot_plan_before_late_open_result(self):
+    def test_comparison_plans_before_late_open_using_available_price(self):
         def delay_second_result(rows):
             return [replace(row, ts_init=timestamp("2026-07-08 09:30:10"))
                     if row.symbol == "000002.SZ" and row.kind == "auction" else row
@@ -87,18 +87,27 @@ class AuctionReplayReviewTest(unittest.TestCase):
         planner.plan = record_time
         try:
             engine.run()
-            self.assertEqual(planning_times, [timestamp("2026-07-08 09:30:10.500")])
+            self.assertEqual(planning_times, [timestamp("2026-07-08 09:25:00.500")])
             self.assertEqual(len(planner.requests[0].candidates), 2)
+            self.assertEqual({candidate.stock_code: candidate.open_price
+                              for candidate in planner.requests[0].candidates},
+                             {"000001.SZ": 10, "000002.SZ": 20})
         finally:
             engine.dispose()
 
-    def test_comparison_missing_required_open_never_freezes_an_incomplete_plan(self):
-        engine, strategy, planner, _ = replay_fixture(auction_enabled=False, transform_rows=lambda rows: [
-            row for row in rows if row.symbol != "000002.SZ" or row.kind != "auction"])
+    def test_comparison_missing_candidate_price_filters_only_that_candidate(self):
+        engine, strategy, planner, _ = replay_fixture(
+            auction_enabled=False, transform_rows=lambda rows: keep_comparison_clock_running([
+                row for row in rows if row.symbol != "000002.SZ"]))
         try:
             engine.run()
-            self.assertEqual(planner.requests, [])
-            self.assertNotIn(date(2026, 7, 8), strategy._processed_dates)
+            self.assertEqual(len(planner.requests), 1)
+            self.assertEqual([candidate.stock_code for candidate in planner.requests[0].candidates],
+                             ["000001.SZ"])
+            self.assertTrue(strategy._target_version)
+            self.assertTrue(any(event.stock_code == "000002.SZ"
+                                and event.extra.get("reason") == "missing_open_price"
+                                for event in strategy.signal_events))
         finally:
             engine.dispose()
 

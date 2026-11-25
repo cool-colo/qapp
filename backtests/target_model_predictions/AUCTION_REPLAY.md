@@ -63,9 +63,13 @@ The resulting fixed daily quantities are persisted before execution, with snapsh
 time, planning stage and prediction ranks in target `extra` JSON. The 09:27 snapshot reuses
 this plan. A restart restores it and reconciles active orders before submitting.
 An existing target without auction provenance is used only for normal execution.
-Missing mandatory candidate/holding prices, optimizer failure, persistence failure, or a
-missed cutoff skips auction participation. Suspended holdings retain their existing
-previous-close valuation and cannot trade.
+Auction planning uses the shared candidate filters and holding exit rules. Missing
+candidate prices exclude those candidates; holdings without a planning price use
+the previous close for sizing and stop checks. Holdings with neither price nor
+previous close are omitted with a warning. An empty snapshot, optimizer failure,
+persistence failure, or a missed cutoff skips auction participation. Suspended
+holdings retain their previous-close valuation and cannot trade. Previous-close
+planning valuation does not supply a valid auction execution reference.
 
 Live price limits continue to come from the Nautilus instrument. Daily historical
 price limits are used only by the tick-backtest subclass, independently of whether
@@ -248,8 +252,8 @@ order confirmations. The auction/continuous comparison uses identical bounds.
 A replay starts with configured cash and builds targets from observations received
 inside the interval; it does not replay earlier trading or inherit an earlier
 auction plan. A midday start can plan from continuous quotes carrying the actual
-open. Auction preparation inside the interval still requires complete snapshot
-coverage from the supplied observations. Signals, calendars, historical limits
+open. Auction preparation requires a nonempty same-day snapshot; individual missing
+prices are handled by the shared planning rules. Signals, calendars, historical limits
 and daily valuation bars load for the included exchange dates. `daily_portfolio`
 and `daily_positions` retain their daily-close valuation basis; a partial-day run
 does not turn those reports into valuation at the requested end minute. Run
@@ -336,13 +340,13 @@ Reports include per-order `auction_execution.csv`, actual fill events for daily
 cash/position reconstruction, and (with `--compare-auction`)
 `auction_comparison.csv` plus the continuous-only equity curve. The comparison
 runs the same data and continuous windows with auction execution disabled; its
-target plan is generated when the actual open becomes available. It therefore
+target plan uses prices available when daily planning is triggered. It therefore
 measures the complete change in planning and execution timing.
-The tick-backtest subclass waits until actual opens have arrived for every eligible
-signal candidate and nonsuspended holding, even if delivery times differ. Timer
-and refresh triggers obey this same readiness check. Known excluded candidates do
-not block readiness; a required open missing for the whole day leaves planning
-deferred with an explicit warning, instead of freezing an incomplete baseline.
+The tick-backtest subclass delegates price availability to shared planning rules;
+it does not wait for all candidate or holding opens. Missing candidate prices are
+filtered, while holdings may use the previous close for valuation and exit checks.
+The captured planning context remains frozen when later prices arrive. Timer and
+refresh triggers retain their trading-day and replay-time guards.
 
 Repeat the comparison with participation rates such as `0.005`, `0.01`, `0.02` and
 with different submission/cancel delays, using separate report directories. These

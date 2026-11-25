@@ -99,6 +99,8 @@ class RiskManagerModelTargetPlanner(ModelTargetPlanner):
         investable = request.investable_asset if request.investable_asset is not None else request.total_asset
         if investable is not None and float(investable) > 0:
             payload["total_asset"] = float(investable)
+        if request.account_id is not None:
+            payload["account_id"] = request.account_id
         return payload
 
     @staticmethod

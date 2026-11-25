@@ -591,6 +591,25 @@ class TargetLiveConfigTest(unittest.TestCase):
             recorder._on_before_auction_timer(None)
         record.assert_not_called()
 
+    def test_before_auction_restart_catches_up_only_before_fills(self) -> None:
+        recorder, strategy = self.constructed_recorder(MagicMock())
+        strategy._trading_dates = {date(2026, 11, 23)}
+        for timestamp, expected in (
+            ("2026-11-23 09:23:59", False),
+            ("2026-11-23 09:24:00", True),
+            ("2026-11-23 09:24:59", True),
+            ("2026-11-23 09:25:00", False),
+            ("2026-11-22 09:24:30", False),
+        ):
+            with (
+                self.subTest(timestamp=timestamp),
+                patch.object(SnapshotRecorder, "_now", return_value=pd.Timestamp(timestamp, tz="Asia/Shanghai")),
+                patch.object(SnapshotRecorder, "_run_full_tick_fetch"),
+                patch.object(SnapshotRecorder, "_run_before_auction") as record,
+            ):
+                recorder._catch_up_on_start()
+                self.assertEqual(record.call_count, int(expected))
+
     def test_snapshot_fixed_timers_enable_per_task_reporting(self) -> None:
         recorder = self._make_snapshot_recorder_stub("2026-07-08 09:27:00")
         recorder._before_time = (9, 27)
@@ -2142,6 +2161,8 @@ class TargetLiveConfigTest(unittest.TestCase):
     def _make_snapshot_recorder_stub(now_text: str) -> SimpleNamespace:
         recorder = SimpleNamespace()
         recorder.config = SnapshotRecorderConfig(account_id="ACC", trader_id="TRADER")
+        recorder._before_auction_time = (9, 24)
+        recorder._run_before_auction = MagicMock()
         recorder._run_full_tick_fetch = MagicMock()
         recorder._run_before_trading = MagicMock()
         recorder._run_continuous_trading = MagicMock()

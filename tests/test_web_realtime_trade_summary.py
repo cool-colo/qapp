@@ -398,13 +398,23 @@ def test_unchecking_auction_option_omits_auction_only_stocks() -> None:
         mysql.connection.close()
 
 
-def test_conflicting_actual_auction_prices_fail_instead_of_inventing_an_open() -> None:
+def test_conflicting_actual_auction_prices_keep_trades_without_inventing_an_open() -> None:
     mysql = SqliteMySql()
     try:
         mysql.fill("auction-1", "F1", "600824.SH", price=10, trade_time="09:25:00")
         mysql.fill("auction-2", "F2", "600824.SH", price=11, trade_time="09:25:00")
-        with pytest.raises(ValueError, match="conflicting opening-auction prices for 600824.SH"):
-            realtime_trade_summary("simulation", "A1", "T1", FakeData(mysql))
+        result = realtime_trade_summary("simulation", "A1", "T1", FakeData(mysql))
+        stock = result["slippage"]["stocks"][0]
+        assert stock["trade_count"] == 2
+        assert stock["traded_qty"] == 200
+        assert stock["traded_amount"] == 2100
+        assert stock["pricing_error"] == "集合竞价成交价冲突，无法确定开盘价"
+        assert stock["avg_open_price"] is None
+        assert stock["slippage_amount"] is None
+        assert stock["slippage_bps"] is None
+        assert result["slippage"]["total"]["amount"] is None
+        assert result["slippage"]["total"]["unpriced_stock_count"] == 1
+        assert result["sell_amount"] == 2100
     finally:
         mysql.connection.close()
 

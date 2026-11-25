@@ -982,6 +982,11 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
             {candidate.instrument_id for candidate in candidates}
             | {holding.instrument_id for holding in current_holdings},
         )
+        venue = self._instrument_ids[0].venue if self._instrument_ids else None
+        account = self.portfolio.account(venue=venue)
+        if account is None:
+            raise ValueError(f"Planning requires a Nautilus account for venue={venue}")
+        account_id = account.id.get_id()
         total_asset = float(self._portfolio_value())
         # The sizing basis includes every actual holding, before local exclusions
         # or sellable-quantity reductions applied to current_holdings.
@@ -1021,6 +1026,7 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
             total_asset=total_asset,
             investable_asset=investable_asset,
             open_prices=open_prices,
+            account_id=account_id,
         )
         return request, forced_exits
 
@@ -1676,8 +1682,6 @@ class TargetModelPredictionsStrategy(OrchestratedStrategyMixin, TargetQuantitySt
             inputs = planning_context.instruments.get(instrument_id_text)
             if inputs is not None and inputs.price is not None:
                 return inputs.price, inputs.price_source
-            if planning_context.stage == "opening_auction":
-                return None, None
             close = None if inputs is None else inputs.previous_close
         else:
             price = self._today_open_price(instrument_id_text)

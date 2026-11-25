@@ -526,32 +526,21 @@ class LiveControlServer:
         return row
 
     def _closed_row(self, position: Any, iid_text: str) -> dict:
-        # Sold out today: nothing held now, so 当前拥股/可用/市值/持仓成本 are 0.
-        #
-        # 当日涨幅 and 当日盈亏 are DIFFERENT things and use DIFFERENT prices:
-        #   - 最新价 / 当日涨幅 are properties of the *stock*: the current live quote
-        #     and its move off 昨收. A sold-out row still tracks the live quote, so we
-        #     show the current market price (matching the broker screen), NOT the exit
-        #     price. Using avg_px_close as 最新价 was the bug — under QMT snapshot
-        #     reconciliation avg_px_open == avg_px_close, so it is just the cost price,
-        #     neither a live price nor a reliable exit price.
-        #   - 当日盈亏 is *our* day result on the shares we sold: (卖出均价 − 昨收) ×
-        #     卖出股数, using the actual exit price (avg_px_close), independent of where
-        #     the stock trades now.
-        # realized_pnl is basically fees under reconciliation, so 盈亏比例 stays "-".
-        avg_price = _float_or_none(position.avg_px_open)  # 成本价
-        avg_close = _float_or_none(position.avg_px_close)  # 卖出均价 (清仓均价)
-        last_price = self._last_price(iid_text)  # 最新价 (current live quote)
+        # A reconciled position's avg_px_close and peak_qty include synthetic
+        # adjustments and historical position size. Only actual same-day sells
+        # establish the proceeds and quantity for today's realized result.
+        avg_price = _float_or_none(position.avg_px_open)
+        last_price = self._last_price(iid_text)
         prev_close = self._prev_close(iid_text)
-        sold_qty = _decimal_or_none(position.peak_qty) or Decimal(0)
+        sells = self._today_sells(iid_text)
 
         day_change = None  # 当日涨幅: stock's move off 昨收, from the live quote
         if last_price is not None and prev_close is not None and prev_close > 0:
             day_change = (last_price - prev_close) / prev_close
 
         day_pnl = None  # 当日盈亏: our result on sold shares, from the exit price
-        if avg_close is not None and prev_close is not None and prev_close > 0:
-            day_pnl = (avg_close - prev_close) * float(sold_qty)
+        if sells["sell_qty"] > 0 and prev_close is not None and prev_close > 0:
+            day_pnl = sells["sell_notional"] - prev_close * sells["sell_qty"]
 
         row = self._base_row(iid_text)
         row.update(
@@ -564,7 +553,7 @@ class LiveControlServer:
                 "unrealized_pnl": None,  # 持仓盈亏 (已清仓 → 留空)
                 "pnl_ratio": "-",  # 盈亏比例 (无法从对账数据可靠计算)
                 "day_change": day_change,  # 当日涨幅 = (最新价 − 昨收) / 昨收
-                "day_pnl": day_pnl,  # 当日盈亏 = (卖出均价 − 昨收) × 卖出股数
+                "day_pnl": day_pnl,  # Actual same-day sell proceeds less previous-close value
                 "market_value": 0.0,  # 市值
                 "position_cost": 0.0,  # 持仓成本
                 "closed_today": True,

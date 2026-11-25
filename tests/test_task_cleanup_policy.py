@@ -372,7 +372,8 @@ class CleanupPolicyConfigurationTest(unittest.TestCase):
         shipped = OrchestrationConfig.load("configs/task_orchestration.yaml")
         self.assertEqual([name for name, s in shipped.tasks.items() if s.skip_entry_cleanup],
                          ["auction_execution"])
-        self.assertFalse(any(s.skip_exit_cleanup for s in shipped.tasks.values()))
+        self.assertEqual([name for name, s in shipped.tasks.items() if s.skip_exit_cleanup],
+                         ["auction_execution"])
 
     def test_only_strict_boolean_flags_are_accepted(self):
         from trading_orchestration.configuration.orchestration_config import OrchestrationConfig

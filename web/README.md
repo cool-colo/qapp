@@ -10,8 +10,8 @@ A local, read-only dashboard for the live trading data this repo persists:
   opening-auction fills even when the matching order has no opening price. Actual
   opening-auction prices, identified by broker trade times from 09:25 up to 09:30,
   establish the day's open for that stock: auction slippage is zero, and later fills
-  use that same opening price. Conflicting auction prices raise rather than creating
-  an average opening price. **包含集合竞价成交** is checked by default. Unchecking
+  use that same opening price. Conflicting auction prices leave the affected open price and slippage unavailable
+  with an explicit warning; turnover and orders remain visible. **包含集合竞价成交** is checked by default. Unchecking
   it removes auction fills from the slippage rows and their amount-weighted bp
   denominator while retaining their opening prices for later fills. Turnover cards
   always cover the whole day. Missing opening prices for continuous fills still make
@@ -33,10 +33,10 @@ A local, read-only dashboard for the live trading data this repo persists:
   loss rates. It requests only those stock codes from the node's generic
   `/realtime/ticks?stock_codes=...` API, backed by the per-second strategy market
   snapshot; it does not download the whole-market snapshot. Below it, a minute-level
-  **盘前计划交易损失（bp）** curve uses today's latest target version from
-  `live_target_portfolio` (ordered by `write_time`, then `id`, without a snapshot-phase
-  filter) minus `before_trading` `live_position_snapshot.volume`, taking the union
-  of both stock sets. Repeated stocks within that version use their latest row.
+  **盘前计划交易损失（bp）** curve uses the selected committed planning archive from
+  `live_target_plan` (latest by default, with its planning persistence time displayed)
+  minus `before_auction` `live_position_snapshot.volume`, taking the union
+  of both stock sets. Historical planning requests can be selected independently.
   Holdings absent from the latest targets are full sells, including stop-loss exits.
   Completed trades remain in the estimate; a new target version updates the book
   on refresh. Each minute's `close` from `ricequant_stock_minute_realtime`

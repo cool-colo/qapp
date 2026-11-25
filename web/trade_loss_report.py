@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -201,6 +203,27 @@ def build_minute_trade_loss(
     }
 
 
+def load_target_plans(mysql: MySqlSource, *, account: str, trader: str, trading_date: str) -> list[dict[str, Any]]:
+    rows = mysql.query(
+        """SELECT request_id, target_version, updated_at, payload FROM live_target_plan
+        WHERE account_id = %(account_id)s AND trader_id = %(trader_id)s
+          AND trade_date = %(trade_date)s AND status = 'committed'
+        ORDER BY updated_at DESC, id DESC""",
+        {"account_id": account, "trader_id": trader, "trade_date": trading_date},
+    )
+    plans = []
+    for row in rows:
+        payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+        plans.append({
+            "request_id": row["request_id"], "target_version": row["target_version"],
+            "planning_time": str(row["updated_at"]),
+            "targets": [{"stock_code": instrument.rsplit(".", 1)[0], "target_qty": qty,
+                         "target_version": row["target_version"]}
+                        for instrument, qty in payload["quantities"].items()],
+        })
+    return plans
+
+
 def query_minute_trade_loss(
     mysql: MySqlSource,
     clickhouse: ClickHouseClient,
@@ -208,6 +231,7 @@ def query_minute_trade_loss(
     account: str,
     trader: str,
     trading_date: str,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     day = date.fromisoformat(trading_date).isoformat()
     params = {"account_id": account, "trader_id": trader, "trade_date": day}
@@ -215,24 +239,14 @@ def query_minute_trade_loss(
         account_id = %(account_id)s AND trader_id = %(trader_id)s
         AND trade_date = %(trade_date)s AND status = 'ok'
     """
-    target_rows = mysql.query(
-        f"""SELECT stock_code, target_qty, target_version
-        FROM live_target_portfolio WHERE {identity}
-        ORDER BY write_time DESC, id DESC""",
-        params,
-    )
-    # Select one whole version, so stocks removed by replanning are not inherited
-    # from earlier targets. A version may be repeated across snapshot phases;
-    # keep its newest record per stock.
-    targets: list[dict[str, Any]] = []
-    seen_codes: set[str] = set()
-    if target_rows:
-        latest_version = target_rows[0]["target_version"]
-        for row in target_rows:
-            code = str(row["stock_code"])
-            if row["target_version"] == latest_version and code not in seen_codes:
-                targets.append(row)
-                seen_codes.add(code)
+    plans = load_target_plans(mysql, account=account, trader=trader, trading_date=day)
+    if request_id:
+        selected = next((plan for plan in plans if plan["request_id"] == request_id), None)
+    else:
+        selected = plans[0] if plans else None
+    if request_id and selected is None:
+        raise ValueError("selected target planning does not exist for this account and date")
+    targets = selected["targets"] if selected else []
     result: dict[str, Any] = {
         "trade_date": day,
         "status": "missing_preopen_target",
@@ -240,9 +254,14 @@ def query_minute_trade_loss(
         "trades": [],
         "points": [],
     }
-    if not targets:
+    result["target_plans"] = [{k: v for k, v in plan.items() if k != "targets"} for plan in plans]
+    result["selected_request_id"] = selected["request_id"] if selected else None
+    result["planning_time"] = selected["planning_time"] if selected else None
+    result["target_versions"] = [selected["target_version"]] if selected else []
+    result["position_snapshot_type"] = "before_auction"
+    if selected is None:
         return result
-    preopen_identity = f"{identity} AND snapshot_type = 'before_trading'"
+    preopen_identity = f"{identity} AND snapshot_type = 'before_auction'"
     positions = mysql.query(
         f"SELECT stock_code, volume FROM live_position_snapshot WHERE {preopen_identity}",
         params,
@@ -261,6 +280,5 @@ def query_minute_trade_loss(
         [row["stock_code"] for row in trades], day,
     )) if trades else []
     result.update(build_minute_trade_loss(trades, minutes))
-    result["target_versions"] = sorted({row["target_version"] for row in targets if row["target_version"]})
     result["status"] = "ok" if trades else "no_trades"
     return result

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from task_orchestration.models import Decision, RunState
 from strategies.opening_auction import auction_time
-from nautilus_trader.model.enums import MarketStatusAction
 from trading_orchestration.services.whole_market_snapshot import SnapshotProvider
 from trading_orchestration.components.planners.planning_context_builder import PlanningContextProvider
 
@@ -61,19 +60,7 @@ class AuctionGoalPlanner:
             host.apply_full_tick_snapshot(fields, 'auction_prepare')
             snapshot = self.builder.build(day, stage='opening_auction', snapshot=fields,
                                           ts_init=batch.completed_at_ns)
-            signal_day = host._resolve_signal_date(day)
-            required = host._held_instrument_ids() | {
-                str(host._instrument_by_stock[item['stock_code']])
-                for item in host._signals_by_date.get(signal_day, [])
-                if item['stock_code'] in host._instrument_by_stock}
-            suspended = host._suspended_by_date.get(day, set())
-            missing = [iid for iid in sorted(required)
-                       if (iid not in snapshot.instruments or snapshot.instruments[iid].price is None)
-                       and host._stock_code_for_instrument(iid) not in suspended
-                       and (iid not in snapshot.instruments
-                            or snapshot.instruments[iid].market_status != MarketStatusAction.SUSPEND)]
-            if missing or not fields:
-                self.evidence['missing_instruments'] = missing
+            if not fields:
                 return self._failure(day, 'invalid_auction_planning_snapshot')
             self.snapshot = snapshot
             if host._target_date != day or not host._target_version:

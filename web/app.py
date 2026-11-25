@@ -69,7 +69,7 @@ class SellRequest(BaseModel):
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-SNAPSHOT_TYPES = {"before_trading", "continuous_trading", "after_trading"}
+SNAPSHOT_TYPES = {"before_auction", "before_trading", "continuous_trading", "after_trading", "all"}
 
 # Per-account snapshot tables share these key columns.
 _ACCOUNT_KEYS = "account_id = %(account_id)s AND trader_id = %(trader_id)s"
@@ -292,7 +292,7 @@ def get_positions(
     mysql = _mysql(data, source)
     where = [_ACCOUNT_KEYS, "trade_date = %(date)s"]
     params: dict[str, Any] = {"account_id": account, "trader_id": trader, "date": date}
-    if snapshot_type:
+    if snapshot_type and snapshot_type != "all":
         where.append("snapshot_type = %(snapshot_type)s")
         params["snapshot_type"] = snapshot_type
     rows = mysql.query(
@@ -328,7 +328,7 @@ def get_target(
     mysql = _mysql(data, source)
     where = [_ACCOUNT_KEYS, "trade_date = %(date)s"]
     params: dict[str, Any] = {"account_id": account, "trader_id": trader, "date": date}
-    if snapshot_type:
+    if snapshot_type and snapshot_type != "all":
         where.append("snapshot_type = %(snapshot_type)s")
         params["snapshot_type"] = snapshot_type
     rows = mysql.query(
@@ -466,7 +466,7 @@ def get_asset_series(
                nt_balance_locked, nt_unrealized_pnl, nt_realized_pnl
         FROM live_asset_snapshot
         WHERE {_ACCOUNT_KEYS}
-          AND snapshot_type = %(snapshot_type)s
+          AND (%(snapshot_type)s = 'all' OR snapshot_type = %(snapshot_type)s)
           AND trade_date BETWEEN %(start)s AND %(end)s
         ORDER BY trade_date
         """,
@@ -1259,7 +1259,8 @@ def realtime_trade_summary(
         auction_open = row.pop("auction_open_price")
         auction_max = row.pop("auction_max_price")
         if auction_open != auction_max:
-            raise ValueError(f"conflicting opening-auction prices for {row['stock_code']}")
+            row["unpriced_trade_count"] = row["trade_count"]
+            row["pricing_error"] = "集合竞价成交价冲突，无法确定开盘价"
         if row["unpriced_trade_count"]:
             for column in ("avg_open_price", "slippage_amount", "slippage_bps"):
                 row[column] = None
@@ -1603,12 +1604,14 @@ def realtime_trade_loss(
     account: str,
     trader: str,
     data: DataAccess = Depends(get_data),
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """Latest targets minus preopen holdings valued at each realtime minute close."""
     try:
         payload = trade_loss_report.query_minute_trade_loss(
             _mysql(data, source),
             data.clickhouse,
+            request_id=request_id,
             account=account,
             trader=trader,
             trading_date=datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat(),

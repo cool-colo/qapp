@@ -42,12 +42,13 @@ class AuctionCleanupPolicyTest(unittest.TestCase):
                                   ts_event=timestamp("2026-07-08 09:30:10"))
                           for r in morning if r.ts_init == timestamp("2026-07-08 09:30:00")]
 
-    def run_auction(self, *, skip, missing=(), available_at="09:25:00.200"):
+    def run_auction(self, *, skip, missing=(), available_at="09:25:00.200", skip_exit=False):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "tasks.yaml"
             path.write_text("schema_version: 2\nexposure:\n  enabled: false\ntasks:\n"
                             "  auction_execution:\n    skip_entry_cleanup: " +
-                            ("true" if skip else "false") + "\n    skip_exit_cleanup: false\n")
+                            ("true" if skip else "false") + "\n    skip_exit_cleanup: " +
+                            ("true" if skip_exit else "false") + "\n")
             engine, strategy, _, _ = replay_fixture(continuous=True,
                 transform_rows=self.morning_rows,
                 strategy_type=lambda c: MissingExecutionPriceStrategy(c,
@@ -77,6 +78,16 @@ class AuctionCleanupPolicyTest(unittest.TestCase):
         self.assertEqual({o.ts_init for o in orders}, {admitted.now_ns})
         self.assertTrue(all(timestamp("2026-07-08 09:24:58") <= o.ts_init < timestamp("2026-07-08 09:25:00") for o in orders))
         self.assertTrue([r for r in records if r.action == "CLEANUP_COMPLETED" and r.evidence["kind"] == "exit"])
+
+    def test_accepted_orders_finish_before_cutoff_and_skip_exit_cleanup(self):
+        records, orders = self.run_auction(skip=True, skip_exit=True)
+        outcome = next(r for r in records if r.action == "OUTCOME_DECIDED")
+        self.assertEqual(outcome.reason, "auction_orders_accepted")
+        self.assertLess(outcome.now_ns, timestamp("2026-07-08 09:25:00"))
+        self.assertEqual([r.evidence["kind"] for r in records if r.action == "CLEANUP_SKIPPED"],
+                         ["entry", "exit"])
+        self.assertTrue(orders)
+        self.assertTrue(all(o.filled_qty == o.quantity for o in orders))
 
     def test_original_entry_cleanup_delay_can_exhaust_the_two_second_window(self):
         records, orders = self.run_auction(skip=False)
