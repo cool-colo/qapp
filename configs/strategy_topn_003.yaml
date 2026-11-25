@@ -93,9 +93,9 @@ preopen_latency_fixed_advance_ms: 50
 # Planning fetches a whole-market full-tick batch; execution uses cached prices.
 # No cancels before 09:30.
 auction_enabled: true
-auction_start_time: "09:24:25"  # Planning timer: fetch latest prices, then freeze targets.
-auction_execution_time: "09:24:58"  # Execution timer: validate cached full tick/depth prices, then submit.
-auction_submit_cutoff: "09:25:00"  # Exclusive: no new submissions at or after this time.
+auction_start_time: "09:16:25"  # Planning timer: fetch latest prices, then freeze targets.
+auction_execution_time: "09:16:58"  # Execution timer: validate cached full tick/depth prices, then submit.
+auction_submit_cutoff: "09:17:00"  # Exclusive: no new submissions at or after this time.
 auction_buy_offset_bps: 80.0  # BUY: reference price + 80 BP (0.8%).
 auction_sell_offset_bps: 50.0  # SELL: reference price - 50 BP (0.5%).
 auction_commission_rate: 0.000085  # 万 0.85, both buys and sells
