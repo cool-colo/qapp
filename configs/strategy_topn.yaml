@@ -85,8 +85,8 @@ exchange_execution_windows: "14:30-14:56"
 # Independent cancel windows: inclusive start, exclusive end (seconds supported).
 # Cancellation checks continue after stop_time; replacements keep execution_windows.
 # 14:56:59 can cancel; 14:57:00 cannot cancel during the closing auction.
-cancel_windows: "09:35-11:30,13:00-14:56"
-exchange_cancel_windows: "09:35-11:30,13:00-14:56"
+cancel_windows: "09:30-11:30,13:00-14:56"
+exchange_cancel_windows: "09:30-11:30,13:00-14:56"
 # Retained latency-probe settings; they cannot bypass the execution window.
 preopen_latency_execution_enabled: false
 preopen_latency_max_advance_ms: 3000
